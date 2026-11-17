@@ -8809,6 +8809,8 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
             None => { i += 1; }
             Some(None) => {
                 let p = pending.remove(i);
+                // the checker stops queueing the group's checks again at each epoch move
+                crate::borrowck::lazy::unwant(unsafe { (&*up).front.checker_id }, p.group);
                 for why in &unchecked {
                     eprintln!("relax live: {}: the borrow checker did not check {} (it stays unverified baseline code)", p.what, why);
                 }
@@ -8846,8 +8848,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let mut invalidated: Vec<String> = Vec::new();
                 let mut first_seq = u64::MAX;
                 let what = pending[i].what.clone();
+                let checker = unsafe { (&*up).front.checker_id };
                 pending.retain(|q| {
                     if reverted.contains(&q.group) || (!ok && q.group == group) {
+                        crate::borrowck::lazy::unwant(checker, q.group);
                         first_seq = first_seq.min(q.event_seq);
                         UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
                         false

@@ -750,6 +750,15 @@ fn def_ice(prog: &crate::program::Program, d: crate::program::DefId, what: &str,
     prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} of {}: {}{} -- Relax bug, report it", what, prog.def_path(d), said, jit::take_ice_location()))
 }
 
+/// What a borrowck verdict says beyond its errors: an internal error for every body a failure left
+/// unchecked (never taken as checked: rustc's delayed bug), and a note on stderr for every body
+/// holding a construct the MIR builder does not express (a known gap, not refused).
+pub(crate) fn verdict_gaps(prog: &crate::program::Program, d: crate::program::DefId, v: &crate::borrowck::Verdict) -> Vec<String> {
+    let errors = v.unchecked.iter().map(|x| def_ice(prog, d, "the borrows", x)).collect();
+    for x in &v.unsupported { stderr_line!("relax check: note: not borrow-checked: {}", x); }
+    errors
+}
+
 /// `f` on `defs`, on the check's workers, in `defs`' order.
 fn def_round<R: Send>(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, defs: &[crate::program::DefId], what: &str, f: &(impl Fn(&crate::program::Program, &crate::tcx::Tcx, crate::program::DefId) -> R + Sync)) -> Vec<DefWork<R>> {
     par_map(defs, jobs(), |&d| def_work(|said| def_ice(prog, d, what, said), || f(prog, tcx, d)))
@@ -982,30 +991,30 @@ fn body_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, options: &
             return (staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVACY), privacy).collect(), Vec::new());
         }
         // E0004 / E0005 and the pattern lints (rustc check_match: its errors stop the body
-        // before borrowck); an internal failure of the analysis reports nothing, as in a check
+        // before borrowck); an internal failure of the analysis is an internal error of the body
         let pats = body_step(6, || crate::memstat::tagged(Tag::Patterns, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::pattern_analysis::check_body(prog, tcx, &body)))));
         // (binding conflicts of `x @ pat` do not end the checks: borrowck runs after them)
-        let mut at_patterns = Vec::new();
-        match pats {
+        let at_patterns = match pats {
             Ok(r) if !r.errors.is_empty() => { let mut e = r.errors; e.extend(r.at_patterns); return (staged(patterns, e).collect(), Vec::new()) }
-            Ok(r) => at_patterns = r.at_patterns,
+            Ok(r) => r.at_patterns,
             Err(p) if crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
-            Err(_) => {
-                if check_trace() { stderr_line!("relax check: pattern analysis failed in {}", prog.def_path(d)); }
+            Err(p) => {
+                return (vec![(patterns, def_ice(prog, d, "the patterns", p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("a panic")))], Vec::new());
             }
-        }
+        };
         if lints && !crate::borrowck::enabled(options) {
             return (staged(patterns, at_patterns).collect(), Vec::new());
         }
         let v = body_step(7, || crate::memstat::tagged(Tag::Borrowck, || crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body)));
         crate::borrowck::note_verdict(&v);
-        if borrowck_unchecked() {
-            for x in &v.unchecked { eprintln!("relax check: borrowck unchecked: {}", x); }
-        }
+        // a body the borrow check could not finish is never taken as checked (rustc: a delayed bug)
+        let borrowck = Stage::of(Phase::Mir, crate::check_order::MIR_BORROWCK, d);
+        let mut internal: Vec<(Stage, String)> = verdict_gaps(prog, d, &v).into_iter().map(|e| (borrowck, e)).collect();
         let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
         let origin = if lints { crate::borrowck::event::Origin::Check } else { crate::borrowck::event::Origin::DeferredCheck };
         let events = body_step(8, || crate::memstat::tagged(Tag::Borrowck, || crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, origin)));
-        (staged(patterns, at_patterns).collect(), events)
+        internal.extend(staged(patterns, at_patterns));
+        (internal, events)
     };
     let (mut errs, events) = inner();
     errs.extend(staged(Stage::new(Phase::Attrs, 0), gates));
@@ -1595,6 +1604,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // RELAX_BORROWCK_INSTANCES=1: every reached instance is borrow-checked too (the background
     // checker's view: concrete type arguments, all crates)
     if crate::borrowck::enabled(options) && options.borrowck_instances {
+        let mut borrow_errors = Vec::new();
         for id in 0..unsafe { (&(*up).fns).len() } {
             let key = unsafe { (&(*up).fns)[id].key.clone() };
             let FnKey::Inst(d, args) = key else { continue };
@@ -1608,10 +1618,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                 }
                 let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
                 crate::borrowck::note_verdict(&v);
+                borrow_errors.extend(verdict_gaps(&uu.prog, d, &v));
                 borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
             }));
             let _ = r;
         }
+        for e in borrow_errors { errors.push((unit_stage(&e), e)); }
     }
     let bodies_blocked;
     unsafe {

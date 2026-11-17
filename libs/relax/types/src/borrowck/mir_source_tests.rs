@@ -1074,3 +1074,28 @@ fn a_closures_higher_ranked_signature_regions_survive_normalization_under_the_bi
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+/// A body holding inline asm is one the MIR builder does not express: it is listed as unsupported (the
+/// check names it in a note), not as an internal failure (the check reports those as errors), and the
+/// crate's other bodies are checked as before.
+#[test]
+fn an_inline_asm_body_is_unsupported_not_an_internal_failure() {
+    let (prog, tcx, user) = load_source("
+        pub fn spin() { unsafe { core::arch::asm!(\"nop\") } }
+        pub fn plain(x: &u8) -> u8 { *x }
+        pub fn bad() -> &'static u8 { let x = 1u8; &x }", 2021, "repro");
+    let (mut unsupported, mut errors) = (Vec::new(), Vec::new());
+    for owner in crate::borrowck::body::owners(&prog) {
+        if prog.def(owner.owner).krate != user { continue; }
+        let state = EvalState::new();
+        let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
+        let body = tcx.typeck(&prog, owner.owner);
+        assert!(body.errors.is_empty(), "typeck: {:?}", body.errors);
+        let v = crate::borrowck::driver::check_root(&cx, &prog, &tcx, &body, None);
+        assert!(v.unchecked.is_empty(), "internal failures: {:?}", v.unchecked);
+        unsupported.extend(v.unsupported);
+        errors.extend(v.errors.iter().map(|e| format!("{} {}", prog.def_path(owner.owner), e.code)));
+    }
+    assert!(unsupported.len() == 1 && unsupported[0].ends_with("spin: inline asm"), "{unsupported:?}");
+    assert!(errors.len() == 1 && errors[0].ends_with("bad E0515"), "the other bodies are checked: {errors:?}");
+}

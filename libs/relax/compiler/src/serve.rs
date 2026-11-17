@@ -205,6 +205,7 @@ impl Session {
                 let polymorphic = args.iter().any(|a| !u.tcx.tys.is_concrete(*a));
                 if body.errors.is_empty() && crate::borrowck::enabled(options) {
                     let verdict = u.tcx.with_errors(&cx, || crate::borrowck::check_body(&cx, &u.prog, &u.tcx, &body)).0;
+                    errors.extend(crate::check::verdict_gaps(&u.prog, item, &verdict));
                     borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), item, &args, verdict.errors, crate::borrowck::event::Origin::Serve).iter().map(|e| e.error.to_diagnostic()));
                 }
                 // Match check_crate's treatment of polymorphic bodies: concrete instances
