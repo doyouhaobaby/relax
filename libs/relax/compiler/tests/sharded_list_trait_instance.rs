@@ -1,41 +1,42 @@
+// A safe analogue of Tokio's sharded-list trait dispatch: normalizing Target
+// must not lose the impl header's implied outlives bounds.
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
-unsafe trait Link {
+trait Link {
     type Handle;
     type Target;
-    fn as_raw(handle: &Self::Handle) -> NonNull<Self::Target>;
+    fn target(handle: &Self::Handle) -> &Self::Target;
 }
-unsafe trait ShardedListItem: Link {
-    unsafe fn get_shard_id(target: NonNull<Self::Target>) -> usize;
+trait ShardedListItem: Link {
+    fn get_shard_id(target: &Self::Target) -> usize;
 }
 struct Header(usize);
 struct Task<S: 'static> {
     header: Arc<Header>,
     scheduler: PhantomData<S>,
 }
-unsafe impl<S> Link for Task<S> {
+impl<S> Link for Task<S> {
     type Handle = Task<S>;
     type Target = Header;
-    fn as_raw(handle: &Task<S>) -> NonNull<Header> {
-        NonNull::from(handle.header.as_ref())
+    fn target(handle: &Task<S>) -> &Header {
+        handle.header.as_ref()
     }
 }
-unsafe impl<S> ShardedListItem for Task<S> {
-    unsafe fn get_shard_id(target: NonNull<Self::Target>) -> usize {
-        unsafe { target.as_ref().0 }
+impl<S> ShardedListItem for Task<S> {
+    fn get_shard_id(target: &Self::Target) -> usize {
+        target.0
     }
 }
 struct ShardedList<L: ShardedListItem>(PhantomData<L>);
 impl<L: ShardedListItem> ShardedList<L> {
     fn lock_shard(&self, val: &L::Handle) -> usize {
-        unsafe { L::get_shard_id(L::as_raw(val)) }
+        L::get_shard_id(L::target(val))
     }
 }
 struct Handle;
 #[test]
-fn generic_unsafe_subtrait_method_resolves_inherited_associated_type() {
+fn generic_subtrait_method_resolves_inherited_associated_type() {
     let task = Task::<Arc<Handle>> {
         header: Arc::new(Header(7)),
         scheduler: PhantomData,
@@ -49,16 +50,16 @@ struct BorrowedTask<'a, S: 'a> {
     header: Header,
     scheduler: PhantomData<&'a S>,
 }
-unsafe impl<'a, S> Link for BorrowedTask<'a, S> {
+impl<'a, S> Link for BorrowedTask<'a, S> {
     type Handle = Self;
     type Target = Header;
-    fn as_raw(handle: &Self) -> NonNull<Header> {
-        NonNull::from(&handle.header)
+    fn target(handle: &Self) -> &Header {
+        &handle.header
     }
 }
-unsafe impl<'a, S> ShardedListItem for BorrowedTask<'a, S> {
-    unsafe fn get_shard_id(target: NonNull<Self::Target>) -> usize {
-        unsafe { target.as_ref().0 }
+impl<'a, S> ShardedListItem for BorrowedTask<'a, S> {
+    fn get_shard_id(target: &Self::Target) -> usize {
+        target.0
     }
 }
 fn borrowed_shard<'a>(value: &'a usize) -> usize {
