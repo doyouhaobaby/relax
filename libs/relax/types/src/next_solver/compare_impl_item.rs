@@ -82,7 +82,13 @@ impl Tcx {
             let p = ocx.normalize_predicate(&env, &p);
             ocx.register_obligation(Goal { param_env: env.clone(), predicate: p });
         }
-        let mut wf_tys = Vec::new();
+        // Impl headers are assumed well formed. Their implied outlives bounds
+        // remain available even when an associated type in the method signature
+        // normalizes to a type that no longer mentions the impl parameters.
+        let mut wf_tys = vec![self.impl_self[&imp]];
+        if let Some(args) = self.impl_trait_args.get(&imp) { wf_tys.extend_from_slice(args); }
+        let normalized: Vec<_> = wf_tys.iter().map(|&ty| ocx.normalize_ty(&env, ty)).collect();
+        wf_tys.extend(normalized);
         match prog.def(method).kind {
             DefKind::AssocFn => {
                 let imp_sig = self.fn_item_sig(prog, method).ok_or(NoSolution)?;
