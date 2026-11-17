@@ -1374,6 +1374,26 @@ fn round41_preempted_typeck_can_be_checked_later() {
     assert!(body.errors.is_empty(), "{:?}", body.errors);
 }
 
+/// A constant's typeck preempted while the borrow check qualifies it (`BuildProvider::mir_const_qualif`, a
+/// `thread_local!` initializer or a `const` the body reads) unwinds as the preemption it is: the JIT retries the
+/// body. Caught as "typeck panicked", the body was left unchecked and reported as an internal error.
+#[test]
+fn a_preempted_constant_typeck_unwinds_through_its_qualification() {
+    use crate::mir::transform::qualifs::ConstQualifsProvider;
+    let (prog, tcx) = program("const C: u32 = 1 + 2;\nfn reads() -> u32 { C }", "preempt_qualif");
+    let c = named(&prog, "C");
+    let provider = crate::mir::build::driver::BuildProvider { prog: &prog, tcx: &tcx, memo: Default::default() };
+    let writer = crate::preempt::WriterWaiting::new();
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _on = crate::preempt::Preemptible::on();
+        provider.mir_const_qualif(c)
+    }));
+    assert!(first.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)), "the preemption became the constant's qualification: {:?}", first.as_ref().ok());
+    drop(writer);
+    let again = provider.mir_const_qualif(c);
+    assert!(again.is_ok(), "the constant is not qualified once the writer is done (a stale in-progress mark?): {again:?}");
+}
+
 /// The panic of a check that reaches an anonymous const nobody fed names it: this message is the
 /// reason of the ledger's checker_panic record. A const parameter's path (`[u8; N]`) lowers to the
 /// parameter, and its holder's lowering feeds nothing (an anonymous const of a static's type, typed

@@ -560,6 +560,9 @@ pub struct Fcx<'a> {
     deferred_dyn: Vec<(ExprId, TyId, TyId, u32)>,
     /// Reference-to-pointer casts and casts whose target pointee was open.
     deferred_casts: Vec<(ExprId, TyId, TyId)>,
+    /// The deferred casts to a raw pointer whose source was an open type at the cast: only a source
+    /// that resolved to a reference takes the deferred path, any other is the cast check's alone.
+    open_source_casts: Vec<ExprId>,
     /// every `e as T` (cast expression's position), validated after fallback (cast.rs)
     cast_checks: Vec<(ExprId, TyId, TyId, u32)>,
     /// how many patterns enclose the one being checked
@@ -818,6 +821,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         diverging: Vec::new(),
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),
+        open_source_casts: Vec::new(),
         cast_checks: Vec::new(),
         pat_nest: 0,
         bind_mode: 0,
@@ -1838,13 +1842,15 @@ impl<'a> Fcx<'a> {
                     } else {
                         self.rollback_to(snap);
                         // rustc check_ref_cast: &[T; N] -> *const T first coerces
-                        // to a pointer to the array, using the source mutability.
+                        // to a pointer to the array, using the source mutability
+                        // (`array_ptr_type`); the cast then goes from it to the element.
                         let inner = self.shallow(inner);
                         if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
                             let snap = self.start_snapshot();
                             if self.eq(element, pointee) {
                                 self.commit_from(snap);
-                                self.set_coerce(e.0, Coerce::RefToRaw(sm), target);
+                                let array_ptr = self.tcx.tys.intern(TyKind::Ptr(sm, inner));
+                                self.set_coerce(e.0, Coerce::RefToRaw(sm), array_ptr);
                             } else { self.rollback_to(snap); }
                         }
                     }
@@ -2065,7 +2071,11 @@ impl<'a> Fcx<'a> {
             order.extend(deferred.into_iter().flatten().map(|d| (Some(d), None)));
         }
         for (d, check) in order {
-            if let Some((x, xt, target)) = d { self.finish_deferred_cast(x, xt, target); }
+            if let Some((x, xt, target)) = d {
+                // an open source that resolved to anything but a reference is the cast check's alone
+                let open = self.open_source_casts.contains(&x);
+                if !open || matches!(self.tcx.tys.kind(self.shallow(xt)), TyKind::Ref(..)) { self.finish_deferred_cast(x, xt, target); }
+            }
             if let Some((x, xt, target, lo)) = check { self.check_cast_final(x, xt, target, lo); }
         }
         // pending pointer-to-dyn coercions, now that their pointees are known
@@ -5327,6 +5337,12 @@ impl<'a> Fcx<'a> {
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
                 if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
                     self.deferred_casts.push((*x, xt, target));
+                } else if matches!((&kx, &kt), (TyKind::Infer(_), TyKind::Ptr(..))) {
+                    // an open source (`get(&s) as *const u32`, the element of `s` decided later):
+                    // rustc checks every cast at the end of typeck, where a reference source is
+                    // borrowed raw like one known here
+                    self.deferred_casts.push((*x, xt, target));
+                    self.open_source_casts.push(*x);
                 } else if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
                     self.set_coerce(x.0, Coerce::ToDyn(src, dy), target);
                 } else if let Some((sd, dd)) = self.dyn_upcast(&kx, &kt) {

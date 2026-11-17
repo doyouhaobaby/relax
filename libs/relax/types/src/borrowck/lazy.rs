@@ -68,7 +68,7 @@ fn runtime_disjoint(v: &super::Verdict) -> Vec<(crate::mir::Span, crate::mir::Sp
 /// disjoint-index checks is checked again in every run (the checks are not part of the stored verdict).
 fn storable(result: &Result<Option<super::Verdict>, String>) -> Option<StoredVerdict> {
     match result {
-        Ok(Some(v)) if v.errors.is_empty() && runtime_disjoint(v).is_empty() => Some(v.unchecked.first().map_or(StoredVerdict::Clean, |why| StoredVerdict::Unchecked(why.clone()))),
+        Ok(Some(v)) if v.errors.is_empty() && runtime_disjoint(v).is_empty() => Some(v.unchecked.first().or(v.unsupported.first()).map_or(StoredVerdict::Clean, |why| StoredVerdict::Unchecked(why.clone()))),
         Ok(Some(_)) => None,
         Ok(None) => Some(StoredVerdict::Unchecked("typeck".into())),
         _ => None,
@@ -162,6 +162,7 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
         let mut d = DISJOINT.lock().unwrap_or_else(|e| e.into_inner());
         for k in &gone { d.remove(k); }
     }
+    let gone_defs: Vec<DefId> = gone.iter().map(|k| k.1).collect();
     for k in gone {
         q.seen.remove(&k);
         if let Some(at) = q.rank_of.remove(&k) {
@@ -172,6 +173,8 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
     }
     q.pending_ranks.retain(|k, _| k.0 != src || keep(k.1));
     q.pending_order.retain(|k| k.0 != src || keep(k.1));
+    // the dropped owners a waiting patch group wants: checked again at the carried epoch
+    if q.requeue_wanted(src, base, Some(&gone_defs)) > 0 { WAKE.notify_one(); }
 }
 
 /// The program behind `src` was rebuilt unchanged (the settle rebuild: a restored program and
@@ -242,7 +245,11 @@ struct Queue {
     epoch: HashMap<usize, u64>, seq: u64,
     /// (src, epoch) -> the earlier epoch it stands for (carry_epoch): keys hold that one
     alias: HashMap<(usize, u64), u64>,
+    /// The checks live patch groups wait for (`want`), by (src, owner): queued again in the step
+    /// that drops them (`advance`, `carry_epoch`) until every group that wants one is settled.
+    wanted: HashMap<(usize, DefId), Wanted>,
 }
+struct Wanted { src: Arc<dyn FrontSource>, args: Vec<TyId>, groups: Vec<u32> }
 /// A live edit's checks: the person waits for its verdict. Ahead of hot code's: those are
 /// promoted keeping their place among the startup's checks, so a first edit after a cold start,
 /// at rank 0 with them, waited 9 s behind 362 promoted after it (an app, 11-04).
@@ -272,6 +279,22 @@ impl Queue {
         self.rank_of.remove(&item.key);
         Some((at.0, item))
     }
+    /// Queue the wanted checks of `src` at `epoch` again (of `defs` only, when given): the step
+    /// that dropped them asks for them, as no running code may (a static's initializer runs once).
+    fn requeue_wanted(&mut self, src: usize, epoch: u64, defs: Option<&[DefId]>) -> usize {
+        let again: Vec<(DefId, Arc<dyn FrontSource>, Vec<TyId>)> = self.wanted.iter()
+            .filter(|(k, _)| k.0 == src && defs.is_none_or(|d| d.contains(&k.1)) && !self.rank_of.contains_key(&(src, k.1, epoch)))
+            .map(|(k, w)| (k.1, w.src.clone(), w.args.clone())).collect();
+        let n = again.len();
+        for (def, item_src, args) in again {
+            let key = (src, def, epoch);
+            if specv_trace() { eprintln!("gandalf: the check of {def:?} a live patch waits for is queued again at epoch {epoch}"); }
+            self.seen.insert(key, ());
+            record(key, FnVerdict::Pending);
+            self.insert(Item { key, args: Some(args), cache_key: None, src: item_src, discovery: 0 }, RANK_EDIT);
+        }
+        n
+    }
     fn advance(&mut self, src: usize, epoch: u64) -> bool {
         let previous = self.epoch.get(&src).copied();
         if previous.is_some_and(|e| e > epoch) { return false; }
@@ -288,8 +311,28 @@ impl Queue {
             instances.retain(|k, _| k.0 != src || k.2 >= epoch);
             !instances.is_empty()
         });
+        self.requeue_wanted(src, epoch, None);
         true
     }
+}
+
+/// A live patch group (`group`) runs `def`'s code unverified and waits for its verdict: an epoch
+/// move or an edit's carry that drops the check queues it again in the same step, until `unwant`.
+pub fn want(src: &Arc<dyn FrontSource>, def: DefId, args: Vec<TyId>, group: u32) {
+    let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let q = guard.get_or_insert_with(Queue::default);
+    let w = q.wanted.entry((src.identity(), def)).or_insert_with(|| Wanted { src: src.clone(), args: Vec::new(), groups: Vec::new() });
+    w.args = args;
+    if !w.groups.contains(&group) { w.groups.push(group); }
+}
+/// Patch group `group` of `src` is settled (verified or reverted): its checks are not wanted again.
+pub fn unwant(src: usize, group: u32) {
+    let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(q) = guard.as_mut() else { return };
+    q.wanted.retain(|k, w| {
+        if k.0 == src { w.groups.retain(|g| *g != group); }
+        !w.groups.is_empty()
+    });
 }
 pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
     let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -598,7 +641,7 @@ fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[Ty
     let key = (src, def, epoch);
     match result {
         Ok(Some(v)) => {
-            let incomplete = v.errors.is_empty().then(|| v.unchecked.first().cloned()).flatten();
+            let incomplete = v.errors.is_empty().then(|| v.unchecked.first().or(v.unsupported.first()).cloned()).flatten();
             let checks = runtime_disjoint(&v);
             {
                 let mut d = DISJOINT.lock().unwrap_or_else(|e| e.into_inner());
@@ -724,7 +767,18 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             }
             let _slow = Slow(std::time::Instant::now(), &phase, prog, *def, item.discovery);
             let now = tcx.collect_epoch.load(Ordering::SeqCst);
-            if QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(now != *epoch, |q| q.canon(*identity, now) != *epoch || q.epoch.get(identity).is_some_and(|e| *e > *epoch)) {
+            let moved = match QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                None => now != *epoch,
+                Some(q) => {
+                    // the program moved on since this check was queued: the queue moves with it here
+                    // (it drops the older epoch's checks and queues the wanted ones again), not only at
+                    // the next check asked for
+                    let at = q.canon(*identity, now);
+                    if at > *epoch { q.advance(*identity, at); }
+                    at != *epoch || q.epoch.get(identity).is_some_and(|e| *e > *epoch)
+                }
+            };
+            if moved {
                 stale = true; return;
             }
             if *def == crate::program::NO_DEF {

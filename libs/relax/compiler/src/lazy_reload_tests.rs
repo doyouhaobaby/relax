@@ -332,7 +332,9 @@ fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
 }
 
 /// SPEC-V: a patch runs before its verdict as baseline code with `noalias` dropped; a rejected one
-/// is never promoted, is reported and reverts; a clean one is promoted with its `noalias` facts.
+/// is never promoted, is reported and reverts; a clean one is promoted with its `noalias` facts, its
+/// check queued again when an epoch move drops it. A constant-evaluation twin's first code queues
+/// its base's check.
 #[test]
 fn specv_patch_before_verdict() {
     const CHILD: &str = "RELAX_SPECV_TEST";
@@ -378,6 +380,15 @@ fn specv_patch_before_verdict() {
         let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
         (id, u.entry(id))
     });
+    // a constant-evaluation twin is checked with its base (verdict_owner): the twin's first code
+    // queues the base's check, which may have no code of its own (a static's initializer)
+    let (checker, first_epoch) = (u.front.checker_id, u.tcx.collect_epoch.load(Ordering::SeqCst));
+    let asked = || !matches!(crate::borrowck::lazy::verdict(checker, def, &[], first_epoch), crate::borrowck::lazy::FnVerdict::Unchecked(ref why) if why == "not queued");
+    assert!(!asked(), "nothing asked for the check before the twin");
+    let twin = crate::owner::call(crate::owner::Class::Program, || u.fn_id(crate::jit::FnKey::Ctfe(id)));
+    assert_eq!(u.verdict_owner(twin), Some(def));
+    u.note_first_borrowck(twin, None);
+    assert!(asked(), "the twin's first code queued its base's check");
     let run = |expected| {
         let mut result = 0u32;
         unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }
@@ -417,6 +428,16 @@ fn specv_patch_before_verdict() {
     // the worker acknowledges a settle request between checks: the second one is answered after the queued check ran
     crate::borrowck::settle().recv().unwrap();
     crate::borrowck::settle().recv().unwrap();
+    if case == "clean" {
+        // the epoch moves on (as a commit or a deferred module's load moves it) after the patch's
+        // check was queued or ran: the move drops it and the verdicts of the epoch before, and
+        // queues the checks a waiting group wants again in the same step (else the group would
+        // wait for a verdict nothing brings: no running code asks for it)
+        let epoch = u.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::borrowck::lazy::set_ranks(u.front.checker_id, epoch, &[]);
+        let v = crate::borrowck::lazy::verdict(u.front.checker_id, def, &[], epoch);
+        assert!(!matches!(v, crate::borrowck::lazy::FnVerdict::Unchecked(ref why) if why == "not queued"), "the move queued the group's check again: {v:?}");
+    }
     let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 20 {
         crate::reload::settle_verdicts(up, &mut pending, &mut undos);

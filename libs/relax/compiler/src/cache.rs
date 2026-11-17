@@ -4842,17 +4842,23 @@ impl Cache {
             eprintln!("relax cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}; of the image's own slots {}), image slots {} stale {} cached at present {}",
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], replaced, self.image_slots, self.image_stale, self.manifest_present_cached);
         }
-        // the union: the loaded manifest's own slots this start did not install, after this start's
-        // (their code entries as the loaded manifest named them, while the index holds them), and
-        // the slots its image installed ahead in this run's image
+        // the union: the loaded manifest's own slots this start did not install, after this start's,
+        // and the slots its image installed ahead in this run's image. A carried slot keeps its
+        // recorded code entry only when this run takes that key as its own (recorded_key: the
+        // loaded manifest was made from these sources, or every crate the slot names is unchanged
+        // since, and no live edit), else none (its key is made again when it runs). This manifest
+        // is stamped with this run's sources, so the next start trusts every key it names: a key
+        // carried across a source change named code made for the earlier source, and a struct
+        // that gained a field had its old layout's code prelinked by every later start.
         let mut image_ids = present_ids;
-        let mut carried = (0, 0);
+        let mut carried = (0, 0, 0);
         if !lean {
             let mine: HashSet<u128> = list.iter().map(|(b, _)| identity_hash(b)).collect();
             for (i, b) in self.manifest[..self.manifest_main.min(self.manifest.len())].iter().enumerate() {
                 if i % 1024 == 1023 && stop() { return false; }
                 if mine.contains(&identity_hash(b)) { continue; }
-                let k = self.manifest_old_keys.get(i).copied().filter(|k| *k != 0 && (self.has_index(k) || self.pending_keys.contains(k))).unwrap_or(0);
+                let k = self.recorded_key(b).filter(|k| self.has_index(k) || self.pending_keys.contains(k)).unwrap_or(0);
+                carried.2 += (k == 0 && self.manifest_old_keys.get(i).is_some_and(|o| *o != 0)) as usize;
                 list.push((b.clone(), k));
                 carried.0 += 1;
             }
@@ -4862,7 +4868,7 @@ impl Cache {
             image_ids.extend(ahead);
         }
         if self.verbose {
-            eprintln!("relax cache: startup manifest {}: {} slots of the loaded manifest and {} its image installed ahead kept with this start's", if lean { "lean (this start's slots only)" } else { "the union of recent startups" }, carried.0, carried.1);
+            eprintln!("relax cache: startup manifest {}: {} slots of the loaded manifest ({} without the code entry it recorded: not this run's key) and {} its image installed ahead kept with this start's", if lean { "lean (this start's slots only)" } else { "the union of recent startups" }, carried.0, carried.2, carried.1);
         }
         crate::run::yield_section("manifest image");
         // the image an earlier try built and then gave way after (a busy session's tries each

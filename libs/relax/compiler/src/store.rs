@@ -359,7 +359,7 @@ fn queue_seal(file: &Path, hb: &[u8]) {
                 next
             };
             let Some((file, hb)) = next else { break };
-            seal(&file, &hb);
+            let _ = seal(&file, &hb);
         }
     });
     if started.is_err() {
@@ -367,15 +367,16 @@ fn queue_seal(file: &Path, hb: &[u8]) {
     }
 }
 
-/// Makes the payloads of the commit `hb` names (an exit's, verified by this process) durable, then
-/// clears its slot's `tail`: a write barrier, then, under the lock and only while the header still
-/// is `hb`, the same header with the active slot's `tail` at its end (its generation unchanged).
-/// The barrier runs outside the lock: no reader or appender waits on the disk for it.
-fn seal(file: &Path, hb: &[u8; HEADER]) {
-    let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(file) else { return };
-    if order_writes(&f).is_err() || f.lock().is_err() {
-        return;
-    }
+/// Makes the payloads of the commit `hb` names (an exit's, verified by this process, or an append's
+/// just made) durable, then clears its slot's `tail`: a write barrier, then, under the lock and
+/// only while the header still is `hb`, the same header with the active slot's `tail` at its end
+/// (its generation unchanged). The barrier runs outside the lock: no reader or appender waits on
+/// the disk for it. A file gone (a newer generation replaced it) has nothing to seal; Err: the
+/// barrier or the lock failed, and the commit stays to be verified by the next open.
+fn seal(file: &Path, hb: &[u8; HEADER]) -> std::io::Result<()> {
+    let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(file) else { return Ok(()) };
+    order_writes(&f)?;
+    f.lock()?;
     let mut now = [0u8; HEADER];
     if f.read_exact(&mut now).is_ok() && now == *hb {
         if let Some(h) = Header::parse(&now) {
@@ -387,6 +388,7 @@ fn seal(file: &Path, hb: &[u8; HEADER]) {
         }
     }
     let _ = f.unlock();
+    Ok(())
 }
 
 /// What a run in this process sets, as a fresh process has it (a run that ends in place).
@@ -863,7 +865,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let dir = base.parent().unwrap_or(Path::new("."));
     // the current generation, locked; a newer one written meanwhile (another process's
     // rewrite) is taken instead
-    let mut f = loop {
+    let (mut f, gen_file) = loop {
         let (g, path) = current_gen(base);
         let f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
@@ -874,7 +876,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         };
         f.lock()?;
         if !gen_path(base, g + 1).exists() {
-            break f;
+            break (f, path);
         }
         let _ = f.unlock();
     };
@@ -952,19 +954,27 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     crate::memstat::print_tag("cache append", crate::memstat::Tag::CacheStore);
     let ib = encode_index(&ix);
     let next = 1 - k;
-    // the payloads before the index and header that commit them; nothing after the header (a
-    // commit lost to a power cut is a cache miss, and other processes read the page cache). An
-    // exit's commit has no barrier: the next open verifies its payloads, from `tail` on.
-    if ordered {
-        order_writes(&f)?;
-    }
+    // The commit goes in under the lock without a barrier, as an exit commits: its slot keeps
+    // `tail`, so an open meanwhile verifies these payloads. The barrier comes after the lock is
+    // released (`seal`, which then moves `tail` to the end): a barrier can wait on a busy disk for
+    // tens of seconds, and under the lock every open of this store (another process's start
+    // included) would wait with it. Nothing is written after the header (a commit lost to a
+    // power cut is a cache miss, and other processes read the page cache). An exit's commit is
+    // not sealed: the next open verifies its payloads, from `tail` on.
     f.seek(SeekFrom::Start(h.slot_off(next)))?;
     f.write_all(&ib)?;
     let mut nh = Header { active: next, cap: h.cap, slots: h.slots };
-    nh.slots[next as usize] = Slot { n: ix.len() as u64, end: off, sum: sum64(&ib), tail: if ordered { off } else { tail } };
+    nh.slots[next as usize] = Slot { n: ix.len() as u64, end: off, sum: sum64(&ib), tail };
+    let hb = nh.bytes();
     f.seek(SeekFrom::Start(0))?;
-    f.write_all(&nh.bytes())?;
+    f.write_all(&hb)?;
     let _ = f.unlock();
+    drop(f);
+    if ordered {
+        if let Err(e) = seal(&gen_file, &hb) {
+            write_failed(base, &e);
+        }
+    }
     Ok(None)
 }
 
@@ -1039,7 +1049,7 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
         h.slots[0] = Slot { n: ix.len() as u64, end: off, sum: sum64(&ib), tail: if ordered { off } else { h.data_start() } };
         out.seek(SeekFrom::Start(h.slot_off(0)))?;
         out.write_all(&ib)?;
-        // the payloads before the header that commits them (as `append`)
+        // the payloads before the header that commits them (a temp file nobody reads yet)
         out.flush()?;
         if ordered {
             order_writes(out.get_ref())?;
@@ -1057,7 +1067,7 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
 /// A run's image store (cache.rs front_run): an ordinary store file that one process creates
 /// under a fresh name and only appends to. Payloads go past the data end with positioned writes
 /// (the page cache; no sync per payload) and each is mapped read-only right after its write; the
-/// index is committed (data synced first, then the inactive slot and the header, as `append`)
+/// index is committed (data synced first, outside the lock, then the inactive slot and the header)
 /// only before another store refers to its entries. Never truncated or rewritten: a full index
 /// makes the caller start another run store. Other processes read it as any store (Store::open).
 pub struct RunStore {
@@ -1216,7 +1226,8 @@ impl RunStore {
         };
         ix.sort_by_key(|e| e.key);
         ix.dedup_by_key(|e| e.key);
-        // the payloads before the index and header that commit them (see `append`)
+        // the payloads before the index and header that commit them, outside the file lock (no
+        // open waits on the disk for it; see `seal`)
         if ordered {
             order_writes(&self.file)?;
         }
@@ -1959,7 +1970,7 @@ mod tests {
         // sealed here, or already by the thread the open started
         let mut hb = [0u8; HEADER];
         std::fs::File::open(&p).unwrap().read_exact(&mut hb).unwrap();
-        seal(&p, &hb);
+        seal(&p, &hb).unwrap();
         let (s, ix) = active(&p);
         assert_eq!(s.tail, s.end, "a sealed commit has nothing left to verify");
         assert_eq!(ix.len(), 2);

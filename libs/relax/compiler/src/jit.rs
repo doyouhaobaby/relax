@@ -9439,9 +9439,14 @@ impl Unit {
         // instances are not queued, and their verdict keys are not computed
         // a closure is checked with its parent (verdict_owner): its first code queues the parent, which
         // may never get code of its own (inlined into its callers; a closure handed to a thread or a
-        // stream): its verdict stayed pending for the whole run, and the closure ran unverified code
+        // stream): its verdict stayed pending for the whole run, and the closure ran unverified code.
+        // A constant-evaluation twin is checked with its base the same way: a static whose initializer
+        // runs as code (a OnceLock) has only its twin's code, so its check was never queued, and a
+        // live patch group holding the twin waited for that verdict for good
+        // a live patch's code (its group): its check is wanted until the group is settled
+        let group = self.fns[id as usize].patch_gen;
         let mut id = id;
-        while let FnKey::Closure(_, _, parent) = self.fns[id as usize].key {
+        while let FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) = self.fns[id as usize].key {
             if parent as usize >= self.fns.len() { return; }
             id = parent;
         }
@@ -9468,6 +9473,9 @@ impl Unit {
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
             if borrowck_discovery() {
                 crate::borrowck::lazy::note_program(options, &src, epoch);
+            }
+            if rank == Some(crate::borrowck::lazy::RANK_EDIT) && group > 0 {
+                crate::borrowck::lazy::want(&src, d, a.clone(), group);
             }
             crate::borrowck::lazy::note_compiled(options, &src, crate::borrowck::lazy::NoteFn {
                 def: d, args: a, cache_key: key, epoch, rank, cached,
@@ -9506,7 +9514,7 @@ impl Unit {
             Some((rank, def, since)) => format!("worker runs {} (rank {rank}) since @{:.3}", if def == crate::program::NO_DEF { "discovery".to_string() } else { self.prog.def_path(def) }, since as f64 / 1e9),
             None => "worker idle".to_string(),
         };
-        format!("{} {:?} epoch {} {worker} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
+        format!("{} ({:?}) {:?} epoch {} {worker} queued {:?}", self.prog.def_path(d), d, crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
     }
 
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).

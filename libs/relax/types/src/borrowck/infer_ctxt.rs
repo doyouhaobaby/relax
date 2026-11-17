@@ -26,6 +26,8 @@ pub struct BorrowckInferCtxt<'tcx> {
     /// A type op of the body failed (custom.rs scrape_region_constraints): the root's potentially
     /// region-dependent goals are re-proven (`check_potentially_region_dependent_goals`).
     pub type_op_failed: std::cell::Cell<bool>,
+    /// What the first failing type op was asked, for the report when no error explains the failure.
+    pub type_op_failure: RefCell<Option<String>>,
     encountered_re_error: std::cell::Cell<bool>,
     pub universal_regions: Option<super::universal_regions::UniversalRegions>,
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
@@ -59,7 +61,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()), root_typeck: None }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), type_op_failure: RefCell::new(None), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()), root_typeck: None }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -157,6 +159,17 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         if result.is_err() {
             self.tainted_by_errors.set(true);
             self.type_op_failed.set(true);
+            if self.type_op_failure.borrow().is_none() {
+                let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
+                let what = match &input {
+                    crate::next_solver::type_op::TypeOpInput::Normalize(_, t) => format!("normalize `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::ProvePredicate(_, p) => format!("prove {:?}", p.kind),
+                    crate::next_solver::type_op::TypeOpInput::AscribeUserType(_, t, _) => format!("ascribe a user type to `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::DropckOutlives(_, t) => format!("the drop outlives of `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::Custom => "a relation of the body's types".to_string(),
+                };
+                *self.type_op_failure.borrow_mut() = Some(what);
+            }
             if let Some(input_dbg) = &input_dbg {
                 let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
                 let what = match input_dbg {
@@ -254,7 +267,9 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }))
     }
     fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg], locations: Locations, category: ConstraintCategory) {
-        let def = self.tcx.lang_items.get(trait_).unwrap_or_else(|| panic!("required trait lang item: {trait_:?}"));
+        // A program without core has no `Sized` or `Copy` lang item and nothing of them to prove: sizedness is the
+        // solver's (trait_goals.rs), and building chose each copy without the trait.
+        let Some(def) = self.tcx.lang_items.get(trait_) else { return };
         // `try_fast_path`'s sizedness rule (prove_predicate.rs:13), asked before the predicate is built
         if let (LangItem::Sized | LangItem::MetaSized, Some(&GenericArg::Type(ty))) = (trait_, args.first()) {
             if crate::next_solver::eval_ctxt::fast_path::sizedness_holds(&self.infcx, self.prog, self.param_env_id(), def, trait_ == LangItem::MetaSized, ty) { return; }
@@ -483,7 +498,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         BorrowckTypeOps::normalize(self, out, ty, locations)
     }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool {
-        let def = self.tcx.lang_items.get(LangItem::Sized).expect("Sized lang item");
+        let Some(def) = self.tcx.lang_items.get(LangItem::Sized) else { return true };
         self.infcx.evaluate_obligation(self.prog, Goal { param_env: self.param_env_id(), predicate: crate::next_solver::collect::trait_predicate(def, vec![GenericArg::Type(ty)]) }).must_apply_modulo_regions()
     }
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)> {
