@@ -39,6 +39,13 @@ pub mod intrinsics {
         /// true when this target (arm64; x86-64 with FMA3) fuses in hardware: a constant per run
         pub fn fma_native() -> bool;
     }
+    unsafe extern "relax-intrinsic" {
+        /// rustc's `intrinsics::overflow_checks`: whether the program's profile has overflow checks,
+        /// so code inheriting them (rustc's `#[rustc_inherit_overflow_checks]`) panics on overflow
+        /// as the program's own arithmetic does. One value for the whole program, read at run time;
+        /// true in constant evaluation, as rustc's.
+        pub safe fn overflow_checks() -> bool;
+    }
     pub use super::intrinsics_simd as simd;
     /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
     pub use crate::hint::assert_unchecked as assume;

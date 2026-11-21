@@ -13093,6 +13093,18 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::Call(Callee::Host(rt), Vec::new(), vec![r]));
                 Some(Val::L(vec![r]))
             }
+            "overflow_checks" => {
+                // intrinsics::overflow_checks() -> bool: true in constant evaluation, as rustc's (one
+                // value there for every crate); at run time Rt::overflow_checks, the program's
+                // profile, which no compiled function depends on
+                if self.const_init {
+                    return Some(Val::L(vec![self.iconst(1)]));
+                }
+                let r = self.f.vreg(Cls::I);
+                let rt = self.u.rs.overflow_checks;
+                self.emit(Inst::Call(Callee::Host(rt), Vec::new(), vec![r]));
+                Some(Val::L(vec![r]))
+            }
             "rethrow" => {
                 // intrinsics_rt::rethrow(): Rt::rethrow (the next panic continues a reported one)
                 let rt = self.u.rs.rethrow;

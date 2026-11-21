@@ -1742,7 +1742,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     jit::COMPILE_ERRORS_FATAL.store(false, std::sync::atomic::Ordering::Relaxed);
     // lints (rustc's deny-by-default ones are errors; warn-level ones are printed)
     relax_types::lint::enable();
-    crate::layout::set_root_crate(root);
+    crate::run::set_program_root(&u.prog, root);
     let mut own = vec![false; u.prog.crates.len()];
     for &k in crates {
         own[k as usize] = true;

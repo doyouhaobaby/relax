@@ -39,13 +39,17 @@ const RELEASE: crate::resolve::ProfileChecks = crate::resolve::ProfileChecks { d
 
 /// The checks' values: `cfg!(debug_assertions)` at run time and in a const, a failing
 /// `debug_assert!`'s panic, the overflow panics of an add, a shift and a negation, and a sum that
-/// does not overflow.
+/// does not overflow. Then std's code that inherits the program's checks (rustc's
+/// `#[rustc_inherit_overflow_checks]`, `intrinsics::overflow_checks`): a `RangeFrom` stepping
+/// past its type's maximum, which panics with the add's message under checks and wraps without,
+/// and `core::range::RangeFrom`'s iterator, which yields the maximum first.
 const CHECKS: &str = r#"
 pub const ON: usize = if cfg!(debug_assertions) { 1 } else { 0 };
 fn add(a: u8, b: u8) -> u8 { a + b }
 fn shl(a: u32, b: u32) -> u32 { a << b }
 fn neg(a: i32) -> i32 { -a }
-pub fn values(out: &mut [usize; 7]) {
+fn message(e: Box<dyn std::any::Any + Send>) -> usize { (e.downcast_ref::<&str>() == Some(&"attempt to add with overflow")) as usize }
+pub fn values(out: &mut [usize; 11]) {
     out[0] = cfg!(debug_assertions) as usize;
     out[1] = ON;
     out[2] = std::panic::catch_unwind(|| debug_assert!(std::hint::black_box(1) == 2)).is_err() as usize;
@@ -53,6 +57,12 @@ pub fn values(out: &mut [usize; 7]) {
     out[4] = std::panic::catch_unwind(|| shl(1, std::hint::black_box(32))).is_err() as usize;
     out[5] = std::panic::catch_unwind(|| neg(std::hint::black_box(i32::MIN))).is_err() as usize;
     out[6] = add(std::hint::black_box(250), 5) as usize;
+    let past = std::panic::catch_unwind(|| { let mut r = std::hint::black_box(255u8)..; r.next(); r.start as usize });
+    out[7] = past.as_ref().map_or(999, |s| *s);
+    out[8] = past.err().map_or(0, message);
+    let mut it = core::range::RangeFrom::from(std::hint::black_box(254u8)..).into_iter();
+    out[9] = it.next().unwrap() as usize * 1000 + it.next().unwrap() as usize;
+    out[10] = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.next().unwrap() as usize)).unwrap_or(999);
 }
 "#;
 
@@ -96,6 +106,8 @@ fn unit_in(session: crate::Session, src: &str, name: &str, checks: crate::resolv
     std::fs::remove_dir(dir).unwrap();
     let cfg = &prog.crates[krate as usize].cfg;
     assert_eq!((cfg.holds("debug_assertions"), cfg.holds("overflow_checks")), (checks.debug_assertions, checks.overflow_checks), "the crate's cfg is its profile's");
+    // the program's checks, which std's code inheriting them reads at run time (run.rs set_program_root)
+    crate::layout::set_overflow_checks(checks.overflow_checks);
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     (crate::jit::Unit::new(prog, tcx, core), krate)
@@ -117,11 +129,12 @@ fn cfg_macro_is_the_crates_cfg_at_run_time_and_in_consts() {
     let width = if cfg!(target_pointer_width = "64") { 64 } else { 32 };
     let arch = if cfg!(target_arch = "x86_64") { 1 } else if cfg!(target_arch = "aarch64") { 2 } else { 0 };
     assert_eq!(out, [cfg!(target_endian = "little") as usize, cfg!(target_pointer_width = "64") as usize, arch, width, width, 4, 7, width, 1]);
-    let (first, o3, refused): ([usize; 7], [usize; 7], _) = values_at_o3(CHECKS, "cfg_checked", CHECKED);
-    assert_eq!(first, [1, 1, 1, 1, 1, 1, 255], "the test profile's checks at the first tier");
+    let (first, o3, refused): ([usize; 11], [usize; 11], _) = values_at_o3(CHECKS, "cfg_checked", CHECKED);
+    assert_eq!(first, [1, 1, 1, 1, 1, 1, 255, 999, 1, 254_255, 999], "the test profile's checks at the first tier");
     assert_eq!(o3, first, "the test profile's checks at O3 (not built: {refused:?})");
-    let (first, o3, _): ([usize; 7], [usize; 7], _) = values_at_o3(CHECKS, "cfg_released", RELEASE);
-    assert_eq!((first, o3), ([0, 0, 0, 0, 0, 0, 255], [0, 0, 0, 0, 0, 0, 255]), "the release profile's: no check, at the first tier and at O3");
+    let (first, o3, _): ([usize; 11], [usize; 11], _) = values_at_o3(CHECKS, "cfg_released", RELEASE);
+    let released = [0, 0, 0, 0, 0, 0, 255, 0, 0, 254_255, 0];
+    assert_eq!((first, o3), (released, released), "the release profile's: no check, at the first tier and at O3");
 }
 
 /// Products of integers widened to 128 bits, under the test profile's overflow checks: signed

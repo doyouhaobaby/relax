@@ -1337,7 +1337,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     };
     // the crate under test is the program's own crate (run.rs): its #![recursion_limit] and
     // #![type_length_limit] govern monomorphization (TypingEnv::fully_monomorphized)
-    crate::layout::set_root_crate(krate);
+    crate::run::set_program_root(&prog, krate);
     // the file is checked whole before any test runs, as `rustc --test` compiles it first (the
     // package form's up-front check, run.rs test_subjects); marked before collection
     crate::borrowck::event::set_check_scope();

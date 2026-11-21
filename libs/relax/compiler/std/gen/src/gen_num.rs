@@ -860,6 +860,11 @@ fn gen_step(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    fn forward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_add(n as {n}) }}");
         let _ = writeln!(o, "    fn backward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_sub(n as {n}) }}");
     }
+    // rustc's Step::forward / backward for the integers (#[rustc_inherit_overflow_checks]): an
+    // overflow panics as the program's own `+` / `-` does when its profile has overflow checks, and
+    // wraps when it has none (`Step::forward(-128i8, 255)` is 127)
+    let _ = writeln!(o, "    fn forward(start: {n}, n: usize) -> {n} {{ if crate::intrinsics::overflow_checks() && Self::forward_checked(start, n).is_none() {{ crate::panicking::panic_str(\"attempt to add with overflow\") }} start.wrapping_add(n as {n}) }}");
+    let _ = writeln!(o, "    fn backward(start: {n}, n: usize) -> {n} {{ if crate::intrinsics::overflow_checks() && Self::backward_checked(start, n).is_none() {{ crate::panicking::panic_str(\"attempt to subtract with overflow\") }} start.wrapping_sub(n as {n}) }}");
     // the caller knows the step stays in range (rustc's Step::forward_unchecked): no test
     let _ = writeln!(o, "    unsafe fn forward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_add(n as {n}) }}");
     let _ = writeln!(o, "    unsafe fn backward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_sub(n as {n}) }}");

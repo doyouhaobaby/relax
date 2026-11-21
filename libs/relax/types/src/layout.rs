@@ -1506,9 +1506,25 @@ pub fn set_root_crate(c: u32) {
     ROOT_CRATE.store(c, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The program's profile has overflow checks: its root crate's `cfg(overflow_checks)`. Code reads it
+/// at run time (`intrinsics::overflow_checks`, the runtime's `overflow_checks` entry), so no
+/// compiled function depends on the profile that compiled it.
+static OVERFLOW_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the program's profile has overflow checks ([`OVERFLOW_CHECKS`]).
+pub fn overflow_checks() -> bool {
+    OVERFLOW_CHECKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the program's overflow checks, with its root crate ([`set_root_crate`]), before its code runs.
+pub fn set_overflow_checks(on: bool) {
+    OVERFLOW_CHECKS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&LIVE_SESSION, std::sync::atomic::AtomicBool::new(false));
     reset(&ROOT_CRATE, std::sync::atomic::AtomicU32::new(0));
+    reset(&OVERFLOW_CHECKS, std::sync::atomic::AtomicBool::new(false));
 }

@@ -261,6 +261,9 @@ pub struct Rt {
     pub panicking: u64,
     /// `rethrow()`: the next panic on this thread continues one already reported (resume_unwind)
     pub rethrow: u64,
+    /// `overflow_checks() -> u64`: 1 when the program's profile has overflow checks
+    /// (intrinsics::overflow_checks, layout::overflow_checks)
+    pub overflow_checks: u64,
 }
 
 /// `Rt` as symbols (syms.rs): what lowering and glue put into RIR.
@@ -292,6 +295,7 @@ pub struct RtSyms {
     pub land: relax_backend::rir::Sym,
     pub panicking: relax_backend::rir::Sym,
     pub rethrow: relax_backend::rir::Sym,
+    pub overflow_checks: relax_backend::rir::Sym,
 }
 
 
@@ -4678,6 +4682,14 @@ fn rt_panicking() -> u64 {
 }
 
 rt_fn! {
+/// intrinsics::overflow_checks(): the program's profile has overflow checks (its root crate's
+/// cfg, set before its code runs): one value for every crate's code, so none is compiled for one
+pub(crate) leaf fn rt_overflow_checks() -> u64 {
+    crate::layout::overflow_checks() as u64
+}
+}
+
+rt_fn! {
 /// std::panic::resume_unwind: the panic that follows continues one already reported (and
 /// parked, under inspect). Like rustc's resume_unwind it starts no new report: the unwind
 /// goes on to the next catch.
@@ -6069,13 +6081,13 @@ impl Unit {
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
             payload_end: std::sync::atomic::AtomicUsize::new(0),
             std_default_hook: std::sync::atomic::AtomicUsize::new(0),
-            rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
+            rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0), overflow_checks: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
             pending_cache_cursor: 0,
             start_order: Vec::new(),
-            rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
+            rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0, overflow_checks: 0 },
             bodies: Default::default(),
             old_bodies: Default::default(),
             preserve_log: Default::default(),
@@ -6210,6 +6222,7 @@ impl Unit {
             land: 0,
             panicking: rt_panicking as *const () as usize as u64,
             rethrow: rt_rethrow as *const () as usize as u64,
+            overflow_checks: rt_overflow_checks as *const () as usize as u64,
         };
         if no_codegen {
             #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
@@ -6276,6 +6289,7 @@ impl Unit {
             land: u.syms.intern(crate::syms::SymKind::Rt("land"), u.rt.land),
             panicking: u.syms.intern(crate::syms::SymKind::Rt("panicking"), u.rt.panicking),
             rethrow: u.syms.intern(crate::syms::SymKind::Rt("rethrow"), u.rt.rethrow),
+            overflow_checks: u.syms.intern(crate::syms::SymKind::Rt("overflow_checks"), u.rt.overflow_checks),
         };
         relax_codegen::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
         relax_codegen::loops::set_memset(u.rs.memset);

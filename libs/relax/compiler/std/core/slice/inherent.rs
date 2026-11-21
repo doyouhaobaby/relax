@@ -240,6 +240,26 @@ impl<T> [T] {
         *self = rest;
         Some(last)
     }
+    /// rustc 1.98.0 (substr_range): returns the element range of a subslice by address.
+    #[must_use]
+    pub fn subslice_range(&self, subslice: &[T]) -> Option<crate::range::Range<usize>> {
+        let size = crate::mem::size_of::<T>();
+        if size == 0 {
+            panic!("elements are zero-sized");
+        }
+
+        let byte_start = subslice.as_ptr().addr().wrapping_sub(self.as_ptr().addr());
+        if !byte_start.is_multiple_of(size) {
+            return None;
+        }
+        let start = byte_start / size;
+        let end = start.wrapping_add(subslice.len());
+        if start <= self.len() && end <= self.len() {
+            Some(crate::range::Range { start, end })
+        } else {
+            None
+        }
+    }
     /// Real core's `element_offset` (slice/mod.rs): the index of `element` if it is one of this
     /// slice's elements by address (not by value); panics for a zero-sized `T`.
     pub fn element_offset(&self, element: &T) -> Option<usize> {

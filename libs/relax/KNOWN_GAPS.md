@@ -322,3 +322,36 @@ fn main() {
 Start in net/socket_windows.rs: a `write_vectored` that makes one WSASend of the buffers (an
 `IoSlice` is a `WSABUF` on Windows), called from net/tcp.rs as on unix (net/socket_unix.rs).
 Windows' File, stdio and pipes keep the trait's default, as in rustc's std.
+
+## 16. Std's code that inherits overflow checks follows the program's profile, not its caller's crate
+
+rustc's std marks some functions `#[rustc_inherit_overflow_checks]`: they check for overflow as the
+crate they are instantiated in does. Of these, Relax's std has the integers' `Step::forward` and
+`Step::backward` (what `(start..)` iteration steps with) and `core::range::RangeFromIter`, through
+`intrinsics::overflow_checks`.
+
+- rustc: the crate's own profile decides. A dependency built with
+  `[profile.dev.package.<name>] overflow-checks = false` wraps `(255u8..)` past its end in its own
+  code, while the program's crate, built with checks, panics there.
+- Relax: the program's profile decides for every crate: its root crate's `cfg(overflow_checks)`
+  (the package it runs or tests), read when the code runs. In the example above the dependency
+  panics too.
+
+This is by design: std's compiled code is shared by every crate of a run and kept across runs, so
+one value for the whole program keeps each compiled function independent of the profile of the
+crate that called it. A per-crate value comes back if a real program needs a dependency's own
+setting. In constant evaluation `intrinsics::overflow_checks` is true, as rustc's.
+
+## 17. A reader opened on a store-only file before the run's first write to it keeps the store copy
+
+Under a mount with an edits folder (a shared workspace, an app's repository store), a file that
+only the repository's store holds has no disk file of its own until the run writes it.
+
+- rustc: a reader that opened a file sees the program's later writes to it in place.
+- Relax: a read-only open of such a file reads from a copy. The run's first write to it copies the
+  file into the edits folder, and that reader keeps the store copy. A reader opened after that
+  write, or on a file the run already wrote, opens the disk file and follows the writer, as
+  natively.
+
+This is by design, as with an overlay's copy-up: closing it would copy every file the run opens
+for reading into the edits folder, which is the user's change set.

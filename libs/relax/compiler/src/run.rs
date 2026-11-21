@@ -2451,7 +2451,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let fn_defs = if ahead { startup_defs(&prog, &format!("{}/startup/{}.startup", target_dir, package)) } else { Vec::new() };
     // `main` lives at the root of the root crate (find_main)
     let root_crate = root;
-    crate::layout::set_root_crate(root_crate);
+    set_program_root(&prog, root_crate);
     // A live session (hot reload of the program's own sources, reload.rs)
     if options.live {
         crate::layout::LIVE_SESSION.store(true, Ordering::Relaxed);
@@ -3061,6 +3061,13 @@ pub fn progress() -> (String, u32, u32) {
 /// The C-ABI fns carrying `#[no_mangle]` (symbol = the fn's name) or `#[export_name = ".."]` whose
 /// symbol starts with one of `prefixes`. A symbol defined twice is an error: the host would bind
 /// one of the two silently.
+/// The program's root crate (`main`'s, or the crate under test) and its profile's overflow checks,
+/// which every crate's code reads at run time (`intrinsics::overflow_checks`).
+pub(crate) fn set_program_root(prog: &crate::program::Program, root: u32) {
+    crate::layout::set_root_crate(root);
+    crate::layout::set_overflow_checks(prog.crates.get(root as usize).is_some_and(|c| c.cfg.holds("overflow_checks")));
+}
+
 pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<Vec<(String, DefId)>, String> {
     let mut out: Vec<(String, DefId)> = Vec::new();
     for (di, d) in prog.defs.iter().enumerate() {

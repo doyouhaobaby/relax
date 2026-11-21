@@ -39,6 +39,11 @@ impl str {
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// rustc 1.98.0 (substr_range): returns the byte range of a substring by address.
+    #[must_use]
+    pub fn substr_range(&self, substr: &str) -> Option<crate::range::Range<usize>> {
+        self.as_bytes().subslice_range(substr.as_bytes())
+    }
     pub const fn as_bytes(&self) -> &[u8] {
         unsafe { crate::intrinsics_mem::str_as_bytes(self) }
     }

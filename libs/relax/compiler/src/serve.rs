@@ -70,7 +70,7 @@ impl Session {
     pub fn new(mut unit: Box<Unit>, root: u32, mut errors: Vec<String>) -> Self {
         crate::borrowck::lazy::disable_gandalf();
         crate::jit::COMPILE_ERRORS_FATAL.store(false, std::sync::atomic::Ordering::Relaxed);
-        crate::layout::set_root_crate(root);
+        crate::run::set_program_root(&unit.prog, root);
         // the app scope was set from the unit graph by run::cmd_run_inner (gandalf_app_roots);
         // the root crate's own errors are reported even when the rule leaves it out
         let own_crates: Vec<_> = (0..unit.prog.crates.len() as u32)

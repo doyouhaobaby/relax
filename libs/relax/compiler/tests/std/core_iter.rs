@@ -15,6 +15,61 @@ fn a01_ranges() {
     println!("| ranges {}", s);
     let r = 5..9;
     println!("| contains {} {} len {}", r.contains(&5), r.contains(&9), (5..9).len());
+
+    fn ends<I: core::iter::FusedIterator + DoubleEndedIterator + ExactSizeIterator>(mut it: I)
+    where
+        I::Item: std::fmt::Debug,
+    {
+        let first = it.next();
+        let last = it.next_back();
+        let middle = it.next();
+        println!("| ends {:?} {:?} {:?} len {} fused {:?} {:?}", first, last, middle, it.len(), it.next_back(), it.next());
+    }
+
+    let half = core::range::Range::from(2u16..5);
+    let it: core::range::RangeIter<u16> = half.iter();
+    println!("| half {:?} rev {:?} count {}", it.clone(), it.rev().collect::<Vec<_>>(), half.iter().count());
+    ends(half.into_iter());
+
+    let incl = core::range::RangeInclusive::from(253u8..=255);
+    let it: core::range::RangeInclusiveIter<u8> = incl.iter();
+    println!("| inclusive {:?} rev {:?} count {}", it.clone(), it.rev().collect::<Vec<_>>(), incl.iter().count());
+    ends(incl.into_iter());
+
+    println!("| exact lengths {} {} {} {} {} {}", core::range::Range::from(2usize..5).iter().len(),
+        core::range::Range::from(8u8..9).iter().len(), core::range::Range::from(-3isize..0).iter().len(),
+        core::range::Range::from(-4i8..2).iter().len(), core::range::Range::from(-1i16..4).iter().len(),
+        core::range::RangeInclusive::from(i8::MIN..=i8::MAX).iter().len());
+
+    let mut chars = core::range::Range::from('a'..'g').into_iter();
+    let mut signed = core::range::RangeInclusive::from(-2i8..=4).into_iter();
+    println!("| skips {:?} {:?} {:?} {:?}", chars.nth(1), chars.nth_back(1), signed.nth_back(2), signed.nth(1));
+    println!("| ordered {:?} {:?} {:?} {}", chars.clone().min(), chars.max(), signed.clone().last(), signed.is_sorted());
+
+    let old_half: core::range::legacy::Range<u16> = half.into();
+    let old_incl: core::range::legacy::RangeInclusive<u8> = incl.into();
+    let old_from: core::range::legacy::RangeFrom<i32> = core::range::RangeFrom::from(-3..).into();
+    let old_to: core::range::legacy::RangeToInclusive<i32> = core::range::RangeToInclusive::from(..=7).into();
+    println!("| legacy {:?} {:?} {:?} {:?}", old_half, old_incl, old_from, old_to);
+    println!("| round trip {:?} {:?} {:?} {:?}", core::range::Range::from(old_half),
+        core::range::RangeInclusive::from(old_incl), core::range::RangeFrom::from(old_from),
+        core::range::RangeToInclusive::from(old_to));
+    let mut single = 9..=9;
+    single.next();
+    let converted = std::panic::catch_unwind(|| core::range::RangeInclusive::from(single));
+    println!("| exhausted conversion empty or panics {}", converted.map_or(true, |r| r.is_empty()));
+    let mut exhausted = u8::MAX..=u8::MAX;
+    exhausted.next();
+    println!("| overflowed endpoint conversion panics {}", std::panic::catch_unwind(|| core::range::RangeInclusive::from(exhausted)).is_err());
+
+    // a RangeFrom past its type's maximum wraps without overflow checks (this file's profile, as
+    // `rustc -O`), the old one and the new one's iterator alike
+    let mut from = core::range::RangeFrom::from(253u8..).into_iter();
+    let it: core::range::RangeFromIter<i8> = core::range::RangeFrom::from(-2i8..).iter();
+    println!("| from {:?} then {:?} hint {:?} nth {:?} {:?}", from.by_ref().take(3).collect::<Vec<_>>(), from.next(),
+        from.size_hint(), it.clone().nth(3), it);
+    let mut old = 254u8..;
+    println!("| legacy from {:?} {:?} {:?} nth {:?}", old.next(), old.next(), old.next(), (i8::MAX..).nth(1));
 }
 
 #[test]

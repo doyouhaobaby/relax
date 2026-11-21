@@ -947,6 +947,8 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "catch_panic" => HostBind::Builtin(Builtin::CatchPanic),
                 "panicking" if abort => HostBind::Builtin(Builtin::Nop),
                 "rethrow" if abort => HostBind::Trap,
+                // the exported program's profile, as a constant (the runtime entry reads it)
+                "overflow_checks" => HostBind::Builtin(if crate::layout::overflow_checks() { Builtin::One } else { Builtin::Nop }),
                 n => HostBind::Import("r".into(), n.to_string()),
             },
             Some(SymKind::Foreign(n)) => match web.then(|| web_binding(&n)).flatten().or_else(|| single.then(|| single_thread(&n)).flatten()) {
@@ -1739,6 +1741,7 @@ pub(crate) fn prepare_shipping(u: &Unit, f: &mut Func) {
                     Some(SymKind::Foreign(n)) if single => single_thread(&n),
                     Some(SymKind::Rt("panicking")) if abort => Some(HostBind::Builtin(Builtin::Nop)),
                     Some(SymKind::Rt("rethrow")) if abort => Some(HostBind::Trap),
+                    Some(SymKind::Rt("overflow_checks")) => Some(HostBind::Builtin(if crate::layout::overflow_checks() { Builtin::One } else { Builtin::Nop })),
                     _ => None,
                 },
                 _ => None,
