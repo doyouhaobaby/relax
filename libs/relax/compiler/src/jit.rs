@@ -25136,7 +25136,10 @@ fn headless_started() {
     if !FIRST_PRESENT.load(Ordering::Acquire) && live_startup_done() {
         let _ = QUIET_START_NS.compare_exchange(0, wall_ns().max(1), Ordering::AcqRel, Ordering::Relaxed);
         crate::store::note_checks("by the start's end");
-        crate::cache::start_deferred_front("a quiet start");
+        // A live test session's start ends at its first pass, whose first_test_pass_done wakes the
+        // startup thread here while it starts the same write: one cause, one name, whichever of
+        // the two writes them.
+        crate::cache::start_deferred_front(if FIRST_TEST_PASS.load(Ordering::Acquire) { "the first test pass" } else { "a quiet start" });
     }
 }
 
@@ -25225,8 +25228,9 @@ impl Drop for MainHeld {
 /// deferred records are written from here when no demand compile is in flight, as an app's are
 /// after its first present. A session ends by a signal, which no exit writer survives, and its
 /// quiet start (headless_started) came only once it had sat idle long enough. With a compile
-/// still in flight the quiet start writes them. Its start ends here too (startup_main), and its
-/// startup manifest's window closes (manifest_window_closed): the manifest is recorded now, as an
+/// still in flight the start's end (headless_started, which this wakes at once) writes them. Its
+/// start ends here too (startup_main), and its startup manifest's window closes
+/// (manifest_window_closed): the manifest is recorded now, as an
 /// app's is after its first frame, not 2 s of idle later (a session stopped in between left the
 /// next one no warm start). A cold Fab session's is on disk 2.1-2.7 s after its verdict (the mid
 /// writer's next pass, its record and the spill after it).
