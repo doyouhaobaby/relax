@@ -160,6 +160,11 @@ fn payload_text(p: &(dyn std::any::Any + Send)) -> String {
 /// inside the thread). A panic is reported and handled by `policy`; a return ends the thread
 /// (state `exited`).
 pub fn run(name: &str, policy: OnPanic, mut body: impl FnMut()) {
+    // a thread std has no name for (a test's, one native code started) takes this one at the OS:
+    // a panic's note, `inspect threads` and stall lines show it
+    if std::thread::current().name().is_none() {
+        crate::os::thread::set_own_name(name);
+    }
     let i = register(name, policy);
     let mut restarts = 0u32;
     loop {
@@ -300,11 +305,16 @@ mod tests {
                 if k <= MAX_RESTARTS + 1 {
                     panic!("again {}", k);
                 }
-            })
+            });
+            crate::os::thread::name(crate::os::thread::current())
         });
-        h.join().unwrap();
+        let os_name = h.join().unwrap();
         let r = snapshot().into_iter().find(|r| r.name == "lifeline-test-dead").unwrap();
         assert_eq!(r.state, DEAD);
         assert_eq!(r.restarts, MAX_RESTARTS + 1);
+        // std left the thread unnamed: it took its lifeline name at the OS, which its panics' notes
+        // show (Linux keeps 15 bytes of it)
+        let want = if cfg!(any(target_os = "linux", target_os = "android")) { "lifeline-test-d" } else { "lifeline-test-dead" };
+        assert_eq!(os_name, want, "the thread's OS name");
     }
 }

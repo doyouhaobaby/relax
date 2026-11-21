@@ -120,6 +120,10 @@ fn default_hook(info: &PanicHookInfo<'_>) {
         &mut err,
         format_args!("\nthread '{}' ({}) panicked at {}:\n{}\n{}", name, sys::os::thread_os_id(), info.location, info.message, note),
     );
+    // (rustc's lines above as they are; what else names an unnamed thread on a line after them)
+    if let Some(about) = crate::thread::unnamed_note(&thread) {
+        let _ = crate::io::Write::write_all(&mut err, about.as_bytes());
+    }
     if style != STYLE_OFF {
         crate::backtrace::print_panic_backtrace(&mut err, style == STYLE_FULL);
     }
