@@ -7797,6 +7797,9 @@ pub struct FrontImages {
     /// which load again so their resolution and expansion record what the lints read (import
     /// and macro uses); the restore keeps every crate before them
     reload: relax_session::sync::Mutex<Vec<(String, String)>>,
+    /// the last restore loaded crates again (`reload`) of a graph certified whole whose collected
+    /// image was recorded of that graph: loading them again makes the program the image holds
+    reload_current: std::sync::atomic::AtomicBool,
 }
 impl FrontImages {
     /// See `reload`.
@@ -7808,6 +7811,10 @@ impl FrontImages {
     }
     pub(crate) fn reloading(&self) -> bool {
         !self.reload.lock().unwrap().is_empty()
+    }
+    /// See `reload_current`.
+    pub(crate) fn reload_current(&self) -> bool {
+        self.reload_current.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// A first load of `pre`'s crate set (no graph of it is stored here): true when another
     /// run was making it and has now recorded it (store.rs `flight`), so a restore finds its
@@ -9359,6 +9366,19 @@ mod cold_tests {
         let (whole, _, proof) = images.restore_collected(sess, &pre).expect("unchanged sources restore");
         assert_eq!(whole.crates.len(), names.len());
         assert!(proof.is_some());
+        assert!(!images.reload_current(), "a whole restore loads nothing again");
+        // a test's subject loads again for its lints (reload_crates): with nothing changed, what it
+        // loads is what the image holds, so the run records nothing again (run.rs COLLECTED_CURRENT);
+        // after an edit of it, the image must be recorded again
+        images.reload_crates(vec![("late".to_string(), pre[6].root.clone())]);
+        assert_eq!(images.restore_collected(sess, &pre).expect("a restore below the reloaded crate").0.crates.len(), 6);
+        assert!(images.reload_current(), "an unchanged graph's image holds the reloaded crate as it loads");
+        let late = std::fs::read_to_string(&pre[6].root).unwrap();
+        std::fs::write(&pre[6].root, "pub fn f6() -> u32 { 60 }").unwrap();
+        assert_eq!(images.restore_collected(sess, &pre).expect("a restore below the edited reloaded crate").0.crates.len(), 6);
+        assert!(!images.reload_current(), "an edit of the reloaded crate: the image no longer holds it");
+        std::fs::write(&pre[6].root, late).unwrap();
+        images.reload_crates(Vec::new());
         // a body edit of the top crate: everything below it stays, `top` and the clean `late`
         // after it are collected again
         std::fs::write(&pre[5].root, "pub fn top() -> u32 { mid::mid() + 2 }").unwrap();

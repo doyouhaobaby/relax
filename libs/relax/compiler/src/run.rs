@@ -1749,8 +1749,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 1;
         }
     }
-    // the whole program came from the collected store: it holds this program already
-    COLLECTED_CURRENT.store(collected_restored, Ordering::Relaxed);
+    // the whole program came from the collected store: it holds this program already. So it does
+    // for a test whose subject loaded again for its lints (test_lints) while every crate before
+    // it restored, of the graph its image was recorded of (FrontImages::reload_current): what
+    // loaded again is what the image holds. The exit encoded and summed the image again (0.5 s of
+    // a 7.2 s warm Fab scenario test) and rewrote it whole (1.3 GB) when the run's interner had grown.
+    let image_current = collected_restored || test_lints && restored_crates != 0
+        && front_images.as_ref().is_some_and(|images| images.reload_current() && restored_crates == images.reload_prefix(&pre));
+    COLLECTED_CURRENT.store(image_current, Ordering::Relaxed);
     COLLECTED_RESTORED.store(collected_restored, Ordering::Relaxed);
     let collected_suffix = restored.as_ref().filter(|_| !collected_restored)
         .map(|(p, _, _)| (p.defs.len(), p.imports.len()));
