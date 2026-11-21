@@ -240,12 +240,39 @@ pub(crate) fn booting() -> bool {
     BOOTING.load(Ordering::SeqCst)
 }
 
+/// The hosted run's boot was handed to its app domain's load ([`BOOTING`]): the compile closure
+/// returns once that load is started on a thread of its own (the host's `domain-load`), and the
+/// load goes on with the program's crates, the state the run was started with and the domain's
+/// main thread. The load's end is the boot's ([`domain_boot_over`]): a restart that waited only
+/// for the closure ended the run while the load went on, the load read and removed the state file
+/// that restart had just handed to the next run, and the next run came up without the app's state
+/// (restart_in_place.py's boot stage, 1 relaunch in about 20 on a loaded Linux box; CI 11-21).
+/// From the hand-off until the next boot's closure starts: a closure that returns late, after a
+/// restart already ended its run and the next boot is due, leaves that boot's gate alone.
+static BOOT_IN_DOMAIN: AtomicBool = AtomicBool::new(false);
+
+/// The boot goes on in the app domain's load (true), or the closure ends it after all: the domain
+/// could not be started ([`BOOT_IN_DOMAIN`]).
+pub(crate) fn boot_to_domain(handed: bool) {
+    BOOT_IN_DOMAIN.store(handed, Ordering::SeqCst);
+}
+
+/// The app domain's load is over, its program started or not: so is the boot it was handed, if it
+/// was ([`BOOT_IN_DOMAIN`]).
+pub(crate) fn domain_boot_over() {
+    if BOOT_IN_DOMAIN.load(Ordering::SeqCst) {
+        boot_over();
+    }
+}
+
 /// One boot of the host's compile closure: the gate is on while it runs and off however it
-/// returns, a panic included ([`BOOTING`]).
+/// returns, a panic included, unless the boot went on in the app domain's load ([`BOOTING`],
+/// [`BOOT_IN_DOMAIN`]).
 pub(crate) struct Boot;
 
 impl Boot {
     pub(crate) fn on() -> Self {
+        BOOT_IN_DOMAIN.store(false, Ordering::SeqCst);
         boot_begins();
         Boot
     }
@@ -253,7 +280,9 @@ impl Boot {
 
 impl Drop for Boot {
     fn drop(&mut self) {
-        boot_over();
+        if !BOOT_IN_DOMAIN.load(Ordering::SeqCst) {
+            boot_over();
+        }
     }
 }
 
@@ -2962,7 +2991,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // process: it takes it instead of resolving the package again (domain.rs start_prepared).
         *HANDOFF.lock().unwrap() = Some(Resolved { units, g, order, cfgs, live_inputs: domain_inputs });
         let spec = crate::domain::AppSpec { package, cargo_flags, units_json, argv: Some(prog_args), ..Default::default() };
+        // the boot goes on in the app domain's load, which ends it (before it can, as it starts)
+        boot_to_domain(true);
         let result = (MAIN_HOST.get().expect("run host").start)(spec);
+        if result.is_err() { boot_to_domain(false); }
         if result.is_ok() && !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }
         return match result {
             Ok(()) => 0,

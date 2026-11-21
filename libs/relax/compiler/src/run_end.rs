@@ -399,5 +399,16 @@ mod tests {
             panic!("the boot's own panic");
         });
         assert!(panicked.is_err() && !crate::run::booting(), "a boot that panicked is over");
+        // a hosted app's boot goes on in its app domain's load after the compile closure returned
+        // (a restart that ended the run then lost the app's state to that load, 11-21)
+        let boot = crate::run::Boot::on();
+        crate::run::boot_to_domain(true);
+        let restart = std::thread::spawn(super::wait_boot);
+        drop(boot);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(crate::run::booting() && !restart.is_finished(), "the end waits for the app domain's load, not for the closure");
+        crate::run::domain_boot_over();
+        assert!(restart.join().unwrap() && !crate::run::booting(), "the load is over: so is the boot");
+        crate::run::boot_to_domain(false);
     }
 }

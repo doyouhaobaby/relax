@@ -1808,6 +1808,16 @@ pub fn wait_thread_done(id: DomainId) {
 
 /// The host starts an app as a domain of the program `makepad run` booted (`start` on its unit).
 pub fn start_prepared_in_run(spec: AppSpec, id: DomainId) -> Result<DomainId, Vec<String>> {
+    // the run's boot, handed to its app domain's load, is over when this returns or unwinds: the
+    // program started, or it will not (run.rs BOOT_IN_DOMAIN). Only the run's end clears the app
+    // domain, and it waits for this.
+    struct BootOver(DomainId);
+    impl Drop for BootOver {
+        fn drop(&mut self) {
+            if crate::run::app_domain() == Some(self.0) { crate::run::domain_boot_over(); }
+        }
+    }
+    let _boot = BootOver(id);
     let up = crate::run::running_unit();
     if up.is_null() { let _loading = Loading(id); return fail(id, vec!["no program is running".into()]); }
     start_prepared(up, spec, id)
