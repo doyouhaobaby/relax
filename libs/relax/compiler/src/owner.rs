@@ -1039,7 +1039,22 @@ pub(crate) fn stop() {
     if let Some(thread) = OWNER_JOIN.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = thread.join();
     }
+    POSTS_VOID.store(false, Ordering::Release);
 }
+
+/// The run ends (`run_end`), its unit about to retire: every task posted to the owner (`post`,
+/// `post_queued`) and not yet run goes unrun from here, and so does any posted later, until the
+/// owner stops. They are the run's own work, and some hold its unit's address: a real-time reach's
+/// next step, posted by the step before it behind the unit's retirement, ran on the freed unit
+/// ("a posted compiler task panicked: write_code: ... is not code memory", a run that ended in
+/// place before its first frame, 11-21). A task running now ends first: the retirement is the
+/// owner's next request after it.
+pub(crate) fn void_posts() {
+    POSTS_VOID.store(true, Ordering::Release);
+}
+
+/// Posted tasks go unrun (`void_posts`).
+static POSTS_VOID: AtomicBool = AtomicBool::new(false);
 
 /// Runs `f` on the owner thread and returns its result (its panic resumes here). On the owner it
 /// runs at once (nested: constant evaluation's JIT code compiling what it calls). The caller
@@ -1528,9 +1543,12 @@ fn serve(r: usize) {
     if traced {
         crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, crate::inspect::pstream::SITE | (req.site as *const std::panic::Location<'static> as u64));
     }
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { (*req.run)() }
-    }));
+    // (a run's end voided the posted tasks: this one goes unrun, `void_posts`)
+    let res = if !req.waited && POSTS_VOID.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*req.run)() }))
+    };
     let busy = crate::jit::frame_leave(frame);
     if req.waited {
         OPEN_FOR.with(|o| o.borrow_mut().pop());

@@ -91,6 +91,8 @@ pub unsafe fn end(up: *mut Unit, grace: Duration) -> Ended {
     // from here the process's own threads are not at the run's state
     let gate = crate::run_threads::reset_gate();
     crate::pmhost::free_world();
+    // (the owner's posted tasks are the run's: none runs on its unit once it retires)
+    crate::owner::void_posts();
     let up = crate::run::take_run_unit();
     if !up.is_null() {
         let no_thread_in_it = stayed.is_empty();
