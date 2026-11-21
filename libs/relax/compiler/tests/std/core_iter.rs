@@ -60,6 +60,23 @@ fn a03_peekable_flat_map() {
         }
     }
     println!("| peek {}", out);
+    let mut items = (1..3).peekable();
+    let rejected = items.next_if_map(|n| Err::<u8, _>(n + 10));
+    let accepted = items.next_if_map(|n| Ok(n * 2));
+    println!("| next_if_map {:?} {:?}", rejected, accepted);
+    let rejected = items.next_if_map_mut(|n| {
+        *n += 20;
+        None::<u8>
+    });
+    let accepted = items.next_if_map_mut(|n| Some(*n * 3));
+    let end = items.next_if_map_mut(|_| Some(0));
+    println!("| next_if_map_mut {:?} {:?} {:?}", rejected, accepted, end);
+    // A rejected end stays peeked even when the underlying iterator can resume.
+    let mut source = [None, Some(7)].into_iter();
+    let mut intermittent = std::iter::from_fn(|| source.next().flatten()).peekable();
+    let at_end = intermittent.next_if_map(Ok);
+    let still_at_end = intermittent.next_if_map_mut(|v| Some(*v));
+    println!("| peeked end {:?} {:?} {:?} {:?}", at_end, still_at_end, intermittent.next(), intermittent.next());
     let fm: u32 = v.iter().flat_map(|x| 0..*x).sum();
     println!("| flat_map {}", fm);
     let nested: Vec<Vec<u32>> = v.iter().map(|x| (0..*x).collect()).collect();

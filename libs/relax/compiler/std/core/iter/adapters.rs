@@ -1091,6 +1091,32 @@ impl<I: Iterator> Peekable<I> {
             }
         }
     }
+    /// rustc 1.94.0 (peekable_next_if_map): consumes the mapped value or puts the returned item back.
+    pub fn next_if_map<R>(&mut self, f: impl FnOnce(I::Item) -> Result<R, I::Item>) -> Option<R> {
+        let unpeek = if let Some(item) = self.next() {
+            match f(item) {
+                Ok(result) => return Some(result),
+                Err(item) => Some(item),
+            }
+        } else {
+            None
+        };
+        self.peeked = Some(unpeek);
+        None
+    }
+    /// rustc 1.94.0 (peekable_next_if_map): consumes the mapped value or retains the modified item.
+    pub fn next_if_map_mut<R>(&mut self, f: impl FnOnce(&mut I::Item) -> Option<R>) -> Option<R> {
+        let unpeek = if let Some(mut item) = self.next() {
+            match f(&mut item) {
+                Some(result) => return Some(result),
+                None => Some(item),
+            }
+        } else {
+            None
+        };
+        self.peeked = Some(unpeek);
+        None
+    }
     pub fn next_if_eq<T: ?Sized>(&mut self, expected: &T) -> Option<I::Item>
     where
         I::Item: PartialEq<T>,

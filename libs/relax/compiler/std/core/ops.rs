@@ -820,6 +820,20 @@ impl<B, C> ControlFlow<B, C> {
             ControlFlow::Break(_) => None,
         }
     }
+    /// rustc 1.96.0 (control_flow_ok): converts a break value to `Ok` and a continue value to `Err`.
+    pub const fn break_ok(self) -> Result<B, C> {
+        match self {
+            ControlFlow::Continue(c) => Err(c),
+            ControlFlow::Break(b) => Ok(b),
+        }
+    }
+    /// rustc 1.96.0 (control_flow_ok): converts a continue value to `Ok` and a break value to `Err`.
+    pub const fn continue_ok(self) -> Result<C, B> {
+        match self {
+            ControlFlow::Continue(c) => Ok(c),
+            ControlFlow::Break(b) => Err(b),
+        }
+    }
     pub fn map_break<T, F: FnOnce(B) -> T>(self, f: F) -> ControlFlow<T, C> {
         match self {
             ControlFlow::Continue(c) => ControlFlow::Continue(c),

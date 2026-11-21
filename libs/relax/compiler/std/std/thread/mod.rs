@@ -248,6 +248,20 @@ impl Builder {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        unsafe { self.spawn_unchecked(f) }
+    }
+
+    /// rustc 1.82.0 (thread_spawn_unchecked): spawns a thread whose closure and result may borrow local data.
+    ///
+    /// # Safety
+    /// All borrows in the closure and its result must remain valid for their uses, including their drops.
+    /// Joining the thread before the borrowed data goes out of scope satisfies this requirement.
+    #[track_caller]
+    pub unsafe fn spawn_unchecked<F, T>(self, f: F) -> io::Result<JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
         unsafe { Ok(JoinHandle(self.spawn_unchecked_(f, None, Location::caller())?)) }
     }
 
@@ -260,11 +274,11 @@ impl Builder {
         unsafe { Ok(ScopedJoinHandle(self.spawn_unchecked_(f, Some(scope.data.clone()), Location::caller())?)) }
     }
 
-    /// # Safety: `f` and `T` must outlive the thread (callers: 'static, or a scope that joins).
+    /// # Safety: the caller must keep the data borrowed by `f` and `T` alive through their uses.
     unsafe fn spawn_unchecked_<'a, F, T>(self, f: F, scope_data: Option<Arc<ScopeData>>, at: &'static Location<'static>) -> io::Result<JoinInner<'a, T>>
     where
-        F: FnOnce() -> T + Send + 'a,
-        T: Send + 'a,
+        F: FnOnce() -> T + Send,
+        T: Send,
     {
         let stack_size = match self.stack_size {
             Some(s) => s,
@@ -282,7 +296,7 @@ impl Builder {
         if let Some(scope) = &my_packet.scope {
             scope.increment_num_running_threads();
         }
-        // lifetime erased: the thread is joined before 'a ends (scope) or 'a is 'static
+        // The packet's erased scope lifetime is covered by the caller's safety contract.
         let their_packet: Arc<Packet<'static, T>> = core::mem::transmute(my_packet.clone());
         #[cfg(not(relax_web))]
         let test = unsafe { __relax_test_inherit() };

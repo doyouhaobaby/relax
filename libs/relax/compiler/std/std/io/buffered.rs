@@ -155,6 +155,10 @@ impl<W> IntoInnerError<W> {
     pub fn into_error(self) -> Error {
         self.1
     }
+    /// rustc 1.55.0 (io_into_inner_error_parts): returns the flush error and the recoverable writer.
+    pub fn into_parts(self) -> (Error, W) {
+        (self.1, self.0)
+    }
 }
 
 impl<W> fmt::Display for IntoInnerError<W> {
@@ -407,6 +411,13 @@ impl<W: Write> LineWriter<W> {
     }
     pub fn get_mut(&mut self) -> &mut W {
         self.inner.get_mut()
+    }
+    /// rustc 1.0.0 (rust1): writes the buffered bytes and returns the underlying writer.
+    pub fn into_inner(self) -> core::result::Result<W, IntoInnerError<LineWriter<W>>> {
+        self.inner.into_inner().map_err(|err| {
+            let (error, inner) = err.into_parts();
+            IntoInnerError(LineWriter { inner }, error)
+        })
     }
 }
 

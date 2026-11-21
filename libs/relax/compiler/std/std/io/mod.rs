@@ -440,6 +440,10 @@ impl<T, U> Chain<T, U> {
     pub fn get_ref(&self) -> (&T, &U) {
         (&self.first, &self.second)
     }
+    /// rustc 1.20.0 (more_io_inner_methods): mutably borrows both readers in chain order.
+    pub fn get_mut(&mut self) -> (&mut T, &mut U) {
+        (&mut self.first, &mut self.second)
+    }
 }
 
 impl<T: Read, U: Read> Read for Chain<T, U> {
