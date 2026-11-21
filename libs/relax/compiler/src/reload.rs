@@ -7478,6 +7478,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut pre_n = 0usize;
     // (what an earlier patch built and did not install is not this one's)
     crate::zone_alloc::kept_with(|| u.built_digests.clear());
+    // The copy records (`inlined_into`) of the slots built again start over, as their builds note
+    // them again; a refused edit drops those builds, and the running code keeps the copies it
+    // holds: their records come back (below, `copies_before`). (A refused layout edit left a host
+    // whose dropped build took no copy off the record, and the next edit of the copied fn did not
+    // build it again: the host ran the old copy, 11-22.)
+    let mut copies_before: Vec<(u32, Vec<u32>)> = Vec::new();
     if errs.is_empty() {
         for &id in slots.iter().chain(fresh.iter()) {
             // SPEC-V: the edited bodies have no verdict for their new text yet: flagged before any
@@ -7487,7 +7493,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let f = &mut u.fns[id as usize];
             f.unverified.store(unverified, Ordering::Relaxed);
             f.rir = None;
-            if let Some(h) = &mut f.history { h.inlined_into.clear(); }
+            if let Some(h) = &mut f.history {
+                if !h.inlined_into.is_empty() { copies_before.push((id, h.inlined_into.clone())); }
+                h.inlined_into.clear();
+            }
             f.build_err = None;
             f.spec = None;
             u.reload_errors.remove(&id);
@@ -7862,7 +7871,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let f = &mut u.fns[id as usize];
             f.unverified.store(unverified, Ordering::Relaxed);
             f.rir = None;
-            if let Some(h) = &mut f.history { h.inlined_into.clear(); }
+            if let Some(h) = &mut f.history {
+                if !h.inlined_into.is_empty() { copies_before.push((id, h.inlined_into.clone())); }
+                h.inlined_into.clear();
+            }
             f.build_err = None;
             f.spec = None;
             u.reload_errors.remove(&id);
@@ -7969,6 +7981,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if !errs.is_empty() {
         if pre_paused {
             crate::inspect::instrument::resume_program();
+        }
+        // the running code's copies are on the record again (with what the dropped builds noted:
+        // a host noted only there is built again for nothing, never left out)
+        for (id, hosts) in copies_before.drain(..) {
+            for h in hosts {
+                if !u.fns[id as usize].history().inlined_into.contains(&h) {
+                    crate::zone_alloc::slots_with(|| u.fns[id as usize].history.get_or_insert_with(Default::default).inlined_into.push(h));
+                }
+            }
         }
         if !staged_keeps.is_empty() {
             u.kept_old.retain(|s, _| !staged_keeps.contains(s));

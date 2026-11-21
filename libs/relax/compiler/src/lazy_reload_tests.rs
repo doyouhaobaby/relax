@@ -4078,7 +4078,9 @@ pub fn start(p: *mut u64) {
 /// frame runs the text from before it. Then a thread waits in `host`'s O3 code, which holds a
 /// copy of `peek`, and a second O3 build replaces that code under the frame: a field of `S`,
 /// which `peek` makes, is refused naming `host` (an earlier build's code is no less stale for a
-/// copy of a fn the patch rebuilds).
+/// copy of a fn the patch rebuilds). That edit's own build of `host` takes in no copy (its `peek`
+/// is past the size O1 takes in); an edit of `peek`'s body after the refusal builds `host` again
+/// all the same, as its running code holds the copy.
 #[test]
 fn a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check() {
     isolated_test!(a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check);
@@ -4159,9 +4161,22 @@ pub fn begin(p: *mut u64) {
     let copy = rig.unit.code.read().unwrap().inlined_at(host_o3).is_some_and(|l| l.contains(&peek));
     let tiered = tiered == [host] && rig.tier_up("host") == [host] && first(&rig, host) != host_o3;
     let host_name = rig.name(host);
-    let copied = rig.edit("lib.rs", &[("pub struct S { pub l: u64, pub m: u64, pub n: u64 }", "pub struct S { pub k: u64, pub l: u64, pub m: u64, pub n: u64 }"), ("S { l: 0, m: 0, n: 7 }", "S { k: 0, l: 0, m: 0, n: 7 }"), ("S { l: 0, m: 0, n: 5 }", "S { k: 0, l: 0, m: 0, n: 5 }")]);
+    // (in the refused text peek is past the size O1 takes in: that text's build of host calls it)
+    let grown = format!("{}    s.n\n}}", "    std::hint::black_box(0u64);\n".repeat(14));
+    let copied = rig.edit("lib.rs", &[("pub struct S { pub l: u64, pub m: u64, pub n: u64 }", "pub struct S { pub k: u64, pub l: u64, pub m: u64, pub n: u64 }"), ("S { l: 0, m: 0, n: 7 }", "S { k: 0, l: 0, m: 0, n: 7 }"), ("S { l: 0, m: 0, n: 5 }", "S { k: 0, l: 0, m: 0, n: 5 }"), ("    s.n\n}", grown.as_str())]);
     let held = refused_with(&copied, &["struct `S` changed its layout", &host_name]);
     let hosted = rig.release();
+    // peek's body alone, on the running text
+    let body = rig.edit("lib.rs", &[
+        ("pub struct S { pub k: u64, pub l: u64, pub m: u64, pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }"),
+        ("S { k: 0, l: 0, m: 0, n: 7 }", "S { m: 0, n: 7 }"),
+        ("S { k: 0, l: 0, m: 0, n: 5 }", "S { m: 0, n: 5 }"),
+        (grown.as_str(), "    s.n + 1\n}"),
+    ]);
+    rig.flags[3].store(0, SeqCst);
+    rig.call("begin");
+    rig.wait(3);
+    let peeked = rig.flag(2);
     assert_eq!(field.rung, crate::reload::Rung::Patch, "a field of S applies while the thread is in `{name}`'s code from before its tier-up: {:?}", field.lines);
     assert_eq!(read, 7, "the call after the field, in the new layout");
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the body's edit applies: {:?}", o.lines);
@@ -4173,6 +4188,8 @@ pub fn begin(p: *mut u64) {
     assert!(tiered, "a second O3 build replaced `{host_name}`'s O3 code under the frame");
     assert!(held.0, "a field of S is refused, naming `{host_name}`, whose frame's code holds a copy of peek: {}", held.1);
     assert_eq!(hosted, 10, "the host's thread ends in the code it was in");
+    assert_eq!(body.rung, crate::reload::Rung::Patch, "peek's body applies: {:?}", body.lines);
+    assert_eq!(peeked, 12, "`{host_name}`'s code, which still held its copy of peek when the refused edit's build of it took none, is built again by peek's edit and runs its new body: {:?}", body.lines);
 }
 
 /// T3c T11 (Q2, I3): a closure a patch retired is never built again from its text. Phase 1: the
