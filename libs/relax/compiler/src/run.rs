@@ -64,6 +64,15 @@ pub(crate) static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
 pub fn live_session() -> bool {
     LIVE_SESSION.load(Ordering::Acquire)
 }
+/// This live session's edits are written into its store's edits folder by a client
+/// (RELAX_STORE_LIVE): the client sends the fix of a build that failed and asks for the run that
+/// takes it (`session relaunch`), whether or not anyone sees the run's window.
+static EDITS_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a client pushes this live session's edits ([`EDITS_PUSHED`]).
+pub fn edits_pushed() -> bool {
+    EDITS_PUSHED.load(Ordering::Acquire)
+}
 pub(crate) static VERBOSE: AtomicBool = AtomicBool::new(false);
 static STARTUP_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
@@ -1329,6 +1338,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         driver_options.live = true;
     }
     LIVE_SESSION.store(driver_options.live, Ordering::Release);
+    EDITS_PUSHED.store(driver_options.live && store_live, Ordering::Release);
     // a live run parks a call of code that does not compile until a live edit fixes it (jit.rs
     // PARK_COMPILE_ERRORS); a test, a check and a run nothing can patch keep the error fatal
     jit::PARK_COMPILE_ERRORS.store(driver_options.live && !live_tests && !check && !harness && !plain_test, Ordering::Relaxed);
