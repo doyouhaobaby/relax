@@ -2759,7 +2759,7 @@ pub(crate) fn install_ice_hook() {
 
 thread_local! {
     /// builds running on this thread (build_rir_mode, compile_slot_locked's compile_fn, the split
-    /// front's prepare_rir_from): their panics are compile errors, silent
+    /// front's prepare_rir_from, a lowering ahead): their panics are compile errors, silent
     static ICE_SCOPE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -29971,6 +29971,11 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
     let _mem = crate::memstat::tag(crate::memstat::Tag::Lower);
     let _ = crate::program::take_missing();
     let fn_key = FnKey::Inst(d, args.to_vec());
+    // its panic is caught below and becomes a deferral (the locked build lowers the body again and
+    // reports it): silent, as a build's, on whichever thread lowers ahead (a program thread about to
+    // build the slot printed it)
+    install_ice_hook();
+    let scope = IceScope::enter();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
@@ -29985,6 +29990,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
         // a twin's closures are its base's (their bodies come with the base's own lowering)
         Ok::<_, String>(LoweredAhead { epoch, file: if plain.is_some() { u.fns[into as usize].file } else { body.file }, func, body: (closures && plain.is_none()).then_some(body), callees, consts, tls })
     }));
+    drop(scope);
     let missing = !crate::program::take_missing().is_empty();
     let ready = match r {
         Ok(Ok(r)) if !missing => Ok(r),
