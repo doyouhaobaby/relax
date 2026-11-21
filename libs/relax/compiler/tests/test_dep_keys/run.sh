@@ -4,8 +4,11 @@
 # key a crate's verdict by its own text and its dependencies' interfaces.
 # Cold, after a tdk-base body edit, and after an interface edit, test selects two dependencies
 # and finds 0, 1, 0 stored clean. Run checks all app crates, then only tdk-base, then all again.
-# Both commands must catch tdk-mid's new error when a static, source position, or macro input
-# changes, an impl Trait return loses Send, a const fn body changes, or a fn gains an inherent impl.
+# Never stale: in each case below the crates are clean as written, and one change that leaves the
+# interface text as it was (a static a const reads, a position a const reads, an input a macro
+# reads) or that changes an interface body (an impl Trait return losing Send, a const fn body, an
+# inherent impl in a plain fn body) makes tdk-mid fail. The test run after it must report that
+# error, not tdk-mid's stored verdict; so must `makepad run` in the cases marked `run`.
 H=$(cd "$(dirname "$0")" && pwd)
 if [ $# -ge 1 ]; then J=$1; else
   ROOT=$(cd "$H/../../../../.." && pwd)
@@ -27,7 +30,7 @@ counts() {
 # "<checked> <all>" from the app check
 run_counts() {
   local out
-  out=$(cd "$W" && "$J" run --bin tdk-run 2>&1)
+  out=$(cd "$W" && "$J" run test-dep-keys --bin tdk-run 2>&1)
   echo "$out" | grep -q '^tdk-run ' || { echo "$out" | tail -20 >&2; echo "x x"; return; }
   echo "$out" | sed -n 's/.*relax: app check: \([0-9][0-9]*\) of \([0-9][0-9]*\) app crates checked.*/\1 \2/p' | tail -1
 }
@@ -58,7 +61,7 @@ outcome() {
 }
 outcome_run() {
   local out status
-  out=$(cd "$W" && "$J" run --bin tdk-run 2>&1)
+  out=$(cd "$W" && "$J" run test-dep-keys --bin tdk-run 2>&1)
   status=$?
   if [ "$status" -eq 0 ] && echo "$out" | grep -q 'tdk-run'; then echo ok
   elif [ "$status" -ne 0 ] && echo "$out" | grep -Fq 'mid/src/lib.rs'; then echo mid
@@ -66,17 +69,20 @@ outcome_run() {
 }
 # file $1 of the copy holds $2
 put() { mkdir -p "$(dirname "$W/$1")"; printf '%s\n' "$2" > "$W/$1"; }
-# case <name> <change>: a clean run as the crates are written, then the change, then a run that
-# reports tdk-mid's error
+# case <name> <change> [run]: a clean run as the crates are written, then the change, then a run that
+# reports tdk-mid's error. With `run`, `makepad run` too: the cases whose input reaches the two keys
+# differently (the check extra, and the late inputs each check's store ledger holds); the others hash
+# the same interface digest in both keys and run once.
 case_() {
-  local a ar b br
+  local a ar=- b br=-
   a=$(outcome)
-  ar=$(outcome_run)
+  [ "$3" = run ] && ar=$(outcome_run)
   eval "$2"
   b=$(outcome)
-  br=$(outcome_run)
+  [ "$3" = run ] && br=$(outcome_run)
   echo "$1: $a, then $b; run: $ar, then $br"
-  if [ "$a" != ok ] || [ "$b" != mid ] || [ "$ar" != ok ] || [ "$br" != mid ]; then bad="$bad $1"; fi
+  if [ "$a" != ok ] || [ "$b" != mid ]; then bad="$bad $1"
+  elif [ "$3" = run ] && { [ "$ar" != ok ] || [ "$br" != mid ]; }; then bad="$bad $1"; fi
 }
 MID='pub fn mid_value() -> u32 {
     tdk_base::base_value() + 1
@@ -93,7 +99,7 @@ put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
 static S: usize = 3;
 pub static T: usize = 4;
 pub const C: usize = S;'
-case_ static "sed -i.x -e 's/S: usize = 3;/S: usize = 9;/' -e 's/T: usize = 4;/T: usize = 3;/' -e 's/S: usize = 9;/S: usize = 4;/' '$W/base/src/lib.rs'"
+case_ static "sed -i.x -e 's/S: usize = 3;/S: usize = 9;/' -e 's/T: usize = 4;/T: usize = 3;/' -e 's/S: usize = 9;/S: usize = 4;/' '$W/base/src/lib.rs'" run
 
 # the line a const is written on (caller_location), after a body that gains a line
 put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
@@ -121,13 +127,13 @@ case_ line "sed -i.x 's/{ 1 }/{\\
 put base/src/data.txt abc
 put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
 pub const C: usize = include_str!("data.txt").len() - 1;'
-case_ include_str "put base/src/data.txt abcd"
+case_ include_str "put base/src/data.txt abcd" run
 
 # an environment variable a const reads
 export TDK_TEXT=abc
 put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
 pub const C: usize = env!("TDK_TEXT").len();'
-case_ env "export TDK_TEXT=abcd"
+case_ env "export TDK_TEXT=abcd" run
 
 # a file tdk-mid's own body includes (its type is the file's length)
 put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
@@ -137,7 +143,7 @@ put mid/src/lib.rs "$MID
 pub fn own() -> [u8; 4] {
     *include_bytes!(\"own.bin\")
 }"
-case_ include_bytes "printf abc > '$W/mid/src/own.bin'"
+case_ include_bytes "printf abc > '$W/mid/src/own.bin'" run
 
 # the hidden return type of an impl Trait loses Send
 put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
