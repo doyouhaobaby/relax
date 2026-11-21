@@ -141,6 +141,10 @@ impl OsString {
         let b = self.inner.into_boxed_slice();
         unsafe { Box::from_raw(Box::into_raw(b) as *mut OsStr) }
     }
+    /// rustc 1.89.0 (os_string_pathbuf_leak): the buffer leaked, as a `&mut OsStr` that lives as long as asked
+    pub fn leak<'a>(self) -> &'a mut OsStr {
+        unsafe { &mut *(self.inner.leak() as *mut [u8] as *mut OsStr) }
+    }
     pub fn display(&self) -> Display<'_> {
         self.as_os_str().display()
     }
