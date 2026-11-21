@@ -890,6 +890,12 @@ pub struct CodeTables {
     pub index: Vec<(u64, u32, u32)>,
     /// per `index` entry (same position): its CodeKind, packed
     kinds: Vec<u16>,
+    /// per `index` entry (same position): its install's number among all installs and when it
+    /// went in (ms on clock::ms_since_start, the `t=` of the JIT's logs). A panic or fault report
+    /// names a frame's code version by them (`version_of`): code windows do not lie in install
+    /// order, and nothing else keeps when each body went in. Written per install, never per call.
+    installs: Vec<(u32, u32)>,
+    next_install: u32,
     /// the slots an O3 body inlined (fresh or from the cache), by code start: an inlined frame
     /// names its fn, `versions` its inliners
     inlined: HashMap<u64, Box<[u32]>>,
@@ -927,13 +933,17 @@ impl CodeTables {
             let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off, staged: i.staged.clone() };
             self.unwind.insert(at, own);
         }
+        let install = (self.next_install, crate::clock::ms_since_start() as u32);
+        self.next_install += 1;
         if self.index.last().map_or(true, |l| l.0 < at) {
             self.index.push((at, len, id));
             self.kinds.push(kind.pack());
+            self.installs.push(install);
         } else {
             let k = self.index.partition_point(|x| x.0 < at);
             self.index.insert(k, (at, len, id));
             self.kinds.insert(k, kind.pack());
+            self.installs.insert(k, install);
         }
     }
 
@@ -941,7 +951,37 @@ impl CodeTables {
         let _k = crate::zone_alloc::kept();
         self.index.reserve(n);
         self.kinds.reserve(n);
+        self.installs.reserve(n);
         self.image_unwind.reserve(n);
+    }
+
+    /// Which code version of its slot the body at `start` is: (its number, counted from 1 in
+    /// install order; how many bodies the slot has had; when it went in, ms on
+    /// clock::ms_since_start). The index never drops a body, so the count is every install. A
+    /// report's lookup, one pass over the index.
+    pub fn version_of(&self, start: u64) -> Option<(u32, u32, u32)> {
+        let k = self.index.partition_point(|x| x.0 < start);
+        let e = self.index.get(k).filter(|e| e.0 == start)?;
+        let (seq, ms) = *self.installs.get(k)?;
+        let (mut before, mut all) = (0, 0);
+        for (x, i) in self.index.iter().zip(&self.installs) {
+            if x.2 == e.2 {
+                all += 1;
+                before += (i.0 < seq) as u32;
+            }
+        }
+        Some((before + 1, all, ms))
+    }
+
+    /// The code a frame's pc is in, for a person: "O3 fresh, v3 of 3, tiered at t=12.345 s" (its
+    /// tier, origin and version; "no code body" where the tables hold none).
+    pub fn code_label(&self, pc: u64) -> String {
+        let Some((start, _, _)) = self.entry_at(pc) else { return "no code body".to_string() };
+        let k = self.kind_of(start);
+        match self.version_of(start) {
+            Some((v, of, ms)) => format!("{} {}, v{} of {}, tiered at t={:.3} s", k.tier_name(), k.origin_name(), v, of, ms as f64 / 1000.0),
+            None => format!("{} {}", k.tier_name(), k.origin_name()),
+        }
     }
 
     /// Whether the code body that starts at `start` is a twin's (a sandboxed module's code).
@@ -1449,10 +1489,11 @@ impl RawLine {
 }
 
 /// Names address `a` into `l` from a fault handler: JIT code (its fn, slot, the code version's
-/// tier and origin, the offset; a slot's thunk / lazy stub), the unit's areas, the compiler or
-/// burst arena, the faulting thread's stack, else the host image and symbol (dladdr: the process
-/// is ending, and the raw line with every number was written before). No allocation; the code
-/// tables only through try_read (the faulting thread may hold them).
+/// tier, origin, number and install time, the offset; a slot's thunk / lazy stub), the unit's
+/// areas, the compiler or burst arena, the faulting thread's stack, else the host image and
+/// symbol (dladdr: the process is ending, and the raw line with every number was written
+/// before). No allocation; the code tables only through try_read (the faulting thread may hold
+/// them).
 unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
     if a == 0 {
         l.put(b"null");
@@ -1475,6 +1516,12 @@ unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
                 l.put(b" +").hex(a - start).put(b" (slot ").dec(id as u64).put(b", ").put(k.tier_name().as_bytes()).put(b" ").put(k.origin_name().as_bytes());
                 if t.slot_at(a) != Some(id) {
                     l.put(b", replaced body");
+                }
+                // which of the slot's bodies, and when it went in (CodeTables::code_label's words)
+                if let Some((v, of, ms)) = t.version_of(start) {
+                    let frac = (ms % 1000) as u64;
+                    l.put(b", v").dec(v as u64).put(b" of ").dec(of as u64).put(b", tiered at t=").dec((ms / 1000) as u64).put(b".");
+                    l.put(if frac < 10 { &b"00"[..] } else if frac < 100 { &b"0"[..] } else { &b""[..] }).dec(frac).put(b" s");
                 }
                 l.put(b", code ").hex(start).put(b"+").hex(len as u64).put(b")");
                 return;
@@ -2964,7 +3011,7 @@ pub fn poisoned_note() -> Option<String> {
 pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u32, const_eval_depth: u32) -> bool {
     let u = &*cur_unit();
     let tname = os::thread::name(os::thread::current());
-    let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| { let pc = info.frames.first().copied().unwrap_or(0); match crate::inspect::symbols::host_symbol(pc) { Some((name, image, 0)) => format!("{:#x} (host {}, {})", pc, name, image), Some((name, image, off)) => format!("{:#x} (host {}+{:#x}, {})", pc, name, off, image), None => format!("{:#x}", pc) } }));
+    let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f).map(|(id, loc)| (id, loc, u.code.read().unwrap_or_else(|e| e.into_inner()).code_label(*f)))).map(|(id, loc, code)| format!("{} ({}; {})", u.fns[id as usize].name, loc, code)).unwrap_or_else(|| { let pc = info.frames.first().copied().unwrap_or(0); match crate::inspect::symbols::host_symbol(pc) { Some((name, image, 0)) => format!("{:#x} (host {}, {})", pc, name, image), Some((name, image, off)) => format!("{:#x} (host {}+{:#x}, {})", pc, name, off, image), None => format!("{:#x}", pc) } }));
     // a fault while a constant is evaluated in a check (a null or dangling dereference, a stack
     // overflow from unbounded recursion, an abort): the evaluation fails, which rustc reports
     // as E0080 (the interpreter rejects the same accesses); the initializer's caller reports it.
@@ -9373,7 +9420,8 @@ impl Unit {
     fn report_in(&self, p: &PanicInfo, mut nowait: Option<Vec<&'static str>>) -> String {
         use std::sync::TryLockError;
         let mut s = String::from("{");
-        s.push_str(&format!("\"kind\":{:?},\"message\":{:?},\"build\":{:?}", p.kind, p.message, crate::jit::PROVENANCE));
+        // (t_ms: now, on the clock a frame's tiered_ms reads)
+        s.push_str(&format!("\"kind\":{:?},\"message\":{:?},\"build\":{:?},\"t_ms\":{}", p.kind, p.message, crate::jit::PROVENANCE, crate::clock::ms_since_start() as u32));
         // (nowait: the locks of every frame, tried once here)
         let mut frames_g = None;
         let mut code_g = None;
@@ -9430,14 +9478,16 @@ impl Unit {
                         (Some(_), Some(g)) => g.get(id as usize).map_or(0, size),
                         (Some(_), None) => 0,
                     };
-                    // the code version the pc is in (tier, origin, start): which optimised code ran
-                    let entry = |t: &CodeTables| t.entry_at(*f).map(|e| (e.0, t.kind_of(e.0)));
+                    // the code version the pc is in (tier, origin, start; its number among the
+                    // slot's bodies and when it went in): which optimised code ran
+                    let entry = |t: &CodeTables| t.entry_at(*f).map(|e| (e.0, t.kind_of(e.0), t.version_of(e.0)));
                     let at = match &code_g {
                         Some(t) => entry(&**t),
                         None => self.code.try_read().ok().and_then(|t| entry(&*t)),
                     };
-                    let (start, kind) = at.unwrap_or((fe.code, CodeKind::default()));
-                    s.push_str(&format!("{{\"fn\":{:?},\"at\":{:?},\"off\":{},\"patch_gen\":{},\"tier\":{},\"code\":\"{} {} {:#x}\",\"frame\":{}}}", fe.name, loc, f.wrapping_sub(start), fe.patch_gen, t1 as u8, kind.tier_name(), kind.origin_name(), start, fr))
+                    let (start, kind, version) = at.unwrap_or((fe.code, CodeKind::default(), None));
+                    let version = version.map_or(String::new(), |(v, of, ms)| format!(",\"v\":{},\"of\":{},\"tiered_ms\":{}", v, of, ms));
+                    s.push_str(&format!("{{\"fn\":{:?},\"at\":{:?},\"off\":{},\"patch_gen\":{},\"tier\":{},\"code\":\"{} {} {:#x}\"{},\"frame\":{}}}", fe.name, loc, f.wrapping_sub(start), fe.patch_gen, t1 as u8, kind.tier_name(), kind.origin_name(), start, version, fr))
                 }
                 None => s.push_str(&format!("{{\"pc\":\"{:#x}\"}}", f)),
             }
