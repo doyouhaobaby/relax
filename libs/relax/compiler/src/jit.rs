@@ -31904,8 +31904,8 @@ mod front_yield_tests {
     }
 
     /// The app's jobs hold every token and run on, waiting for nothing: a speculative build queued
-    /// behind them still runs, beside them and taking no token: a tier-up does not wait for a busy
-    /// pool, which would leave its work on slow code.
+    /// behind them still runs, beside them and taking none of their tokens: a tier-up does not wait
+    /// for a busy pool, which would leave its work on slow code.
     #[test]
     fn a_compile_job_runs_beside_jobs_on_every_token() {
         isolated_test!(a_compile_job_runs_beside_jobs_on_every_token);
@@ -31950,7 +31950,14 @@ mod front_yield_tests {
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
         let held = budget::tokens();
         let rows: Vec<String> = held.holders.iter().map(|h| format!("{} client {} class {} lent {} above {} {}", h.thread, h.client, h.class, h.lent, h.above, h.label)).collect();
-        assert!(held.holders.iter().any(|h| h.thread == building && h.client == budget::JIT && h.above), "it runs above the budget, taking no token from the app: thread {building}, running {}, {rows:#?}", held.running);
+        // The app keeps every token it holds, and the build runs beside them: above the budget, or,
+        // while the JIT comes first (`budget::set_jit_first`, at each pick of a compile queue: this
+        // one's or, under the JIT, the host's, which shares the budget), on a token of the JIT's own
+        // part past the app's limit. Either can be the case here (11-21: the second, 1 run in many).
+        let app = held.holders.iter().filter(|h| h.client == budget::APP && !h.lent).count();
+        assert_eq!(app, budget::limit() as usize, "the app keeps every token it took: {rows:#?}");
+        let beside = |h: &budget::Holder| h.above || held.running > budget::limit() as usize;
+        assert!(held.holders.iter().any(|h| h.thread == building && h.client == budget::JIT && beside(h)), "it runs beside the full budget, taking no token from the app: thread {building}, running {}, jit first {}, {rows:#?}", held.running, budget::jit_first());
         BACK_END_GATE.store(0, Ordering::SeqCst);
         while queue::running_class(up, f).is_some() {
             std::thread::yield_now();
