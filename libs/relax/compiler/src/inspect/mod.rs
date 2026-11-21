@@ -1196,7 +1196,7 @@ fn cmd_threads(out: &mut Out) {
     let mut list = threads::list();
     name_handles(&mut list);
     let waits = crate::waits::snapshot();
-    let jit_rows = crate::lifeline::snapshot();
+    let (jit_rows, ended) = crate::lifeline::snapshot_with_ended();
     out.measured("threads", "os+registry", &[]);
     for t in &list {
         let w = waits.iter().find(|w| w.thread == t.handle && t.handle != 0);
@@ -1229,9 +1229,17 @@ fn cmd_threads(out: &mut Out) {
             wait
         ));
     }
-    // registered JIT threads the OS no longer lists: gone (dead after panics, or ended)
+    // A live registry row can be absent from the OS sample.
     for r in jit_rows.iter().filter(|r| !list.iter().any(|t| t.os_id == r.os_id)) {
         out.line(&format!("{{\"id\":\"{}\",\"name\":{},\"role\":\"jit\",\"state\":\"gone\"{}}}", tid_label(r.os_id), json_str(&r.name), lifeline_fields(r)));
+    }
+    let now = crate::clock::wall_ns();
+    for (name, r) in ended {
+        let panic = if r.panics != 0 { format!(",\"last_panic\":{}", json_str(&r.last_panic)) } else { String::new() };
+        out.line(&format!(
+            "{{\"name\":{},\"role\":\"jit\",\"state\":\"ended\",\"started\":{},\"ended\":{},\"dead\":{},\"panics\":{},\"last_end\":\"{}\",\"last_end_ms_ago\":{}{}}}",
+            json_str(&name), r.started, r.ended, r.dead, r.panics, crate::lifeline::STATE_NAMES[r.last_end as usize], now.saturating_sub(r.last_end_ns) / 1_000_000, panic
+        ));
     }
 }
 
