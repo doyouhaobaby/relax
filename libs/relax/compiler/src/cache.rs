@@ -6501,7 +6501,10 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     if !retiring.is_empty() || retiring_path(&sets, me).exists() {
         let left: std::collections::BTreeSet<String> = files.iter().map(|f| name(&f.1)).filter(|n| retiring.contains(n) && !named.contains(n)).collect();
         let text: String = left.iter().map(|n| format!("{n}\n")).collect();
-        let _ = pack::write_atomic_with(&sets, &format!("{me:016x}.retiring"), |f| std::io::Write::write_all(f, text.as_bytes()));
+        // (unchanged: not renamed over again)
+        if std::fs::read_to_string(retiring_path(&sets, me)).ok().as_deref() != Some(text.as_str()) {
+            let _ = pack::write_atomic_with(&sets, &format!("{me:016x}.retiring"), |f| std::io::Write::write_all(f, text.as_bytes()));
+        }
     }
     // run stores (file images) no store refers to: once per process (the scan reads every store's
     // references), at its first prune
@@ -6684,7 +6687,10 @@ fn write_sets(sets: &std::path::Path, build: u64, programs: &[(u64, std::collect
             retiring.extend(prev.lines().filter_map(|l| l.rsplit_once(' ')).filter(|(r, _)| r.starts_with("code ") || r.starts_with("front "))
                 .map(|(_, n)| n.to_string()).filter(|n| !now.contains(n) && crate::store::name_ours(n)));
             let text: String = roles.iter().map(|(r, n)| format!("{r} {n}\n")).collect();
-            let _ = pack::write_atomic_with(sets, &file, |f| std::io::Write::write_all(f, text.as_bytes()));
+            // (unchanged: not renamed over again)
+            if text != prev {
+                let _ = pack::write_atomic_with(sets, &file, |f| std::io::Write::write_all(f, text.as_bytes()));
+            }
         }
     }
     let named = set_files(sets, build).iter()
@@ -7673,11 +7679,18 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     mark("demand-encode");
     let payload = crate::crate_image::encode(&graph);
     entries.push(NewEntry { key: front_graph_key(recipe.identity), kind: KIND_FRONT_GRAPH, payload });
-    let _io = spill_io_write();
-    mark("io-lock");
-    let _commit = crate::load_profile::span(job.profile, "front-graph-commit", "graph writer");
-    crate::store::append(&path, entries, true).ok()?;
-    mark("commit");
+    // a load of the same graph makes the same entries (a test's subject loads again for its lints
+    // each run, run.rs test_lints): the store holds them already, and its rewrite wrote 72 MB on
+    // every warm run of a Fab scenario test
+    if Store::open(&path).is_some_and(|st| st.holds_exactly(&entries)) {
+        mark("unchanged");
+    } else {
+        let _io = spill_io_write();
+        mark("io-lock");
+        let _commit = crate::load_profile::span(job.profile, "front-graph-commit", "graph writer");
+        crate::store::append(&path, entries, true).ok()?;
+        mark("commit");
+    }
     if crate::preload::trace() {
         let mut prev = 0.0;
         let parts: Vec<String> = marks.iter().map(|&(n, t)| { let d = t - prev; prev = t; format!("{}={:.0}", n, d) }).collect();

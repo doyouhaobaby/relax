@@ -1081,6 +1081,17 @@ impl Store {
         e.kind == kind && e.len == len && e.sum == sum && self.verify_at(i)
     }
 
+    /// Whether the store holds exactly `entries`, as `append` with `drop_all` would leave it: their
+    /// keys and no other, each payload of the same kind, length and checksum (checked on disk).
+    pub fn holds_exactly<T: Entry>(&self, entries: &[T]) -> bool {
+        let mut keys: Vec<u128> = entries.iter().map(|e| e.key()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len() == entries.len() && self.index.len() == entries.len()
+            && entries.iter().all(|e| e.kind() != KIND_REMOVED
+                && entry_sum(e).is_some_and(|(len, sum)| self.matches_sum(e.key(), e.kind(), len, sum)))
+    }
+
     /// The payload of `key` (binary search).
     pub fn get(&self, key: u128) -> Option<(u32, &[u8])> {
         let i = self.index.binary_search_by(|e| { let k = e.key; k.cmp(&key) }).ok()?;
