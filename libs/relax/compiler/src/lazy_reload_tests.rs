@@ -4071,7 +4071,14 @@ pub fn start(p: *mut u64) {
 /// the thread in code from before it, naming `hot`: that loop never runs the edit. The tier-up's
 /// retired code is code of the slot's earlier patch group like any replaced version (before,
 /// the check took code it found in neither the slot's code nor its patch versions for the
-/// patch's own: a stale pass).
+/// patch's own: a stale pass). A field added to `S` before the body's edit applies: the frame
+/// runs the text `hot` has, built with no copy of what the patch rebuilds (a layout edit named
+/// a log thread parked in std code since before that code's tier-up, and its restart offer
+/// pointed at that thread, 11-21). One after the body's edit is refused naming `hot`, whose
+/// frame runs the text from before it. Then a thread waits in `host`'s O3 code, which holds a
+/// copy of `peek`, and a second O3 build replaces that code under the frame: a field of `S`,
+/// which `peek` makes, is refused naming `host` (an earlier build's code is no less stale for a
+/// copy of a fn the patch rebuilds).
 #[test]
 fn a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check() {
     isolated_test!(a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check);
@@ -4091,8 +4098,34 @@ pub fn start(p: *mut u64) {
     AT.store(p as usize, Ordering::SeqCst);
     std::thread::spawn(worker);
 }
+pub fn later(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    a[2].store(read(&S { n: 7 }), Ordering::SeqCst);
+}
+fn peek() -> u64 {
+    let s = std::hint::black_box(S { n: 5 });
+    s.n
+}
+#[inline(never)]
+pub fn host(a: &[AtomicU64; 4]) -> u64 {
+    let v = peek();
+    a[1].store(1, Ordering::SeqCst);
+    while a[0].load(Ordering::SeqCst) == 0 { std::hint::spin_loop(); }
+    v + peek()
+}
+pub fn hosted() {
+    let a = flags();
+    a[2].store(host(a), Ordering::SeqCst);
+    a[3].store(1, Ordering::SeqCst);
+}
+pub fn begin(p: *mut u64) {
+    AT.store(p as usize, Ordering::SeqCst);
+    std::thread::spawn(hosted);
+}
 "#);
-    let mut rig = KeptRig::new("tierloop", &[("lib.rs", &lib)], &["start"]);
+    // (O1 inlines small callees, as a session does)
+    let mut rig = KeptRig::with("tierloop", &[("lib.rs", &lib)], &["start", "later", "begin"], |_| {});
+    rig.call("later");
     rig.call("start");
     rig.wait(1);
     let first = |rig: &KeptRig, s: u32| rig.unit.fns[s as usize].code;
@@ -4100,14 +4133,46 @@ pub fn start(p: *mut u64) {
     assert_eq!(hot.len(), 1, "hot has code, and O3 code now");
     let (slot, name) = (hot[0], rig.name(hot[0]));
     let o3 = first(&rig, slot);
+    let field = rig.edit("lib.rs", &[("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }"), ("S { n: 7 }", "S { m: 0, n: 7 }"), ("S { n: 5 }", "S { m: 0, n: 5 }")]);
+    rig.call("later");
+    let read = rig.flag(2);
     let o = rig.edit("lib.rs", &[("n * 0 + 5", "n * 0 + 6")]);
     let gen = rig.unit.patch_log.iter().filter(|(s, _)| *s == slot).map(|(_, g)| *g).max();
     let old = gen.map(|g| crate::reload::running_old_code(&rig.unit, g));
+    let after = rig.edit("lib.rs", &[("pub struct S { pub m: u64, pub n: u64 }", "pub struct S { pub l: u64, pub m: u64, pub n: u64 }"), ("S { m: 0, n: 7 }", "S { l: 0, m: 0, n: 7 }"), ("S { m: 0, n: 5 }", "S { l: 0, m: 0, n: 5 }")]);
+    let refused = refused_with(&after, &["struct `S` changed its layout", &name, "runs code from before an earlier edit"]);
     let got = rig.release();
+    // a host's O3 code with a copy of peek, and a thread in it under the next O3 build
+    use std::sync::atomic::Ordering::SeqCst;
+    rig.flags[3].store(0, SeqCst);
+    rig.call("begin");
+    rig.wait(3);
+    let tiered = rig.tier_up("host");
+    for k in 0..4 {
+        rig.flags[k].store(0, SeqCst);
+    }
+    rig.call("begin");
+    rig.wait(1);
+    let slot_of = |rig: &KeptRig, name: &str| (0..rig.unit.fns.len() as u32).find(|&s| matches!(&rig.unit.fns[s as usize].key, crate::jit::FnKey::Inst(d, _) if rig.unit.prog.name(*d) == name)).unwrap_or_else(|| panic!("no slot for `{name}`"));
+    let (host, peek) = (slot_of(&rig, "host"), slot_of(&rig, "peek"));
+    let host_o3 = first(&rig, host);
+    let copy = rig.unit.code.read().unwrap().inlined_at(host_o3).is_some_and(|l| l.contains(&peek));
+    let tiered = tiered == [host] && rig.tier_up("host") == [host] && first(&rig, host) != host_o3;
+    let host_name = rig.name(host);
+    let copied = rig.edit("lib.rs", &[("pub struct S { pub l: u64, pub m: u64, pub n: u64 }", "pub struct S { pub k: u64, pub l: u64, pub m: u64, pub n: u64 }"), ("S { l: 0, m: 0, n: 7 }", "S { k: 0, l: 0, m: 0, n: 7 }"), ("S { l: 0, m: 0, n: 5 }", "S { k: 0, l: 0, m: 0, n: 5 }")]);
+    let held = refused_with(&copied, &["struct `S` changed its layout", &host_name]);
+    let hosted = rig.release();
+    assert_eq!(field.rung, crate::reload::Rung::Patch, "a field of S applies while the thread is in `{name}`'s code from before its tier-up: {:?}", field.lines);
+    assert_eq!(read, 7, "the call after the field, in the new layout");
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the body's edit applies: {:?}", o.lines);
     assert!(gen.is_some_and(|g| g > 0) && first(&rig, slot) != o3, "the patch installs new code for `{name}`: {:?}", o.lines);
     assert!(matches!(&old, Some(Ok(Some(n))) if *n == name), "the landing check names `{name}`, whose loop runs the code the tier-up replaced: {old:?}");
+    assert!(refused.0, "a field after the body's edit is refused, naming `{name}`, whose frame runs the text from before it: {}", refused.1);
     assert_eq!(got, 5, "the thread ends in the code it was in");
+    assert!(copy, "`{host_name}`'s O3 code holds a copy of peek");
+    assert!(tiered, "a second O3 build replaced `{host_name}`'s O3 code under the frame");
+    assert!(held.0, "a field of S is refused, naming `{host_name}`, whose frame's code holds a copy of peek: {}", held.1);
+    assert_eq!(hosted, 10, "the host's thread ends in the code it was in");
 }
 
 /// T3c T11 (Q2, I3): a closure a patch retired is never built again from its text. Phase 1: the

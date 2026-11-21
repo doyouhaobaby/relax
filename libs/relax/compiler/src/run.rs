@@ -1782,7 +1782,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // for a test whose subject loaded again for its lints (test_lints) while every crate before
     // it restored, of the graph its image was recorded of (FrontImages::reload_current): what
     // loaded again is what the image holds. The exit encoded and summed the image again (0.5 s of
-    // a 7.2 s warm Fab scenario test) and rewrote it whole (1.3 GB) when the run's interner had grown.
+    // a 7.2 s warm scenario test of a large app) and rewrote it whole (1.3 GB) when the run's interner had grown.
     let image_current = collected_restored || test_lints && restored_crates != 0
         && front_images.as_ref().is_some_and(|images| images.reload_current() && restored_crates == images.reload_prefix(&pre));
     COLLECTED_CURRENT.store(image_current, Ordering::Relaxed);
@@ -4801,7 +4801,7 @@ static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
 /// A record of the collected program is under way, taken under its front read: its capture or,
 /// past the read, its store write. The mid-run writes run on several threads (the periodic one,
 /// the quit write, a self-spawn's on the spawning thread), and two that each found the program not
-/// yet recorded wrote it twice (a cold Fab scenario run on a Linux node: 666 MB, then 667 MB
+/// yet recorded wrote it twice (a cold scenario run of a large app on Linux: 666 MB, then 667 MB
 /// 0.8 s later). Under a front write no capture runs, so one under way is in its store write,
 /// which needs no lock: the exit's record waits for it (finish_run's cache write).
 static COLLECTED_RECORDING: AtomicBool = AtomicBool::new(false);
