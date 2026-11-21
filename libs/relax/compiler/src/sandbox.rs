@@ -2059,6 +2059,10 @@ extern "C" fn sb_getpid() -> i32 {
 extern "C" fn sb_pthread_self() -> u64 {
     cur_seg().map_or(0, |(_, k)| k as u64 + 1)
 }
+/// A host thread's OS name: none for a module's (ERANGE, as for a buffer too small; nothing written)
+extern "C" fn sb_getname_np() -> i32 {
+    34
+}
 
 rt_fn! {
 fn sb_fmt_str(p: u64, len: u64, spec: u64) {
@@ -2221,6 +2225,8 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         "pthread_main_np" => Some(("sb_main_np", sb_main_np as *const () as u64)),
         "gettid" => Some(("sb_gettid", sb_gettid as *const () as u64)),
         "pthread_self" => Some(("sb_pthread_self", sb_pthread_self as *const () as u64)),
+        // (std's unnamed spawn reads its spawner's OS name, thread/mod.rs Thread::spawned: none)
+        "pthread_getname_np" => Some(("sb_getname_np", sb_getname_np as *const () as u64)),
         "getpid" => Some(("sb_getpid", sb_getpid as *const () as u64)),
         "abort" => Some(("abort", 0)),
         // std's catch_unwind names its recovery point (jit.rs relax_catch_caught: a thread-local flag)
