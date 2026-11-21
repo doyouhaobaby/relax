@@ -763,7 +763,7 @@ fn handle_web_socket(
                             .send(HttpServerRequest::BinaryMessage {
                                 web_socket_id,
                                 response_sender: tx_socket.clone(),
-                                data: data.to_vec(),
+                                data: std::mem::take(data),
                             })
                             .is_err()
                         {
