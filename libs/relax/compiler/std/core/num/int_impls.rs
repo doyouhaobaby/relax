@@ -4,7 +4,7 @@
 
 use crate::intrinsics_int as ii;
 use crate::num::parse;
-use crate::num::ParseIntError;
+use crate::num::{ParseIntError, Saturating};
 
 impl u8 {
     pub const MIN: u8 = 0;
@@ -96,6 +96,12 @@ impl u8 {
     pub const fn checked_next_power_of_two(self) -> Option<u8> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u8) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i8 { self as i8 }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<i8> {
+        let res = self.wrapping_sub(rhs) as i8;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: i8) -> Option<u8> { let (a, b) = self.overflowing_add(rhs as u8); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: i8) -> u8 { self.wrapping_add(rhs as u8) }
     pub const fn saturating_add_signed(self, rhs: i8) -> u8 { let (res, over) = self.overflowing_add(rhs as u8); if over == (rhs < 0) { res } else if over { u8::MAX } else { 0 } }
@@ -218,6 +224,12 @@ impl u16 {
     pub const fn checked_next_power_of_two(self) -> Option<u16> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u16) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i16 { self as i16 }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<i16> {
+        let res = self.wrapping_sub(rhs) as i16;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: i16) -> Option<u16> { let (a, b) = self.overflowing_add(rhs as u16); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: i16) -> u16 { self.wrapping_add(rhs as u16) }
     pub const fn saturating_add_signed(self, rhs: i16) -> u16 { let (res, over) = self.overflowing_add(rhs as u16); if over == (rhs < 0) { res } else if over { u16::MAX } else { 0 } }
@@ -340,6 +352,12 @@ impl u32 {
     pub const fn checked_next_power_of_two(self) -> Option<u32> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u32) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i32 { self as i32 }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<i32> {
+        let res = self.wrapping_sub(rhs) as i32;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: i32) -> Option<u32> { let (a, b) = self.overflowing_add(rhs as u32); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: i32) -> u32 { self.wrapping_add(rhs as u32) }
     pub const fn saturating_add_signed(self, rhs: i32) -> u32 { let (res, over) = self.overflowing_add(rhs as u32); if over == (rhs < 0) { res } else if over { u32::MAX } else { 0 } }
@@ -462,6 +480,12 @@ impl u64 {
     pub const fn checked_next_power_of_two(self) -> Option<u64> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u64) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i64 { self as i64 }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<i64> {
+        let res = self.wrapping_sub(rhs) as i64;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: i64) -> Option<u64> { let (a, b) = self.overflowing_add(rhs as u64); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: i64) -> u64 { self.wrapping_add(rhs as u64) }
     pub const fn saturating_add_signed(self, rhs: i64) -> u64 { let (res, over) = self.overflowing_add(rhs as u64); if over == (rhs < 0) { res } else if over { u64::MAX } else { 0 } }
@@ -598,6 +622,12 @@ impl u128 {
     pub const fn checked_next_power_of_two(self) -> Option<u128> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u128) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i128 { self as i128 }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<i128> {
+        let res = self.wrapping_sub(rhs) as i128;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: i128) -> Option<u128> { let (a, b) = self.overflowing_add(rhs as u128); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: i128) -> u128 { self.wrapping_add(rhs as u128) }
     pub const fn saturating_add_signed(self, rhs: i128) -> u128 { let (res, over) = self.overflowing_add(rhs as u128); if over == (rhs < 0) { res } else if over { u128::MAX } else { 0 } }
@@ -721,6 +751,12 @@ impl usize {
     pub const fn checked_next_power_of_two(self) -> Option<usize> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: usize) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> isize { self as isize }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<isize> {
+        let res = self.wrapping_sub(rhs) as isize;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: isize) -> Option<usize> { let (a, b) = self.overflowing_add(rhs as usize); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: isize) -> usize { self.wrapping_add(rhs as usize) }
     pub const fn saturating_add_signed(self, rhs: isize) -> usize { let (res, over) = self.overflowing_add(rhs as usize); if over == (rhs < 0) { res } else if over { usize::MAX } else { 0 } }
@@ -844,6 +880,12 @@ impl usize {
     pub const fn checked_next_power_of_two(self) -> Option<usize> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: usize) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> isize { self as isize }
+    /// rustc 1.91.0 (unsigned_signed_diff): Returns the signed difference when it fits.
+    pub const fn checked_signed_diff(self, rhs: Self) -> Option<isize> {
+        let res = self.wrapping_sub(rhs) as isize;
+        let overflow = (self >= rhs) == (res < 0);
+        if !overflow { Some(res) } else { None }
+    }
     pub const fn checked_add_signed(self, rhs: isize) -> Option<usize> { let (a, b) = self.overflowing_add(rhs as usize); if b ^ (rhs < 0) { None } else { Some(a) } }
     pub const fn wrapping_add_signed(self, rhs: isize) -> usize { self.wrapping_add(rhs as usize) }
     pub const fn saturating_add_signed(self, rhs: isize) -> usize { let (res, over) = self.overflowing_add(rhs as usize); if over == (rhs < 0) { res } else if over { usize::MAX } else { 0 } }
@@ -1802,5 +1844,485 @@ impl u8 {
     pub const fn eq_ignore_ascii_case(&self, other: &u8) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
     pub fn make_ascii_uppercase(&mut self) { *self = self.to_ascii_uppercase(); }
     pub fn make_ascii_lowercase(&mut self) { *self = self.to_ascii_lowercase(); }
+}
+
+impl Saturating<u8> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(u8::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(u8::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = u8::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(u8::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(u8::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<u16> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(u16::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(u16::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = u16::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(u16::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(u16::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<u32> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(u32::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(u32::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = u32::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(u32::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(u32::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<u64> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(u64::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(u64::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = u64::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(u64::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(u64::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<u128> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(u128::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(u128::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = u128::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(u128::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(u128::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<usize> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(usize::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(usize::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = usize::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(usize::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(usize::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is a power of two.
+    pub const fn is_power_of_two(self) -> bool { self.0.is_power_of_two() }
+}
+
+impl Saturating<i8> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(i8::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(i8::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = i8::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(i8::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(i8::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
+}
+
+impl Saturating<i16> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(i16::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(i16::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = i16::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(i16::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(i16::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
+}
+
+impl Saturating<i32> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(i32::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(i32::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = i32::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(i32::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(i32::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
+}
+
+impl Saturating<i64> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(i64::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(i64::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = i64::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(i64::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(i64::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
+}
+
+impl Saturating<i128> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(i128::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(i128::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = i128::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(i128::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(i128::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
+}
+
+impl Saturating<isize> {
+    /// rustc 1.74.0 (saturating_int_impl): The smallest representable value.
+    pub const MIN: Self = Saturating(isize::MIN);
+    /// rustc 1.74.0 (saturating_int_impl): The largest representable value.
+    pub const MAX: Self = Saturating(isize::MAX);
+    /// rustc 1.74.0 (saturating_int_impl): The number of bits in the integer.
+    pub const BITS: u32 = isize::BITS;
+    /// rustc 1.74.0 (saturating_int_impl): Counts the one bits.
+    pub const fn count_ones(self) -> u32 { self.0.count_ones() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the zero bits.
+    pub const fn count_zeros(self) -> u32 { self.0.count_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the leading zero bits.
+    pub const fn leading_zeros(self) -> u32 { self.0.leading_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Counts the trailing zero bits.
+    pub const fn trailing_zeros(self) -> u32 { self.0.trailing_zeros() }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the left.
+    pub const fn rotate_left(self, n: u32) -> Self { Saturating(self.0.rotate_left(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Rotates the bits to the right.
+    pub const fn rotate_right(self, n: u32) -> Self { Saturating(self.0.rotate_right(n)) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the byte order.
+    pub const fn swap_bytes(self) -> Self { Saturating(self.0.swap_bytes()) }
+    /// rustc 1.74.0 (saturating_int_impl): Reverses the bit order.
+    pub const fn reverse_bits(self) -> Self { Saturating(self.0.reverse_bits()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a big-endian value to native byte order.
+    pub const fn from_be(x: Self) -> Self { Saturating(isize::from_be(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts a little-endian value to native byte order.
+    pub const fn from_le(x: Self) -> Self { Saturating(isize::from_le(x.0)) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to big-endian byte order.
+    pub const fn to_be(self) -> Self { Saturating(self.0.to_be()) }
+    /// rustc 1.74.0 (saturating_int_impl): Converts to little-endian byte order.
+    pub const fn to_le(self) -> Self { Saturating(self.0.to_le()) }
+    /// rustc 1.74.0 (saturating_int_impl): Raises the integer to a power, saturating on overflow.
+    pub const fn pow(self, exp: u32) -> Self { Saturating(self.0.saturating_pow(exp)) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the absolute value, saturating on overflow.
+    pub const fn abs(self) -> Self { Saturating(self.0.saturating_abs()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns the sign as -1, 0, or 1.
+    pub const fn signum(self) -> Self { Saturating(self.0.signum()) }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is greater than zero.
+    pub const fn is_positive(self) -> bool { self.0.is_positive() }
+    /// rustc 1.74.0 (saturating_int_impl): Returns whether the value is less than zero.
+    pub const fn is_negative(self) -> bool { self.0.is_negative() }
 }
 
