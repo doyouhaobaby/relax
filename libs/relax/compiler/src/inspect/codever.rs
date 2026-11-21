@@ -1054,7 +1054,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::jit::compile_tier1(up, id) })).unwrap_or(false);
                     let row = crate::owner::call(crate::owner::Class::Program, || {
                         let u = unsafe { &*up };
-                        let r: Result<bool, String> = if ok { Ok(true) } else { Err("the O3 build was dropped (not verified, instrumented by a probe, outdated, or failed: RELAX_TIER1_TRACE=1 says why)".into()) };
+                        let r: Result<bool, String> = if ok { Ok(true) } else { Err("the O3 build was dropped (not verified, instrumented by a probe, outdated, or failed: RELAX_O3_TRACE=1 says why)".into()) };
                         let mut s = format!("{{\"o3\":{},\"slot\":{},\"installed\":{},{}", json_str(&short(&super::display_name(u, id, 0), 160)), id, ok, patched_row(u, id, &before, &r));
                         if !ok {
                             s.push_str(&format!(",\"why\":{}", json_str(r.as_ref().err().unwrap())));
