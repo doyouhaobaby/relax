@@ -42,8 +42,8 @@ pub mod intrinsics {
     unsafe extern "relax-intrinsic" {
         /// rustc's `intrinsics::overflow_checks`: whether the program's profile has overflow checks,
         /// so code inheriting them (rustc's `#[rustc_inherit_overflow_checks]`) panics on overflow
-        /// as the program's own arithmetic does. One value for the whole program, read at run time;
-        /// true in constant evaluation, as rustc's.
+        /// as the program's own arithmetic does. One value for the whole program: std is compiled
+        /// for it (a constant in its code); true in constant evaluation, as rustc's.
         pub safe fn overflow_checks() -> bool;
     }
     pub use super::intrinsics_simd as simd;

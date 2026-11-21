@@ -248,7 +248,8 @@ pub struct Lcx<'a> {
     /// lowering a const/static initializer: borrowed temporaries live in static memory
     /// (rustc's constant promotion), not on the initializer's stack
     const_init: bool,
-    // N:rustc_mir_build/src/builder/mod.rs:777-785: const owners always check overflow.
+    // N:rustc_mir_build/src/builder/mod.rs:777-785: const owners always check overflow; a body
+    // marked #[rustc_inherit_overflow_checks] checks as the program does (`inherited_checks`).
     overflow_checks: bool,
     /// a #[track_caller] fn: its implicit `&'static Location` parameter
     caller_loc: Option<VReg>,
@@ -825,6 +826,14 @@ impl<'a> Lcx<'a> {
         }
         let prog = &self.u.prog;
         self.errors.push(prog.record_error(self.b.file, pos, "lower", msg));
+    }
+
+    /// The overflow checks code that inherits them has (rustc's `#[rustc_inherit_overflow_checks]`,
+    /// `intrinsics::overflow_checks`): in a std crate the program's, which std is compiled for
+    /// (relax_overflow_checks, lib.rs std_cfg); in another crate its own profile's (KNOWN_GAPS 16:
+    /// rustc's are the instantiating crate's).
+    fn inherited_checks(&self) -> bool {
+        self.u.prog.file_crate.get(self.b.file as usize).and_then(|&k| self.u.prog.crates.get(k as usize)).is_some_and(|c| c.cfg.holds("relax_overflow_checks") || c.cfg.holds("overflow_checks"))
     }
 
     fn ast(&self) -> &'a Ast {
@@ -2104,10 +2113,13 @@ impl<'a> Lcx<'a> {
     }
 
     pub fn lower_fn_body(&mut self, def: DefId) {
-        self.overflow_checks |= matches!(self.u.prog.def(def).kind, DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst);
-        self.scan_addr_taken();
         let ast = self.ast();
         let prog_def_item = self.u.prog.def(def).item;
+        if matches!(self.u.prog.def(def).kind, DefKind::Fn | DefKind::AssocFn) && crate::lang_items::has_attr(&self.u.prog, self.u.prog.def(def).file, ast.list(ast.item(prog_def_item).attrs), "rustc_inherit_overflow_checks") {
+            self.overflow_checks = self.inherited_checks();
+        }
+        self.overflow_checks |= matches!(self.u.prog.def(def).kind, DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst);
+        self.scan_addr_taken();
         if self.u.prog.def(def).kind == DefKind::AnonConst {
             let e = relax_types::const_eval::const_body(&self.u.prog, def).expect("anonymous const body");
             let out = self.f.vreg(Cls::I);
@@ -2317,7 +2329,15 @@ impl<'a> Lcx<'a> {
         }
         self.scan_addr_taken();
         let (params, body) = match &ast.expr(ExprId(ce)).kind {
-            ExprKind::Closure(row) => { let r = ast.row(*row); (r.params.clone(), r.body) }
+            ExprKind::Closure(row) => {
+                let r = ast.row(*row);
+                // a closure checks as the crate it is written in unless it is marked itself
+                // (rustc: the body owner's own attributes), as std's sum and product folds are
+                if r.inherit_overflow_checks {
+                    self.overflow_checks = self.inherited_checks();
+                }
+                (r.params.clone(), r.body)
+            }
             // a closure slot whose expression id names something else in this parse (a code
             // cache entry made from another numbering of the file): an error, never empty code
             _ => {
@@ -13095,15 +13115,9 @@ impl<'a> Lcx<'a> {
             }
             "overflow_checks" => {
                 // intrinsics::overflow_checks() -> bool: true in constant evaluation, as rustc's (one
-                // value there for every crate); at run time Rt::overflow_checks, the program's
-                // profile, which no compiled function depends on
-                if self.const_init {
-                    return Some(Val::L(vec![self.iconst(1)]));
-                }
-                let r = self.f.vreg(Cls::I);
-                let rt = self.u.rs.overflow_checks;
-                self.emit(Inst::Call(Callee::Host(rt), Vec::new(), vec![r]));
-                Some(Val::L(vec![r]))
+                // value there for every crate); in code, the checks its crate inherits
+                let on = self.const_init || self.inherited_checks();
+                Some(Val::L(vec![self.iconst(on as i64)]))
             }
             "rethrow" => {
                 // intrinsics_rt::rethrow(): Rt::rethrow (the next panic continues a reported one)

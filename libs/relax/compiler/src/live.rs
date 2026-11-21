@@ -78,7 +78,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     };
     // a live session (reload.rs)
     crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
-    crate::run::set_program_root(&prog, krate);
+    crate::layout::set_root_crate(krate);
     // Single-file live sessions have one app crate and no Cargo unit graph.
     crate::borrowck::event::set_app_scope(vec![prog.crates[krate as usize].root_path().to_string()]);
     let mut tcx = crate::tcx::Tcx::new();

@@ -830,6 +830,11 @@ pub(crate) fn resolve_package(
     // with the profile's build-override. Relax's std crates (the sysroot's proc_macro too) keep
     // their own.
     let profile = unitgraph::test_profile().map(|p| crate::resolve::profile(workspace, p)).transpose()?;
+    // A run's crates build as `cargo build --release` builds them: the release profile's checks
+    // (cargo's default, `[profile.release]` with its `inherits`, CARGO_PROFILE_RELEASE_*), so a
+    // workspace that turns on overflow checks or debug assertions in release has them. Its host
+    // units keep what a run gives them (no profile: their scripts' rerun keys stay as they are).
+    let run_profile = if profile.is_none() { Some(crate::resolve::profile(workspace, "release")?) } else { None };
     let ours = |dir: &str| crate::vfs::relative_path(dir, std_dir).is_none();
     let host_checks: Vec<Vec<String>> = g.pkg.iter().zip(&g.crates).map(|((dir, name, version), c)| match &profile {
         Some(p) if ours(dir) => p.checks(dir, name, version, c.registry, true).cfgs().map(str::to_string).collect(),
@@ -994,7 +999,7 @@ pub(crate) fn resolve_package(
             cs.set.push(x.replace('"', ""));
         }
         let (dir, name, version) = &g.pkg[ci];
-        if let Some(p) = profile.as_ref().filter(|_| ours(dir)) {
+        if let Some(p) = profile.as_ref().or(run_profile.as_ref()).filter(|_| ours(dir)) {
             for x in p.checks(dir, name, version, c.registry, c.host_only || c.proc_macro).cfgs() {
                 if !cs.set.iter().any(|y| y == x) {
                     cs.set.push(x.to_string());
@@ -1661,7 +1666,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::crates::set_crate_env(&c.name, g.env[ci].clone());
     }
     prog.std_simd = crate::std_simd_wanted(g.crates.iter().map(|c| c.src_path.as_str()));
-    let mut pre = crate::std_pre_crates(sess, prog.std_simd);
+    // the program's checks are its root crate's (its profile's, above): std is compiled for them
+    prog.std_overflow_checks = cfgs.get(subject_ci).is_some_and(|c| c.holds("overflow_checks"));
+    let mut pre = crate::std_pre_crates(sess, prog.std_simd, prog.std_overflow_checks);
     let std_count = pre.len();
     let std_names: Vec<_> = pre.iter().map(|c| (c.name.clone(), c.name.clone())).collect();
     let mut pre_index = vec![usize::MAX; g.crates.len()];
@@ -2461,7 +2468,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let fn_defs = if ahead { startup_defs(&prog, &format!("{}/startup/{}.startup", target_dir, package)) } else { Vec::new() };
     // `main` lives at the root of the root crate (find_main)
     let root_crate = root;
-    set_program_root(&prog, root_crate);
+    crate::layout::set_root_crate(root_crate);
     // A live session (hot reload of the program's own sources, reload.rs)
     if options.live {
         crate::layout::LIVE_SESSION.store(true, Ordering::Relaxed);
@@ -3071,13 +3078,6 @@ pub fn progress() -> (String, u32, u32) {
 /// The C-ABI fns carrying `#[no_mangle]` (symbol = the fn's name) or `#[export_name = ".."]` whose
 /// symbol starts with one of `prefixes`. A symbol defined twice is an error: the host would bind
 /// one of the two silently.
-/// The program's root crate (`main`'s, or the crate under test) and its profile's overflow checks,
-/// which every crate's code reads at run time (`intrinsics::overflow_checks`).
-pub(crate) fn set_program_root(prog: &crate::program::Program, root: u32) {
-    crate::layout::set_root_crate(root);
-    crate::layout::set_overflow_checks(prog.crates.get(root as usize).is_some_and(|c| c.cfg.holds("overflow_checks")));
-}
-
 pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<Vec<(String, DefId)>, String> {
     let mut out: Vec<(String, DefId)> = Vec::new();
     for (di, d) in prog.defs.iter().enumerate() {

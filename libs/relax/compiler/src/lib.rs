@@ -1134,15 +1134,16 @@ fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_
 /// Loads core, alloc (when present) and std; returns core and the dependency list user crates
 /// get ([core, alloc, std]).
 /// core, alloc (when the std has it) and std, as load_std_crates loads them (for a preload).
-/// `simd`: with core::simd / std::simd (see `std_simd_wanted`).
-pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<preload::PreCrate> {
+/// `simd`: with core::simd / std::simd (see `std_simd_wanted`); `overflow_checks`: the program's
+/// profile has overflow checks (`std_cfg`).
+pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> Vec<preload::PreCrate> {
     let dir = std_dir();
     let mut v = vec![preload::PreCrate {
         
         name: "core".to_string(),
         root: format!("{}/core/lib.rs", dir),
         edition: 2021,
-        cfg: std_cfg(sess, simd),
+        cfg: std_cfg(sess, simd, overflow_checks),
         deps: Vec::new(),
         proc_macro: false,
         image_deps: Vec::new(),
@@ -1155,7 +1156,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<
             name: "alloc".to_string(),
             root: alloc_root,
             edition: 2021,
-            cfg: std_cfg(sess, simd),
+            cfg: std_cfg(sess, simd, overflow_checks),
             deps: Vec::new(),
             proc_macro: false,
             image_deps: Vec::new(),
@@ -1167,7 +1168,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<
         name: "std".to_string(),
         root: format!("{}/std/lib.rs", dir),
         edition: 2021,
-        cfg: std_cfg(sess, simd),
+        cfg: std_cfg(sess, simd, overflow_checks),
         deps: Vec::new(),
         proc_macro: false,
         image_deps: Vec::new(),
@@ -1191,8 +1192,11 @@ pub(crate) fn program_cfg(sess: &std::sync::Arc<crate::Session>, features: &[Str
 }
 
 /// The cfg set of the std crates: the host's, plus relax_portable_simd when the program uses
-/// core::simd.
-pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool) -> cfg::CfgSet {
+/// core::simd, and relax_overflow_checks when the program's profile has overflow checks: std's
+/// code that inherits them (`#[rustc_inherit_overflow_checks]`, `intrinsics::overflow_checks`)
+/// is compiled for the program's setting, and the cfg keeps the two compilations apart in every
+/// cache, side by side.
+pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> cfg::CfgSet {
     // a web target's std is read as rustc's std for the triple (cfg.rs `web`), with Relax std's
     // web layer (`relax_web`: core::arch::wasm32, std/sys/web.rs)
     let mut c = match sess.options.check_target {
@@ -1205,6 +1209,9 @@ pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool) -> cfg::CfgSet
     };
     if simd {
         c.set.push("relax_portable_simd".to_string());
+    }
+    if overflow_checks {
+        c.set.push("relax_overflow_checks".to_string());
     }
     c
 }
@@ -1235,18 +1242,18 @@ pub(crate) fn load_std_crates_with(sess: &std::sync::Arc<crate::Session>, prog: 
 }
 
 fn load_std_crates_inner(sess: &std::sync::Arc<crate::Session>, prog: &mut program::Program, loaded: &mut impl FnMut(&mut program::Program, u32)) -> Result<(u32, Vec<(program::Sym, u32)>), String> {
-    let simd = prog.std_simd;
-    let pre = std_pre_crates(sess, simd);
-    let core = prog.load_crate_deferred("core", &pre[0].root, 2021, std_cfg(sess, simd), Vec::new())?;
+    let (simd, checks) = (prog.std_simd, prog.std_overflow_checks);
+    let pre = std_pre_crates(sess, simd, checks);
+    let core = prog.load_crate_deferred("core", &pre[0].root, 2021, std_cfg(sess, simd, checks), Vec::new())?;
     loaded(prog, core);
     let core_sym = prog.syms.intern("core");
     let mut deps = vec![(core_sym, core)];
     if pre.len() == 3 {
-        let alloc = prog.load_crate_deferred("alloc", &pre[1].root, 2021, std_cfg(sess, simd), deps.clone())?;
+        let alloc = prog.load_crate_deferred("alloc", &pre[1].root, 2021, std_cfg(sess, simd, checks), deps.clone())?;
         loaded(prog, alloc);
         deps.push((prog.syms.intern("alloc"), alloc));
     }
-    let std = prog.load_crate_deferred("std", &pre[pre.len() - 1].root, 2021, std_cfg(sess, simd), deps.clone())?;
+    let std = prog.load_crate_deferred("std", &pre[pre.len() - 1].root, 2021, std_cfg(sess, simd, checks), deps.clone())?;
     loaded(prog, std);
     deps.push((prog.syms.intern("std"), std));
     Ok((core, deps))
@@ -1264,6 +1271,7 @@ pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, n
     pmhost::install();
     let mut prog = program::Program::new(sess);
     prog.std_simd = std_simd_wanted([root]);
+    prog.std_overflow_checks = checks.overflow_checks;
     let (core, deps) = load_std_crates(sess, &mut prog).map_err(|e| vec![e])?;
     let mut cfgset = program_cfg(sess, &[]);
     if test {
@@ -1337,7 +1345,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     };
     // the crate under test is the program's own crate (run.rs): its #![recursion_limit] and
     // #![type_length_limit] govern monomorphization (TypingEnv::fully_monomorphized)
-    crate::run::set_program_root(&prog, krate);
+    crate::layout::set_root_crate(krate);
     // the file is checked whole before any test runs, as `rustc --test` compiles it first (the
     // package form's up-front check, run.rs test_subjects); marked before collection
     crate::borrowck::event::set_check_scope();

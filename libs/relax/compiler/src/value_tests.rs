@@ -106,8 +106,6 @@ fn unit_in(session: crate::Session, src: &str, name: &str, checks: crate::resolv
     std::fs::remove_dir(dir).unwrap();
     let cfg = &prog.crates[krate as usize].cfg;
     assert_eq!((cfg.holds("debug_assertions"), cfg.holds("overflow_checks")), (checks.debug_assertions, checks.overflow_checks), "the crate's cfg is its profile's");
-    // the program's checks, which std's code inheriting them reads at run time (run.rs set_program_root)
-    crate::layout::set_overflow_checks(checks.overflow_checks);
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     (crate::jit::Unit::new(prog, tcx, core), krate)

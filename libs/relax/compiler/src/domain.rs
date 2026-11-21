@@ -1615,7 +1615,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let prepared = crate::owner::call(crate::owner::Class::Program, || unsafe {
         if cancelled(id) { return Err("domain compilation cancelled".into()); }
         let u = &mut *(upn as *mut Unit);
-        if crate::run::app_domain() == Some(id) { crate::run::set_program_root(&u.prog, root); }
+        if crate::run::app_domain() == Some(id) { crate::layout::set_root_crate(root); }
         let main_def = crate::run::find_main(&u.prog, root).ok_or_else(|| format!("no `fn main` at the root of {}", spec.package))?;
         let fid = u.fn_id(crate::jit::FnKey::Inst(main_def, Vec::new()));
         crate::wasm_export::entry(u.wasm_export_id, fid);
@@ -1835,7 +1835,7 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
 unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd).len();
+    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd, u.prog.std_overflow_checks).len();
     let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
     let mut crate_of = vec![u32::MAX; g.crates.len()];
     let mut batch_of = vec![usize::MAX; g.crates.len()];

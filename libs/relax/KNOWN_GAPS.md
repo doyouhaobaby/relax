@@ -325,22 +325,22 @@ Windows' File, stdio and pipes keep the trait's default, as in rustc's std.
 
 ## 16. Std's code that inherits overflow checks follows the program's profile, not its caller's crate
 
-rustc's std marks some functions `#[rustc_inherit_overflow_checks]`: they check for overflow as the
-crate they are instantiated in does. Of these, Relax's std has the integers' `Step::forward` and
-`Step::backward` (what `(start..)` iteration steps with) and `core::range::RangeFromIter`, through
-`intrinsics::overflow_checks`.
+rustc's std marks some functions and closures `#[rustc_inherit_overflow_checks]`, and reads
+`intrinsics::overflow_checks` in others: they check for overflow as the crate they are instantiated in
+does.
 
 - rustc: the crate's own profile decides. A dependency built with
   `[profile.dev.package.<name>] overflow-checks = false` wraps `(255u8..)` past its end in its own
   code, while the program's crate, built with checks, panics there.
 - Relax: the program's profile decides for every crate: its root crate's `cfg(overflow_checks)`
-  (the package it runs or tests), read when the code runs. In the example above the dependency
+  (the package it runs or tests, its cargo profile resolved as cargo resolves it). Std is compiled
+  once for each setting, and both stay cached side by side. In the example above the dependency
   panics too.
 
-This is by design: std's compiled code is shared by every crate of a run and kept across runs, so
-one value for the whole program keeps each compiled function independent of the profile of the
-crate that called it. A per-crate value comes back if a real program needs a dependency's own
-setting. In constant evaluation `intrinsics::overflow_checks` is true, as rustc's.
+This is by design: std's compiled code is shared by every crate of a run, so one value for the whole
+program compiles std once per profile rather than once per calling crate. A per-crate value comes
+back if a real program needs a dependency's own setting. In constant evaluation
+`intrinsics::overflow_checks` is true, as rustc's.
 
 ## 17. A reader opened on a store-only file before the run's first write to it keeps the store copy
 
