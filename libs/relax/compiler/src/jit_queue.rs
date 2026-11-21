@@ -68,7 +68,10 @@ struct Policy {
     /// running builds below Interactive (the burst gate's count: a check beside the program is none)
     builds: usize,
     noninteractive: usize,
+    /// the running Background jobs but O3 builds (breadth: O2, speculation, checks)
     background: usize,
+    /// the running Background O3 builds: their own part while the JIT comes first (`wide`)
+    background_o3: usize,
     /// the running jobs per tier (the startup's tier widths)
     tiers: [usize; TIERS],
     /// through the startup the checks ahead of the main thread run on a few workers, as many as its
@@ -77,6 +80,11 @@ struct Policy {
     ahead_full: bool,
     limit: usize,
     background_limit: usize,
+    /// O3's Background ceiling, `budget::jit_background_limit`: the cores the app's Background work
+    /// leaves while the JIT comes first, else `background_limit`
+    wide: usize,
+    /// Visible work is queued or running here: every Background build keeps `background_limit`
+    visible: bool,
     /// before the first present: the startup's tier widths apply
     widths: bool,
     o3_stopped: bool,
@@ -258,10 +266,13 @@ impl Queue {
             builds: 0,
             noninteractive: 0,
             background: 0,
+            background_o3: 0,
             tiers: [0; TIERS],
             ahead_full: false,
             limit: budget::limit() as usize,
             background_limit: budget::background_limit() as usize,
+            wide: budget::jit_background_limit() as usize,
+            visible: self.plan.iter().any(|p| !p[budget::VISIBLE as usize].is_empty()),
             widths: !FIRST_PRESENT.load(Ordering::Acquire) && !HEADLESS.load(Ordering::Acquire),
             o3_stopped: TIER_STOP.load(Ordering::Acquire),
             o3_startup: startup_holds_tier1(),
@@ -272,7 +283,8 @@ impl Queue {
             let class = r.class.class();
             if r.tier != 4 && class != budget::INTERACTIVE { policy.noninteractive += 1; }
             if r.tier < 4 && class != budget::INTERACTIVE { policy.builds += 1; }
-            if class == budget::BACKGROUND { policy.background += 1; }
+            if class == budget::BACKGROUND { if r.tier == 2 { policy.background_o3 += 1 } else { policy.background += 1 } }
+            if class == budget::VISIBLE { policy.visible = true; }
             policy.tiers[r.tier] += 1;
             if r.tier == 0 && !r.promoted { ahead += 1; }
         }
@@ -283,7 +295,8 @@ impl Queue {
     fn class_blocked(&self, class: u8, tier: usize, policy: &Policy) -> Option<&'static str> {
         if tier < 4 && !eligible(class, policy.burst, policy.builds) { return Some("UI burst"); }
         if class != budget::INTERACTIVE {
-            if let Some(why) = drain_blocked(class, policy.noninteractive, policy.background, policy.limit, policy.background_limit) { return Some(why); }
+            let (background, ceiling) = background_drains(tier, policy.visible, policy.background, policy.background_o3, policy.background_limit, policy.wide);
+            if let Some(why) = drain_blocked(class, policy.noninteractive, background, policy.limit, ceiling) { return Some(why); }
             if policy.widths {
                 let width = match tier { 1 => 1, 2 | 3 => 2, _ => usize::MAX };
                 if policy.tiers[tier] >= width { return Some("startup tier width"); }
@@ -402,6 +415,14 @@ fn drain_blocked(class: u8, noninteractive: usize, background: usize, limit: usi
     if class != budget::INTERACTIVE && noninteractive >= limit { return Some("first-compile reserve"); }
     if class == budget::BACKGROUND && background >= background_limit { return Some("visible reserve"); }
     None
+}
+/// The running Background builds tier `tier` counts against and their ceiling. While the JIT comes
+/// first (`wide` above `background_limit`) its O3 builds take `wide` against their own count, and
+/// breadth (O2, speculation, checks) keeps `background_limit` against the rest: hot code reaches O3
+/// without waiting out the O2 backlog, and breadth takes no more than before. Visible work queued
+/// or running here: one part, as before, so its drains stay free.
+fn background_drains(tier: usize, visible: bool, rest: usize, o3: usize, background_limit: usize, wide: usize) -> (usize, usize) {
+    if visible { (rest + o3, background_limit) } else if tier == 2 { (o3, wide) } else { (rest, background_limit) }
 }
 fn eligible(class: u8, burst: bool, noninteractive: usize) -> bool {
     !(burst && class != budget::INTERACTIVE && noninteractive != 0)
@@ -538,6 +559,19 @@ fn idle_tiers() -> bool {
 }
 fn is_tier_up(tier: usize) -> bool {
     tier == 1 || tier == 2
+}
+/// The JIT comes first in the CPU budget (`budget::set_jit_first`, at each pick): the app is up
+/// (its first present, or a headless run) and O3 builds are queued or running. Then its O3 builds
+/// take the physical cores the app's Background work leaves (`background_drains`); once the O3
+/// queue has drained and its last build is done, Background is one part again. O2 of everything is
+/// breadth: it is never settled, so it does not hold the phase open (a game's first world load
+/// waited out 2.5-5x the O2 builds while it did). Before the first present the start-up's tier
+/// widths apply and Background keeps its ceiling: the UI thread's first frame compiles there.
+/// Measured states, not a timer: a start-up, a first reach and the settle after an edit each queue
+/// their tier-ups.
+fn jit_first() -> bool {
+    (FIRST_PRESENT.load(Ordering::Acquire) || HEADLESS.load(Ordering::Acquire))
+        && COUNTS[2].load(Ordering::Relaxed) + RUNNING[2].load(Ordering::Relaxed) > 0
 }
 /// The calling thread may wait for a helper's check or lowering of a body it needs: not while
 /// tier-ups run at the idle policy (idle_tiers), whose prefronts check and lower bodies too, unless
@@ -1064,6 +1098,7 @@ fn worker_loop(index: usize) {
                     q.tick_queued = true;
                     q.push(Job::Tick, wall_ns());
                 }
+                budget::set_jit_first(jit_first());
                 let now = HeatNow::take();
                 let takes = Takes::of(worker.idle.load(Ordering::Relaxed));
                 let head = q.head(&now, takes);
@@ -1266,6 +1301,13 @@ mod tests {
         assert_eq!(drain_blocked(budget::BACKGROUND, 1, 1, 2, 1), Some("visible reserve"), "parked Background builds cannot fill the Visible drain");
         assert_eq!(drain_blocked(budget::VISIBLE, 1, 1, 2, 1), None, "Visible work passes a parked Background build");
         assert_eq!(drain_blocked(budget::INTERACTIVE, 2, 1, 2, 1), None, "first compiles retain their drain above both lower classes");
+        let (o3, o3_ceiling) = background_drains(2, false, 1, 1, 1, 3);
+        assert_eq!(drain_blocked(budget::BACKGROUND, 2, o3, 3, o3_ceiling), None, "while the JIT comes first an O3 build passes a running O2 build and O3 build");
+        let (o2, o2_ceiling) = background_drains(1, false, 1, 1, 1, 3);
+        assert_eq!(drain_blocked(budget::BACKGROUND, 2, o2, 3, o2_ceiling), Some("visible reserve"), "breadth keeps background_limit beside the wide O3 part");
+        let (seen, seen_ceiling) = background_drains(2, true, 0, 1, 1, 3);
+        assert_eq!(drain_blocked(budget::BACKGROUND, 1, seen, 3, seen_ceiling), Some("visible reserve"), "Visible work here: O3 keeps the old reserve");
+        assert_eq!(background_drains(2, false, 0, 0, 1, 1), (0, 1), "flag down: O3 at background_limit, as before");
         let mut q = Queue::new();
         q.push(Job::Spec(1, 10), 1);
         q.push(Job::Spec(1, 11), 2);
