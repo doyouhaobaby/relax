@@ -208,6 +208,16 @@ impl TcpListener {
     pub fn ttl(&self) -> io::Result<u32> {
         Ok(self.sock.get_int(sn::IPPROTO_IP, sn::IP_TTL)? as u32)
     }
+    /// rustc 1.9.0 (net2_mutators): Sets the listener's IPV6_V6ONLY socket option.
+    #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
+    pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
+        self.sock.set_int(sn::IPPROTO_IPV6, sn::IPV6_V6ONLY, only_v6 as c_int)
+    }
+    /// rustc 1.9.0 (net2_mutators): Returns the listener's IPV6_V6ONLY socket option.
+    #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
+    pub fn only_v6(&self) -> io::Result<bool> {
+        Ok(self.sock.get_int(sn::IPPROTO_IPV6, sn::IPV6_V6ONLY)? != 0)
+    }
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         self.sock.take_error()
     }

@@ -679,6 +679,7 @@ const UTIME_OMIT: i64 = (1 << 30) - 2;
 #[cfg(not(target_vendor = "apple"))]
 extern "C" {
     fn futimens(fd: c_int, times: *const FutimensSpec) -> c_int;
+    fn utimensat(dirfd: c_int, path: *const c_char, times: *const FutimensSpec, flags: c_int) -> c_int;
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -718,6 +719,7 @@ const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
 #[cfg(target_vendor = "apple")]
 extern "C" {
     fn fsetattrlist(fd: c_int, attr_list: *mut c_void, attr_buf: *mut c_void, attr_buf_size: usize, options: u32) -> c_int;
+    fn setattrlist(path: *const c_char, attr_list: *mut c_void, attr_buf: *mut c_void, attr_buf_size: usize, options: u32) -> c_int;
 }
 
 /// real std sys/fs/unix.rs TimesAttrlist: the times that are set, in the attribute order
@@ -1281,6 +1283,37 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result
         cvt_r(|| unsafe { sys::chmod(c.as_ptr(), perm.mode as sys::mode_t) })?;
         Ok(())
     })
+}
+
+fn set_path_times(path: &Path, times: FileTimes, follow_symlinks: bool) -> io::Result<()> {
+    run_path_with_cstr(path, &|p| {
+        #[cfg(target_vendor = "apple")]
+        let result = {
+            const FSOPT_NOFOLLOW: u32 = 1;
+            let ta = TimesAttrlist::from_times(&times);
+            let options = if follow_symlinks { 0 } else { FSOPT_NOFOLLOW };
+            unsafe { setattrlist(p.as_ptr(), ta.attrlist(), ta.times_buf(), ta.times_buf_size(), options) }
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let result = {
+            const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+            let spec = [file_time_to_timespec(times.accessed), file_time_to_timespec(times.modified)];
+            let flags = if follow_symlinks { 0 } else { AT_SYMLINK_NOFOLLOW };
+            unsafe { utimensat(sys::os::AT_FDCWD, p.as_ptr(), spec.as_ptr(), flags) }
+        };
+        cvt(result)?;
+        Ok(())
+    })
+}
+
+/// rustc 1.99.0 (fs_set_times): Sets a file's timestamps, following symbolic links.
+pub fn set_times<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
+    set_path_times(path.as_ref(), times, true)
+}
+
+/// rustc 1.99.0 (fs_set_times): Sets a file's timestamps without following the final symbolic link.
+pub fn set_times_nofollow<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
+    set_path_times(path.as_ref(), times, false)
 }
 
 // chown(2), lchown(2) and fchown(2), as real std's sys fs: `u32::MAX` (-1) leaves that id as it is.

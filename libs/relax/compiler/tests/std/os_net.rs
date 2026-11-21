@@ -81,6 +81,15 @@ fn a02_tcp() {
     let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
     l2.set_nonblocking(true).unwrap();
     println!("| {:?}", l2.accept().map(|_| ()).map_err(|e| e.kind()));
+    #[allow(deprecated)]
+    for addr in ["[::1]:0", "127.0.0.1:0"] {
+        let listener = TcpListener::bind(addr).unwrap();
+        println!("| {addr} only_v6 {:?}", listener.only_v6().map_err(|e| e.kind()));
+        for value in [true, false] {
+            println!("| {addr} set_only_v6({value}) {:?}", listener.set_only_v6(value).map_err(|e| e.kind()));
+            println!("| {addr} only_v6 {:?}", listener.only_v6().map_err(|e| e.kind()));
+        }
+    }
 }
 
 #[test]

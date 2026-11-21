@@ -1839,6 +1839,24 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result
     Ok(())
 }
 
+fn set_path_times(path: &Path, times: FileTimes, extra_flags: u32) -> io::Result<()> {
+    let p = maybe_verbatim(path)?;
+    let mut opts = OpenOptions::new();
+    opts.set_access_mode(FILE_WRITE_ATTRIBUTES);
+    opts.set_custom_flags(FILE_FLAG_BACKUP_SEMANTICS | extra_flags);
+    opts.open_native(&p)?.set_times(times)
+}
+
+/// rustc 1.99.0 (fs_set_times): Sets a file's timestamps, following symbolic links.
+pub fn set_times<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
+    set_path_times(path.as_ref(), times, 0)
+}
+
+/// rustc 1.99.0 (fs_set_times): Sets a file's timestamps without following the final symbolic link.
+pub fn set_times_nofollow<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
+    set_path_times(path.as_ref(), times, FILE_FLAG_OPEN_REPARSE_POINT)
+}
+
 /// CreateSymbolicLinkW for std::os::windows::fs::symlink_file / symlink_dir: unprivileged
 /// creation (developer mode) requested, retried without the flag on older Windows (real std).
 pub(crate) fn symlink_inner(original: &Path, link: &Path, dir: bool) -> io::Result<()> {

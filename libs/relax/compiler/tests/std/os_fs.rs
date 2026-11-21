@@ -61,6 +61,18 @@ fn a01_files() {
     fs::remove_file(d.join("d.txt")).unwrap();
     println!("| {:?}", fs::remove_file(d.join("d.txt")).map_err(|e| e.kind()));
     println!("| {:?} {:?}", fs::exists(&f), fs::exists(d.join("nope")));
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    {
+        let e = std::os::unix::fs::chroot(d.join("missing")).unwrap_err();
+        println!("| chroot missing {:?}", e.kind());
+    }
+    #[cfg(unix)]
+    #[allow(deprecated)]
+    {
+        use std::os::unix::raw::{gid_t, pid_t, uid_t};
+        println!("| raw sizes gid {} pid {} uid {}", std::mem::size_of::<gid_t>(),
+                 std::mem::size_of::<pid_t>(), std::mem::size_of::<uid_t>());
+    }
     fs::remove_dir_all(&d).unwrap();
     println!("| {}", d.exists());
 }
