@@ -13,6 +13,27 @@ use crate::cmp::Ordering;
 use crate::intrinsics_mem as im;
 use crate::vec::Vec;
 
+/// rustc (slice_pattern, unstable): the array or slice matched by a prefix or suffix operation.
+#[unstable(feature = "slice_pattern", issue = "56345")]
+pub trait SlicePattern {
+    type Item;
+    fn as_slice(&self) -> &[Self::Item];
+}
+
+impl<T> SlicePattern for [T] {
+    type Item = T;
+    fn as_slice(&self) -> &[T] {
+        self
+    }
+}
+
+impl<T, const N: usize> SlicePattern for [T; N] {
+    type Item = T;
+    fn as_slice(&self) -> &[T] {
+        self
+    }
+}
+
 impl<T> [T] {
     /// Real core's `align_to`: the longest middle slice of `U` whose start is aligned for `U`
     /// and whose end falls on a `T` boundary (slice/mod.rs align_to + align_to_offsets).
@@ -396,6 +417,16 @@ impl<T> [T] {
             None
         }
     }
+    /// rustc 1.98.0 (strip_circumfix): removes a matching prefix followed by a matching suffix.
+    #[must_use = "returns the subslice without modifying the original"]
+    pub fn strip_circumfix<S, P>(&self, prefix: &P, suffix: &S) -> Option<&[T]>
+    where
+        T: PartialEq,
+        S: SlicePattern<Item = T> + ?Sized,
+        P: SlicePattern<Item = T> + ?Sized,
+    {
+        self.strip_prefix(prefix.as_slice())?.strip_suffix(suffix.as_slice())
+    }
     /// rustc 1.100.0 (trim_prefix_suffix): `self` without `prefix` if it starts with it, else `self`
     pub fn trim_prefix(&self, prefix: &[T]) -> &[T]
     where
@@ -699,6 +730,26 @@ impl<T> [T] {
     #[track_caller]
     pub const fn as_chunks_mut<const N: usize>(&mut self) -> (&mut [[T; N]], &mut [T]) {
         it::as_chunks_mut(self)
+    }
+
+    /// rustc 1.88.0 (slice_as_chunks): views a slice as an exact number of arrays.
+    ///
+    /// # Safety
+    /// `N` must be nonzero and divide the slice length exactly.
+    #[must_use]
+    #[track_caller]
+    pub const unsafe fn as_chunks_unchecked<const N: usize>(&self) -> &[[T; N]] {
+        unsafe { im::slice_from_raw(self.as_ptr() as *const [T; N], self.len() / N) }
+    }
+
+    /// rustc 1.88.0 (slice_as_chunks): views a mutable slice as an exact number of mutable arrays.
+    ///
+    /// # Safety
+    /// `N` must be nonzero and divide the slice length exactly.
+    #[must_use]
+    #[track_caller]
+    pub const unsafe fn as_chunks_unchecked_mut<const N: usize>(&mut self) -> &mut [[T; N]] {
+        unsafe { im::slice_from_raw_mut(self.as_mut_ptr() as *mut [T; N], self.len() / N) }
     }
 
     #[track_caller]

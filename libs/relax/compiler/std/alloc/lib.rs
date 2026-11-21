@@ -30,6 +30,11 @@ pub mod collections {
 /// alloc::ffi (CString lives in core/ffi/c_string.rs; std-os lane)
 pub mod ffi {
     pub use core::ffi::{CString, FromVecWithNulError, IntoStringError, NulError};
+
+    /// rustc 1.88.0 (c_str_module): owned C strings and their conversion errors.
+    pub mod c_str {
+        pub use core::ffi::{CString, FromVecWithNulError, IntoStringError, NulError};
+    }
 }
 
 pub mod fmt {
@@ -53,6 +58,19 @@ pub mod slice {
 }
 
 pub mod str {
+    use crate::boxed::Box;
+
+    /// rustc 1.20.0 (str_box_extras): converts a boxed slice of valid UTF-8 into a boxed string slice.
+    ///
+    /// # Safety
+    /// The bytes must be valid UTF-8.
+    #[must_use]
+    pub unsafe fn from_boxed_utf8_unchecked(v: Box<[u8]>) -> Box<str> {
+        unsafe { Box::from_raw(Box::into_raw(v) as *mut str) }
+    }
+
+    #[allow(deprecated)]
+    pub use core::str::LinesAny;
     pub use core::str::{
         from_utf8, from_utf8_mut, from_utf8_unchecked, from_utf8_unchecked_mut, pattern, Bytes, CharIndices, Chars,
         EncodeUtf16, EscapeDebug, EscapeDefault, EscapeUnicode, FromStr, Lines, MatchIndices, Matches, ParseBoolError,
