@@ -4766,6 +4766,25 @@ fn drop_program_memos() -> bool {
 /// A mid-run write tried to record the collected program (once per run; the exit tries again
 /// only if it is still not current).
 static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
+/// A record of the collected program is under way, taken under its front read: its capture or,
+/// past the read, its store write. The mid-run writes run on several threads (the periodic one,
+/// the quit write, a self-spawn's on the spawning thread), and two that each found the program not
+/// yet recorded wrote it twice (a cold Fab scenario run on a Linux node: 666 MB, then 667 MB
+/// 0.8 s later). Under a front write no capture runs, so one under way is in its store write,
+/// which needs no lock: the exit's record waits for it (finish_run's cache write).
+static COLLECTED_RECORDING: AtomicBool = AtomicBool::new(false);
+/// COLLECTED_RECORDING for as long as it lives.
+struct RecordingCollected;
+impl RecordingCollected {
+    /// None: another thread records the collected program now.
+    fn take() -> Option<Self> {
+        // (made only when taken: a guard made and dropped by a failed take ended the holder's claim)
+        (!COLLECTED_RECORDING.swap(true, Ordering::AcqRel)).then(|| RecordingCollected)
+    }
+}
+impl Drop for RecordingCollected {
+    fn drop(&mut self) { COLLECTED_RECORDING.store(false, Ordering::Release); }
+}
 /// A mid-run write recorded the startup manifest (its window had closed).
 static MID_MANIFEST_DONE: AtomicBool = AtomicBool::new(false);
 /// Mid-run writes that gave the owner back to a waiting request before they were whole (their
@@ -5254,6 +5273,12 @@ fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left:
         let _c = crate::zone_alloc::compiler();
         let _live = CaptureLive::enter();
         let read = jit::front_read("cache collected");
+        // one record at a time: another thread's under way, or done since this write's check
+        let Some(recording) = RecordingCollected::take() else {
+            verbose!("relax collected: another thread records the program now");
+            return;
+        };
+        if COLLECTED_CURRENT.load(Ordering::Relaxed) || MID_COLLECTED_TRIED.load(Ordering::Relaxed) { return; }
         // the program the front images were taken of, and it stays so while the read is held
         if jit::front_epoch() != epoch {
             collected_skip("a front write came after the front images were taken");
@@ -5270,7 +5295,7 @@ fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left:
         }
         let _capturing = CapturingNow::enter();
         match inputs.capture(prog, tcx, &capture_stop) {
-            Ok(record) => (record, inputs.crates(prog)),
+            Ok(record) => (record, inputs.crates(prog), recording),
             Err(why) => {
                 crate::inspect::flightrec::event("cache.collected", &why, 0, 0);
                 eprintln!("relax collected: not recorded: {why}");
@@ -5279,7 +5304,7 @@ fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left:
         }
     };
     let capture_ms = t_capture.elapsed().as_secs_f64() * 1e3;
-    let (record, crates) = record;
+    let (record, crates, recording) = record;
     let retired = match record {
         crate::cache::CollectedRecord::Ready(dest, payload) => {
             MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
@@ -5304,6 +5329,8 @@ fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left:
             false
         }
     };
+    // (before the owner publish: the exit waits for it on the owner thread)
+    drop(recording);
     // (one bounded publish marks it; the retired boot snapshot is dropped here)
     if retired {
         let retired_boot = crate::owner::publish(|| unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
@@ -5610,7 +5637,14 @@ fn summary_inner(why: &str) {
                 if r.is_ok() && front_recordable() && !COLLECTED_CURRENT.load(Ordering::Relaxed) {
                     if let Some(_front) = jit::front_write_within(2000) {
                         exit_mark("front lock");
-                        if c.record_collected(&u.prog, &u.tcx).is_some() { COLLECTED_CURRENT.store(true, Ordering::Relaxed); }
+                        // a mid-run record past its capture (the front write excludes one in it)
+                        // ends its store write first: it needs no lock, and may record the program
+                        while COLLECTED_RECORDING.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        if !COLLECTED_CURRENT.load(Ordering::Relaxed) && c.record_collected(&u.prog, &u.tcx).is_some() {
+                            COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+                        }
                         exit_mark("collected");
                     } else {
                         verbose!("relax collected: not recorded at exit: the front end is still read by another thread");
@@ -6126,6 +6160,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&COLLECTED_RESTORED, AtomicBool::new(false));
     reset(&COLLECTED_WRITTEN, relax_session::sync::Mutex::new(None));
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
+    reset(&COLLECTED_RECORDING, AtomicBool::new(false));
     reset(&MID_MANIFEST_DONE, AtomicBool::new(false));
     reset(&MID_MANIFEST_LEN, std::sync::atomic::AtomicUsize::new(0));
     reset(&MANIFEST_WINDOW_LEN, std::sync::atomic::AtomicUsize::new(usize::MAX));
