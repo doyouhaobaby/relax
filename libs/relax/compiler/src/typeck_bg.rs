@@ -7,7 +7,7 @@
 //! compile. An error is reported at once, as a compile error of code that has not run (stderr, the
 //! launcher's report, the run's diagnostics), whether that code ever runs or not; the program
 //! itself never runs unchecked code (a build checks its body first, jit.rs). A crate whose every
-//! body is clean stores its verdict (cache.rs crate_check_key), so a later run checks only what
+//! body is clean stores its verdict (cache.rs crate_check_key and app_check_key), so a later run checks only what
 //! changed, as cargo builds a dependency once. Not checked here: the app's own crates (checked
 //! whole before main, run.rs), proc-macro crates (they run in the macro host) and the sysroot
 //! (shipped checked, as rustc ships it). The bodies checked here are not kept
@@ -84,13 +84,15 @@ fn stopping() -> bool {
 
 /// The crates this check covers -- not the app's (checked before main), not a proc-macro crate,
 /// not the sysroot, in a test run only the registry crates the tests see, and no verdict stored
-/// for it -- with their verdicts' cache keys; and the stored findings of the crates it skips.
-fn todo_crates(u: &Unit, scope: &Scope, skipped: &[u128]) -> (Vec<bool>, Vec<Option<u128>>, Vec<(u32, usize)>) {
+/// for it -- with their fingerprint keys, the stored findings of the crates it skips, and the
+/// crates whose fingerprint lookup missed and can try an interface key.
+fn todo_crates(u: &Unit, scope: &Scope, skipped: &[u128]) -> (Vec<bool>, Vec<Option<u128>>, Vec<(u32, usize)>, Vec<u32>) {
     use crate::borrowck::lazy::StoredVerdict;
     use crate::vfs::canonical as canon;
     let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
     let prog = &u.prog;
     let mut findings = Vec::new();
+    let mut misses = Vec::new();
     let (todo, keys) = (0..prog.crates.len() as u32).map(|k| {
         let c = &prog.crates[k as usize];
         if c.proc_macro || k == scope.root || crate::borrowck::event::app_crate(prog, k)
@@ -111,12 +113,12 @@ fn todo_crates(u: &Unit, scope: &Scope, skipped: &[u128]) -> (Vec<bool>, Vec<Opt
                     findings.push((k, errors.len()));
                     (false, None)
                 }
-                _ => (true, Some(key)),
+                _ => { misses.push(k); (true, Some(key)) }
             },
             None => (true, None),
         }
     }).unzip();
-    (todo, keys, findings)
+    (todo, keys, findings, misses)
 }
 
 enum Checked {
@@ -235,6 +237,7 @@ fn no_present_coming() -> bool {
 }
 
 fn run(up: *mut Unit, scope: &Scope) {
+    use crate::borrowck::lazy::{push_verdict_key, StoredVerdict};
     while !jit::past_startup() {
         if stopping() { return; }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -246,7 +249,33 @@ fn run(up: *mut Unit, scope: &Scope) {
     let n = { let r = jit::front_read("typeck bg crates"); r.of(&f).0.crates.len() as u32 };
     let skipped_text: Vec<u128> = (0..n).map(crate::check::skipped_text_hash).collect();
     let upn = up as usize;
-    let (todo, keys, stored_findings) = crate::owner::call(crate::owner::Class::Publish, || todo_crates(unsafe { &*(upn as *const Unit) }, scope, &skipped_text));
+    let (mut todo, mut keys, mut stored_findings, misses) = crate::owner::call(crate::owner::Class::Publish, || todo_crates(unsafe { &*(upn as *const Unit) }, scope, &skipped_text));
+    let mut fp_keys = Vec::new();
+    if !misses.is_empty() {
+        let inputs = {
+            let r = jit::front_read("typeck bg keys");
+            crate::check::iface_inputs_with_skipped(r.of(&f).0, &misses, &skipped_text)
+        };
+        crate::owner::call(crate::owner::Class::Publish, || {
+            // An edit can change the cache's interfaces between the two owner calls.
+            if crate::reload::program_edits() != 0 { return; }
+            let u = unsafe { &*(upn as *const Unit) };
+            let Some(c) = u.cache.as_ref() else { return };
+            let cache = unsafe { &mut *c.get() };
+            fp_keys = std::mem::replace(&mut keys, vec![None; todo.len()]);
+            for (i, &k) in misses.iter().enumerate() {
+                let key = cache.app_check_key(k, inputs.own[i], inputs.skipped[&k], inputs.deps(i));
+                match key.and_then(|key| cache.borrowck_stored(key)) {
+                    Some(verdict @ (StoredVerdict::Clean | StoredVerdict::Failed(_))) => {
+                        todo[k as usize] = false;
+                        if let StoredVerdict::Failed(errors) = &verdict { stored_findings.push((k, errors.len())); }
+                        if let Some(fp_key) = fp_keys[k as usize] { push_verdict_key(fp_key, verdict); }
+                    }
+                    _ => keys[k as usize] = key,
+                }
+            }
+        });
+    }
     *STORED_FINDINGS.lock().unwrap_or_else(|p| p.into_inner()) = stored_findings;
     if !todo.contains(&true) { return finish(t0, w0); }
     // the files' progress: the keys of the files loaded so far (more as skipped files load)
@@ -297,7 +326,7 @@ fn run(up: *mut Unit, scope: &Scope) {
     // edit's versions are in the tables: the bodies checked were not all the boot's)
     let store_file = |key: u128| {
         if crate::reload::program_edits() == 0 {
-            crate::borrowck::lazy::push_verdict_key(key, crate::borrowck::lazy::StoredVerdict::Clean);
+            push_verdict_key(key, StoredVerdict::Clean);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
     };
@@ -348,10 +377,11 @@ fn run(up: *mut Unit, scope: &Scope) {
         for &k in &todo_list {
             if boot && !ice.contains(&k) && !given_up.contains(&k) && !skipped.contains(&k) && !pending.contains(&k) && stored.insert(k) {
                 let verdict = match failed.get(&k) {
-                    Some(errors) => crate::borrowck::lazy::StoredVerdict::Failed(errors.clone()),
-                    None => crate::borrowck::lazy::StoredVerdict::Clean,
+                    Some(errors) => StoredVerdict::Failed(errors.clone()),
+                    None => StoredVerdict::Clean,
                 };
-                if let Some(key) = keys[k as usize] { crate::borrowck::lazy::push_verdict_key(key, verdict); }
+                if let Some(&Some(fp_key)) = fp_keys.get(k as usize) { push_verdict_key(fp_key, verdict.clone()); }
+                if let Some(key) = keys[k as usize] { push_verdict_key(key, verdict); }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
         }

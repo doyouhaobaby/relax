@@ -197,7 +197,7 @@ pub(crate) fn skipped_text_hash(c: u32) -> u128 {
     h.finish128()
 }
 
-/// The test dependency check's own text of each crate of `crates` (cache.rs dep_check_key): the
+/// The interface keys' own text of each crate of `crates` (cache.rs dep_check_key, app_check_key): the
 /// crate as rustc is invoked on it and the text of the files the boot loaded (as its fingerprint
 /// hashes them, without its dependencies'; skipped_text_hash has the others).
 fn own_text_hashes(prog: &crate::program::Program, crates: &[u32]) -> Vec<u128> {
@@ -236,6 +236,42 @@ pub(crate) fn dependency_closure(prog: &crate::program::Program, c: u32) -> Vec<
     out
 }
 
+/// What the interface keys (cache.rs dep_check_key, app_check_key) of `crates` hash beside the
+/// interfaces: each crate's own text, its dependency closure, each closure crate's check extra
+/// (by crate index; 0 for a crate no closure holds) and the text of the skipped files of every
+/// crate named (the crates and their closures).
+pub(crate) struct IfaceInputs {
+    pub own: Vec<u128>,
+    pub closures: Vec<Vec<u32>>,
+    pub extras: Vec<u128>,
+    pub skipped: std::collections::HashMap<u32, u128>,
+}
+
+impl IfaceInputs {
+    /// The dependency terms of the key for the crate at position `i` in the selection.
+    pub(crate) fn deps(&self, i: usize) -> impl Iterator<Item = (u32, u128, u128)> + '_ {
+        self.closures[i].iter().map(move |d| (*d, self.skipped[d], self.extras[*d as usize]))
+    }
+}
+
+pub(crate) fn iface_inputs(prog: &crate::program::Program, crates: &[u32]) -> IfaceInputs {
+    iface_inputs_with_skipped(prog, crates, &[])
+}
+
+/// Reuses the skipped text hashes the background check already read for its fingerprint keys.
+pub(crate) fn iface_inputs_with_skipped(prog: &crate::program::Program, crates: &[u32], skipped_text: &[u128]) -> IfaceInputs {
+    let own = own_text_hashes(prog, crates);
+    let closures: Vec<Vec<u32>> = crates.iter().map(|&k| dependency_closure(prog, k)).collect();
+    let mut want = vec![false; prog.crates.len()];
+    for &d in closures.iter().flatten() { want[d as usize] = true; }
+    let extras = crate::cache::crate_check_extras(prog, &want);
+    let mut skipped = std::collections::HashMap::new();
+    for &k in crates.iter().chain(closures.iter().flatten()) {
+        skipped.entry(k).or_insert_with(|| skipped_text.get(k as usize).copied().unwrap_or_else(|| skipped_text_hash(k)));
+    }
+    IfaceInputs { own, closures, extras, skipped }
+}
+
 /// `makepad run`'s type check of every body of `crates` (the app's own crates whose clean verdict
 /// is not stored: run.rs, before `main`), on RELAX_JOBS threads: the checked bodies stay in
 /// the typeck query for the builds that follow. A body that fails while files the lazy selection
@@ -260,29 +296,57 @@ pub struct AppCheck {
 /// The app check's lookups and loads (the cache is read here: before main, on the boot thread).
 /// None: every crate's clean verdict is stored.
 pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
+    use crate::borrowck::lazy::StoredVerdict;
+    use std::sync::atomic::Ordering::Relaxed;
     let u = unsafe { &*up };
     let t0 = jit::wall_ns();
-    APP_CHECK_ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
+    APP_CHECK_ASKED.store(true, Relaxed);
     let mut keys = Vec::new();
     let mut todo = Vec::new();
-    for &k in crates {
-        let skipped = skipped_text_hash(k);
-        let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.crate_check_key(k, skipped, 0));
-        let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
-        if !stored {
-            todo.push(k);
-            keys.extend(key.map(|key| (k, key)));
+    let (mut iface_hits, mut iface_ns) = (0, 0);
+    if let Some(c) = &u.cache {
+        let cache = unsafe { &mut *c.get() };
+        let mut misses = Vec::new();
+        for &k in crates {
+            let skipped = skipped_text_hash(k);
+            let fp_key = cache.crate_check_key(k, skipped, 0);
+            if !matches!(fp_key.and_then(|key| cache.borrowck_stored(key)), Some(StoredVerdict::Clean)) {
+                misses.push((k, fp_key, skipped));
+            }
         }
+        if !misses.is_empty() {
+            let t = jit::wall_ns();
+            let missed_crates: Vec<u32> = misses.iter().map(|m| m.0).collect();
+            let inputs = iface_inputs(&u.prog, &missed_crates);
+            for (i, (k, fp_key, skipped)) in misses.into_iter().enumerate() {
+                // A skipped file changed between the two reads. Check the crate without caching it.
+                if inputs.skipped[&k] != skipped { todo.push(k); continue; }
+                let iface_key = cache.app_check_key(k, inputs.own[i], skipped, inputs.deps(i));
+                if matches!(iface_key.and_then(|key| cache.borrowck_stored(key)), Some(StoredVerdict::Clean)) {
+                    iface_hits += 1;
+                    if let Some(key) = fp_key { cache.record_borrowck(key, StoredVerdict::Clean); }
+                } else {
+                    todo.push(k);
+                    keys.extend(fp_key.map(|key| (k, key)));
+                    keys.extend(iface_key.map(|key| (k, key)));
+                }
+            }
+            iface_ns = jit::wall_ns() - t;
+        }
+    } else {
+        todo.extend_from_slice(crates);
     }
-    RUN_CHECK[0].store(todo.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    RUN_CHECK[0].store(todo.len() as u64, Relaxed);
+    RUN_CHECK[5].store(iface_hits, Relaxed);
+    RUN_CHECK[6].store(iface_ns, Relaxed);
     let t1 = jit::wall_ns();
-    RUN_CHECK[3].store(t1 - t0, std::sync::atomic::Ordering::Relaxed);
-    if todo.is_empty() { RUN_CHECK[2].store(t1 - t0, std::sync::atomic::Ordering::Relaxed); return None; }
+    RUN_CHECK[3].store(t1 - t0, Relaxed);
+    if todo.is_empty() { RUN_CHECK[2].store(t1 - t0, Relaxed); return None; }
     unsafe { jit::load_skipped_of(up, &todo) };
-    RUN_CHECK[4].store(jit::wall_ns() - t1, std::sync::atomic::Ordering::Relaxed);
+    RUN_CHECK[4].store(jit::wall_ns() - t1, Relaxed);
     let u = unsafe { &*up };
     let owners = body_owners(&u.prog, &todo);
-    RUN_CHECK[1].store(owners.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    RUN_CHECK[1].store(owners.len() as u64, Relaxed);
     Some(AppCheck { t0, todo, keys, owners })
 }
 
@@ -569,30 +633,22 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         let (t0, cpu0) = (jit::wall_ns(), relax_session::clock::cpu_ns());
         let up = upn as *mut Unit;
         let front = unsafe { (*up).front.clone() };
-        // Each selected crate's own text and dependency closure, and each dependency's check extra.
-        let (crates, own, closures, extras) = {
+        let (crates, inputs) = {
             let r = jit::front_read("test dependency crates");
             let prog = r.of(&front).0;
             let crates = select(prog);
-            let own = own_text_hashes(prog, &crates);
-            let closures: Vec<Vec<u32>> = crates.iter().map(|&k| dependency_closure(prog, k)).collect();
-            let mut want = vec![false; prog.crates.len()];
-            for &d in closures.iter().flatten() { want[d as usize] = true; }
-            let extras = crate::cache::crate_check_extras(prog, &want);
-            (crates, own, closures, extras)
+            let inputs = iface_inputs(prog, &crates);
+            (crates, inputs)
         };
         names.retain(|(k, _)| crates.contains(k));
         names.sort_unstable_by_key(|(k, _)| *k);
         names.dedup_by_key(|(k, _)| *k);
-        // the text of the files the boot skipped, of every crate a key names (read here, off the owner)
-        let mut skipped = std::collections::HashMap::new();
-        for &k in crates.iter().chain(closures.iter().flatten()) { skipped.entry(k).or_insert_with(|| skipped_text_hash(k)); }
         let (todo, keys) = crate::owner::call(crate::owner::Class::Publish, || {
             let u = unsafe { &*up };
             let mut todo = Vec::new();
             let mut keys = Vec::new();
-            for ((&k, &own), closure) in crates.iter().zip(&own).zip(&closures) {
-                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.dep_check_key(k, own, skipped[&k], closure.iter().map(|d| (*d, skipped[d], extras[*d as usize]))));
+            for (i, &k) in crates.iter().enumerate() {
+                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.dep_check_key(k, inputs.own[i], inputs.skipped[&k], inputs.deps(i)));
                 let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
                 if !stored {
                     todo.push(k);
@@ -736,8 +792,9 @@ static GATE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 static APP_CHECK_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The last run_check_crates: crates checked, their body owners, wall ns, of it the stored verdicts'
-/// lookup and the skipped files' load.
-pub static RUN_CHECK: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// lookup and the skipped files' load, crates found by their dependencies' interfaces, and wall
+/// ns spent making and looking up those interface keys.
+pub static RUN_CHECK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// `f` over `items` on RELAX_JOBS threads (at most 16), results in `items` order.
 /// The check's threads: RELAX_JOBS, else one per hardware thread (at most 16).
@@ -2402,7 +2459,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&BOOT_SKIPPED, std::sync::OnceLock::new());
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
-    reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
+    reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 7]);
     reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
     reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
     reset(&GATE_SAID, std::sync::atomic::AtomicBool::new(false));

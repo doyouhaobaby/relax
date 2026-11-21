@@ -2530,6 +2530,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let app = crate::check::app_crates(&u.prog, root);
         app_check = crate::check::prepare_check(&mut *u, &app);
         phase("app check lookups", t_check);
+        verbose!("relax: app check lookups: {} of {} app crates to check ({} by their dependencies' interfaces, those keys {:.0} ms)",
+            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(),
+            crate::check::RUN_CHECK[5].load(Ordering::Relaxed), crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6);
         if app_check.is_some() {
             // (the cache's: on the owner)
             let t_graph = Instant::now();
@@ -2551,9 +2554,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let app = crate::check::app_crates(&u.prog, root);
         let errors = crate::check::run_check_crates(&mut *u, &app);
         phase("app check", t_check);
-        verbose!("relax: app check: {} of {} app crates checked ({} body owners), {} errors; verdict lookup {:.0} ms, skipped files' load {:.0} ms",
+        verbose!("relax: app check: {} of {} app crates checked ({} body owners), {} errors; verdict lookup {:.0} ms ({} by their dependencies' interfaces, those keys {:.0} ms), skipped files' load {:.0} ms",
             crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), errors.len(),
-            crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
+            crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[5].load(Ordering::Relaxed),
+            crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
         if !errors.is_empty() {
             for e in &errors {
                 if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }

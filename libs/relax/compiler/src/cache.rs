@@ -3664,7 +3664,7 @@ impl Cache {
     /// boot skipped (fp_now: its loaded files, those a restored image holds past its boot's, and
     /// its dependencies'), as the code keys rest on, and `skipped`, the text of its files this
     /// boot's selection did not load (check.rs skipped_text_hash): every file of it. A
-    /// borrowck-kind entry (record_borrowck).
+    /// borrowck-kind entry (record_borrowck). Mode 0 also looks up `app_check_key` on a miss.
     pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
         let fp = self.fp_now(c as usize)?;
         let mut h = Sip128::new();
@@ -3734,8 +3734,19 @@ impl Cache {
     /// `ledger_current` drops the whole store when its run read a different value.
     /// A borrowck-kind entry (record_borrowck). Returns None for an unknown interface.
     pub fn dep_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
+        self.iface_check_key("test-deps-check-crate", c, own, skipped, closure)
+    }
+
+    /// `makepad run`'s check of crate `c` (crate_check_key mode 0), keyed by its own text and
+    /// its dependencies' interfaces, as dep_check_key keys the test dependency check. After a
+    /// body edit in a dependency, the fingerprint key misses and this second lookup can hit.
+    pub fn app_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
+        self.iface_check_key("run-typeck-crate-iface", c, own, skipped, closure)
+    }
+
+    fn iface_check_key(&mut self, tag: &str, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
         let mut h = Sip128::new();
-        h.str("test-deps-check-crate");
+        h.str(tag);
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
         h.u128(crate::dirs::anchors_key());
         h.u32(CRATE_CHECK_VERSION);

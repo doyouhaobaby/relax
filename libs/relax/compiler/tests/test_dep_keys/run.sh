@@ -1,11 +1,11 @@
 #!/bin/bash
-# usage: run.sh [<makepad binary>] (none: builds this checkout's host makepad): the test
-# dependency check keys a crate's verdict by its own text and its dependencies' interfaces (M51).
-# A body edit in tdk-base checks tdk-base again, not tdk-mid above it; an interface edit checks both.
-# Never stale: in each case below the crates are clean as written, and one change that leaves the
-# interface text as it was (a static a const reads, a position a const reads, an input a macro
-# reads) makes tdk-mid's `sized` fail. The run after it must report that error, not tdk-mid's
-# stored verdict.
+# usage: run.sh [<makepad binary>] (default builds this checkout's host makepad)
+# The makepad test dependency check (M51) and makepad run app check (cache.rs app_check_key)
+# key a crate's verdict by its own text and its dependencies' interfaces.
+# Cold, after a tdk-base body edit, and after an interface edit, test selects two dependencies
+# and finds 0, 1, 0 stored clean. Run checks all app crates, then only tdk-base, then all again.
+# Both commands must catch tdk-mid's new error when a static, source position, or macro input
+# changes, an impl Trait return loses Send, a const fn body changes, or a fn gains an inherent impl.
 H=$(cd "$(dirname "$0")" && pwd)
 if [ $# -ge 1 ]; then J=$1; else
   ROOT=$(cd "$H/../../../../.." && pwd)
@@ -24,14 +24,29 @@ counts() {
   echo "$out" | grep -q '^test t::uses_mid \.\.\. ok' || { echo "$out" | tail -20 >&2; echo "x x"; return; }
   echo "$out" | sed -n 's/.*test dependency check: \([0-9]*\) crates selected, \([0-9]*\) stored clean.*/\1 \2/p' | tail -1
 }
+# "<checked> <all>" from the app check
+run_counts() {
+  local out
+  out=$(cd "$W" && "$J" run --bin tdk-run 2>&1)
+  echo "$out" | grep -q '^tdk-run ' || { echo "$out" | tail -20 >&2; echo "x x"; return; }
+  echo "$out" | sed -n 's/.*relax: app check: \([0-9][0-9]*\) of \([0-9][0-9]*\) app crates checked.*/\1 \2/p' | tail -1
+}
 cold=$(counts "$J")
+run_cold=$(run_counts)
 cp "$W/edits/body.rs" "$W/base/src/lib.rs"
 body=$(counts "$J")
+run_body=$(run_counts)
 cp "$W/edits/iface.rs" "$W/base/src/lib.rs"
 iface=$(counts "$J")
+run_iface=$(run_counts)
 echo "cold: $cold; body edit: $body; interface edit: $iface (selected, stored clean)"
+echo "run: cold: $run_cold; body edit: $run_body; interface edit: $run_iface (checked, app crates)"
 bad=""
 if [ "$cold" != "2 0" ] || [ "$body" != "2 1" ] || [ "$iface" != "2 0" ]; then bad=" keys (want 2 0, 2 1, 2 0)"; fi
+all=${run_cold#* }
+if ! [[ $all =~ ^[0-9]+$ ]] || [ "$run_cold" != "$all $all" ] || [ "$run_body" != "1 $all" ] || [ "$run_iface" != "$all $all" ]; then
+  bad="$bad run-keys (want all, 1, all)"
+fi
 
 # a run's outcome: ok, or mid (the dependency check reported tdk-mid's error)
 outcome() {
@@ -41,23 +56,33 @@ outcome() {
   elif echo "$out" | grep -q '^test t::uses_mid \.\.\. ok'; then echo ok
   else echo "$out" | tail -20 >&2; echo x; fi
 }
+outcome_run() {
+  local out status
+  out=$(cd "$W" && "$J" run --bin tdk-run 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ] && echo "$out" | grep -q 'tdk-run'; then echo ok
+  elif [ "$status" -ne 0 ] && echo "$out" | grep -Fq 'mid/src/lib.rs'; then echo mid
+  else echo "$out" | tail -20 >&2; echo x; fi
+}
 # file $1 of the copy holds $2
 put() { mkdir -p "$(dirname "$W/$1")"; printf '%s\n' "$2" > "$W/$1"; }
 # case <name> <change>: a clean run as the crates are written, then the change, then a run that
 # reports tdk-mid's error
 case_() {
-  local a b
+  local a ar b br
   a=$(outcome)
+  ar=$(outcome_run)
   eval "$2"
   b=$(outcome)
-  echo "$1: $a, then $b"
-  if [ "$a" != ok ] || [ "$b" != mid ]; then bad="$bad $1"; fi
+  br=$(outcome_run)
+  echo "$1: $a, then $b; run: $ar, then $br"
+  if [ "$a" != ok ] || [ "$b" != mid ] || [ "$ar" != ok ] || [ "$br" != mid ]; then bad="$bad $1"; fi
 }
 MID='pub fn mid_value() -> u32 {
     tdk_base::base_value() + 1
 }
 
-// no test calls it: the dependency check alone checks it
+// neither the test nor main calls it: both checks must catch its error
 pub fn sized() -> [u8; 3] {
     [0u8; tdk_base::C]
 }'
@@ -113,6 +138,34 @@ pub fn own() -> [u8; 4] {
     *include_bytes!(\"own.bin\")
 }"
 case_ include_bytes "printf abc > '$W/mid/src/own.bin'"
+
+# the hidden return type of an impl Trait loses Send
+put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
+pub const C: usize = 3;
+pub fn hidden() -> impl Sized { 1u32 }'
+put mid/src/lib.rs "$MID
+fn need_send<T: Send>(_: T) {}
+pub fn sends() { need_send(tdk_base::hidden()) }"
+case_ rpit_send "sed -i.x '/^pub fn hidden()/s/{ 1u32 }$/{ std::rc::Rc::new(1u32) }/' '$W/base/src/lib.rs'"
+
+# a const fn body sets an array length in tdk-mid
+put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
+pub const C: usize = 3;
+pub const fn n() -> usize { 3 }'
+put mid/src/lib.rs "$MID
+pub fn sized_n() -> [u8; 3] { [0u8; tdk_base::n()] }"
+case_ const_fn_body "sed -i.x '/^pub const fn n()/s/{ 3 }$/{ 4 }/' '$W/base/src/lib.rs'"
+
+# an inherent impl inside a function takes precedence over the trait method
+put base/src/lib.rs 'pub fn base_value() -> u32 { 1 }
+pub const C: usize = 3;
+pub struct B;
+pub trait Ext { fn go(&self) -> u32 { 1 } }
+impl Ext for B {}'
+put mid/src/lib.rs "$MID
+pub fn goes() -> u32 { use tdk_base::Ext; tdk_base::B.go() }"
+impl_edit="/^pub fn base_value()/s/{ 1 }$/{ impl B { pub fn go(\&self) -> \&'static str { \"\" } } 1 }/"
+case_ impl_in_body 'sed -i.x "$impl_edit" "$W/base/src/lib.rs"'
 
 if [ -z "$bad" ]; then echo "test_dep_keys: ok"
 else echo "test_dep_keys: FAILED:$bad"; exit 1; fi
