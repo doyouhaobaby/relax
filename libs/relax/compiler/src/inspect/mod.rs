@@ -10,6 +10,7 @@
 
 pub mod answer;
 pub mod asm;
+pub mod backtrace;
 pub(crate) use asm::plain_name as asm_plain;
 pub mod calltree;
 pub mod client;
@@ -156,8 +157,11 @@ pub fn start(app: &str) {
     // run_dir: the cache this run uses (devhub's JIT cache clear names the apps running on it)
     let run_dir = crate::dirs::relax_dir().display().to_string();
     let extra = format!(",\"session_log\":{},\"run\":{},\"run_dir\":{},\"agent\":{},\"test_run\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), json_str(&run_dir), AGENT.load(Relaxed), TEST_RUN.load(Relaxed));
-    #[cfg(windows)]
-    let extra = match crate::restart_parent::parent_pid() {
+    // the run's own live log (its path crosses each restart, while this pid does not)
+    let extra = format!("{extra},\"live_log\":{}", json_str(&crate::reload::live_log_file()));
+    // the parent this run stands behind (Windows, macOS: restart_parent.rs), whose pid stays
+    let run_pid = crate::restart_parent::parent_pid();
+    let extra = match run_pid {
         Some(parent) => format!("{extra},\"restart_parent\":{parent}"),
         None => extra,
     };
@@ -186,7 +190,9 @@ pub fn start(app: &str) {
     };
     // (a `--silent` run's stderr is the program's: a test reading it sees only the program)
     if crate::harness::live::enabled() || !TEST_RUN.load(Relaxed) && !crate::run::silent() {
-        eprintln!("{t}-remote: pid {} app {} socket {} ({t} inspect {} help)", pid, app, sock.display(), pid, t = crate::tool_name());
+        // `run`: the pid that stays across the run's restarts as new processes (its parent's, else
+        // this one's), for a reader that has only the output
+        eprintln!("{t}-remote: pid {} app {} run {} socket {} ({t} inspect {} help)", pid, app, run_pid.unwrap_or(pid), sock.display(), pid, t = crate::tool_name());
     }
     events::start();
     timeline::hitch_init();
@@ -204,7 +210,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hold", "[files=<path>=<blob id or ->, one a line> | take dir=<dir> files=... | off]", "hold back a landing (devhub's show, until its tip is proven): while a file says what the landing wrote (its git blob id, - when it removes the file) its change waits; every other save applies at once; take: the held files move to a proven tip's text (<dir>/<path>, of that blob id; -: gone), the rest stays held; off: the landing goes in; no words: how many files are held"),
     ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs, which others lie in no package of the graph (`outside`), and which others the program opened, probed or listed the folder of (`read`)"),
     ("test-results", "[group=<n>]", "the latest completed live test run: group and test count, then each test's name, status and whether it ran for that edit; group= refuses the results of another edit"),
-    ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
+    ("session", "relaunch [process=1]", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames); process=1: again on the binary it runs, nothing rebuilt (macOS: as a new process behind the run's parent, which keeps the run pid; Linux: in place)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / Relax runtime / system), its hot fns, the owner's service, other busy threads"),
@@ -232,7 +238,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("contention", "[s=3] [n=15]", "lock / condvar / park / owner waits grouped by what was waited on: total and longest wait, per frame, waiting threads, who ended them (records s seconds of timeline first; alias of timeline waits)"),
     ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
     ("remarks", "<fn|@slot> [n=20]", "the O3 tier's optimisation remarks for the fn: every call its last O3 build kept (hot sites first) and why (no rule, budget, growth ceiling, cold, recursive, no body) with the numbers, and the tiers of its code"),
-    ("cache", "", "where this session's code came from: the warm cache's lookups (hits; misses by reason: no entry for the key, invalidated, did not link, not storable), the startup image (placed / stale / failed), stores opened, entries recorded, and the installed code by tier and origin (fresh / warm-cache / warm-image / live-patch / inspect)"),
+    ("cache", "[verify [fn|all] [n=40]]", "verify: every inlined copy in the installed code (its line table's inline levels) that no edit of the inlined fn would build again (no slot of it reaches the code through the reload's host walk) -- an edit leaves the copy running old text -- marked guarded (a patch flag exits it) and recorded (the code's entry names it among its inputs: a later session's edit refuses the entry); without verify: where this session's code came from: the warm cache's lookups (hits; misses by reason: no entry for the key, invalidated, did not link, not storable), the startup image (placed / stale / failed), stores opened, entries recorded, and the installed code by tier and origin (fresh / warm-cache / warm-image / live-patch / inspect)"),
     ("code", "[n=<top>]", "JIT code growth (code is append-only, never freed): bytes and installs by source (first, tier-up, re-optimize, patch, module) and the fns with the most versions"),
     ("versions", "<fn|file:line>", "every code version of the fn: per slot its installed, replaced and retired code (tier baseline/O1/O2/O3/O3-guarded/instrumented, origin fresh/warm-cache/warm-image/live-patch/inspect, address, patch generation, cache key and build), which threads run in which, and the slots whose code holds an inlined copy of it"),
     ("why-tier", "<fn|file:line|@slot> | stuck [n=20] | uncounted [n=20]", "`stuck`: how many hot fns ended below O3 with nothing pending, by reason. Else why a fn is (not) at O3, answer first: per slot its count stub (armed, call weight, re-arms), its decayed cost against the threshold, the loop counter, cost checks by code version, the O3 queue (position, reason, age), the counted (PGO) window, the verdict, O3 builds installed / dropped / refused with reasons, retiers left, pins, and its last tier-up decisions"),
@@ -323,7 +329,11 @@ fn dispatch_command(req: &Req, out: &mut Out) {
     }
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
-            Some("relaunch") => match crate::reload::relaunch_pending(&crate::reload::inspect_asker()) {
+            Some("relaunch") => match if matches!(req.get("process"), Some("1" | "true")) {
+                crate::reload::relaunch_process(&crate::reload::inspect_asker())
+            } else {
+                crate::reload::relaunch_pending(&crate::reload::inspect_asker())
+            } {
                 // the waiting edits stay noted until a run loads them (the app may postpone it)
                 Ok(how) => {
                     out.line(&format!("{{\"relaunch\":\"queued\",\"as\":\"{}\",\"pid\":{}}}", how, std::process::id()))
@@ -681,10 +691,19 @@ pub struct Captured {
 }
 
 impl Captured {
-    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>: <why>".
+    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>
+    /// (<function>+<d> in <image>): <why>", the function named for host code (symbols.rs, the
+    /// image's own symbol table: the loader's functions export no name). A report of a walk that
+    /// stopped in host code said only its address, which no other box or later build places.
     pub fn stops(&self) -> Option<String> {
         let why = self.stop?;
-        Some(format!("walk stops at {:#x}: {why}", self.frames.last().copied().unwrap_or(0)))
+        let pc = self.frames.last().copied().unwrap_or(0);
+        let at = if crate::jit::in_jit_code(pc) {
+            String::new()
+        } else {
+            symbols::host_symbol(pc).map_or_else(String::new, |(name, image, d)| format!(" ({name}+{d:#x} in {image})"))
+        };
+        Some(format!("walk stops at {pc:#x}{at}: {why}"))
     }
 }
 
@@ -1191,6 +1210,11 @@ fn cmd_threads(out: &mut Out) {
         if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
             wait.push_str(&lifeline_fields(r));
         }
+        if t.state == "uninterruptible" {
+            if let Some(k) = threads::kernel_wait(t.os_id) {
+                wait.push_str(&format!(",\"kernel_wait\":{}", json_str(&k)));
+            }
+        }
         // held by a pause (or for good: a frame in code a layout patch replaced)
         if instrument::held_now(t.os_id) {
             wait.push_str(",\"held\":true");
@@ -1324,6 +1348,11 @@ pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
         if c.t.handle != 0 && instrument::stopped(&c.t) {
             err.push_str(&script_stack_field("script", c.t.handle));
         }
+        if c.t.state == "uninterruptible" {
+            if let Some(k) = threads::kernel_wait(c.t.os_id) {
+                err.push_str(&format!(",\"kernel_wait\":{}", json_str(&k)));
+            }
+        }
         out.line(&format!("{{\"threads\":[{}],\"state\":\"{}\",\"frames\":[{}]{}}}", names.join(","), c.t.state, key.join(","), err));
     }
 }
@@ -1417,6 +1446,7 @@ fn cmd_jit(req: &Req, out: &mut Out) {
 /// to its verdict) and the patch groups that run while their check has not reported. devhub's
 /// watch on an edit's verdict waits while either is on, however long: a two-file Fab edit took
 /// 70 s to compile, and a fixed 60 s watch said the edit was not applied (11-16).
+/// `unverified_why` says what the oldest of those groups waits on (reload::unverified_why).
 fn cmd_live(req: &Req, out: &mut Out) {
     use std::fmt::Write;
     let a = crate::postframe::activity();
@@ -1436,13 +1466,14 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"editing\":{},\"unverified\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"editing\":{},\"unverified\":{},\"unverified_why\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
         crate::reload::patches_installed(),
         crate::postframe::FRAME_PATCH.load(Relaxed),
         crate::reload::restart_pending().len(),
         crate::reload::save_seen() as u8,
         crate::reload::UNVERIFIED_PATCHES.load(Relaxed),
+        json_str(&crate::reload::unverified_why()),
         runs_what(),
         a.demand(),
         a.ahead_done,

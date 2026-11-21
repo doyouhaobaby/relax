@@ -963,6 +963,38 @@ fn a_closure_body_call_reborrowed_to_a_shared_return_type_is_checked() {
 }
 
 #[test]
+fn a_unary_operand_on_a_closure_parameter_needs_its_type_where_it_stands() {
+    // expr.rs check_expr_unop: `!`, `-` and `*` resolve their operand's type structurally first, so a
+    // closure's parameter that only a later call names is E0282 there (relax took it from the call
+    // and compiled what rustc refuses). A comparison, `+` and `||` register their obligation instead
+    // and take the type from the call: rustc accepts those.
+    const SOURCE: &str = "pub struct R { pub len: u32, pub writable: bool }
+pub fn not_param(rs: &[R]) -> u64 {
+    let count = |width, write| rs.iter().filter(|r| r.len >= width && (!write || r.writable)).count() as u64;
+    count(1, false)
+}
+pub fn neg_param() -> i32 { let g = |x| -x; g(1i32) }
+pub fn deref_param() -> u32 { let g = |a| *a; g(&1u32) }
+pub fn binary_params(rs: &[R]) -> u64 {
+    let n = |width| rs.iter().filter(|r| r.len >= width).count() as u64;
+    let add = |a, b| a + b;
+    let or = |a, b| a || b;
+    n(1) + add(1u64, 2u64) + or(true, false) as u64
+}";
+    let (prog, tcx, user) = load_source(SOURCE, 2021, "repro");
+    let mut by_fn = std::collections::HashMap::new();
+    for owner in crate::borrowck::body::owners(&prog) {
+        if prog.def(owner.owner).krate != user { continue; }
+        by_fn.insert(prog.syms.str(prog.def(owner.owner).name).to_string(), tcx.typeck(&prog, owner.owner).errors.clone());
+    }
+    for f in ["not_param", "neg_param", "deref_param"] {
+        let errors = &by_fn[f];
+        assert!(errors.len() == 1 && errors[0].contains(": E0282: "), "{f}: {errors:?}");
+    }
+    assert!(by_fn["binary_params"].is_empty(), "binary_params: {:?}", by_fn["binary_params"]);
+}
+
+#[test]
 fn an_ambiguous_subtype_predicate_is_a_type_annotation_error() {
     // type/type-check/cannot_infer_local_or_array.rs: the local's variable is related to the array type's.
     let errors = typeck_errors_source("pub fn main() { let x = []; }", 2021);

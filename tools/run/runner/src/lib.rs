@@ -229,9 +229,10 @@ pub fn main(host: &'static Host) {
     // environment (relax-base progenv.rs); a provided crate's read of the program's environment
     // (relax-api env) answers with them. A test's package binary that a launcher clearing the
     // environment started builds with its test's run's build environment (selfexe.rs prepared_build).
+    // A run Relax std's spawn started takes its parent's by the descriptor it names (spawned_build).
     let handed = match &relaunch {
         Some(_) => relax_compiler::selfexe::relaunch_build(),
-        None if bin.is_none() => relax_compiler::selfexe::prepared_build(&relax_compiler::os::proc::args_bytes()),
+        None if bin.is_none() => relax_compiler::selfexe::spawned_build().or_else(|| relax_compiler::selfexe::prepared_build(&relax_compiler::os::proc::args_bytes())),
         None => None,
     };
     relax_compiler::progenv::init_handed(handed);
@@ -322,8 +323,9 @@ fn run(raw_args: Vec<Vec<u8>>) {
             std::process::exit(2);
         }
     };
-    // Windows has no exec: a run that can restart becomes the child of this process, which waits
-    #[cfg(windows)]
+    // a run that can restart becomes the child of this process, which waits: Windows has no exec,
+    // and on macOS an exec keeps a pid the window server has marked as exiting (restart_parent.rs)
+    #[cfg(any(windows, target_os = "macos"))]
     relax_compiler::restart_parent::enter(&raw_args);
     // a child started in a virtual folder of a git repository run gets the mount table
     if let Err(e) = relax_compiler::vfs::mount_from_env() {

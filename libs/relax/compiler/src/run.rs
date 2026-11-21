@@ -45,6 +45,9 @@ static PHASES: relax_session::sync::Mutex<Vec<(String, f64)>> = relax_session::s
 static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
+/// `--quit-after-present`: the run quits once its startup went quiet after the first present (a
+/// warm-up run: its cache is committed by the quit write as for any quit)
+static QUIT_AFTER_PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// `--silent`: nothing of Relax's own on stderr but errors (a program re-running itself, a
 /// binary's wrapper script). The switch is relax-base's (`progress::silent`), which every layer
@@ -1160,6 +1163,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
             "--no-live" => no_live = true,
+            // unix: the run sends itself SIGTERM, which takes the platform's termination path;
+            // Windows has no signal for that path, so the run goes on there
+            "--quit-after-present" => {
+                if cfg!(windows) { eprintln!("makepad: --quit-after-present is not supported on Windows; the run goes on") }
+                else { QUIT_AFTER_PRESENT.store(true, Ordering::Relaxed) }
+            }
             // a run no one attends (an app a test starts, makepad_test launch_package): no live
             // session, and nothing parks -- a compile error is its call's panic, a panic unwinds at
             // once, a crash ends the run -- so the test fails with the text instead of waiting
@@ -1999,10 +2008,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let max_err: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     if !prog.errors.is_empty() {
+        // Report this load's resolution diagnostics once, independently of stored check verdicts.
         for e in &prog.errors {
+            crate::run::first_report(0, e);
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "resolve")); }
         }
-        eprintln!("relax: {} unresolved imports (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
+        eprintln!("relax: {} name resolution errors (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
         for e in prog.errors.iter().take(max_err) {
             eprintln!("  {}", e);
         }
@@ -2077,9 +2088,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test`: the crates under test are checked as `cargo test` compiles them before any
     // test runs (test_subjects); marked before declaration collection, as a check marks its crates
     let test_subjects: Vec<u32> = if (harness || plain_test) && !check { vec![root] } else { Vec::new() };
+    // and their path dependencies, which it checks whole beside the tests (check.rs
+    // start_test_deps), with the validation-only checks a run gives the app's own crates: without
+    // them a private field a dependency's struct update names (E0451) ran under `makepad test`
+    // while `run` and `check` refused it
+    let path_crates: Vec<u32> = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| crate_of[ci]).collect();
+    let test_deps: Vec<u32> = if test_subjects.is_empty() { Vec::new() } else { test_dep_crates(&prog, &path_crates, &test_subjects) };
     if !test_subjects.is_empty() {
         let mut own = vec![false; prog.crates.len()];
         for &k in &test_subjects { prog.crates[k as usize].validate = true; own[k as usize] = true; }
+        for &k in &test_deps { prog.crates[k as usize].validate = true; }
         prog.own_crates = own.clone();
         relax_types::lint::enable();
         prog.run_import_sim(&own);
@@ -2283,7 +2301,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if !selftest {
             let t = Instant::now();
             let std_crates = crate::check::std_crates(&u.prog);
-            let errors = crate::check::run_check_crates(&mut *u, &std_crates);
+            let errors = crate::check::run_check_crates(&mut *u, &std_crates, false);
             for e in &errors {
                 if crate::diag::enabled() { crate::diag::emit(&crate::diag::from_legacy(e, "typeck")); } else { eprintln!("{e}"); }
             }
@@ -2497,23 +2515,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 101;
         }
         if !self_exec {
-            let candidates: Vec<u32> = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| crate_of[ci]).collect();
             let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();
-            let subjects = test_subjects.clone();
-            crate::check::start_test_deps(&mut *u, move |prog| {
-                use crate::vfs::canonical as canon;
-                let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
-                // the subject's dependencies (a test graph's other targets are not its)
-                let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {
-                    let c = &prog.crates[*k as usize];
-                    !subjects.contains(k) && subjects.iter().any(|&s| prog.crate_sees(s, *k)) && !c.proc_macro
-                        && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
-                        && !canon(c.root_path()).starts_with(&std_dir)
-                }).collect();
-                crates.sort_unstable();
-                crates.dedup();
-                crates
-            }, names, runtime);
+            let deps = test_deps.clone();
+            crate::check::start_test_deps(&mut *u, move |_| deps, names, runtime);
         }
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
         if plain_test {
@@ -2526,8 +2530,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // first runs: a lazy compile checks its body, and a compile error ends the run.
         let t_check = Instant::now();
         let app = crate::check::app_crates(&u.prog, root);
-        app_check = crate::check::prepare_check(&mut *u, &app);
+        app_check = crate::check::prepare_check(&mut *u, &app, true);
         phase("app check lookups", t_check);
+        verbose!("relax: app check lookups: {} of {} app crates to check ({} body verdicts by their dependencies' interfaces, interface keys {:.0} ms, {} item file digests materialized)",
+            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(),
+            crate::check::RUN_CHECK[5].load(Ordering::Relaxed), crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6,
+            u.cache.as_ref().map_or(0, |c| c.stats.item_file_digests));
         if app_check.is_some() {
             // (the cache's: on the owner)
             let t_graph = Instant::now();
@@ -2547,11 +2555,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // after the first frame (typeck_bg.rs).
         let t_check = Instant::now();
         let app = crate::check::app_crates(&u.prog, root);
-        let errors = crate::check::run_check_crates(&mut *u, &app);
+        let errors = crate::check::run_check_crates(&mut *u, &app, true);
         phase("app check", t_check);
-        verbose!("relax: app check: {} of {} app crates checked ({} body owners), {} errors; verdict lookup {:.0} ms, skipped files' load {:.0} ms",
-            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), errors.len(),
-            crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
+        verbose!("relax: app check: {} of {} app crates checked ({} body owners, {} item defs), {} errors; verdict lookup {:.0} ms ({} by their dependencies' interfaces, those keys {:.0} ms), skipped files' load {:.0} ms",
+            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), crate::check::RUN_CHECK[7].load(Ordering::Relaxed), errors.len(),
+            crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[5].load(Ordering::Relaxed),
+            crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
         if !errors.is_empty() {
             for e in &errors {
                 if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }
@@ -2730,6 +2739,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let platform = u.prog.crates.iter().any(|c| unitgraph::presents(&unitgraph::manifest_dir_of(c.root_path())));
     jit::live_needs_present(!live_tests && platform);
+    jit::live_tests_session(live_tests);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
     jit::startup_main(platform && !HARNESS_RUN.load(Ordering::Acquire));
     if HAL_RUN.load(Ordering::Acquire) && platform && !HARNESS_RUN.load(Ordering::Acquire) && !live_tests {
@@ -2827,8 +2837,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // test. Its check ran beside the boot until here (check.rs start_test_deps); the tests wait for
     // its verdict. (They ran beside it: one met a compile error in its call and the others passed on
     // code that does not build, 11-08.)
-    // (a run that is no test started no such check: 0)
-    if crate::check::finish_test_deps(0) != 0 {
+    // (a run that is no test started no such check: 0) (Its wait is no quiet of the program's
+    // start: jit::MainHeld.)
+    let deps = {
+        let _held = jit::MainHeld::new();
+        crate::check::finish_test_deps(0)
+    };
+    if deps != 0 {
         eprintln!("error: no test ran: a path dependency does not compile (`{tool} test` fails as `cargo test` does on code rustc rejects)", tool = crate::tool_name());
         return 101;
     }
@@ -3339,6 +3354,25 @@ static HOST_THREAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn host_thread() -> u64 {
     HOST_THREAD.load(Ordering::Acquire)
 }
+/// The path dependencies of `makepad test`'s crates under test (`subjects`), of `path_crates` (the
+/// graph's crates that are no registry package's): what its run checks whole beside the tests
+/// (check.rs start_test_deps) and validates as a run validates the app's own crates. Not the
+/// subjects, a proc macro or Relax's std; a test graph's other targets are not a subject's.
+fn test_dep_crates(prog: &crate::program::Program, path_crates: &[u32], subjects: &[u32]) -> Vec<u32> {
+    use crate::vfs::canonical as canon;
+    let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
+    let seen: Vec<u32> = subjects.iter().flat_map(|&s| crate::check::dependency_closure(prog, s)).collect();
+    let mut crates: Vec<u32> = path_crates.iter().copied().filter(|k| {
+        let c = &prog.crates[*k as usize];
+        !subjects.contains(k) && seen.contains(k) && !c.proc_macro
+            && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
+            && !canon(c.root_path()).starts_with(&std_dir)
+    }).collect();
+    crates.sort_unstable();
+    crates.dedup();
+    crates
+}
+
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 
@@ -3979,9 +4013,14 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
     // trimmed, 37 s of trims): a writer waits from here on, so the readers stop at their next preemption
     // point, and the wait for the front to come free runs here, off the owner, which goes on
     // serving meanwhile (the main thread's requests, the questions the readers wait on).
+    // Not while the collected program is captured: the capture holds its front read for seconds
+    // and starts over for a waiting writer, and the monitor asks this again next round (settles
+    // every 330 ms under RELAX_SETTLE_STRESS had a 2.6 s capture start over 183 times, and the
+    // run's collected image, so its settle rebuild, waited for the whole run).
+    if capture_running() { return false; }
     let _waiting = crate::preempt::WriterWaiting::new();
     while jit::front_try_write().is_none() {
-        if jit::QUIT_SEEN.load(Ordering::Relaxed) || crate::preempt::is_stopped() { return false; }
+        if jit::QUIT_SEEN.load(Ordering::Relaxed) || crate::preempt::is_stopped() || capture_running() { return false; }
         crate::lifeline::beat();
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -4066,6 +4105,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let settle_on = runtime.settle_drop;
         let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
+        // --quit-after-present: the run's own quiet-after-present watch (the settle's is off with
+        // RELAX_SETTLE_DROP=0)
+        let mut quit_watch = QUIT_AFTER_PRESENT.load(Ordering::Relaxed).then(SettleWatch::default);
         let mut settle_present = 0;
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
@@ -4153,7 +4195,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let start = MAIN_START_WALL.load(Ordering::Relaxed);
             let since = main_ms.saturating_sub(mid_last);
             // also with no new code: the manifest whose window closed, the collected program
-            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::manifest_window_closed()
                 || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
                 || jit::live_startup_done() && crate::cache::front_graph_pending();
             // the warm record (manifest, front graph, collected program) is written as soon
@@ -4181,11 +4223,10 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 mid_flushed = n;
                 mid_last = main_ms;
                 let busy = mid_busy.clone();
-                let quiet = record || mid_still;
                 let _ = crate::run_threads::spawn("run-cache-write", move || { let _z = crate::zone_alloc::compiler_thread();
                     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
                     let t = Instant::now();
-                    let r = mid_flush(quiet, record);
+                    let r = mid_flush(record);
                     if crate::memstat::enabled() || crate::cache::trace_on() {
                         verbose!("relax cache: mid-run write at t={:.0} ms: {:?} (entries, front images) in {:.1} ms", crate::clock::ms_since_start(), r, t.elapsed().as_secs_f64() * 1e3);
                     }
@@ -4294,6 +4335,17 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                             crate::memstat::print("after the settle and the adoption", &crate::memreport::unit_sizes(unsafe { &*up }));
                         });
                     }
+                }
+            }
+            // the startup's first compiles went quiet after the first present (1 s without one, or
+            // a trickle 5 s on): the run ends as an outside SIGTERM would end it, through the
+            // platform's termination path and the quit write, so its cache is committed
+            if let Some(watch) = quit_watch.as_mut() {
+                if watch.ready(jit::wall_ns(), latest_present(), jit::demand_compiled())
+                    && (crate::check::audit_dir().is_none() || !crate::typeck_bg::running()) {
+                    quit_watch = None;
+                    eprintln!("makepad: quitting after the first present (--quit-after-present)");
+                    crate::serve_os::stop(std::process::id());
                 }
             }
             // one rebuild per first present (the run's, then each domain's) once its compiles have
@@ -4719,6 +4771,32 @@ fn mid_yielded() {
 /// The install order's length when a mid-run write last recorded the manifest (or its tail): the
 /// quit write records the session's later installs as its tail
 static MID_MANIFEST_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The install order's length when the startup manifest's window closed, as the first write past
+/// it found it (MAX: not yet): the startup manifest is that much of it, whichever try records it.
+/// A cold run installs for minutes after its window; a manifest of the whole order so far was
+/// another record each try, and a try that gave way left the next one more to do.
+static MANIFEST_WINDOW_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// A test's startup manifest gives way this many times more, as to a waiting request.
+#[cfg(test)]
+pub(crate) static MANIFEST_GIVES_WAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+fn manifest_test_gives_way() -> bool {
+    let mut n = MANIFEST_GIVES_WAY.load(Ordering::SeqCst);
+    while n > 0 {
+        match MANIFEST_GIVES_WAY.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
+#[cfg(not(test))]
+fn manifest_test_gives_way() -> bool {
+    false
+}
 /// The last mid-run write found an in-session rebuild of the startup image due (cache
 /// image_refresh_due): the next one opens the stores spills wrote first, as the image takes their
 /// entries
@@ -4816,8 +4894,6 @@ fn quit_mark() {
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
     // nothing parked waits for a decision now, and a paused program goes on to its quit
     crate::inspect::events::quit_releases();
-    // the quit write and the exit's commit without waiting on the disk (store.rs Slot::tail)
-    crate::store::set_exiting();
     if ONCE.swap(true, Ordering::SeqCst) || unsafe { RUN_UNIT }.is_null() { return; }
     if jit::started() {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
@@ -4840,7 +4916,7 @@ fn quit_mark() {
             // (the exit's write does the rest)
             if EXIT_STAGE.load(Ordering::SeqCst) != 0 { break; }
             let yields = MID_YIELDS.load(Ordering::Relaxed);
-            let pass = mid_flush(true, true);
+            let pass = mid_flush(true);
             r = pass.or(r);
             let whole = MID_YIELDS.load(Ordering::Relaxed) == yields;
             if whole && (QUIT_WRITE_FINISHING.load(Ordering::SeqCst)
@@ -4866,12 +4942,21 @@ fn quit_mark() {
     }
 }
 
+/// (tests) One settle of unit `up`, as the run monitor tries it: whether it settled.
+#[cfg(test)]
+pub(crate) unsafe fn settle_pass(up: *mut Unit) -> bool {
+    RUN_UNIT = up;
+    let r = try_settle(&mut jit::SettleDrops::default(), false);
+    RUN_UNIT = std::ptr::null_mut();
+    r
+}
+
 /// (tests) One pass of the quit write over unit `up`, as quit_mark's thread runs it: the entries
 /// and front images it wrote.
 #[cfg(test)]
 pub(crate) unsafe fn quit_write_pass(up: *mut Unit) -> Option<(usize, usize)> {
     RUN_UNIT = up;
-    let r = mid_flush(true, true);
+    let r = mid_flush(true);
     RUN_UNIT = std::ptr::null_mut();
     r
 }
@@ -4895,7 +4980,7 @@ pub(crate) extern "C" fn relax_self_spawn() {
     }
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let t = Instant::now();
-    let r = mid_flush(true, true);
+    let r = mid_flush(true);
     verbose!("relax cache: written before a run of this program again: {:?} (entries, front images) in {:.1} ms", r, t.elapsed().as_secs_f64() * 1e3);
 }
 
@@ -5019,6 +5104,8 @@ fn drop_later_now() {
 /// timeline (`pf`, `timeline`) shows each section as a span inside the owner's service, so a
 /// frame that waited for the owner names the section that held it.
 pub(crate) fn yield_section(s: &'static str) {
+    // (a capture off the owner thread holds no owner section: the settle rebuild's, record_collected)
+    if !crate::owner::is_owner() { return; }
     let prev = std::mem::replace(&mut *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner()), s);
     // (on the owner thread, inside its service span: every section is set and cleared there)
     if crate::owner::is_owner() && crate::inspect::timeline::recording() {
@@ -5068,13 +5155,174 @@ fn set_mid_cache_dir(dir: &std::path::Path) {
 // never prints the exit summary): files mapped, images not matching, arrays copied back
 static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// this thread captures the collected program under a front read (record_collected): it
+    /// makes no request the owner thread must serve (owner.rs request_dyn)
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread captures the collected program under a front read now.
+pub(crate) fn capturing() -> bool {
+    CAPTURING.try_with(|c| c.get()).unwrap_or(false)
+}
+
+/// What stops the collected capture under its front read: a front writer waits (a load, a live
+/// edit: it then waits for one stop interval), or the run ends. A settle does not wait while one
+/// runs (try_settle).
+pub(crate) fn capture_stop() -> bool {
+    crate::preempt::writer_waiting() || crate::preempt::is_stopped()
+}
+
+/// Captures of the collected program under way on any thread, from just before their front read.
+static CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A capture of the collected program is under way (a settle gives way to it).
+pub(crate) fn capture_running() -> bool {
+    CAPTURES.load(Ordering::Acquire) != 0
+}
+
+/// A capture under way for as long as it lives.
+pub(crate) struct CaptureLive(());
+impl CaptureLive {
+    pub(crate) fn enter() -> Self {
+        CAPTURES.fetch_add(1, Ordering::AcqRel);
+        CaptureLive(())
+    }
+}
+impl Drop for CaptureLive {
+    fn drop(&mut self) {
+        // (never below zero: a run that ends in place resets the count)
+        let mut n = CAPTURES.load(Ordering::Acquire);
+        while n > 0 {
+            match CAPTURES.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+/// The collected program, recorded off the owner thread. One owner step takes the front images
+/// of files loaded since this write took them (`imaged_files`: the program's file count they
+/// cover), the encoder's inputs, and the front-write count all of it describes. On this thread a
+/// front read then holds that program while it is encoded: the owner goes on compiling, and a
+/// front writer (a load, a live edit) waits for at most one stop interval, which drops the
+/// encode for a later write. The store write and the commit run with no lock. A front write
+/// between the two steps, or a table changed under the read (the shape guard: a change made
+/// without the front write), leaves the record to a later write.
+fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left: bool) {
+    let t = Instant::now();
+    // the cache files' pages the run has resident go first (a settle's trim drops them too):
+    // the record's copy of the program comes on top of what the process holds
+    crate::pack::release_resident();
+    // files the post-boot loader loaded since this write took its front images (a run that did
+    // not restore loads for seconds after present): their images are taken in the owner step
+    // (the front-write count read there says the program is still the one they are of)
+    let late = wait && front_recordable() && crate::owner::publish(|| unsafe { (*up).prog.files.len() } != imaged_files);
+    let step = || {
+        let u = unsafe { &mut *up };
+        let (mut imaged, mut left, mut late_spill) = (imaged_files, crates_left, None);
+        if late {
+            let stop = || crate::owner::request_waiting();
+            if let Some(c) = u.cache.as_mut() {
+                let (_, all_taken) = push_front_images(&u.prog, c, &stop);
+                left = !(all_taken && c.record_front_crates_until(&u.prog, &stop));
+                late_spill = c.spill_take();
+                if !left { imaged = u.prog.files.len(); }
+            }
+        }
+        (u.cache.as_ref().map(|c| c.collected_record_inputs()), late_spill, imaged, left, jit::front_epoch())
+    };
+    // (no late files: one bounded publish copies the encoder's inputs)
+    let (inputs, late_spill, imaged, left, epoch) = if late { crate::owner::call(crate::owner::Class::Program, step) } else { crate::owner::publish(step) };
+    let owner_ms = t.elapsed().as_secs_f64() * 1e3;
+    let Some(inputs) = inputs else { return };
+    if left { mid_yielded(); }
+    // the late files' images are in the store before the record that maps them
+    if late_spill.is_some_and(|s| s.write().is_err()) {
+        collected_skip("the late files' front images were not written");
+        return;
+    }
+    let t_capture = Instant::now();
+    let record = {
+        let _c = crate::zone_alloc::compiler();
+        let _live = CaptureLive::enter();
+        let read = jit::front_read("cache collected");
+        // the program the front images were taken of, and it stays so while the read is held
+        if jit::front_epoch() != epoch {
+            collected_skip("a front write came after the front images were taken");
+            return;
+        }
+        let (prog, tcx) = read.unit(up);
+        if prog.files.len() != imaged {
+            collected_skip(if left { "the crate records stopped for a waiting request" } else { "files were loaded since the front images were taken" });
+            return;
+        }
+        if !front_recordable() || prog.has_edit_versions() {
+            collected_skip("the session was edited live");
+            return;
+        }
+        let _capturing = CapturingNow::enter();
+        match inputs.capture(prog, tcx, &capture_stop) {
+            Ok(record) => (record, inputs.crates(prog)),
+            Err(why) => {
+                crate::inspect::flightrec::event("cache.collected", &why, 0, 0);
+                eprintln!("relax collected: not recorded: {why}");
+                return;
+            }
+        }
+    };
+    let capture_ms = t_capture.elapsed().as_secs_f64() * 1e3;
+    let (record, crates) = record;
+    let retired = match record {
+        crate::cache::CollectedRecord::Ready(dest, payload) => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            let report = VERBOSE.load(Ordering::Relaxed).then_some(crates);
+            let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) else { return };
+            COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+            crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
+            true
+        }
+        crate::cache::CollectedRecord::Current => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+            true
+        }
+        crate::cache::CollectedRecord::Yielded => {
+            mid_yielded();
+            verbose!("relax collected: record yielded to a front writer after {:.1} ms; retried later", capture_ms);
+            false
+        }
+        crate::cache::CollectedRecord::Failed => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            false
+        }
+    };
+    // (one bounded publish marks it; the retired boot snapshot is dropped here)
+    if retired {
+        let retired_boot = crate::owner::publish(|| unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
+        drop(retired_boot);
+    }
+    verbose!("relax cache: collected record off the owner: the owner step {:.1} ms, the capture under a front read {:.1} ms, in all {:.1} ms", owner_ms, capture_ms, t.elapsed().as_secs_f64() * 1e3);
+}
+
+/// CAPTURING for as long as it lives.
+struct CapturingNow;
+impl CapturingNow {
+    fn enter() -> Self { CAPTURING.with(|c| c.set(true)); CapturingNow }
+}
+impl Drop for CapturingNow {
+    fn drop(&mut self) { let _ = CAPTURING.try_with(|c| c.set(false)); }
+}
+
 /// `wait`: the warm record's writes (after first present, at a quit) wait for the owner thread to
 /// complete its work (which a cold run's compiles fill nearly all the time); other writes skip a busy unit.
-fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
+fn mid_flush(wait: bool) -> Option<(usize, usize)> {
     // the compiled kernels offered so far
     crate::kernel_store::flush();
-    // the first write comes after the start: the mapped front images are checksummed now
-    crate::cache::verify_front_images();
+    // the first write comes after the start: what the opened stores hold of an earlier boot's is
+    // sealed now (the background pass)
+    crate::cache::background_seal();
     let up = unsafe { RUN_UNIT };
     // one unit call: waits for the unit when `wait`, else only if it is free now
     fn unit_call<R>(wait: bool, f: impl FnOnce() -> R) -> Option<R> {
@@ -5088,10 +5336,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     }
     // the deferred cache records in bounded publishes (a program thread waits for one batch);
     // the request below holds only what installs add meanwhile
+    let t_drain = Instant::now();
     jit::drain_records_bounded();
+    let drain_ms = t_drain.elapsed().as_secs_f64() * 1e3;
     // the stores earlier spills wrote, opened here when the startup manifest may be recorded below
     // (cache.rs open_written): its image takes their entries, and the request only indexes them
-    if jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+    if jit::manifest_window_closed()
         && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed) || IMAGE_REFRESH_WANTED.load(Ordering::Relaxed)) {
         let dir = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(dir) = dir { crate::cache::open_written(&dir); }
@@ -5104,8 +5354,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the crate records stopped for a waiting request (record_front_crates_until)
     let mut crates_left = false;
     let probe = YieldProbe::new();
+    let asked = Instant::now();
+    let behind = (crate::owner::queued_in(crate::owner::Class::Program), crate::owner::SERVED.load(Ordering::Relaxed), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed));
+    let mut passed = (0, 0);
     let Some(Some((held, spill))) = unit_call(wait, || {
     let held = Instant::now();
+    passed = (crate::owner::SERVED.load(Ordering::Relaxed).saturating_sub(behind.1 + 1), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed).saturating_sub(behind.2));
     probe.start();
     yield_section("mid write");
     let spill = {
@@ -5125,18 +5379,28 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         let quit = jit::QUIT_SEEN.load(Ordering::Relaxed);
         let tail = quit && done && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
         let refresh = !quit && done && u.cache.as_ref().is_some_and(|c| c.image_refresh_due());
-        if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!done || tail || refresh) {
+        if u.cache.is_some() && jit::manifest_window_closed() && (!done || tail || refresh) {
             MID_MANIFEST_DONE.store(true, Ordering::Relaxed);
-            let len = u.start_order.len();
+            // the startup manifest: the install order as the first write past its window found it,
+            // whichever try records it (a refresh and a manifest the quit records first included);
+            // the session's later installs are its tail, which the quit records after it
+            // (record_tail). A cold run installs for minutes after its window: a manifest of the
+            // whole order so far was more to record, and to build an image of, at every try.
+            if MANIFEST_WINDOW_LEN.load(Ordering::Relaxed) == usize::MAX {
+                MANIFEST_WINDOW_LEN.store(u.start_order.len(), Ordering::Relaxed);
+            }
+            let len = if tail { u.start_order.len() } else { MANIFEST_WINDOW_LEN.load(Ordering::Relaxed).min(u.start_order.len()) };
             yield_section("manifest order");
-            let (order, present) = jit::manifest_order(&*u, u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
+            let (order, present) = jit::manifest_order(&*u, u.start_order[..len].to_vec(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
                 // first: the manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); quit_write_gives_way() };
+                let stop = || { probe.tick("manifest"); quit_write_gives_way() || manifest_test_gives_way() };
                 let root = crate::layout::root_crate();
+                let t_made = Instant::now();
                 let made = if tail { c.record_tail(u, root, &order, &stop) } else { c.record_manifest(u, root, &order, present, &stop) };
+                verbose!("relax cache: {} of {} slots ({} after the recorded manifest's) {} in {:.1} ms", if tail { "manifest tail" } else { "startup manifest" }, order.len(), len.saturating_sub(MID_MANIFEST_LEN.load(Ordering::Relaxed)), if made { "recorded" } else { "yielded" }, t_made.elapsed().as_secs_f64() * 1e3);
                 if made {
                     MID_MANIFEST_LEN.store(len, Ordering::Relaxed);
                 } else {
@@ -5158,6 +5422,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
             c.record_borrowck(k, v);
         }
+        c.flush_seen_bodies();
         probe.tick("borrowck keys");
         if front_recordable() {
             yield_section("front images");
@@ -5187,10 +5452,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     drop_later_now();
     probe.report("mid write");
     let held1 = held.elapsed().as_secs_f64() * 1e3;
+    let owner_wait_ms = held.saturating_duration_since(asked).as_secs_f64() * 1e3;
+    let t_spill = Instant::now();
     let n = match spill {
         Some(s) => s.write().ok()?,
         None => 0,
     };
+    let spill_ms = t_spill.elapsed().as_secs_f64() * 1e3;
     if jit::FIRST_PRESENT.load(Ordering::Acquire) && !FRONT_REPORTED.swap(true, Ordering::Relaxed) {
         if let Some(s) = crate::front::summary() { verbose!("{} (after the first present)", s); }
     }
@@ -5202,89 +5470,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     }
     let graph_ready = jit::live_startup_done()
         && crate::cache::Cache::flush_front_graphs().is_ok();
-    // the collected program, once per run and only when the program is quiet (it is encoded
-    // under the unit and front-end locks): not at the exit
-    if graph_ready && quiet && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
-        // not when a file was loaded since this write took its front images (its restore maps
-        // every file from them); a later quiet flush or the exit tries again. Files the lazy
-        // selection still skips travel in the image (skipped_files, deferred imports).
-        // Encoded on the owner thread, but never in the main thread's way: the encode stops when
-        // the main thread waits for the owner thread (a frame's lazy compile) and a later pass
-        // tries again; the store write runs after the owner thread releases it.
-        let cprobe = YieldProbe::new();
-        // the cache files' pages the run has resident go first (a settle's trim drops them too):
-        // the record's copy of the program comes on top of what the process holds
-        crate::pack::release_resident();
-        if let Some((ready, retired_boot, late_spill, t)) = unit_call(wait, || {
-            cprobe.start();
-            yield_section("collected");
-            let mut ready = None;
-            let mut retired_boot = None;
-            let mut late_spill = None;
-            let t = Instant::now();
-            // asked at each step and through the encode: a waiting request (a frame's lazy
-            // compile, a live patch, a back end's Job) goes first, and a later pass tries again
-            let stop = || { cprobe.tick("collected"); crate::owner::request_waiting() };
-            // the front-end lock: for at most 50 ms, and not while a request waits for the owner
-            // thread this holds
-            let front = {
-                let t = Instant::now();
-                loop {
-                    if let Some(g) = jit::front_write_within(1) { break Some(g); }
-                    if stop() || t.elapsed() >= std::time::Duration::from_millis(50) { break None; }
-                }
-            };
-            if front.is_none() { collected_skip("the front-end lock is busy"); }
-            if let Some(_front) = front {
-                let u = unsafe { &mut *up };
-                // files the post-boot loader loaded since this write took its front images (a
-                // run that did not restore loads for seconds after present): their images are
-                // taken now, under the locks, so the record can be made in this pass (their store
-                // write runs after the owner thread is released, before the record's commit)
-                if wait && u.prog.files.len() != imaged_files && front_recordable() {
-                    if stop() { crates_left = true; mid_yielded(); } else if let Some(c) = u.cache.as_mut() {
-                        let (_, all_taken) = push_front_images(&u.prog, c, &stop);
-                        crates_left = !(all_taken && c.record_front_crates_until(&u.prog, &stop));
-                        late_spill = c.spill_take();
-                        if !crates_left { imaged_files = u.prog.files.len(); }
-                    }
-                }
-                if u.prog.files.len() != imaged_files {
-                    collected_skip(if crates_left { "the crate records stopped for a waiting request" } else { "files were loaded since the front images were taken" });
-                }
-                if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                    match c.encode_collected(&u.prog, &u.tcx, &stop) {
-                        crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
-                        crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                        crate::cache::CollectedRecord::Yielded => { mid_yielded(); verbose!("relax collected: record yielded to a waiting request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3); }
-                        crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
-                    }
-                }
-            }
-            cprobe.tick("collected end");
-            yield_section("");
-            (ready, retired_boot, late_spill, t)
-        }) {
-            cprobe.report("collected record");
-            verbose!("relax cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-            drop(retired_boot);
-            // the late files' images are in the store before the record that maps them
-            let late_written = late_spill.map_or(true, |s| s.write().is_ok());
-            if !late_written && ready.is_some() {
-                MID_COLLECTED_TRIED.store(false, Ordering::Relaxed);
-                collected_skip("the late files' front images were not written");
-            }
-            if let Some((report, dest, payload)) = ready.filter(|_| late_written) {
-                if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) {
-                    COLLECTED_CURRENT.store(true, Ordering::Relaxed);
-                    crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
-                    let retired_boot = crate::owner::call(crate::owner::Class::Program, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
-                    drop(retired_boot);
-                }
-            }
-        }
+    // the collected program, once per run, as soon as its pieces are in the stores: recorded off
+    // the owner thread (record_collected), so it does not wait for the program to go quiet (a
+    // cold run compiles for minutes after its present, and its quit recorded it, seconds long)
+    if graph_ready && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
+        record_collected(up, wait, imaged_files, crates_left);
     }
-    verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[3], parts[0], parts[1], parts[2]);
+    verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill); before it the record drain took {:.1} ms and the wait for the owner {:.1} ms (behind {} queued program requests; meanwhile it served {} requests, {} of them the main thread's ahead of the queue), the spill's write {:.1} ms; front writes so far {}", held1, parts[3], parts[0], parts[1], parts[2], drain_ms, owner_wait_ms, behind.0, passed.0, passed.1, spill_ms, jit::front_epoch());
     crate::inspect::flightrec::event("cache.write", &format!("mid write: {} records, {} images; held the owner {:.1} ms (manifest {:.1}, front images {:.1}, crate records {:.1})", n, n_imgs, held1, parts[0], parts[1], parts[2]), (held1 * 1e6) as u64, 0);
     // All temporary encoders and retired boot arrays are now outside compiler locks.
     crate::memstat::trim();
@@ -5301,8 +5493,7 @@ fn summary_inner(why: &str) {
     // Independent of owner thread state: still emit when exit quiescence times out.
     if why != "stats" { crate::exec_profile::report(false); }
     if why != "stats" {
-        // the exit's writes commit without waiting on the disk (store.rs Slot::tail)
-        crate::store::set_exiting();
+        crate::store::note_checks("by the exit");
         // the run is ending: background borrow checks stop at their next preemption point
         // (nothing waits for them; finished verdicts are stored below)
         crate::borrowck::lazy::stop();
@@ -5382,6 +5573,7 @@ fn summary_inner(why: &str) {
                 for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
                     c.record_borrowck(k, v);
                 }
+                c.flush_seen_bodies();
 
                 // front images of the files the store does not have yet (front.rs) and the crate
                 // records: a run quit before its first mid-run write has all of them left
@@ -5924,11 +6116,13 @@ pub(crate) unsafe fn reset_statics() {
     reset(&DONE, AtomicBool::new(false));
     reset(&EXIT_MARKS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&COLLECTED_CURRENT, AtomicBool::new(false));
+    reset(&CAPTURES, std::sync::atomic::AtomicUsize::new(0));
     reset(&COLLECTED_RESTORED, AtomicBool::new(false));
     reset(&COLLECTED_WRITTEN, relax_session::sync::Mutex::new(None));
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
     reset(&MID_MANIFEST_DONE, AtomicBool::new(false));
     reset(&MID_MANIFEST_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&MANIFEST_WINDOW_LEN, std::sync::atomic::AtomicUsize::new(usize::MAX));
     reset(&IMAGE_REFRESH_WANTED, AtomicBool::new(false));
     reset(&MID_CACHE_DIR, relax_session::sync::Mutex::new(None));
     reset(&MAIN_START_WALL, AtomicU64::new(0));

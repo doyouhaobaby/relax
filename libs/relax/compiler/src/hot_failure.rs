@@ -175,6 +175,9 @@ pub(crate) fn replacement_running() -> bool { REPLACEMENT.load(Ordering::Acquire
 /// from here on a panic of the program's own code is the program's, and a JIT-internal error is
 /// still the JIT's (`replacement_jit_failed`).
 pub(crate) fn restored() {
+    if crate::reload::live_trace() {
+        eprintln!("relax live: restore completed at t={:.0} ms (replacement {}, recovering {})", crate::clock::ms_since_start(), replacement_running(), recovering());
+    }
     if !replacement_running() { return; }
     let _kept = crate::zone_alloc::kept();
     let error = RESTART_ERROR.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,6 +255,9 @@ pub fn pump() {
         let load_id = r.load.clone();
         state().pending.push_back(r);
         durable();
+        if crate::reload::live_trace() {
+            eprintln!("relax live: the restart's record written at t={:.0} ms", crate::clock::ms_since_start());
+        }
         crate::inspect::events::emit("patchrestarted", &record_id,
             &format!("\"record\":{},\"load\":{}", crate::inspect::json_str(&record_id), crate::inspect::json_str(&load_id)));
     }
@@ -322,9 +328,9 @@ pub(crate) fn hand_over() -> Result<Option<std::path::PathBuf>, String> {
     Ok(Some(path))
 }
 
-/// Windows: the next run never started, and the run that asked for it has ended, so its parent
+/// The next run never started, and the run that asked for it has ended, so its parent
 /// (restart_parent.rs) closes the recovery that run's file `path` describes.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) fn next_run_failed(path: &std::path::Path, why: &str) {
     let Some(r) = std::fs::read_to_string(path).ok().and_then(|s| Record::parse(&s)) else {
         eprintln!("relax hot: cannot read the recovery record {}", path.display());
@@ -357,6 +363,9 @@ pub(crate) fn restore() {
             ACTIVE.store(true, Ordering::Release);
             REPLACEMENT.store(true, Ordering::Release);
             let _ = std::fs::remove_file(path);
+            if crate::reload::live_trace() {
+                eprintln!("relax live: recovery taken at t={:.0} ms", crate::clock::ms_since_start());
+            }
         }
         None => eprintln!("relax hot: cannot restore the pending recovery record"),
     }

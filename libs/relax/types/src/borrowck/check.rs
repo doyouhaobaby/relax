@@ -186,8 +186,8 @@ fn compute_polonius_regions(tcx: &Tcx, prog: &Program, body: &Body, regions: &Mi
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
     let borrows = BorrowSet::build(tcx, body, invalidated, moves);
     let liveness = regions.polonius.compute_loan_liveness(tcx, prog, body, moves, &regions.locations, &borrows, &regions.regioncx);
-    let regioncx = regions.regioncx.with_liveness(tcx, prog, liveness, regions.locations.num_points(), &regions.type_tests, regions.nested);
-    MirRegionResult { regioncx, locations: regions.locations.clone(), type_tests: regions.type_tests.clone(), universe_causes: regions.universe_causes.clone(),
+    let regioncx = regions.regioncx.with_liveness(tcx, prog, liveness, regions.locations.num_points(), &regions.type_tests, &regions.advisories, regions.nested);
+    MirRegionResult { regioncx, locations: regions.locations.clone(), type_tests: regions.type_tests.clone(), advisories: regions.advisories.clone(), universe_causes: regions.universe_causes.clone(),
         polonius: regions.polonius.clone(), nested: regions.nested, tainted_by_errors: regions.tainted_by_errors }
 }
 

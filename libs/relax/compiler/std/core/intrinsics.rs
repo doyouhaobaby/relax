@@ -224,9 +224,6 @@ pub mod intrinsics_mem {
         /// reinterpret the bits; Relax checks size equality and R14 (repr(C)/scalars only)
         #[rustc_const_stable(feature = "const_transmute", since = "1.56.0")]
         pub fn transmute<T, U>(v: T) -> U;
-        /// enum discriminant as i64 (0 for non-enums)
-        #[rustc_intrinsic_const_stable_indirect]
-        pub fn discriminant_value<T>(v: &T) -> i64;
         /// stable 128-bit hash of the type (after monomorphisation): low and high halves
         // (rustc's type_id intrinsic is a const fn, const-unstable)
         #[rustc_const_unstable(feature = "core_intrinsics", issue = "none")]
@@ -243,6 +240,14 @@ pub mod intrinsics_mem {
         pub fn slice_len<T>(s: &[T]) -> usize;
         #[rustc_intrinsic_const_stable_indirect]
         pub fn str_as_bytes(s: &str) -> &[u8];
+    }
+    // safe, as rustc's (core::intrinsics::discriminant_value): it reads the discriminant through
+    // a reference, so the built-in derives' reads of it (PartialEq, PartialOrd, Ord, Hash on an
+    // enum) need no `unsafe` and load in a sandboxed module like any of its safe code
+    unsafe extern "relax-intrinsic" {
+        /// enum discriminant as i64 (0 for non-enums)
+        #[rustc_intrinsic_const_stable_indirect]
+        pub safe fn discriminant_value<T>(v: &T) -> i64;
     }
 }
 

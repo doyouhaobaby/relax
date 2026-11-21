@@ -241,6 +241,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
 
 impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     fn universe(&self) -> UniverseIndex { self.infcx.universe() }
+    fn num_region_vars(&self) -> usize { self.infcx.num_region_vars() }
     fn create_next_universe(&mut self) -> UniverseIndex { self.infcx.create_next_universe() }
     fn next_nll_region_var(&mut self, origin: NllRegionVariableOrigin, universe: UniverseIndex) -> RegionId { self.infcx.next_nll_region_var_in_universe(origin, universe) }
     fn to_region_vid(&self, r: RegionId) -> RegionVid {
@@ -276,6 +277,12 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }
         let op = ProvePredicate { predicate: crate::next_solver::collect::trait_predicate(def, args.to_vec()) };
         let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
+    }
+    fn type_must_outlive(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, region: RegionId, locations: Locations, span: Span,
+        outer: ConstraintCategory, category: ConstraintCategory) {
+        let universals = self.universal_regions.as_ref().expect("MIR type ops require universal regions");
+        super::type_check::constraint_conversion::ConstraintConversion::new(self, universals, &self.region_bound_pairs, &self.param_env.clauses,
+            locations, span, outer, out).convert_type_outlives(ty, region, category);
     }
     fn prove_wf(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations, category: ConstraintCategory) {
         let op = ProvePredicate { predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) };

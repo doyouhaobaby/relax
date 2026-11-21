@@ -614,6 +614,20 @@ pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, 
     try_instantiate_body(cx, prog, tcx, def, args).unwrap_or_else(|_| no_codegen_body(prog, tcx, def, args))
 }
 
+/// The body the borrow check reads for the instance `def<args>`, typed as the check types it:
+/// rustc_borrowck reads the identity body's typeck results (TypingMode::borrowck), where another
+/// fn's opaque return stays the opaque its signature names. The identity instance is the stored
+/// typeck body (as check_crate and the background checker pass it); a concrete one is normalized
+/// in the borrowck mode. `instantiate_body`'s instance is revealed (PostAnalysis, codegen's view):
+/// a call's destination there is the callee's hidden type while the check reads the callee's output
+/// as the opaque, a MIR bug (call dest mismatch) at every call of a fn returning `impl Trait`.
+pub fn borrowck_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<std::sync::Arc<Body>, crate::next_solver::NoSolution> {
+    let body = tcx.typeck(prog, def);
+    if *body.args == *args { return Ok(body); }
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, def), param_env: crate::tcx::ParamEnvId::EMPTY, mode: crate::tcx::TypingMode::borrowck(tcx, prog, def) };
+    instantiate::try_normalize_body(prog, tcx, env, &body, args).map(std::sync::Arc::new)
+}
+
 static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
@@ -1088,6 +1102,21 @@ impl<'a> Fcx<'a> {
 
     fn fresh(&mut self, kind: u8) -> TyId {
         match kind { 0 => self.infcx.next_ty_var(), 1 => self.infcx.next_int_var(), 2 => self.infcx.next_float_var(), _ => unreachable!() }
+    }
+
+    /// fn_ctxt/_impl.rs structurally_resolve_type: whether `t`'s outer type is known, the pending goals
+    /// settled first. A type variable still open there (a closure's parameter only a later call
+    /// names) is E0282, unless the body has an error already, and becomes `{error}`: false.
+    fn structurally_resolve(&mut self, t: TyId, lo: u32) -> bool {
+        if !matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Infer(_)) { return true; }
+        self.retry_goals(false);
+        if !matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Infer(_)) { return true; }
+        if self.b.errors.is_empty() && !self.infcx.tainted_by_errors() {
+            self.err(lo, "E0282: type annotations needed".to_string());
+        }
+        let error = self.tcx.tys.error;
+        self.eq(t, error);
+        false
     }
 
     fn shallow(&mut self, t: TyId) -> TyId {
@@ -3802,7 +3831,7 @@ impl<'a> Fcx<'a> {
                     explicit2.push(e);
                 }
             }
-            let targs = self.tcx.fill_trait_defaults(&self.cx.with_infcx(&self.infcx), prog, td, self_t, explicit2);
+            let targs = self.tcx.fill_trait_defaults(&self.cx.with_infcx(&self.infcx), prog, td, self_t, explicit2, crate::types::RegionArgsId::EMPTY);
             let mut args = vec![self_t];
             args.extend(targs);
             // the item's own args from the path (`<S as T<123>>::l::<true>()`)
@@ -5221,6 +5250,8 @@ impl<'a> Fcx<'a> {
                 // rustc_hir_typeck/src/expr.rs check_expr_unary and op.rs:960-1080.
                 UnOp::Neg | UnOp::Not => {
                     let t = self.check_expr(*x, expected);
+                    // the operand's type is resolved structurally first (E0282 while still open)
+                    if !self.structurally_resolve(t, lo) { return error; }
                     let st = self.shallow(t);
                     let builtin = match (op, self.tcx.tys.kind(st)) {
                         (UnOp::Neg, TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)) => true,
@@ -5237,6 +5268,7 @@ impl<'a> Fcx<'a> {
                 }
                 UnOp::Deref => {
                     let t = self.check_expr(*x, None);
+                    if !self.structurally_resolve(t, lo) { return error; }
                     // (a built-in `*` is no adjustment; an overloaded one is the operand's Deref::deref)
                     match self.deref_step_raw(t) {
                         Some((i, overloaded)) => {

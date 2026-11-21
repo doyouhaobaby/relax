@@ -80,7 +80,7 @@ pub struct Discriminant<T>(<T as crate::marker::DiscriminantKind>::Discriminant)
 pub const fn discriminant<T>(v: &T) -> Discriminant<T> {
     // the intrinsic's i64, sign-extended to the widest discriminant type: its low bytes are the
     // value as the discriminant type (the JIT's targets are little-endian)
-    let wide = unsafe { im::discriminant_value(v) } as i128;
+    let wide = im::discriminant_value(v) as i128;
     Discriminant(unsafe { transmute_copy::<i128, <T as crate::marker::DiscriminantKind>::Discriminant>(&wide) })
 }
 

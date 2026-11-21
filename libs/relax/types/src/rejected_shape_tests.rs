@@ -220,3 +220,312 @@ fn a_callee_bound_on_the_callers_own_opaque_output_keeps_its_other_bounds() {
         pub fn ok(x: u8) -> impl Sized { ndu(ok, 5u8); x }");
     assert!(has(&e, "a2", "E0597") && e.len() == 1, "{e:?}");
 }
+
+/// A higher-ranked closure over a reference to a value holding an alias: the closure's binder assumes its
+/// signature well formed, the alias outliving the binder's region among it, so that obligation of its other side
+/// is decided by the assumption rather than by the alias's declared bound (an opaque capturing a borrow, a plain
+/// or a region-carrying projection that stays rigid, two opaques, a fn pointer next to one). Reifying `foo` at a
+/// type holding an opaque stays refused.
+#[test]
+fn a_higher_ranked_closure_assumes_what_an_alias_in_its_argument_outlives() {
+    let e = errors("
+        pub struct M { pub a: f32, pub b: f32 }
+        fn chords(m: &M) -> (usize, impl Fn(f32) -> f32 + '_) { (1, move |f| m.a * f + m.b) }
+        pub fn exact(ms: &[M]) -> f32 {
+            let mut t = 0.0;
+            for m in ms {
+                let arc = (m.a > 0.0).then(|| chords(m));
+                let one = arc.as_ref().is_none_or(|(n, _)| *n == 1);
+                let mid = arc.as_ref().filter(|_| one).map(|(_, at)| at(0.5));
+                t += mid.unwrap_or(0.0);
+            }
+            t
+        }
+        pub fn only_then(m: &M) -> usize { let arc = (m.a > 0.0).then(|| chords(m)); arc.map_or(0, |(n, _)| n) }
+        pub fn none_or(m: &M) -> bool { let arc = Some(chords(m)); arc.as_ref().is_none_or(|(n, _)| *n == 1) }
+        pub fn map_ref(m: &M) -> Option<f32> { let arc = Some(chords(m)); arc.as_ref().map(|(_, at)| at(0.5)) }
+        pub fn filter_ref(m: &M) -> bool { let arc = Some(chords(m)); arc.as_ref().filter(|_| true).is_some() }
+        pub fn filter_own(m: &M) -> bool { let arc = Some(chords(m)); arc.filter(|_| true).is_some() }
+        fn hr<T>(x: &T, f: impl for<'r> Fn(&'r T) -> bool) -> bool { f(x) }
+        pub fn higher(m: &M) -> bool { let arc = chords(m); hr(&arc, |x| x.0 == 1) }
+        pub fn higher_ref(m: &M) -> bool { let arc = chords(m); hr(&&arc, |x| x.0 == 1) }
+        pub struct Hold<'h>(pub &'h M);
+        pub fn higher_struct(m: &M) -> bool { let h = Hold(m); hr(&h, |x| x.0.a > 0.0) }
+        fn mk<T: Fn() -> u8>(t: T) -> impl Fn() -> u8 { t }
+        pub fn captured<T: Fn() -> u8>(t: T) -> bool { let o = mk(t); hr(&o, |x| x() == 1) }
+        pub fn item<I: Iterator>(v: I::Item) -> bool { hr(&v, |_| true) }
+        pub fn rigid_ref<'a, T>(v: <&'a T as IntoIterator>::IntoIter) -> bool where &'a T: IntoIterator { hr(&v, |_| true) }
+        pub fn two(m1: &M, m2: &M) -> bool { hr(&(chords(m1), chords(m2)), |x| (x.0).0 == (x.1).0) }
+        fn twice(x: &u8) -> u8 { *x * 2 }
+        pub fn with_ptr(m: &M) -> bool { hr(&(chords(m), twice as fn(&u8) -> u8), |x| (x.1)(&1) == 2) }
+        static UNIT: &'static &'static () = &&();
+        fn foo<'a, 'b, T>(_: &'a &'b (), v: &'b T) -> &'a T { v }
+        pub fn reify_opaque(m: &M) -> usize {
+            let arc = chords(m);
+            let f: for<'s> fn(&'static &'static (), &'s (usize, _)) -> &'static (usize, _) = foo;
+            f(UNIT, &arc).0
+        }");
+    for f in ["chords", "exact", "only_then", "none_or", "map_ref", "filter_ref", "filter_own", "hr", "higher", "higher_ref", "higher_struct",
+        "mk", "captured", "item", "rigid_ref", "two", "twice", "with_ptr", "foo"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
+    assert!(has(&e, "reify_opaque", ""), "{e:?}");
+}
+
+/// `foo` relies on `'b: 'a`, which its first argument's type implies. Reified to
+/// `for<'s> fn(&'static &'static (), &'s T) -> &'static T`, or first to its own signature and then by subtyping
+/// to that one, it would turn any borrow into a `'static` one. A binder opened with fresh variables proves its
+/// instantiated signature well formed; one opened with placeholders assumes its own signature well formed, so
+/// the pointers whose signature gives the bounds stay accepted, also where a fn pointer sits inside another
+/// binder's signature (a closure over items holding fn pointers, a closure taking one).
+#[test]
+fn a_fn_pointer_keeps_the_bounds_its_signature_implies() {
+    let e = errors("
+        static UNIT: &'static &'static () = &&();
+        fn foo<'a, 'b, T>(_: &'a &'b (), v: &'b T) -> &'a T { v }
+        pub fn reify<'x, T>(x: &'x T) -> &'static T {
+            let f: for<'s> fn(&'static &'static (), &'s T) -> &'static T = foo;
+            f(UNIT, x)
+        }
+        pub fn subtype<'x, T>(x: &'x T) -> &'static T {
+            let f: for<'a, 'b> fn(&'a &'b (), &'b T) -> &'a T = foo;
+            let g: for<'s> fn(&'static &'static (), &'s T) -> &'static T = f;
+            g(UNIT, x)
+        }
+        pub fn get<S, T>(_: &S) -> &T { loop {} }
+        pub fn output<S, T>() -> for<'a> fn(&'a S) -> &'a T { get::<S, T> }
+        pub fn nested<'a, 'b>(x: &'a &'b u8) -> &'a u8 { *x }
+        pub fn placeholders() -> for<'a, 'b> fn(&'a &'b u8) -> &'a u8 { nested }
+        pub struct Foo<'c>(pub &'c u8);
+        impl<'c> Foo<'c> { pub fn me(&self) -> &Foo<'c> { self } }
+        pub fn free<'c>() -> for<'a> fn(&'a Foo<'c>) -> &'a Foo<'c> { Foo::me }
+        pub type Params = fn(&[String]) -> &'static str;
+        static QUERIES: std::sync::Mutex<Vec<(&'static str, Params)>> = std::sync::Mutex::new(Vec::new());
+        pub fn found(name: &str) -> Option<Params> { QUERIES.lock().unwrap().iter().find(|x| x.0 == name).map(|x| x.1) }
+        pub struct Build<'b>(pub &'b mut Vec<u8>);
+        impl Build<'_> {
+            fn put(&mut self, x: u8) -> u8 { self.0.push(x); x }
+            pub fn through(&mut self) -> u8 { let call = |b: &mut Self, f: fn(&mut Self, u8) -> u8| f(b, 1); call(self, Self::put) }
+        }");
+    for f in ["reify", "subtype"] { assert!(has(&e, f, ""), "{f}: {e:?}"); }
+    for f in ["foo", "get", "output", "nested", "placeholders", "me", "free", "found", "put", "through"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
+}
+
+/// A higher-ranked relation nested in a binder's signature that opens no scope of its own (a `dyn`'s
+/// higher-ranked principal) is set aside by the binder when nothing ties it to the binder's other regions: the
+/// shapes below stay accepted (`filter` on an `Option<&dyn Fn(&B)>`, through `&mut dyn FnMut`, a chain, an outer
+/// lifetime inside the dyn's binder, a borrowed output, two dyns, a user trait, next to an opaque, a reify, and
+/// a dyn binder that opens only variables). A nested placeholder tied to the binder's own stays refused, and so
+/// does `foo`'s lifetime extension with a higher-ranked dyn added to both signatures.
+#[test]
+fn a_nested_higher_ranked_relation_is_set_aside_by_its_binder() {
+    let e = errors(r#"
+        // `pred` and the csg-sdf expression it was reduced from
+        pub type Bounds = ([f64; 3], [f64; 3]);
+        
+        pub fn pred<'a>(slope: Option<&'a dyn Fn(&Bounds, f64) -> f64>, v: f64) -> bool {
+            slope.filter(|_| v > 0.0).is_some()
+        }
+        
+        pub struct Prover<'a> {
+            pub slope: Option<&'a dyn Fn(&Bounds, f64) -> f64>,
+            pub lip: &'a dyn Fn() -> f64,
+        }
+        
+        impl Prover<'_> {
+            pub fn radius(&self, c: [f64; 3], v: f64) -> f64 {
+                let at = |c: [f64; 3], v: f64| {
+                    self.slope.filter(|_| v > 0.0).map_or(f64::INFINITY, |slope| {
+                        slope(&(c.map(|x| x - v), c.map(|x| x + v)), v)
+                    })
+                };
+                let local = at(c, v);
+                v / if local.is_finite() { local.max(1.0) } else { (self.lip)().max(1.0) }
+            }
+        }
+        
+        // Each closure signature contains the nested dyn relation being checked.
+        pub fn mut_pred(
+            slope: Option<&mut dyn FnMut(&Bounds) -> f64>,
+            b: &Bounds,
+            v: f64,
+        ) -> Option<f64> {
+            slope.filter(|_| v > 0.0).map(|slope| slope(b))
+        }
+        
+        pub fn chained(slope: Option<&dyn Fn(&Bounds) -> f64>, b: &Bounds, v: f64) -> bool {
+            // Retain the dyn through all three closure signatures.
+            slope.map(|cb| cb).filter(|_| v > 0.0).is_some_and(|cb| cb(b) > 0.0)
+        }
+        
+        pub fn outer_lifetime<'a>(
+            slope: Option<&'a dyn Fn(&Bounds, &'a f64) -> f64>,
+            b: &Bounds,
+            v: &'a f64,
+        ) -> Option<f64> {
+            slope.filter(|_| *v > 0.0).map(|cb| cb(b, v))
+        }
+        
+        pub fn borrowed_output<'b>(
+            slope: Option<&dyn Fn(&Bounds) -> &f64>,
+            b: &'b Bounds,
+        ) -> Option<&'b f64> {
+            slope.filter(|_| true).map(|cb| cb(b))
+        }
+        
+        pub fn two_dyns(
+            pair: Option<(&dyn Fn(&Bounds) -> f64, &dyn Fn(&Bounds) -> f64)>,
+            b: &Bounds,
+        ) -> bool {
+            pair.filter(|_| true).is_some_and(|(left, right)| left(b) == right(b))
+        }
+        
+        pub trait Tr<'s> {
+            fn value(&self, b: &'s Bounds) -> f64;
+        }
+        
+        pub fn user_trait(slope: Option<&dyn for<'s> Tr<'s>>, b: &Bounds) -> Option<f64> {
+            slope.filter(|_| true).map(|cb| cb.value(b))
+        }
+        
+        // These definitions are exactly the binder3 helpers from rejected_shape_tests.rs.
+        pub struct M { pub a: f32, pub b: f32 }
+        fn chords(m: &M) -> (usize, impl Fn(f32) -> f32 + '_) { (1, move |f| m.a * f + m.b) }
+        fn hr<T>(x: &T, f: impl for<'r> Fn(&'r T) -> bool) -> bool { f(x) }
+        
+        pub fn opaque_dyn(m: &M, cb: &dyn Fn(&u8) -> u8) -> bool {
+            hr(&(chords(m), cb), |_| true)
+        }
+        
+        fn g(_: &dyn Fn(&u8)) {}
+        
+        pub fn reify_dyn() -> for<'a> fn(&'a (dyn for<'s> Fn(&'s u8) + 'a)) {
+            g
+        }
+        
+        // The source callback accepts one outer-bound lifetime; contravariance permits
+        // its caller to provide a dyn that accepts every input lifetime.
+        pub fn existential_only_fn(
+            f: for<'r> fn(&'r u8, &'r (dyn Fn(&'r u8) + 'r)),
+        ) -> for<'r> fn(&'r u8, &'r (dyn for<'s> Fn(&'s u8) + 'r)) {
+            f
+        }
+        
+        fn call_higher_ranked(
+            f: impl for<'r> Fn(&'r u8, &'r (dyn for<'s> Fn(&'s u8) + 'r)),
+            x: &u8,
+            cb: &dyn for<'s> Fn(&'s u8),
+        ) {
+            f(x, cb)
+        }
+        
+        pub fn existential_only_closure(
+            f: for<'r> fn(&'r u8, &'r (dyn Fn(&'r u8) + 'r)),
+            x: &u8,
+            cb: &dyn for<'s> Fn(&'s u8),
+        ) {
+            call_higher_ranked(|x, cb| f(x, cb), x, cb)
+        }
+        
+        // Also put the narrowed dyn in the higher-ranked closure's output signature.
+        fn call_adapter(
+            f: impl for<'r> Fn(&'r (dyn for<'s> Fn(&'s u8) + 'r)) -> &'r (dyn Fn(&'r u8) + 'r),
+            x: &u8,
+            cb: &dyn for<'s> Fn(&'s u8),
+        ) {
+            f(cb)(x)
+        }
+        
+        pub fn existential_only_output(x: &u8, cb: &dyn for<'s> Fn(&'s u8)) {
+            call_adapter(|cb| cb, x, cb)
+        }
+        
+        fn extend<'a, 'b, T>(_: &'a &'b (), x: &'b T, _: &dyn for<'s> Fn(&'s u8)) -> &'a T { x }
+        pub fn extend_dyn<'x, T>(x: &'x T, cb: &dyn for<'s> Fn(&'s u8)) -> &'static T {
+            let f: for<'a, 'b, 'c> fn(&'a &'b (), &'b T, &'c dyn for<'s> Fn(&'s u8)) -> &'a T = extend;
+            let g: for<'r, 'c> fn(&'static &'static (), &'r T, &'c dyn for<'s> Fn(&'s u8)) -> &'static T = f;
+            g(&&(), x, cb)
+        }
+
+        pub fn tied_placeholder(
+            source: for<'e> fn(&'e u8, Box<dyn for<'s> Fn(&'s u8)>),
+        ) -> for<'r> fn(&'r u8, Box<dyn Fn(&'r u8)>) {
+            source
+        }
+    "#);
+    assert!(!has(&e, "pred", ""), "pred: {e:?}");
+    assert!(!has(&e, "radius", ""), "radius: {e:?}");
+    assert!(!has(&e, "mut_pred", ""), "mut_pred: {e:?}");
+    assert!(!has(&e, "chained", ""), "chained: {e:?}");
+    assert!(!has(&e, "outer_lifetime", ""), "outer_lifetime: {e:?}");
+    assert!(!has(&e, "borrowed_output", ""), "borrowed_output: {e:?}");
+    assert!(!has(&e, "two_dyns", ""), "two_dyns: {e:?}");
+    assert!(!has(&e, "user_trait", ""), "user_trait: {e:?}");
+    assert!(!has(&e, "opaque_dyn", ""), "opaque_dyn: {e:?}");
+    assert!(!has(&e, "reify_dyn", ""), "reify_dyn: {e:?}");
+    assert!(!has(&e, "existential_only_fn", ""), "existential_only_fn: {e:?}");
+    assert!(!has(&e, "existential_only_closure", ""), "existential_only_closure: {e:?}");
+    assert!(!has(&e, "existential_only_output", ""), "existential_only_output: {e:?}");
+    assert!(has(&e, "tied_placeholder", ""), "tied_placeholder: {e:?}");
+    assert!(has(&e, "extend_dyn", ""), "extend_dyn: {e:?}");
+    // Check the helpers too, so errors there cannot make the shape checks vacuous.
+    assert!(!has(&e, "chords", ""), "chords: {e:?}");
+    assert!(!has(&e, "hr", ""), "hr: {e:?}");
+    assert!(!has(&e, "g", ""), "g: {e:?}");
+    assert!(!has(&e, "call_higher_ranked", ""), "call_higher_ranked: {e:?}");
+    assert!(!has(&e, "call_adapter", ""), "call_adapter: {e:?}");
+    assert!(!has(&e, "extend", ""), "extend: {e:?}");
+}
+
+/// Signature lifetimes produce actionable warnings without changing acceptance; explicit bounds, bound
+/// signature regions, static outputs and inference regions that grow to meet it satisfy the rule.
+#[test]
+fn a_callable_whose_signature_may_not_outlive_a_region_warns() {
+    const CHILD: &str = "RELAX_CALLABLE_OUTLIVES_TEST";
+    if std::env::var(CHILD).is_err() {
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rejected_shape_tests::a_callable_whose_signature_may_not_outlive_a_region_warns", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_LINT_FLAGS", ""));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "callable warning test did not pass: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    let source = r#"
+        fn need<F: 'static>(_: F) {}
+        fn early<'a: 'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn early_fn<'x>() { need(early::<'x>); }
+        fn plain() {}
+        fn id<'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn plain_fn() { need(plain); }
+        pub fn bound_fn() { need(id); }
+        pub fn bound_closure() { need(|x: &u8| *x); }
+        pub fn static_closure() { need(|| -> &'static str { "" }); }
+        pub struct Link<'s>(pub &'s str);
+        pub struct Doc(u8);
+        impl Doc {
+            pub fn resolve<'s>(&self) -> impl FnMut(Link<'s>) -> (&'s str, u8) + '_ { let value = &self.0; move |link: Link<'s>| (link.0, *value) }
+            pub fn resolve_bound<'a, 's: 'a>(&'a self) -> impl FnMut(Link<'s>) -> (&'s str, u8) + 'a { let value = &self.0; move |link: Link<'s>| (link.0, *value) }
+        }
+        pub struct Trees(pub [u8; 2], pub [u8; 2]);
+        impl Trees {
+            pub fn all(&self) -> impl Iterator<Item = u8> + '_ { [&self.0, &self.1].into_iter().flat_map(|t| (0..2usize).map(move |i| t[i])) }
+        }
+    "#;
+    crate::lint::enable();
+    let (e, reports) = crate::lint::capture(|| errors(source));
+    assert!(e.is_empty(), "callable advisories changed acceptance, including a helper: {e:?}");
+    assert!(reports.iter().all(|r| r.level < crate::lint::Level::Deny), "callable cases emitted a lint error: {:?}", reports.iter().map(|r| &r.line).collect::<Vec<_>>());
+    let warnings: Vec<_> = reports.iter().filter(|r| r.lint == crate::lint::CALLABLE_OUTLIVES.name).map(|r| &r.line).collect();
+    let line = |item: &str| source.lines().position(|l| l.contains(&format!("fn {item}"))).expect("test item") + 1;
+    let warning_line = |w: &String| w.split(": warning: ").next().unwrap().rsplit(':').nth(1).and_then(|n| n.parse::<usize>().ok()).expect("warning location");
+    for (item, signature) in [("early_fn", "the signature of `"), ("resolve<", "this closure's signature")] {
+        let found: Vec<_> = warnings.iter().filter(|w| warning_line(w) == line(item)).collect();
+        assert!(!found.is_empty(), "{item}: missing signature lifetime warning: {warnings:?}");
+        assert!(found.iter().all(|w| w.contains(signature) && w.contains("note: a callable outlives a lifetime only if every lifetime its signature names does")
+            && w.contains("help: state the bound where both lifetimes are declared")), "{item}: warning lost the callable, rule or fix: {found:?}");
+    }
+    assert!(warnings.iter().any(|w| warning_line(w) == line("early_fn") && w.contains("early`") && w.contains("`'x: 'static`")), "early_fn: warning lost the function path or named lifetime bound: {warnings:?}");
+    assert!(warnings.iter().any(|w| warning_line(w) == line("resolve<") && w.contains("names `'s`") && w.contains("fn f<'a, 's: 'a>")), "resolve: warning lost the named signature lifetime or anonymous receiver fix: {warnings:?}");
+    for item in ["need<", "early<", "plain()", "id<", "plain_fn", "bound_fn", "bound_closure", "static_closure", "resolve_bound", "all("] {
+        assert!(!warnings.iter().any(|w| warning_line(w) == line(item)), "{item}: a satisfied signature lifetime requirement warned: {warnings:?}");
+    }
+    assert!(warnings.iter().all(|w| [line("early_fn"), line("resolve<")].contains(&warning_line(w))), "unexpected callable warning outside the two unproven requirements: {warnings:?}");
+}

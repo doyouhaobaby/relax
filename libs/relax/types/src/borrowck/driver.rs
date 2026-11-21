@@ -555,10 +555,11 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         }
         // `report_opaque_type_errors`: only when the region inference found no error (those would explain them).
         let opaque_errors = checked.regions.regioncx.errors.is_empty() && !checked.deferred_opaque_type_errors.is_empty();
-        // The borrow set, region names and diagnostics context exist to render errors; rustc makes the
-        // names only when it reports one. A body with nothing to render builds none of them.
+        // The borrow set, region names and diagnostics context also render advisory warnings. A body with
+        // nothing to report builds none of them.
         let r = &checked.result;
-        if !r.errors.is_empty() || !r.region_errors.is_empty() || !r.fv_only.is_empty() || opaque_errors {
+        let advisory_warnings = crate::lint::enabled() && !checked.regions.regioncx.advisory_failures.is_empty();
+        if !r.errors.is_empty() || !r.region_errors.is_empty() || !r.fv_only.is_empty() || opaque_errors || advisory_warnings {
             let borrows = BorrowSet::build(tcx, &p.mir, matches!(p.mir.source.kind, BodyKind::Fn | BodyKind::Closure(_)), &p.moves);
             let names = universal_names(tcx, prog, p);
             let mut dcx = DiagCx::new(tcx, prog, p.owner.owner, &p.mir, &p.moves, &checked.regions, &borrows, &names);

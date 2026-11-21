@@ -2050,7 +2050,7 @@ impl Program {
         ParseSnapshot { old, path: path.to_string(), edition, kname, mod_path, dir, root: root.to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros,
             reuse: self.parse_reuse.get(&old).cloned().unwrap_or_default(),
-            previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone() }
+            previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone(), line_origins: Default::default() }
     }
 
     /// A parse of a NEW file that becomes child module `child` of module `parent` (makepad
@@ -2064,7 +2064,7 @@ impl Program {
         ParseSnapshot { old: self.mods[normal as usize].file, path: path.to_string(), edition: self.crates[krate as usize].edition, kname, mod_path,
             dir: dir_of(path).to_string(), root: self.crates[krate as usize].root_path().to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros: self.macros.clone(), reuse: Default::default(), previous: None,
-            context: self.crates[krate as usize].context.clone() }
+            context: self.crates[krate as usize].context.clone(), line_origins: Default::default() }
     }
 
     /// Adds `v` (a child_parse_snapshot parse) as a new private module `name` of module `parent`
@@ -6576,6 +6576,8 @@ pub struct ParseSnapshot {
     pub reuse: std::sync::Arc<crate::parse_work::Reuse>,
     pub previous: Option<std::sync::Arc<ParsedFile>>,
     pub context: std::sync::Arc<crate::source_context::Context>,
+    /// the regions of the text to parse that count their lines from another text (LineOrigins)
+    pub line_origins: crate::parser::LineOrigins,
 }
 /// Files edited together: each parse sees the imports the others write.
 pub fn share_import_edits<'a>(snapshots: &mut [Option<ParseSnapshot>], sources: impl Iterator<Item = &'a [u8]>) {
@@ -6625,7 +6627,9 @@ impl ParseSnapshot {
     /// diagnostics name it).
     pub fn parse_tokens(&self, src: Vec<u8>, stream: crate::pm_tokens::TokenStream) -> Result<FileVersion, String> {
         let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
-        let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let mut bctx = crate::builtins::FileCtx::new(kname, path, mod_path, cfg);
+        bctx.line_origins = self.line_origins.clone();
+        let bctx = std::rc::Rc::new(bctx);
         let context = self.context.edited(path, src.into());
         let (mut pf, used) = crate::parser::parse_token_stream(stream, path, *edition, Some(crate::macros::MacroScope::new(macros.clone())), bctx, context.sources().clone(), false)
             .map_err(|(span, m)| format!("{}:{}: {}", path, span.lo, m))?;
@@ -6636,7 +6640,9 @@ impl ParseSnapshot {
 
     pub fn parse_full(&self, src: Vec<u8>) -> Result<FileVersion, String> {
         let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
-        let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let mut bctx = crate::builtins::FileCtx::new(kname, path, mod_path, cfg);
+        bctx.line_origins = self.line_origins.clone();
+        let bctx = std::rc::Rc::new(bctx);
         let imports = crate::preload::import_edit(self, &src);
         let mut macros = macros.clone();
         if imports.is_some() || !self.together.is_empty() {
@@ -6848,17 +6854,49 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
 /// Other bodies appended to the file arena never contribute to this ordinal.
 pub fn closure_exprs(prog: &Program, owner: DefId) -> Vec<u32> {
     let def = prog.def(owner);
-    let file = &prog.files[def.file as usize];
-    prog.item_expr_ranges(def.file, def.item).into_iter().flat_map(|(lo, hi)| lo..hi)
-        .filter(|&i| matches!(file.ast.expr(crate::ast::ExprId(i)).kind, crate::ast::ExprKind::Closure { .. } | crate::ast::ExprKind::Async(..))).collect()
+    closure_exprs_at(prog, def.file, def.item)
 }
+
+/// `closure_exprs` of item `item` of file version `file`.
+pub fn closure_exprs_at(prog: &Program, file: u32, item: ItemId) -> Vec<u32> {
+    let f = &prog.files[file as usize];
+    prog.item_expr_ranges(file, item).into_iter().flat_map(|(lo, hi)| lo..hi)
+        .filter(|&i| matches!(f.ast.expr(crate::ast::ExprId(i)).kind, crate::ast::ExprKind::Closure { .. } | crate::ast::ExprKind::Async(..))).collect()
+}
+
+/// Item def `item` in file version `file`: its item there, current or not. A commit moves the def
+/// to the new version (retarget_file), and an older version keeps its own entries in `item_defs`,
+/// so a closure of that version is counted among its owner's closures in the version it names.
+/// None: the item is not in that version (added by a later edit). A closure def stands for the
+/// item it is in.
+pub fn item_in_version(prog: &Program, mut item: DefId, file: u32) -> Option<ItemId> {
+    for _ in 0..64 {
+        let def = prog.def(item);
+        if def.kind != DefKind::Closure || def.parent == NO_DEF { break; }
+        item = def.parent;
+    }
+    let def = prog.def(item);
+    if def.file == file {
+        return Some(def.item);
+    }
+    let n = prog.files.get(file as usize)?.ast.items.len() as u32;
+    (0..n).find(|&i| prog.item_defs.get(&(file, i)) == Some(&item)).map(ItemId)
+}
+
+/// Closure names whose owner has no item in the closure's file version.
+pub static STABLE_CLOSURE_NAME_FILE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// An owner-local closure ordinal; anonymous owners use a file-level fallback.
 pub fn stable_closure_name(prog: &Program, file: u32, e: u32, owner: Option<DefId>) -> String {
     let Some(f) = prog.files.get(file as usize) else { return format!("{{closure@{}}}", e) };
     let path = owner.map(|d| hint_path(&prog.defs, &prog.syms, &prog.files, d)).unwrap_or_default();
-    let n = owner.filter(|d| prog.def(*d).file == file)
-        .and_then(|d| closure_exprs(prog, d).iter().position(|&x| x == e))
+    // counted in the file version the closure names, as the cache's keys count it (closure_ordinal)
+    let n = owner.and_then(|d| {
+            let item = item_in_version(prog, d, file);
+            if item.is_none() { STABLE_CLOSURE_NAME_FILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            item
+        })
+        .and_then(|i| closure_exprs_at(prog, file, i).iter().position(|&x| x == e))
         .unwrap_or_else(|| (0..e).filter(|&i| matches!(f.ast.exprs.get(i as usize).map(|x| &x.kind), Some(crate::ast::ExprKind::Closure { .. }))).count());
     if path.is_empty() {
         format!("{}::{{closure#{}}}", prog.file_paths.get(file as usize).map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or("?"), n)
@@ -7378,6 +7416,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));
     reset(&LOAD_STEPS, std::sync::atomic::AtomicU64::new(0));
     reset(&PARSE_AGAIN, std::sync::atomic::AtomicU64::new(0));
+    reset(&STABLE_CLOSURE_NAME_FILE_MISSES, std::sync::atomic::AtomicU64::new(0));
     reset(&COLLECTING, std::sync::atomic::AtomicBool::new(false));
     reset(&COLLECT_MISSES, relax_session::sync::Mutex::new(Vec::new()));
 }

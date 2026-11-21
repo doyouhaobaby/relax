@@ -470,6 +470,8 @@ fn hand_build(runs: &Path, entry: &Path) -> std::io::Result<String> {
     let kept = unsafe { std::fs::File::from_raw_fd(fd) };
     let m = kept.metadata()?;
     *held = Some(kept);
+    // (Relax std's spawn of the program, or of a package binary it prepared, hands it by this too)
+    crate::progenv::set_build_handle(Some(format!("{} {fd} {} {}", std::process::id(), m.dev(), m.ino())));
     Ok(format!("{fd} {} {}", m.dev(), m.ino()))
 }
 
@@ -521,6 +523,29 @@ pub fn relaunch_build() -> Option<Vec<u8>> {
     let build = handed.and_then(|(fd, dev, ino)| read_handed(&[(pid, fd, dev, ino)], pid));
     if build.is_none() {
         eprintln!("relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
+    }
+    build
+}
+
+/// The build environment the run that spawned this process handed it by a descriptor (progenv
+/// `BUILD_FD`: Relax std's spawn of a run's program, or of a package binary the run prepared),
+/// read and closed, the name taken out of the environment: what the loader builds with before
+/// anything reads the environment (progenv `init_handed`). On Linux, where a launcher closed the
+/// descriptor on the way, that run's own is read through /proc. None when none was handed; said in
+/// one line when one was and it did not reach this process.
+#[cfg(unix)]
+pub fn spawned_build() -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(crate::progenv::BUILD_FD).unwrap();
+    let words = std::env::var_os(name)?;
+    unsafe { std::env::remove_var(name) };
+    let at = words.to_str().and_then(|w| {
+        let mut w = w.split(' ');
+        let r = (w.next()?.parse::<u32>().ok()?, w.next()?.parse::<i32>().ok().filter(|&fd| fd >= 0)?, w.next()?.parse().ok()?, w.next()?.parse().ok()?);
+        w.next().is_none().then_some(r)
+    });
+    let build = at.and_then(|(pid, fd, dev, ino)| read_handed(&[(pid, fd, dev, ino)], pid));
+    if build.is_none() {
+        eprintln!("relax: the build environment of the run that started this process did not reach it (its descriptor was closed on the way); it builds with its own");
     }
     build
 }
@@ -590,6 +615,12 @@ pub fn prepared_build(args: &[Vec<u8>]) -> Option<Vec<u8>> {
 /// a launcher that clears the environment drops the build environment Relax std's spawn handed it.
 #[cfg(windows)]
 pub fn prepared_build(_args: &[Vec<u8>]) -> Option<Vec<u8>> {
+    None
+}
+
+/// On Windows a run hands the build environment in `BUILD_ENV` (`hand_build` names no descriptor).
+#[cfg(windows)]
+pub fn spawned_build() -> Option<Vec<u8>> {
     None
 }
 

@@ -410,6 +410,13 @@ impl File {
             Ok(r as usize)
         }
     }
+    /// One writev(2) of the buffers (real std's File::write_vectored)
+    fn write_vectored_raw(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if self.virtual_stat.is_some() {
+            return Err(vfs::read_only());
+        }
+        io::fd_write_vectored(self.raw(), bufs)
+    }
     fn seek_raw(&self, pos: SeekFrom) -> io::Result<u64> {
         let (whence, off) = match pos {
             SeekFrom::Start(o) => (sys::SEEK_SET, o as i64),
@@ -474,6 +481,12 @@ impl Write for File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_raw(buf)
     }
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.write_vectored_raw(bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -482,6 +495,12 @@ impl Write for File {
 impl Write for &File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_raw(buf)
+    }
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.write_vectored_raw(bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
