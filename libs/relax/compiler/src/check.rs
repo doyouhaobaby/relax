@@ -1172,14 +1172,17 @@ pub fn finish_test_deps(code: i32) -> i32 {
     if *failed { 101 } else { code }
 }
 
-/// The app check beside the program (start_app_check): 0 none, 1 running, 2 done clean.
+/// The app check beside the program (start_app_check): 0 none, 1 running, 2 done clean, 3 found
+/// errors (the run ends in place: run_end::check_failed).
 static BESIDE: (relax_session::sync::Mutex<u8>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new());
 
 /// makepad run of an app that presents frames: its app check runs beside main instead of before
 /// it. Every body is still checked before it first runs (a lazy compile checks its body; a body
 /// with errors is a compile error, which ends the run). The first frame waits for the check
 /// (wait_app_check, from the platform's first window frame); an error ends the run before it,
-/// reported as a build's errors are (`stop`, then exit 101, the program's exit: os::proc::exit).
+/// reported as a build's errors are (`stop`). A live session's hosted run ends in place, as a
+/// restart's end does, and its host waits with no run for the next save or relaunch
+/// (run_end::check_failed); any other run exits 101 (the program's exit: os::proc::exit).
 pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::RuntimeOptions, stop: Box<dyn Fn(&[String]) + Send>) {
     *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 1;
     let upn = up as usize;
@@ -1194,6 +1197,15 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
         }
         if !errors.is_empty() {
             stop(&errors);
+            // a live session: the process never ends for a compile error. The run's end is the
+            // restart's (the program's threads, the run's, the unit, the statics), from its own
+            // thread, never from under the program's threads here; the first frame's gate lets
+            // the app's thread go to it (wait_app_check)
+            if crate::run::live_session() && crate::run::hosted_run() && crate::run_end::check_failed(&errors).is_ok() {
+                *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+                BESIDE.1.notify_all();
+                return;
+            }
             // as the program's own exit ends (os::proc::exit): without the C library's exit
             // handlers, which a native library registered (a GPU driver's teardown, from the
             // window's load) and which run while the program's threads go on in that library
@@ -1204,16 +1216,27 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
     }).expect("app check thread");
 }
 
+/// The app check beside main is running (start_app_check).
+pub(crate) fn app_check_running() -> bool {
+    *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) == 1
+}
+
 /// The first frame's gate (the platform asks before it submits its first window frame): waits
-/// for the app check beside main. An error it finds ends the process instead (start_app_check).
+/// for the app check beside main. An error it finds ends the run instead (start_app_check): the
+/// program's thread here leaves it, with no frame presented and no wait for the end's grace.
 pub fn wait_app_check() {
-    if *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) != 1 { return; }
+    let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    if state == 3 { crate::run_end::leave(); }
+    if state != 1 { return; }
     waited();
     let t0 = std::time::Instant::now();
     let mut g = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     while *g == 1 {
         g = BESIDE.1.wait(g).unwrap_or_else(|e| e.into_inner());
     }
+    let failed = *g == 3;
+    drop(g);
+    if failed { crate::run_end::leave(); }
     if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("relax: the first frame waited {:.0} ms for the app check", t0.elapsed().as_secs_f64() * 1e3);
     }

@@ -226,6 +226,35 @@ pub(crate) fn replacement_jit_failed(why: &str) -> bool {
     true
 }
 
+/// The run's app check found `errors` (run_end::check_failed): the edit's outcome, a refusal with
+/// its diagnostics, as a refused patch's (never the restart's failure nor the JIT's error: a type
+/// error is the person's, and devhub reads `jiterror` as the JIT's). A restart this run replaces
+/// ends with it: the run that follows is no replacement, and no record says it restarted. From the
+/// check's thread, before the run's end: one write, which on a failure stays pending.
+pub(crate) fn check_refused(why: &str, errors: &[String]) {
+    let _kept = crate::zone_alloc::kept();
+    let lines = errors.to_vec();
+    let recovery = {
+        let mut s = state();
+        let r = s.recovery.take().or_else(|| s.restarted.take()).or_else(|| s.replaced.take());
+        s.restarted = None;
+        s.replaced = None;
+        r
+    };
+    ACTIVE.store(false, Ordering::Release);
+    REPLACEMENT.store(false, Ordering::Release);
+    if REPORTING.load(Ordering::Acquire) {
+        let (attempt, failure) = match recovery {
+            Some(r) => (r.attempt, r.failure),
+            None => (current(), String::new()),
+        };
+        let r = record(&attempt, Outcome::Refused, why.to_string(), failure, lines.clone());
+        state().pending.push_back(r);
+        flush();
+    }
+    crate::reload::patch_refused_event(why, true, &lines);
+}
+
 /// Whether this run is a restart's replacement (its restore read a recovery), restored or not.
 pub(crate) fn replacement() -> bool { replacement_running() || state().replaced.is_some() }
 

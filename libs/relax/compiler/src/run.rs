@@ -209,11 +209,12 @@ pub(crate) fn host_end_app() {
 
 /// The host starts the next run in this process (`run_end`), whose boot is due (`boot_begins`):
 /// a host that starts none ends the gate.
-pub(crate) fn host_next_run() {
+pub(crate) fn host_next_run() -> bool {
     let started = MAIN_HOST.get().filter(|_| HOSTED_RUN.load(Ordering::Acquire)).is_some_and(|host| (host.next_run)());
     if !started {
         boot_over();
     }
+    started
 }
 
 /// A hosted run's boot is on: its program has not started, and the boot may still be building
@@ -3371,8 +3372,10 @@ pub struct MainHost {
     /// A run's threads have ended (`run_end`): the app's session goes, with what it held of the
     /// GPU, and the window back to the host.
     pub end_app: fn(),
-    /// A run ended in place (`run_end`): the host starts the next one, its window stays. False:
-    /// it started none (it has no run window).
+    /// A run ended in place (`run_end`): the host starts the next one, its window stays; after a
+    /// run that failed its app check (`run_end::take_check_failure`), one that waits for the next
+    /// save or the window's Restart, as a failed build's does. False: it started none (it has no
+    /// run window).
     pub next_run: fn() -> bool,
 }
 

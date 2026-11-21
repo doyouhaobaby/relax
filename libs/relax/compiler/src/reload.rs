@@ -9642,6 +9642,14 @@ pub(crate) static RESTART_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::
 /// ends it).
 static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
 
+/// A run that failed its app check ended in place (run_end::check_failed): the sources wait for a
+/// run that passes it, as an edit waits for a restart (`session` lists it), until a run loads them.
+pub(crate) fn check_failed_pending(why: &str) {
+    // (a relaunch then says "restarting (the last run ended in place: ...)", not the check's
+    // errors as if they were its reason)
+    note_restart_pending(&format!("the last run ended in place: {why}"));
+}
+
 fn note_restart_pending(why: &str) {
     note_restart_pending_in(why, Vec::new());
 }
