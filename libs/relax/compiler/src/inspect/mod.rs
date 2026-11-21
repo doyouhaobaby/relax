@@ -1449,6 +1449,8 @@ fn cmd_jit(req: &Req, out: &mut Out) {
 /// `unverified_why` says what the oldest of those groups waits on (reload::unverified_why).
 /// `restart_unfinished`: a restart in place is not over (run_end::unfinished): devhub's relaunch
 /// is done only once it is, and no edit waits for a restart.
+/// `held`: the host has no run and waits for a fix (run::host_held: its build or app check
+/// failed): a save is the next run's, which the next save or `session relaunch` starts.
 fn cmd_live(req: &Req, out: &mut Out) {
     use std::fmt::Write;
     let a = crate::postframe::activity();
@@ -1468,12 +1470,13 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"restart_unfinished\":{},\"editing\":{},\"unverified\":{},\"unverified_why\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"restart_unfinished\":{},\"held\":{},\"editing\":{},\"unverified\":{},\"unverified_why\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
         crate::reload::patches_installed(),
         crate::postframe::FRAME_PATCH.load(Relaxed),
         crate::reload::restart_pending().len(),
         crate::run_end::unfinished() as u8,
+        crate::run::host_held() as u8,
         crate::reload::save_seen() as u8,
         crate::reload::UNVERIFIED_PATCHES.load(Relaxed),
         json_str(&crate::reload::unverified_why()),

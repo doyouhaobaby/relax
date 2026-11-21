@@ -8551,6 +8551,17 @@ fn loaded_of(files: &[WatchFile]) -> std::sync::Arc<Vec<String>> {
     crate::zone_alloc::kept_with(|| std::sync::Arc::new(files.iter().filter(|f| f.1 != u32::MAX).map(|f| f.0.clone()).collect()))
 }
 
+/// `inputs`' answer while the host waits for a fix ([`input_paths`]): its first word is what
+/// devhub reads ("held"), the rest what the person does.
+pub const HELD_NO_RUN: &str = "held: no run: the last one did not compile; the next save or `session relaunch` starts the next one";
+
+/// The host starts to wait for a fix (its build failed before the app started, or a run failed
+/// its app check): an `inputs` request waiting for a watcher answers now ([`HELD_NO_RUN`]).
+pub fn inputs_wake() {
+    let _g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    WATCH_READY.notify_all();
+}
+
 fn watch_gone() {
     {
         let _g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -10431,9 +10442,16 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     // the launch) waits for it: it was refused "not started" (11-03). The run's own flag: this
     // answers from before the program is laid out (the layout's flag), and a save that came then
     // read "watches no sources" and ended the session (12 min of native build lost, 11-04)
+    // A host that waits for a fix has no run, and no watcher starts before the next save or
+    // relaunch starts one: it says so at once, as it starts to wait (`inputs_wake`). It read
+    // "watches no sources" in the end of a run that failed its app check, devhub took the session
+    // for over, and a session started on a broken tree ended at the save that fixed it (11-21).
     let mut g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
-    while g.is_none() && crate::run::live_session() && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
+    while g.is_none() && crate::run::live_session() && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) && !crate::run::host_held() {
         g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    if g.is_none() && crate::run::host_held() {
+        return Err(HELD_NO_RUN.into());
     }
     let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
     drop(g);

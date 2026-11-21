@@ -207,6 +207,11 @@ pub(crate) fn host_end_app() {
     }
 }
 
+/// The host has no run and waits for a fix ([`MainHost::held`]); false without a hosted run.
+pub(crate) fn host_held() -> bool {
+    MAIN_HOST.get().filter(|_| HOSTED_RUN.load(Ordering::Acquire)).is_some_and(|host| (host.held)())
+}
+
 /// The host starts the next run in this process (`run_end`), whose boot is due (`boot_begins`):
 /// a host that starts none ends the gate.
 pub(crate) fn host_next_run() -> bool {
@@ -3377,6 +3382,9 @@ pub struct MainHost {
     /// save or the window's Restart, as a failed build's does. False: it started none (it has no
     /// run window).
     pub next_run: fn() -> bool,
+    /// The host has no run and waits for a fix: a build that failed before the app started, or a
+    /// run that failed its app check. The next save or relaunch starts the next one.
+    pub held: fn() -> bool,
 }
 
 /// The host's half of a batch program (`MainHost::batch`).
