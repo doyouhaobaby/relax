@@ -486,6 +486,14 @@ impl OpenOptions {
             vfs::note(&abs, b'f');
             return match k {
                 vfs::Kind::File(stat) => {
+                    // a file the run wrote (its edits folder's copy, a folder mount's file) opens on
+                    // the disk, so its reader sees later writes, as it would natively. A file only
+                    // the repository's store holds reads from a copy: the run's own first write to
+                    // it makes the edits folder's copy, which a reader opened before does not see
+                    // (an overlay's copy-up). A held landing's file reads as every read of it does.
+                    if let Some(Ok(disk)) = vfs::edit_target(&*abs, vfs::Edit::Read) {
+                        return self.open_native(&maybe_verbatim(&disk)?);
+                    }
                     let data = vfs::read(&*abs)?;
                     let mut file = virtual_file()?;
                     file.write_all(&data)?;

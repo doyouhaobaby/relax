@@ -193,6 +193,14 @@ impl OpenOptions {
             vfs::note(&abs, b'f');
             return match k {
                 vfs::Kind::File(stat) => {
+                    // a file the run wrote (its edits folder's copy, a folder mount's file) opens on
+                    // the disk, so its reader sees later writes, as it would natively. A file only
+                    // the repository's store holds reads from a copy: the run's own first write to
+                    // it makes the edits folder's copy, which a reader opened before does not see
+                    // (an overlay's copy-up). A held landing's file reads as every read of it does.
+                    if let Some(Ok(disk)) = vfs::edit_target(&*abs, vfs::Edit::Read) {
+                        return run_path_with_cstr(&disk, &|c| self.open_c(c));
+                    }
                     let data = vfs::read(&*abs)?;
                     let mut file = File { fd: virtual_fd()?, virtual_stat: None };
                     cvt_r(|| unsafe { sys::fchmod(file.raw(), 0o644 as sys::mode_t) })?;
@@ -203,13 +211,12 @@ impl OpenOptions {
                 }
                 // open(2) of a folder for reading succeeds on the disk (its reads fail EISDIR; a
                 // folder's fd is fsync'd to make its entries durable): the run's edits copy of the
-                // folder when there is one, else a folder fd of its own
+                // folder when there is one (its open's error is the answer, as natively), else, for
+                // a folder only the store holds, a folder fd of its own
                 vfs::Kind::Dir => {
                     self.access_mode()?;
                     if let Some(Ok(disk)) = vfs::edit_target(&*abs, vfs::Edit::Existing) {
-                        if let Ok(file) = run_path_with_cstr(&disk, &|c| self.open_c(c)) {
-                            return Ok(file);
-                        }
+                        return run_path_with_cstr(&disk, &|c| self.open_c(c));
                     }
                     Ok(File { fd: virtual_dir_fd()?, virtual_stat: None })
                 }
