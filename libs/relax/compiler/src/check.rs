@@ -178,9 +178,11 @@ pub(crate) fn typeck_digest(prog: &crate::program::Program, tcx: &crate::tcx::Tc
     h.finish128()
 }
 
+/// RELAX_CHECK_AUDIT's folder, read once per run (reset_statics: a run in place reads it again).
+static AUDIT_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
 pub(crate) fn audit_dir() -> Option<&'static Path> {
-    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
+    AUDIT_DIR.get_or_init(|| {
         let _keep = crate::zone_alloc::kept();
         std::env::var_os("RELAX_CHECK_AUDIT").map(PathBuf::from)
     }).as_deref()
@@ -2730,6 +2732,7 @@ fn static_self_access(up: *mut Unit, own: &[bool]) -> Vec<String> {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&BOOT_SKIPPED, std::sync::OnceLock::new());
+    reset(&AUDIT_DIR, std::sync::OnceLock::new());
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 7]);
