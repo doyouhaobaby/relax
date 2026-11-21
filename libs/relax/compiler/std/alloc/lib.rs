@@ -60,11 +60,23 @@ pub mod slice {
 pub mod str {
     use crate::boxed::Box;
 
-    /// rustc 1.20.0 (str_box_extras): converts a boxed slice of valid UTF-8 into a boxed string slice.
+    /// Converts a boxed slice of bytes to a boxed string slice without checking
+    /// that the string contains valid UTF-8.
     ///
     /// # Safety
-    /// The bytes must be valid UTF-8.
+    ///
+    /// * The provided bytes must contain a valid UTF-8 sequence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let smile_utf8 = Box::new([226, 152, 186]);
+    /// let smile = unsafe { std::str::from_boxed_utf8_unchecked(smile_utf8) };
+    ///
+    /// assert_eq!("☺", &*smile);
+    /// ```
     #[must_use]
+    #[inline]
     pub unsafe fn from_boxed_utf8_unchecked(v: Box<[u8]>) -> Box<str> {
         unsafe { Box::from_raw(Box::into_raw(v) as *mut str) }
     }

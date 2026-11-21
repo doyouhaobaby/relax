@@ -51,6 +51,11 @@ fn a01_files() {
     drop(w);
     let gm = fs::metadata(&g).unwrap();
     println!("| {:?} {:o} {}", fs::read(&g).unwrap(), gm.mode() & 0o777, gm.nlink());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::fs::MetadataExt;
+        println!("| linux file type {:o} size {} links {}", gm.st_mode() & 0o170000, gm.st_size(), gm.st_nlink());
+    }
     let mut perm = gm.permissions();
     perm.set_readonly(true);
     fs::set_permissions(&g, perm).unwrap();

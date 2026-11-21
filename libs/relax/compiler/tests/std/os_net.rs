@@ -67,6 +67,14 @@ fn a02_tcp() {
     let mut c = TcpStream::connect(addr).unwrap();
     c.set_nodelay(true).unwrap();
     println!("| {:?} {:?}", c.nodelay(), c.peer_addr().map(|a| a == addr));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::TcpStreamExt;
+        for value in [true, false] {
+            c.set_quickack(value).unwrap();
+            println!("| set_quickack({value}) {}", c.quickack().unwrap());
+        }
+    }
     c.set_read_timeout(Some(Duration::from_millis(2000))).unwrap();
     println!("| {:?}", c.read_timeout().map(|d| d.map(|x| x.as_millis())));
     println!("| {:?}", c.set_read_timeout(Some(Duration::ZERO)).map_err(|e| e.to_string()));

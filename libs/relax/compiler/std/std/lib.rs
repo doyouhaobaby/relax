@@ -63,7 +63,10 @@ pub use core::primitive;
 pub use core::ptr;
 pub use core::result;
 pub use core::slice;
-pub use core::str;
+pub mod str {
+    pub use ::alloc::str::from_boxed_utf8_unchecked;
+    pub use core::str::*;
+}
 pub use core::i8;
 pub use core::i16;
 pub use core::i32;
