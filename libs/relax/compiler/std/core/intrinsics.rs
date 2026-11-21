@@ -5,6 +5,10 @@
 /// Float operations that become single instructions.
 pub mod intrinsics {
     pub use super::intrinsics_mem::{copy, copy_nonoverlapping};
+    /// rustc 1.0.0 (rust1): reinterprets a value as another type of the same size.
+    pub use crate::mem::transmute;
+    /// rustc 1.0.0 (rust1): fills `count` elements of memory with a repeated byte.
+    pub use crate::ptr::write_bytes;
     extern "relax-intrinsic" {
         pub fn sqrt_f64(x: f64) -> f64;
         pub fn sqrt_f32(x: f32) -> f32;
