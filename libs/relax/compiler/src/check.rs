@@ -18,7 +18,9 @@ macro_rules! eprintln {
 
 use relax_types::next_solver::{Goal, ParamEnvId};
 use crate::jit::{self, FnKey, Unit};
-use crate::program::DefKind;
+use crate::program::{DefId, DefKind, Program};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 /// RELAX_CHECK_TIMES: one line per serial step of a check that took 50 ms or more.
 struct StepTimes { on: bool, t: std::time::Instant, label: &'static str }
@@ -134,6 +136,209 @@ pub(crate) fn body_owners(prog: &crate::program::Program, crates: &[u32]) -> Vec
         .filter_map(|d| crate::borrowck::body::CheckedBody::item(prog, d)).map(|b| b.owner).collect()
 }
 
+/// The audit compares resolved types and names across runs, using indices local to the body.
+pub(crate) fn typeck_digest(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, body: &crate::typeck::Body) -> u128 {
+    use crate::typeck::{ty_to_string, Res};
+    let mut h = crate::sip::Sip128::new();
+    for (types, typed) in [(&body.expr_ty, &body.expr_typed), (&body.pat_ty, &body.pat_typed)] {
+        for (i, &ty) in types.iter().enumerate() {
+            if typed.get(i) {
+                h.u8(1);
+                h.u64(i as u64);
+                h.str(&ty_to_string(true, prog, tcx, ty));
+            }
+        }
+        h.u8(0);
+    }
+    // Side tables are keyed by ExprId in the file's arena, including lazily parsed bodies.
+    let index = |key| body.expr_ix(crate::ast::ExprId(key)) as u64;
+    h.u64(body.res.len() as u64);
+    for (&key, &res) in &body.res {
+        h.u64(index(key));
+        match res {
+            Res::Def(d) => { h.u8(0); h.str(&prog.def_path(d)); }
+            Res::Local(n) => { h.u8(1); h.u32(n); }
+            Res::ConstParam(_) => h.u8(2),
+            Res::Err => h.u8(3),
+        }
+    }
+    for table in [&body.methods, &body.binops] {
+        h.u64(table.len() as u64);
+        for (&key, m) in table {
+            h.u64(index(key));
+            h.str(&prog.def_path(m.def));
+            h.u32(m.derefs);
+            h.u8(m.autoref);
+            let args = tcx.tys.list(m.args);
+            h.u64(args.len() as u64);
+            for &ty in args { h.str(&ty_to_string(true, prog, tcx, ty)); }
+        }
+    }
+    h.u64(body.errors.len() as u64);
+    h.finish128()
+}
+
+pub(crate) fn audit_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let _keep = crate::zone_alloc::kept();
+        std::env::var_os("RELAX_CHECK_AUDIT").map(PathBuf::from)
+    }).as_deref()
+}
+
+pub(crate) type AuditReads = relax_session::sync::Mutex<Vec<(DefId, DefId)>>;
+
+/// One attempt at a body check. An unwind records its reads before the worker retries.
+pub(crate) struct ReadBarrier<'a> {
+    owner: DefId,
+    reads: &'a AuditReads,
+}
+
+impl<'a> ReadBarrier<'a> {
+    pub(crate) fn begin(prog: &Program, owner: DefId, reads: &'a AuditReads) -> Self {
+        relax_types::type_queries::read_barrier_begin(prog.def(owner).krate);
+        Self { owner, reads }
+    }
+}
+
+impl Drop for ReadBarrier<'_> {
+    fn drop(&mut self) {
+        let reads = relax_types::type_queries::read_barrier_end();
+        if !reads.is_empty() {
+            self.reads.lock().unwrap_or_else(|p| p.into_inner()).extend(reads.into_iter().map(|r| (self.owner, r)));
+        }
+    }
+}
+
+#[derive(Default)]
+struct CrateAudit {
+    hit: Option<u128>,
+    // Definition order breaks ties between equal printed paths, regardless of worker order.
+    bodies: BTreeMap<DefId, (String, u128)>,
+    holes: BTreeMap<(DefId, DefId), (String, String)>,
+    incomplete: Vec<String>,
+}
+
+/// A printed impl path can name several bodies. Compare all its rows in definition order.
+fn differing_body_paths<'a>(old: &'a str, current: &'a str) -> Vec<&'a str> {
+    let mut paths = BTreeMap::<&str, [Vec<&str>; 2]>::new();
+    for (i, snapshot) in [old, current].into_iter().enumerate() {
+        for line in snapshot.lines() {
+            let (path, digest) = line.rsplit_once('\t').unwrap_or((line, ""));
+            paths.entry(path).or_default()[i].push(digest);
+        }
+    }
+    paths.into_iter().filter_map(|(path, [before, now])| (before != now).then_some(path)).collect()
+}
+
+/// Shared by the app and background checks. Only owned strings and digests reach the file I/O.
+pub(crate) struct CheckAudit {
+    dir: &'static Path,
+    pub(crate) reads: std::sync::Arc<AuditReads>,
+    crates: HashMap<u32, CrateAudit>,
+    files: HashMap<usize, crate::cache::FileDigest>,
+    checked: usize,
+    audited: usize,
+    failed: usize,
+    missing: usize,
+    hole_reads: usize,
+}
+
+impl CheckAudit {
+    pub(crate) fn new(dir: &'static Path) -> Self {
+        Self {
+            dir, reads: Default::default(), crates: HashMap::new(), files: HashMap::new(),
+            checked: 0, audited: 0, failed: 0, missing: 0, hole_reads: 0,
+        }
+    }
+
+    pub(crate) fn hit(&mut self, k: u32, key: u128) {
+        self.crates.entry(k).or_default().hit = Some(key);
+    }
+
+    pub(crate) fn body(&mut self, prog: &Program, tcx: &crate::tcx::Tcx, d: DefId, body: &crate::typeck::Body) {
+        let krate = self.crates.entry(prog.def(d).krate).or_default();
+        let path = prog.def_path(d);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| typeck_digest(prog, tcx, body))) {
+            Ok(digest) => { krate.bodies.insert(d, (path, digest)); }
+            Err(_) => krate.incomplete.push(format!("could not digest {path}")),
+        }
+    }
+
+    pub(crate) fn incomplete(&mut self, k: u32, reason: String) {
+        self.crates.entry(k).or_default().incomplete.push(reason);
+    }
+
+    pub(crate) fn collect_reads(&mut self, prog: &Program) {
+        let mut reads = std::mem::take(&mut *self.reads.lock().unwrap_or_else(|p| p.into_inner()));
+        reads.sort_unstable();
+        reads.dedup();
+        for (d, r) in reads {
+            let Some(krate) = self.crates.get_mut(&prog.def(d).krate).filter(|c| c.hit.is_some()) else { continue };
+            let def = prog.def(r);
+            let f = def.file as usize;
+            let digest = self.files.entry(f).or_insert_with(|| crate::cache::file_digest(&prog.files[f]));
+            if crate::cache::owner_body_hash(&prog.files[f], digest, def.item).is_some() {
+                krate.holes.entry((d, r)).or_insert_with(|| (prog.def_path(d), prog.def_path(r)));
+            }
+        }
+    }
+
+    /// Compare the previous interface-key snapshot before replacing either key. A missing
+    /// baseline seeds the next replay. Return whether the check may publish a Clean verdict.
+    pub(crate) fn verdict<'a>(
+        &mut self, k: u32, name: &str, keys: impl Iterator<Item = u128>, errors: impl Iterator<Item = &'a str>,
+    ) -> bool {
+        use std::fmt::Write;
+        let krate = self.crates.remove(&k).unwrap_or_default();
+        self.checked += 1;
+        let mut failed = false;
+        let mut fail = |what: &str| {
+            stderr_line!("relax: AUDIT FAIL: crate {name}: {what}");
+            failed = true;
+        };
+        let mut bodies: Vec<_> = krate.bodies.into_values().collect();
+        bodies.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut text = String::new();
+        for (path, digest) in bodies { writeln!(text, "{path}\t{digest:032x}").unwrap(); }
+        if let Some(key) = krate.hit {
+            self.audited += 1;
+            for error in errors { fail(error); }
+            self.hole_reads += krate.holes.len();
+            for (checked, read) in krate.holes.into_values() { fail(&format!("{checked} read {read}")); }
+            match std::fs::read_to_string(self.dir.join(format!("{key:032x}"))) {
+                Ok(old) if krate.incomplete.is_empty() && old != text => {
+                    for path in differing_body_paths(&old, &text) {
+                        fail(&format!("body digest differs: {path}"));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.missing += 1;
+                    stderr_line!("relax: AUDIT: crate {name}: no digest stored for {key:032x}");
+                }
+                Err(e) => fail(&format!("cannot read digest {key:032x}: {e}")),
+            }
+        }
+        if krate.incomplete.is_empty() {
+            for key in keys {
+                let result = std::fs::create_dir_all(self.dir)
+                    .and_then(|()| crate::pack::write_atomic(self.dir, &format!("{key:032x}"), text.as_bytes()));
+                if let Err(e) = result { fail(&format!("cannot write digest {key:032x}: {e}")); }
+            }
+        } else {
+            for error in krate.incomplete { fail(&error); }
+        }
+        self.failed += usize::from(failed);
+        !failed
+    }
+
+    pub(crate) fn summary(&self, suffix: &str) {
+        stderr_line!("relax: check audit{suffix}: {} crates checked, {} by an interface key hit audited, {} failed, {} without a stored digest, {} hole reads",
+            self.checked, self.audited, self.failed, self.missing, self.hole_reads);
+    }
+}
+
 /// The item-level errors of `crates` that `makepad check` reports beside the bodies: each
 /// definition's signature checks (an impl's items against its trait, coherence among them), an
 /// impl's unsafety, and -- when those are clean -- well-formedness; in position order, follow-on
@@ -209,12 +414,33 @@ fn own_text_hashes(prog: &crate::program::Program, crates: &[u32]) -> Vec<u128> 
         h.u128(ci.context.fingerprint());
         per[c as usize] = Some(h);
     }
+    let mut inputs = Vec::new();
+    let mut hashes = Vec::new();
     for f in 0..prog.boot_files.min(prog.files.len()) {
         if prog.front_macro_fragments.contains(&f) { continue; }
-        let Some(h) = prog.file_crate.get(f).and_then(|&c| per.get_mut(c as usize)).and_then(Option::as_mut) else { continue };
+        let Some(&c) = prog.file_crate.get(f) else { continue };
+        let c = c as usize;
+        if per.get(c).and_then(Option::as_ref).is_none() { continue; }
         let pf = &prog.files[f];
         let path = prog.file_paths.get(f).map_or("", |p| p.as_str());
-        h.u128(crate::crate_image::file_hash(path, &pf.src[..(pf.src_len as usize).min(pf.src.len())]));
+        inputs.push((path, &pf.src[..(pf.src_len as usize).min(pf.src.len())]));
+        hashes.push((c, 0u128));
+    }
+    if !inputs.is_empty() {
+        let threads = std::thread::available_parallelism().map_or(4, |x| x.get()).clamp(1, 8);
+        let chunk = inputs.len().div_ceil(threads);
+        crate::pool::scope(|s| {
+            for (out, inputs) in hashes.chunks_mut(chunk).zip(inputs.chunks(chunk)) {
+                s.spawn(move || {
+                    for ((_, hash), &(path, src)) in out.iter_mut().zip(inputs) {
+                        *hash = crate::crate_image::file_hash(path, src);
+                    }
+                });
+            }
+        });
+    }
+    for (c, hash) in hashes {
+        per[c].as_mut().unwrap().u128(hash);
     }
     crates.iter().map(|&c| per[c as usize].as_ref().map_or(0, |h| h.finish128())).collect()
 }
@@ -291,10 +517,17 @@ pub struct AppCheck {
     todo: Vec<u32>,
     keys: Vec<(u32, u128)>,
     owners: Vec<crate::program::DefId>,
+    audited: Vec<(u32, u128)>,
 }
 
 /// The app check's lookups and loads (the cache is read here: before main, on the boot thread).
 /// None: every crate's clean verdict is stored.
+///
+/// `RELAX_CHECK_AUDIT=<folder>` rechecks Clean interface-key hits in the app and background
+/// checks. Each must still check clean, request no type check of a dependency body omitted
+/// from its interface, and match the stored per-body digest of resolved types, paths and
+/// methods. Snapshots live under both verdict keys in the folder. A missing snapshot seeds
+/// the next comparison.
 pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
     use crate::borrowck::lazy::StoredVerdict;
     use std::sync::atomic::Ordering::Relaxed;
@@ -303,6 +536,7 @@ pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
     APP_CHECK_ASKED.store(true, Relaxed);
     let mut keys = Vec::new();
     let mut todo = Vec::new();
+    let mut audited = Vec::new();
     let (mut iface_hits, mut iface_ns) = (0, 0);
     if let Some(c) = &u.cache {
         let cache = unsafe { &mut *c.get() };
@@ -322,14 +556,17 @@ pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
                 // A skipped file changed between the two reads. Check the crate without caching it.
                 if inputs.skipped[&k] != skipped { todo.push(k); continue; }
                 let iface_key = cache.app_check_key(k, inputs.own[i], skipped, inputs.deps(i));
-                if matches!(iface_key.and_then(|key| cache.borrowck_stored(key)), Some(StoredVerdict::Clean)) {
+                if let Some(key) = iface_key.filter(|&key| matches!(cache.borrowck_stored(key), Some(StoredVerdict::Clean))) {
                     iface_hits += 1;
-                    if let Some(key) = fp_key { cache.record_borrowck(key, StoredVerdict::Clean); }
-                } else {
-                    todo.push(k);
-                    keys.extend(fp_key.map(|key| (k, key)));
-                    keys.extend(iface_key.map(|key| (k, key)));
+                    if audit_dir().is_none() {
+                        if let Some(key) = fp_key { cache.record_borrowck(key, StoredVerdict::Clean); }
+                        continue;
+                    }
+                    audited.push((k, key));
                 }
+                todo.push(k);
+                keys.extend(fp_key.map(|key| (k, key)));
+                keys.extend(iface_key.map(|key| (k, key)));
             }
             iface_ns = jit::wall_ns() - t;
         }
@@ -341,13 +578,17 @@ pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
     RUN_CHECK[6].store(iface_ns, Relaxed);
     let t1 = jit::wall_ns();
     RUN_CHECK[3].store(t1 - t0, Relaxed);
-    if todo.is_empty() { RUN_CHECK[2].store(t1 - t0, Relaxed); return None; }
+    if todo.is_empty() {
+        RUN_CHECK[2].store(t1 - t0, Relaxed);
+        if let Some(dir) = audit_dir() { CheckAudit::new(dir).summary(""); }
+        return None;
+    }
     unsafe { jit::load_skipped_of(up, &todo) };
     RUN_CHECK[4].store(jit::wall_ns() - t1, Relaxed);
     let u = unsafe { &*up };
     let owners = body_owners(&u.prog, &todo);
     RUN_CHECK[1].store(owners.len() as u64, Relaxed);
-    Some(AppCheck { t0, todo, keys, owners })
+    Some(AppCheck { t0, todo, keys, owners, audited })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -369,6 +610,7 @@ struct BodyCheck {
     strict: bool,
     beside: bool,
     cpu: std::sync::atomic::AtomicU64,
+    audit_reads: Option<std::sync::Arc<AuditReads>>,
 }
 impl BodyCheck {
     fn check(&self, d: crate::program::DefId, impl_check: bool) -> Option<Vec<String>> {
@@ -396,6 +638,7 @@ impl BodyCheck {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _p = beside.then(crate::preempt::Preemptible::on);
                 if impl_check { return crate::unsafety::impl_errors(prog, tcx, d); }
+                let _reads = self.audit_reads.as_deref().map(|reads| ReadBarrier::begin(prog, d, reads));
                 if !strict { return Some(tcx.typeck(prog, d).errors.to_vec()); }
                 let owner = crate::borrowck::body::CheckedBody::item(prog, d).expect("prepared body owner");
                 let (errors, events) = body_errors(prog, tcx, &prog.session.options, &owner, true, false);
@@ -434,11 +677,13 @@ impl BodyCheck {
 /// each body holds a front read, yields to writers and retries after them. Test dependencies use
 /// the full error pipeline.
 fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::RuntimeOptions>, mode: CheckMode) -> PreparedErrors {
-    let AppCheck { t0, todo, keys, owners } = p;
+    let AppCheck { t0, todo, mut keys, owners, audited } = p;
     let strict = mode == CheckMode::Errors;
     let front = unsafe { (*up).front.clone() };
+    let mut audit = audit_dir().map(CheckAudit::new);
     let ctx = std::sync::Arc::new(BodyCheck {
         upn: up as usize, front: front.clone(), strict, beside: beside.is_some(), cpu: std::sync::atomic::AtomicU64::new(0),
+        audit_reads: audit.as_ref().map(|a| a.reads.clone()),
     });
     let check_all = |items: Vec<crate::program::DefId>, impl_check: bool| -> Vec<Option<Vec<String>>> {
         if beside.is_some() { queued_map(&ctx, items, impl_check) } else { par_map(&items, jobs(), |&d| ctx.check(d, impl_check)) }
@@ -492,6 +737,34 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
         let prog = r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0);
         failed.into_iter().flat_map(|(d, e)| { let k = prog.def(d).krate; e.into_iter().map(move |e| (k, e)) }).collect()
     };
+    if let Some(audit) = audit.as_mut() {
+        for (k, key) in audited { audit.hit(k, key); }
+        let names: Vec<String> = {
+            let r = beside.map(|_| jit::front_read("app check audit"));
+            let u = unsafe { &*up };
+            let (prog, tcx) = r.as_ref().map_or((&u.prog, &u.tcx), |r| r.of(&front));
+            for d in owners {
+                let body = tcx.typeck_peek(prog, d).or_else(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _reads = ReadBarrier::begin(prog, d, &audit.reads);
+                        tcx.typeck(prog, d)
+                    })).ok()
+                });
+                match body {
+                    Some(body) => audit.body(prog, tcx, d, &body),
+                    None => audit.incomplete(prog.def(d).krate, format!("could not check {} for its digest", prog.def_path(d))),
+                }
+            }
+            audit.collect_reads(prog);
+            todo.iter().map(|&k| prog.syms.str(prog.crates[k as usize].name).to_owned()).collect()
+        };
+        for (&k, name) in todo.iter().zip(names) {
+            let crate_keys = keys.iter().filter(|(c, _)| *c == k).map(|&(_, key)| key);
+            let crate_errors = errors.iter().filter(|(c, _)| *c == k).map(|(_, e)| e.as_str());
+            if !audit.verdict(k, &name, crate_keys, crate_errors) { keys.retain(|(c, _)| *c != k); }
+        }
+        audit.summary("");
+    }
     let clean = keys.into_iter().filter(|(k, _)| !errors.iter().any(|(c, _)| c == k)).map(|(_, key)| key);
     if beside.is_some() {
         for key in clean { crate::borrowck::lazy::push_verdict_key(key, crate::borrowck::lazy::StoredVerdict::Clean); }
@@ -663,7 +936,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         } else {
             unsafe { jit::load_skipped_of(up, &todo) };
             let owners = { let r = jit::front_read("test dependency owners"); body_owners(r.of(&front).0, &todo) };
-            (owners.len(), check_prepared(up, AppCheck { t0, todo, keys, owners }, Some(&runtime), CheckMode::Errors))
+            (owners.len(), check_prepared(up, AppCheck { t0, todo, keys, owners, audited: Vec::new() }, Some(&runtime), CheckMode::Errors))
         };
         TestDepsResult {
             errors: crate::zone_alloc::kept_clone(&checked.errors), names,

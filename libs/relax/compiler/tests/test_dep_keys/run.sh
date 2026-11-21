@@ -2,8 +2,11 @@
 # usage: run.sh [<makepad binary>] (default builds this checkout's host makepad)
 # The makepad test dependency check (M51) and makepad run app check (cache.rs app_check_key)
 # key a crate's verdict by its own text and its dependencies' interfaces.
-# Cold, after a tdk-base body edit, and after an interface edit, test selects two dependencies
-# and finds 0, 1, 0 stored clean. Run checks all app crates, then only tdk-base, then all again.
+# Cold, after a tdk-base body edit, and after an interface edit, test selects three dependencies
+# and finds 0, 2, 1 stored clean. Run checks all app crates, then only tdk-base, then all but
+# tdk-side. No edit touches tdk-side, beside tdk-base under tdk-mid: an edited start loads it ahead
+# of tdk-base (the reordered load puts clean crates first), so a key that followed the load order
+# would miss after the body edit.
 # Never stale: in each case below the crates are clean as written, and one change that leaves the
 # interface text as it was (a static a const reads, a position a const reads, an input a macro
 # reads) or that changes an interface body (an impl Trait return losing Send, a const fn body, an
@@ -45,10 +48,10 @@ run_iface=$(run_counts)
 echo "cold: $cold; body edit: $body; interface edit: $iface (selected, stored clean)"
 echo "run: cold: $run_cold; body edit: $run_body; interface edit: $run_iface (checked, app crates)"
 bad=""
-if [ "$cold" != "2 0" ] || [ "$body" != "2 1" ] || [ "$iface" != "2 0" ]; then bad=" keys (want 2 0, 2 1, 2 0)"; fi
+if [ "$cold" != "3 0" ] || [ "$body" != "3 2" ] || [ "$iface" != "3 1" ]; then bad=" keys (want 3 0, 3 2, 3 1)"; fi
 all=${run_cold#* }
-if ! [[ $all =~ ^[0-9]+$ ]] || [ "$run_cold" != "$all $all" ] || [ "$run_body" != "1 $all" ] || [ "$run_iface" != "$all $all" ]; then
-  bad="$bad run-keys (want all, 1, all)"
+if ! [[ $all =~ ^[0-9]+$ ]] || [ "$run_cold" != "$all $all" ] || [ "$run_body" != "1 $all" ] || [ "$run_iface" != "$((all - 1)) $all" ]; then
+  bad="$bad run-keys (want all, 1, all but one)"
 fi
 
 # a run's outcome: ok, or mid (the dependency check reported tdk-mid's error)

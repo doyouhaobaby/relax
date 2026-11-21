@@ -21,6 +21,7 @@
 //! completion thread waits for a first present. A crate's check stores its progress file by file
 //! (`Files`): a run that ends before a crate's verdict leaves the next run only the files not in.
 
+use crate::check::{audit_dir, CheckAudit, ReadBarrier};
 use crate::jit::{self, FrontShared, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::typeck::{Body, Res};
@@ -251,6 +252,7 @@ fn run(up: *mut Unit, scope: &Scope) {
     let upn = up as usize;
     let (mut todo, mut keys, mut stored_findings, misses) = crate::owner::call(crate::owner::Class::Publish, || todo_crates(unsafe { &*(upn as *const Unit) }, scope, &skipped_text));
     let mut fp_keys = Vec::new();
+    let mut audit = audit_dir().map(CheckAudit::new);
     if !misses.is_empty() {
         let inputs = {
             let r = jit::front_read("typeck bg keys");
@@ -267,6 +269,11 @@ fn run(up: *mut Unit, scope: &Scope) {
                 let key = cache.app_check_key(k, inputs.own[i], inputs.skipped[&k], inputs.deps(i));
                 match key.and_then(|key| cache.borrowck_stored(key)) {
                     Some(verdict @ (StoredVerdict::Clean | StoredVerdict::Failed(_))) => {
+                        if let (Some(audit), Some(key), StoredVerdict::Clean) = (&mut audit, key, &verdict) {
+                            audit.hit(k, key);
+                            keys[k as usize] = Some(key);
+                            continue;
+                        }
                         todo[k as usize] = false;
                         if let StoredVerdict::Failed(errors) = &verdict { stored_findings.push((k, errors.len())); }
                         if let Some(fp_key) = fp_keys[k as usize] { push_verdict_key(fp_key, verdict); }
@@ -277,7 +284,7 @@ fn run(up: *mut Unit, scope: &Scope) {
         });
     }
     *STORED_FINDINGS.lock().unwrap_or_else(|p| p.into_inner()) = stored_findings;
-    if !todo.contains(&true) { return finish(t0, w0); }
+    if !todo.contains(&true) { return finish(t0, w0, audit.as_ref()); }
     // the files' progress: the keys of the files loaded so far (more as skipped files load)
     let crate_keys: Vec<(u32, u128)> = keys.iter().enumerate().filter_map(|(k, key)| key.filter(|_| todo[k]).map(|key| (k as u32, key))).collect();
     let mut files = Files::default();
@@ -306,7 +313,7 @@ fn run(up: *mut Unit, scope: &Scope) {
     };
     while let Some(d) = stack.pop() {
         if !seen.insert(d) { continue; }
-        match check(&f, d, &todo, &files, scope, &mut failed, &mut ice) {
+        match check(&f, d, &todo, &files, scope, &mut failed, &mut ice, audit.as_mut()) {
             Checked::Done(named) => {
                 clean.insert(d);
                 stack.extend(named.into_iter().rev().filter(|d| !seen.contains(d)));
@@ -350,7 +357,7 @@ fn run(up: *mut Unit, scope: &Scope) {
         let mut pending: HashSet<u32> = HashSet::new();
         for (d, file) in owners {
             seen.insert(d);
-            match check(&f, d, &todo, &files, scope, &mut failed, &mut ice) {
+            match check(&f, d, &todo, &files, scope, &mut failed, &mut ice, audit.as_mut()) {
                 Checked::Done(_) => {
                     clean.insert(d);
                     if let Some(key) = files.checked(file, true) { store_file(key); }
@@ -380,6 +387,17 @@ fn run(up: *mut Unit, scope: &Scope) {
                     Some(errors) => StoredVerdict::Failed(errors.clone()),
                     None => StoredVerdict::Clean,
                 };
+                if let Some(audit) = &mut audit {
+                    let name = {
+                        let r = jit::front_read("typeck bg audit");
+                        let (prog, _) = r.of(&f);
+                        audit.collect_reads(prog);
+                        prog.syms.str(prog.crates[k as usize].name).to_owned()
+                    };
+                    let crate_keys = fp_keys.get(k as usize).copied().flatten().into_iter().chain(keys[k as usize]);
+                    let errors = failed.get(&k).into_iter().flatten().map(String::as_str);
+                    if !audit.verdict(k, &name, crate_keys, errors) && matches!(verdict, StoredVerdict::Clean) { continue; }
+                }
                 if let Some(&Some(fp_key)) = fp_keys.get(k as usize) { push_verdict_key(fp_key, verdict.clone()); }
                 if let Some(key) = keys[k as usize] { push_verdict_key(key, verdict); }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
@@ -427,14 +445,33 @@ fn run(up: *mut Unit, scope: &Scope) {
             if now != skipped || no_present_coming() { break; }
         }
     }
-    finish(t0, w0)
+    if let Some(audit) = &mut audit {
+        // An ICE, an unresolved load or an edit leaves the crate without a verdict. Keep the
+        // previous snapshot and account for the incomplete check in the replay's summary.
+        let remaining: Vec<_> = {
+            let r = jit::front_read("typeck bg audit end");
+            let (prog, _) = r.of(&f);
+            audit.collect_reads(prog);
+            todo_list.iter().copied().filter(|k| !stored.contains(k))
+                .map(|k| (k, prog.syms.str(prog.crates[k as usize].name).to_owned())).collect()
+        };
+        for (k, name) in remaining {
+            if !ice.contains(&k) {
+                let why = if given_up.contains(&k) { "a body still needs a skipped file" } else { "the program was edited" };
+                audit.incomplete(k, format!("check incomplete: {why}"));
+            }
+            audit.verdict(k, &name, std::iter::empty(), failed.get(&k).into_iter().flatten().map(String::as_str));
+        }
+    }
+    finish(t0, w0, audit.as_ref())
 }
 
 /// The crates a warm run skipped for their stored Failed verdicts, with their error counts
 /// (`--verbose`'s done line).
 static STORED_FINDINGS: relax_session::sync::Mutex<Vec<(u32, usize)>> = relax_session::sync::Mutex::new(Vec::new());
 
-fn finish(t0: u64, w0: u64) {
+fn finish(t0: u64, w0: u64, audit: Option<&CheckAudit>) {
+    if let Some(audit) = audit { audit.summary(" (background)"); }
     STATS[3].store(relax_session::clock::cpu_ns() - t0, Ordering::Relaxed);
     STATS[4].store((jit::wall_ns() - w0).max(1), Ordering::Relaxed);
     if crate::run::VERBOSE.load(Ordering::Relaxed) {
@@ -454,7 +491,7 @@ fn finish(t0: u64, w0: u64) {
 
 /// Type-checks body owner `d` of a crate this check covers and reports its errors; a body of any
 /// other crate is only read when a build checked it already (the walk goes on through it).
-fn check(f: &FrontShared, d: DefId, todo: &[bool], files: &Files, scope: &Scope, failed: &mut HashMap<u32, Vec<String>>, ice: &mut HashSet<u32>) -> Checked {
+fn check(f: &FrontShared, d: DefId, todo: &[bool], files: &Files, scope: &Scope, failed: &mut HashMap<u32, Vec<String>>, ice: &mut HashSet<u32>, audit: Option<&mut CheckAudit>) -> Checked {
     loop {
         if stopping() { return Checked::Stop; }
         // the program's own compiles go first (a burst of the UI thread's lazy compiles)
@@ -470,11 +507,12 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], files: &Files, scope: &Scope,
             return Checked::Done(tcx.typeck_peek(prog, d).filter(|b| b.errors.is_empty()).map(|b| named_fns(prog, &b)).unwrap_or_default());
         }
         // an earlier run checked every owner of its file clean (the file's progress entry)
-        if !files.todo(prog.def(d).file) {
+        if audit.is_none() && !files.todo(prog.def(d).file) {
             STATS[6].fetch_add(1, Ordering::Relaxed);
             return Checked::Done(Vec::new());
         }
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reads = audit.as_ref().map(|a| ReadBarrier::begin(prog, d, &a.reads));
             let _p = crate::preempt::Preemptible::on();
             crate::preempt::point();
             tcx.typeck_unstored(prog, d)
@@ -496,14 +534,16 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], files: &Files, scope: &Scope,
                 let e = format!("internal compiler error while checking {} -- Relax bug, report it{}", prog.def_path(d), jit::take_ice_location());
                 STATS[1].fetch_add(1, Ordering::Relaxed);
                 ice.insert(krate);
+                if let Some(audit) = audit { audit.incomplete(krate, e.clone()); }
                 report(&[e], None);
                 return Checked::Failed;
             }
         };
         STATS[0].fetch_add(1, Ordering::Relaxed);
-        if body.errors.is_empty() { return Checked::Done(named_fns(prog, &body)); }
         // a name in a file the lazy selection skipped: checked again once it is loaded
-        if !body.deferred_misses.is_empty() && !prog.skipped_files.is_empty() { return Checked::Later; }
+        if !body.errors.is_empty() && !body.deferred_misses.is_empty() && !prog.skipped_files.is_empty() { return Checked::Later; }
+        if let Some(audit) = audit { audit.body(prog, tcx, d, &body); }
+        if body.errors.is_empty() { return Checked::Done(named_fns(prog, &body)); }
         STATS[1].fetch_add(1, Ordering::Relaxed);
         failed.entry(krate).or_default().extend(body.errors.iter().cloned());
         report(&body.errors, scope.registry.get(krate as usize).and_then(|r| r.as_deref()));

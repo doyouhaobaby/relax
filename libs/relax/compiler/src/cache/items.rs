@@ -367,19 +367,46 @@ pub(crate) fn places_crates(prog: &crate::program::Program) -> Vec<bool> {
 pub(crate) fn crate_check_extras(prog: &crate::program::Program, want: &[bool]) -> Vec<u128> {
     let n = prog.crates.len();
     let places = places_crates(prog);
-    let mut per: Vec<Option<Sip128>> = (0..n).map(|_| None).collect();
+    let mut files = Vec::new();
     for f in 0..prog.boot_files.min(prog.files.len()) {
         if prog.front_macro_fragments.contains(&f) { continue; }
         let Some(&c) = prog.file_crate.get(f) else { continue };
         let c = c as usize;
         if c >= n || !want.get(c).copied().unwrap_or(false) || sysroot_crate(prog, c) { continue; }
-        let x = check_extra(&prog.files[f], places[c]);
+        files.push((f, c));
+    }
+    let extras = file_check_extras(&prog.files, &files, &places);
+    let mut per: Vec<Option<Sip128>> = (0..n).map(|_| None).collect();
+    for ((f, c), x) in files.into_iter().zip(extras) {
         if x == 0 { continue; }
         let h = per[c].get_or_insert_with(|| { let mut h = Sip128::new(); h.str("crate-check-extra"); h });
         h.str(&crate::dirs::anchored(prog.file_paths.get(f).map_or("", |p| p.as_str())));
         h.u128(x);
     }
     per.into_iter().map(|h| h.map_or(0, |h| h.finish128())).collect()
+}
+
+/// Computes the selected files' extras on the pool, in the order of `files`.
+fn file_check_extras(parsed: &[std::sync::Arc<ParsedFile>], files: &[(usize, usize)], places: &[bool]) -> Vec<u128> {
+    if files.is_empty() { return Vec::new(); }
+    struct Shared<'a>(&'a [std::sync::Arc<ParsedFile>]);
+    // SAFETY: check_extra only reads the completed parses. Their lazily built tables are OnceLocks.
+    unsafe impl Sync for Shared<'_> {}
+    let parsed = Shared(parsed);
+    let threads = std::thread::available_parallelism().map_or(4, |x| x.get()).clamp(1, 8);
+    let chunk = files.len().div_ceil(threads);
+    let mut extras = vec![0; files.len()];
+    crate::pool::scope(|s| {
+        for (out, files) in extras.chunks_mut(chunk).zip(files.chunks(chunk)) {
+            let parsed = &parsed;
+            s.spawn(move || {
+                for (extra, &(f, c)) in out.iter_mut().zip(files) {
+                    *extra = check_extra(&parsed.0[f], places[c]);
+                }
+            });
+        }
+    });
+    extras
 }
 
 /// The crates Relax's own sysroot holds.

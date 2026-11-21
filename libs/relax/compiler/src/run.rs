@@ -4338,7 +4338,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // a trickle 5 s on): the run ends as an outside SIGTERM would end it, through the
             // platform's termination path and the quit write, so its cache is committed
             if let Some(watch) = quit_watch.as_mut() {
-                if watch.ready(jit::wall_ns(), latest_present(), jit::demand_compiled()) {
+                if watch.ready(jit::wall_ns(), latest_present(), jit::demand_compiled())
+                    && (crate::check::audit_dir().is_none() || !crate::typeck_bg::running()) {
                     quit_watch = None;
                     eprintln!("makepad: quitting after the first present (--quit-after-present)");
                     crate::serve_os::stop(std::process::id());

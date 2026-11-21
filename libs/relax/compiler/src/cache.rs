@@ -47,7 +47,7 @@ use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
 pub(crate) mod seen_bodies;
-pub(crate) use items::{check_extra, crate_check_extras, owner_body_hash, places_crates, FileDigest};
+pub(crate) use items::{check_extra, crate_check_extras, file_digest, owner_body_hash, places_crates, FileDigest};
 mod deps;
 pub(crate) use deps::{user_names, CheckNode, Name, UserNames};
 mod demand;
@@ -3745,6 +3745,14 @@ impl Cache {
     }
 
     fn iface_check_key(&mut self, tag: &str, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
+        // the closure as a set: crate indices follow the load order, which an edited start
+        // changes (its reordered load puts the clean crates first and the edited suffix after
+        // them), so the terms go in sorted (an interface names its crate: no two are equal)
+        let mut terms = Vec::new();
+        for (d, text, extra) in closure {
+            terms.push((*self.iface.get(d as usize)?, extra, text));
+        }
+        terms.sort_unstable();
         let mut h = Sip128::new();
         h.str(tag);
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
@@ -3753,8 +3761,8 @@ impl Cache {
         h.u128(self.cfg);
         h.u128(own);
         h.u128(skipped);
-        for (d, text, extra) in closure {
-            h.u128(*self.iface.get(d as usize)?);
+        for (iface, extra, text) in terms {
+            h.u128(iface);
             h.u128(extra);
             h.u128(text);
         }
