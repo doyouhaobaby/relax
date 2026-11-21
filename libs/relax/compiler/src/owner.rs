@@ -173,9 +173,11 @@ struct Req {
 
 struct Queue {
     lanes: [VecDeque<usize>; CLASSES],
+    /// posted tasks go unrun (`void_posts`): read as the owner picks each request
+    void: bool,
 }
 
-static Q: Mutex<Queue> = Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES] });
+static Q: Mutex<Queue> = Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES], void: false });
 
 static WAKE: Condvar = Condvar::new();
 static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1039,7 +1041,7 @@ pub(crate) fn stop() {
     if let Some(thread) = OWNER_JOIN.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = thread.join();
     }
-    POSTS_VOID.store(false, Ordering::Release);
+    Q.lock().unwrap_or_else(|e| e.into_inner()).void = false;
 }
 
 /// The run ends (`run_end`), its unit about to retire: every task posted to the owner (`post`,
@@ -1048,13 +1050,11 @@ pub(crate) fn stop() {
 /// next step, posted by the step before it behind the unit's retirement, ran on the freed unit
 /// ("a posted compiler task panicked: write_code: ... is not code memory", a run that ended in
 /// place before its first frame, 11-21). A task running now ends first: the retirement is the
-/// owner's next request after it.
+/// owner's next request after it. The flag is the owner queue's (`Queue::void`), which the run's
+/// end resets with the queue (`reset_statics`): no static of its own for a restart to remember.
 pub(crate) fn void_posts() {
-    POSTS_VOID.store(true, Ordering::Release);
+    Q.lock().unwrap_or_else(|e| e.into_inner()).void = true;
 }
-
-/// Posted tasks go unrun (`void_posts`).
-static POSTS_VOID: AtomicBool = AtomicBool::new(false);
 
 /// Runs `f` on the owner thread and returns its result (its panic resumes here). On the owner it
 /// runs at once (nested: constant evaluation's JIT code compiling what it calls). The caller
@@ -1506,7 +1506,8 @@ pub fn queued_in(class: Class) -> usize {
     Q.lock().unwrap_or_else(|e| e.into_inner()).lanes[class as usize].len()
 }
 
-fn serve(r: usize) {
+/// `void`: posted tasks go unrun (`Queue::void`, as the request was picked).
+fn serve(r: usize, void: bool) {
     let req = unsafe { &*(r as *const Req) };
     SERVED.fetch_add(1, Ordering::Relaxed);
     // served inside a pump, the owner runs: its row stops naming the pump's runner meanwhile (the
@@ -1544,7 +1545,7 @@ fn serve(r: usize) {
         crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, crate::inspect::pstream::SITE | (req.site as *const std::panic::Location<'static> as u64));
     }
     // (a run's end voided the posted tasks: this one goes unrun, `void_posts`)
-    let res = if !req.waited && POSTS_VOID.load(Ordering::Acquire) {
+    let res = if !req.waited && void {
         Ok(())
     } else {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*req.run)() }))
@@ -1652,7 +1653,7 @@ fn owner_loop() {
             std::hint::spin_loop();
         }
         drop(spin);
-        let r = {
+        let (r, void) = {
             let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 // a fork: parked here, between two requests (no request's state half done)
@@ -1666,7 +1667,7 @@ fn owner_loop() {
                     continue;
                 }
                 if let Some(r) = pick(&mut q, Mode::Top) {
-                    break r;
+                    break (r, q.void);
                 }
                 if STOP.load(Ordering::SeqCst) {
                     return;
@@ -1683,7 +1684,7 @@ fn owner_loop() {
             }
         };
         main_last = from_main(r);
-        serve(r);
+        serve(r, void);
         crate::lifeline::beat();
         // between top-level requests: the vtables made for real-time trait-object types
         // (a panic in either is printed by the panic hook: the owner is not serving a request).
@@ -1779,7 +1780,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
         let r = {
             let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
             match pick(&mut q, Mode::Pump) {
-                Some(r) => Some(r),
+                Some(r) => Some((r, q.void)),
                 None => {
                     // a latch completing or a request arriving wakes it; the timeout bounds a
                     // condition nothing announces (an in-flight flag cleared by a Finish)
@@ -1790,9 +1791,9 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
                 }
             }
         };
-        if let Some(r) = r {
+        if let Some((r, void)) = r {
             let t = crate::jit::wall_ns();
-            serve(r);
+            serve(r, void);
             pumping.serving += crate::jit::wall_ns().saturating_sub(t);
         }
     }
@@ -2406,7 +2407,7 @@ mod tests {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
-    reset(&Q, Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES] }));
+    reset(&Q, Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES], void: false }));
     reset(&STARTED, std::sync::Once::new());
     reset(&STOP, AtomicBool::new(false));
     reset(&FOREGROUND, AtomicU32::new(0));
