@@ -1444,7 +1444,7 @@ fn cmd_jit(req: &Req, out: &mut Out) {
 /// graphs): the monotonic counters a rate is diffed from and the UI frames since the last look.
 /// `editing` and `unverified` say whether the JIT is still on an edit: its watcher round (the save
 /// to its verdict) and the patch groups that run while their check has not reported. devhub's
-/// watch on an edit's verdict waits while either is on, however long: a two-file Fab edit took
+/// watch on an edit's verdict waits while either is on, however long: a two-file edit of a large app took
 /// 70 s to compile, and a fixed 60 s watch said the edit was not applied (11-16).
 /// `unverified_why` says what the oldest of those groups waits on (reload::unverified_why).
 fn cmd_live(req: &Req, out: &mut Out) {

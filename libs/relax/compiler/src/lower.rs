@@ -9559,7 +9559,7 @@ impl<'a> Lcx<'a> {
                 // A factor whose value fits one 64-bit word (`a as i128` of a 64-bit or narrower integer,
                 // a literal): `a as i128 * b as i128` never overflows, so it is one widening multiply
                 // (imul / smulh; mul / umulh) and no check -- rustc's, where a general 128-bit product
-                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates: Fab's
+                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates: a large app's
                 // slicer cross and dot products, 18% of its segment splitting under the JIT); a full
                 // 128-bit value by one word (`d as i128 * num`, `2 * n`) is four multiplies and the
                 // check of its third word (rustc's inline smulo of a sign-extended factor)
@@ -14542,7 +14542,7 @@ leaf fn rt_wide_f64(signed: u64, lo: u64, hi: u64) -> f64 {
 rt_fn! {
 /// 128-bit quotient or remainder (mode bit 0: remainder, bit 1: signed). The caller has checked a
 /// zero divisor and signed MIN / -1 (wide_divrem), so it cannot panic: a leaf entry, without the
-/// panic guard each call paid (two divisions a crossing point in Fab's slicer). (A host helper
+/// panic guard each call paid (two divisions a crossing point in a large app's slicer). (A host helper
 /// for now; candidate for an Rt entry.)
 leaf fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
     let a = ((ahi as u128) << 64) | alo as u128;

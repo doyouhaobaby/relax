@@ -23881,7 +23881,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // the candidate needed it again every round and was left out for good. Once a round each: a
     // slot several candidates asked for (each instance of a generic fn inlining one closure) was
     // fronted once per ask, its tries spent in one round, and a front a later round needed (its
-    // parent's body replaced by the parent's own take) never came: an O3 build of a Fab mesher left
+    // parent's body replaced by the parent's own take) never came: an O3 build of a large app's mesher left
     // three closures out, asked 5 times in a round (11-20).
     let mut this_round = std::collections::HashSet::new();
     for s in std::mem::take(&mut needs) {
@@ -25248,7 +25248,7 @@ impl Drop for MainHeld {
 /// start ends here too (startup_main), and its startup manifest's window closes
 /// (manifest_window_closed): the manifest is recorded now, as an
 /// app's is after its first frame, not 2 s of idle later (a session stopped in between left the
-/// next one no warm start). A cold Fab session's is on disk 2.1-2.7 s after its verdict (the mid
+/// next one no warm start). A large app's cold session's is on disk 2.1-2.7 s after its verdict (the mid
 /// writer's next pass, its record and the spill after it).
 pub(crate) fn first_test_pass_done() {
     if DEMAND_COMPILES.load(Ordering::SeqCst) == 0 {
@@ -28743,7 +28743,7 @@ fn prefront_closure_as(front: &FrontShared, into: u32, id: u32, plain: Option<u3
         // made ahead put the body that came from) is no front: its take refuses it (take_lowered_ahead: "closure parent body
         // differs"). Counted as made, it spent the slot's FRONT_TRIES, and the O3 build left the
         // closure out ("made, and needed again", with a front a round asked for more than once:
-        // 109 of the 114 left-out lines of a Fab roadster test's runs, 11-20). Lowered again from
+        // 109 of the 114 left-out lines of the runs of a scenario test of a large app, 11-20). Lowered again from
         // the body the parent has now.
         if from_parent && matches!(pending.get(&into), Some(LoweredState::Ready(l)) if l.body.as_ref().is_some_and(|b| !std::sync::Arc::ptr_eq(b, &body))) {
             if ahead_trace() {
@@ -34700,7 +34700,7 @@ unsafe fn realtime_split(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> boo
 /// reach (realtime_split) that no reach build has taken yet: the owner runs it here and installs it
 /// (split_finish ends the flight), its walk left to that reach build (it finds the slot compiled).
 /// Waiting instead waits for the owner itself: the reach build stays queued while the pool holds it
-/// back (a reserve, parked jobs that wait for this owner). A Fab run's owner waited 2,300 s so on
+/// back (a reserve, parked jobs that wait for this owner). The owner of a large app's run waited 2,300 s so on
 /// an inline candidate its own split had put in flight, main waiting on the owner (11-19). False:
 /// no such back end (another thread's build holds the flight).
 unsafe fn realtime_back_for_wait(up: *mut Unit, id: u32) -> bool {

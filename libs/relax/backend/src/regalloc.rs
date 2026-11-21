@@ -6138,7 +6138,7 @@ pub fn compares_into_readers(options: &relax_session::Options, f: &Func, sel_ok:
 /// branches on `(a ^ d) & (b ^ d) < 0` for `d = a + b`, `(a ^ d) & (a ^ b) < 0` for `d = a - b`,
 /// the 64-bit product's high word against its low word's sign (`mulhi(a, b) != (a * b) >> 63`)
 /// and the 32-bit product against the 64-bit one; 4 to 6 instructions and a test each, a quarter
-/// of the instructions in Fab's hottest loop where native has the op's `jo`. A branch on one of
+/// of the instructions in a large app's hottest loop where native has the op's `jo`. A branch on one of
 /// these, its pieces all in the branch's block and the op's operands written by nothing from the
 /// op on, reads `O(op, ty, a, b)`, the op made again on the flags (at 32 or 64 bits); the pieces
 /// left without readers go. `mul`: the back end makes a multiply's overflow flag (x64 `imul`).

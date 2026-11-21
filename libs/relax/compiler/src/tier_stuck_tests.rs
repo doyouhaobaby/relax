@@ -707,7 +707,7 @@ fn a_front_made_after_a_patch_of_its_file_is_taken() {
 /// body that lowering came from (a new one), and the closure's next front found the old lowering,
 /// said "already lowered" and counted as made: the tries went to a front no take could use, and
 /// the O3 build of a hot caller left the closure out ("made, and needed again": 109 of 114
-/// left-out lines of a Fab roadster test's runs, 11-20).
+/// left-out lines of the runs of a scenario test of a large app, 11-20).
 #[test]
 fn a_closure_front_from_its_parents_old_body_is_made_again() {
     isolated_test!(a_closure_front_from_its_parents_old_body_is_made_again);

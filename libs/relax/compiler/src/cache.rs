@@ -7681,7 +7681,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     entries.push(NewEntry { key: front_graph_key(recipe.identity), kind: KIND_FRONT_GRAPH, payload });
     // a load of the same graph makes the same entries (a test's subject loads again for its lints
     // each run, run.rs test_lints): the store holds them already, and its rewrite wrote 72 MB on
-    // every warm run of a Fab scenario test
+    // every warm run of a scenario test of a large app
     if Store::open(&path).is_some_and(|st| st.holds_exactly(&entries)) {
         mark("unchanged");
     } else {

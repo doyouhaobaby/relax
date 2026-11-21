@@ -1812,7 +1812,7 @@ fn realtime_strict_ready_counts_the_reach_builds_off_the_owner() {
 /// its reach build (realtime_split); its inline candidates stay in its flight until that back end
 /// ends. Nobody waits for such a back end while no reach build has taken it: whoever waits for that
 /// flight runs it -- the owner's front that needs a candidate of it (another given-back slot's,
-/// here), and an O2 job polling for one of its slots. (11-19: a Fab run's owner waited 2,300 s on a
+/// here), and an O2 job polling for one of its slots. (11-19: the owner of a large app's run waited 2,300 s on a
 /// candidate its own split had put in flight, the reach build that would end it held back by the
 /// pool, main waiting on the owner; a job sleeping so holds its worker the same way.)
 #[test]
