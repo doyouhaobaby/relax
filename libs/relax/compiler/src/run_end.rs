@@ -5,7 +5,7 @@
 //! What stays is the process: its main loop, the window, the GPU device, the host's threads.
 
 use crate::jit::Unit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long the run's own threads get to see the end. A compile between two of its points is what
@@ -31,6 +31,28 @@ static RESTARTING: AtomicBool = AtomicBool::new(false);
 
 pub fn restarting() -> bool {
     RESTARTING.load(Ordering::Acquire)
+}
+
+/// Runs ended in place, counted as each restart takes its run (before that run's end); nothing
+/// lowers it.
+static ENDS: AtomicU64 = AtomicU64::new(0);
+/// The count of runs ended in place when the run going now began: the restart that started it
+/// sets it, before the next run's boot.
+static THIS_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// The run going now, as `ended_in_place` takes it: read where the run's host threads start (the
+/// host's compile thread), before any restart can take that run.
+pub fn run_gen() -> u64 {
+    THIS_RUN.load(Ordering::Acquire)
+}
+
+/// A restart took the run `gen` names (`run_gen`): that run ends in place, or ended, and the
+/// restart starts the run after it. Unlike `restarting`, which clears before the next run's boot,
+/// nothing clears it: the host's compile thread, slow on a loaded box, read `restarting` after a
+/// relaunch in the next run's boot had cleared it, took the end for its run's own failure and ended
+/// the run with no next one (the restart fixture's "boot-no-next-run" in CI, 11-21).
+pub fn ended_in_place(gen: u64) -> bool {
+    ENDS.load(Ordering::Acquire) != gen
 }
 
 /// What the run before this one left for it (reload.rs next_run_env: the recovery record, the
@@ -157,6 +179,8 @@ pub fn restart(why: String, state: Option<&[u8]>) -> Result<(), String> {
             return Err(e);
         }
     };
+    // (from here the run is this restart's: `ended_in_place` says so to its threads)
+    ENDS.fetch_add(1, Ordering::AcqRel);
     let spawned = std::thread::Builder::new().name("run-restart".into()).spawn(move || {
         eprintln!("relax live: restarting ({why})");
         let t = Instant::now();
@@ -175,6 +199,7 @@ pub fn restart(why: String, state: Option<&[u8]>) -> Result<(), String> {
         *HANDED.lock().unwrap_or_else(|e| e.into_inner()) = Some(next);
         // the next run's boot is due before another restart can be asked for
         crate::run::boot_begins();
+        THIS_RUN.store(ENDS.load(Ordering::Acquire), Ordering::Release);
         RESTARTING.store(false, Ordering::Release);
         crate::run::host_next_run();
     });
