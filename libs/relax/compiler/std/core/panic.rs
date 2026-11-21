@@ -87,8 +87,10 @@ impl<'a> PanicInfo<'a> {
     pub(crate) fn new(message: fmt::Arguments<'a>, location: &'a Location<'a>) -> PanicInfo<'a> {
         PanicInfo { message, location }
     }
-    pub fn message(&self) -> fmt::Arguments<'a> {
-        self.message
+    /// rustc 1.81.0 (panic_info_message): the message that was given to the panic macro.
+    #[must_use]
+    pub fn message(&self) -> PanicMessage<'_> {
+        PanicMessage { message: &self.message }
     }
     pub fn location(&self) -> Option<&Location<'_>> {
         Some(self.location)
