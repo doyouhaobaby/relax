@@ -3069,8 +3069,8 @@ fn note_abandoned_frames(app_call: bool) {
     }
     // (the names outlive this thread's domain and its heap, also while they are made)
     let _k = crate::zone_alloc::kept();
-    for &ret in &raw[..n] {
-        if crate::stale::in_ended_run(ret) {
+    for (i, &ret) in raw[..n].iter().enumerate() {
+        if crate::stale::in_ended_run(ret) || (i == 0 && delivery_not_begun(ret)) {
             continue;
         }
         let name = match os::proc::image_at_raw(ret) {
@@ -3083,6 +3083,22 @@ fn note_abandoned_frames(app_call: bool) {
             None => a.push((name, 1)),
         }
     }
+}
+
+/// Where a fault stopped is the first instruction of the signal trampoline: the kernel delivered
+/// the fault on top of a delivery it had only set up. Darwin delivers the lowest-numbered pending
+/// signal first, so a run's end kick (SIGEMT, 7) that is pending as the fetch of the ended code
+/// faults (SIGBUS, 10) is set up first, and the SIGBUS comes in at its trampoline's entry. That
+/// delivery has run nothing and holds nothing: no frame is left there. (Linux takes the
+/// synchronous signal first.)
+#[cfg(target_vendor = "apple")]
+fn delivery_not_begun(pc: u64) -> bool {
+    matches!(os::proc::image_at_raw(pc), Some((_, _, sym, start)) if start == pc && sym == b"_sigtramp")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn delivery_not_begun(_pc: u64) -> bool {
+    false
 }
 
 /// A program's `enter`, for the calls native code makes into it (`app_call`). A program unit's entry
