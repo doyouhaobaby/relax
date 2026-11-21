@@ -30427,10 +30427,14 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         return;
     }
     let f: std::sync::Arc<FrontShared> = (*std::ptr::addr_of!((*up).front)).clone();
-    // A start that links cached code (warm or edited) has few misses; they must not
-    // speculatively type-check their cached callees. The normal build checks a missing
-    // body on demand. After a live edit the edited code is not cached: speculation helps again.
-    if f.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() { return; }
+    // A start that links cached code (warm or edited) must not speculatively type-check the cached
+    // callees of what it builds (an edited app's start once checked 80k bodies ahead, 13 s of CPU,
+    // for the 31 its builds took). The body built now is no speculation: it is checked and lowered
+    // either way, here, on the thread that builds it, and not in the owner's front, which every
+    // thread's lazy compile queues for (a warm start entering a large new part of an app: 50k first
+    // compiles, 18 s of fronts on the owner, the UI thread behind them). After a live edit the
+    // edited code is not cached: the callees are checked again.
+    let linked = f.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty();
     // an unverified-mode twin (SPEC-V) is built from its base slot's body: that body is checked
     let key = match f.slot_keys.get(&id) {
         Some(FnKey::Plain(base)) => f.slot_keys.get(&base),
@@ -30439,7 +30443,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
     if let Some(FnKey::Inst(d, args)) = key {
         let t0 = cpu_ns();
         let key = (d, args.clone());
-        typeck_ahead(&f, d, args, 3, false, false);
+        typeck_ahead(&f, d, args, if linked { 0 } else { 3 }, false, false);
         // a helper is checking this very body: wait for its result rather than check it again
         // under the unit lock (not while holding that lock: a constant evaluation's call). Not
         // while helpers may run at the idle policy (queue::waits_on_helpers): the front checks it
