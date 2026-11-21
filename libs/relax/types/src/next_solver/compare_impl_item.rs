@@ -207,6 +207,14 @@ impl Tcx {
 }
 
 impl Tcx {
+    /// Whether impl `imp`'s trait passed its overlap check in the impl's crate (the
+    /// specialization_graph query; true for an inherent impl). The query's E0119 went to the
+    /// diagnostics of the thread that asked it first.
+    pub fn impl_trait_coherent(&self, prog: &Program, imp: DefId) -> bool {
+        let Some(&td) = self.impl_trait.get(&imp) else { return true };
+        (crate::type_queries::Providers { tcx: self, prog }).specialization_graph((prog.def(imp).krate, td)).expect("coherent trait query")
+    }
+
     /// rustc_hir_analysis/src/check/check.rs:1302-1483. Specialization and
     /// unstable default-body attributes are cut; each impl is its own leaf.
     pub fn check_impl_items_against_trait(&self, prog: &Program, imp: DefId) -> Vec<String> {

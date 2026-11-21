@@ -2008,8 +2008,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let max_err: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     if !prog.errors.is_empty() {
-        // reported here, each once: the background item check (typeck_bg.rs) counts them in its
-        // crates' verdicts without saying them again
+        // Report this load's resolution diagnostics once, independently of stored check verdicts.
         for e in &prog.errors {
             crate::run::first_report(0, e);
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "resolve")); }
@@ -2302,7 +2301,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if !selftest {
             let t = Instant::now();
             let std_crates = crate::check::std_crates(&u.prog);
-            let errors = crate::check::run_check_crates(&mut *u, &std_crates);
+            let errors = crate::check::run_check_crates(&mut *u, &std_crates, false);
             for e in &errors {
                 if crate::diag::enabled() { crate::diag::emit(&crate::diag::from_legacy(e, "typeck")); } else { eprintln!("{e}"); }
             }
@@ -2531,11 +2530,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // first runs: a lazy compile checks its body, and a compile error ends the run.
         let t_check = Instant::now();
         let app = crate::check::app_crates(&u.prog, root);
-        app_check = crate::check::prepare_check(&mut *u, &app);
+        app_check = crate::check::prepare_check(&mut *u, &app, true);
         phase("app check lookups", t_check);
-        verbose!("relax: app check lookups: {} of {} app crates to check ({} by their dependencies' interfaces, those keys {:.0} ms)",
+        verbose!("relax: app check lookups: {} of {} app crates to check ({} body verdicts by their dependencies' interfaces, interface keys {:.0} ms, {} item file digests materialized)",
             crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(),
-            crate::check::RUN_CHECK[5].load(Ordering::Relaxed), crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6);
+            crate::check::RUN_CHECK[5].load(Ordering::Relaxed), crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6,
+            u.cache.as_ref().map_or(0, |c| c.stats.item_file_digests));
         if app_check.is_some() {
             // (the cache's: on the owner)
             let t_graph = Instant::now();
@@ -2555,10 +2555,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // after the first frame (typeck_bg.rs).
         let t_check = Instant::now();
         let app = crate::check::app_crates(&u.prog, root);
-        let errors = crate::check::run_check_crates(&mut *u, &app);
+        let errors = crate::check::run_check_crates(&mut *u, &app, true);
         phase("app check", t_check);
-        verbose!("relax: app check: {} of {} app crates checked ({} body owners), {} errors; verdict lookup {:.0} ms ({} by their dependencies' interfaces, those keys {:.0} ms), skipped files' load {:.0} ms",
-            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), errors.len(),
+        verbose!("relax: app check: {} of {} app crates checked ({} body owners, {} item defs), {} errors; verdict lookup {:.0} ms ({} by their dependencies' interfaces, those keys {:.0} ms), skipped files' load {:.0} ms",
+            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), crate::check::RUN_CHECK[7].load(Ordering::Relaxed), errors.len(),
             crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[5].load(Ordering::Relaxed),
             crate::check::RUN_CHECK[6].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
         if !errors.is_empty() {

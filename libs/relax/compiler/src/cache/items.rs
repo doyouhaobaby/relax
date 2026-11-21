@@ -55,6 +55,47 @@ pub(crate) fn file_digest(pf: &ParsedFile) -> FileDigest {
     digest_into(pf, None)
 }
 
+impl super::Cache {
+    /// The crate interface plus the bodies that define items outside it. A collected restore
+    /// keeps the interface but makes each file digest on demand, only after the fingerprint miss.
+    pub(crate) fn own_items(&mut self, u: &crate::jit::Unit, c: u32) -> Option<u128> {
+        let mut h = Sip128::new();
+        h.str("own-items");
+        h.u128(*self.iface.get(c as usize)?);
+        // how rustc is invoked on the crate, as the body key's own text has it
+        h.u128(u.prog.crates.get(c as usize)?.context.fingerprint());
+        // A restore can already hold files the original boot skipped. Their whole text, in
+        // this crate and its dependencies, lives in late_view even when BOOT_SKIPPED is empty.
+        h.u128(*self.late_view.get(c as usize)?);
+        let prog = &u.prog;
+        let skipped = crate::check::boot_skipped_paths(c);
+        if prog.skipped_files.iter().any(|(&m, (path, _, _))| prog.mods[m as usize].krate == c && skipped.binary_search(path).is_err()) {
+            return None;
+        }
+        for (f, &krate) in prog.file_crate.iter().enumerate() {
+            if krate != c { continue; }
+            let path = prog.file_paths.get(f)?;
+            if skipped.binary_search(path).is_ok() { continue; }
+            // A newly discovered child of a skipped module is in neither startup key.
+            if f >= prog.boot_files && !prog.front_macro_fragments.contains(&f) && !self.late_memo.contains_key(&(f as u32)) { return None; }
+            let missing = self.digests.get(f).is_none_or(Option::is_none);
+            let digest = self.digest_of(u, f)?;
+            self.stats.item_file_digests += u64::from(missing);
+            if digest.nested_in.is_empty() { continue; }
+            h.str(&crate::dirs::anchored(path));
+            let mut spans: Vec<_> = digest.nested_in.iter().map(|&(_, owner)| digest.hole(owner)).collect::<Option<_>>()?;
+            spans.sort_unstable();
+            spans.dedup();
+            h.u32(spans.len() as u32);
+            for (lo, hi) in spans {
+                h.u32(hi - lo);
+                h.write(prog.files[f].src.get(lo as usize..hi as usize)?);
+            }
+        }
+        Some(h.finish128())
+    }
+}
+
 /// The interface text of a file (holes marked `{..}`): RELAX_CACHE_IFACE diagnostics.
 pub(crate) fn iface_text(pf: &ParsedFile) -> Vec<u8> {
     let mut v = Vec::new();

@@ -675,6 +675,8 @@ pub struct CacheStats {
     pub code_stores: u64,
     /// ms computing file digests and interface fingerprints at open
     pub iface_ns: u64,
+    /// File digests materialized after item fingerprint misses.
+    pub item_file_digests: u64,
     /// cpu of the per-item work: definition body/position digests (code keys), certificates
     /// written (record) and checked (lookup)
     pub body_ns: u64,
@@ -3661,13 +3663,14 @@ impl Cache {
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
     /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects);
-    /// ITEMS_KEY_MODE, a run's background item check. The test
+    /// ITEMS_KEY_MODE, a run's item check (at the app gate or in the background for dependencies). The test
     /// dependency check keys by its dependencies' interfaces instead (`dep_check_key`). The key:
     /// the Relax build and options (cfg), the crate's fingerprint with the text of the files the
     /// boot skipped (fp_now: its loaded files, those a restored image holds past its boot's, and
     /// its dependencies'), as the code keys rest on, and `skipped`, the text of its files this
     /// boot's selection did not load (check.rs skipped_text_hash): every file of it. A
-    /// borrowck-kind entry (record_borrowck). Mode 0 also looks up `app_check_key` on a miss.
+    /// borrowck-kind entry (record_borrowck). A fingerprint miss tries `app_check_key` for
+    /// mode 0 and `items_check_key` for ITEMS_KEY_MODE.
     pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
         let fp = self.fp_now(c as usize)?;
         let mut h = Sip128::new();
@@ -3749,6 +3752,12 @@ impl Cache {
     /// body edit in a dependency, the fingerprint key misses and this second lookup can hit.
     pub fn app_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
         self.iface_check_key("run-typeck-crate-iface", c, own, skipped, closure)
+    }
+
+    /// The run's item verdict uses the same dependency terms as its body verdict, with the
+    /// crate's own interface and the text of holes defining nested items (`own_items`).
+    pub(crate) fn items_check_key(&mut self, c: u32, own_items: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
+        self.iface_check_key("run-items-crate-iface", c, own_items, skipped, closure)
     }
 
     fn iface_check_key(&mut self, tag: &str, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
