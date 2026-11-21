@@ -235,7 +235,19 @@ impl Tcx {
             return errors;
         }
         for &item in &data.items {
-            if !prog.trait_item_def_id.contains_key(&item) || prog.impl_trait_in_trait_data.contains_key(&item) { continue; }
+            let Some(&trait_item) = prog.trait_item_def_id.get(&item) else { continue };
+            if prog.impl_trait_in_trait_data.contains_key(&item) { continue; }
+            if prog.def(item).kind == DefKind::AssocFn {
+                if let (Some(imp_sig), Some(trait_sig)) = (self.fn_item_sig(prog, item), self.fn_item_sig(prog, trait_item)) {
+                    let (actual, expected) = (imp_sig.params.len(), trait_sig.params.len());
+                    if actual != expected {
+                        let unit = if actual == 1 { "parameter" } else { "parameters" };
+                        errors.push(error(item, format!("E0050: method `{}` has {actual} {unit} but the declaration in trait `{}` has {expected}",
+                            prog.name(item), prog.def_path(trait_item))));
+                        continue;
+                    }
+                }
+            }
             if matches!(prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy) && self.compare_impl_item(prog, item).is_err() {
                 let code = match prog.def(item).kind { DefKind::AssocConst => "E0326", DefKind::AssocTy => "E0277", _ => "E0053" };
                 errors.push(error(item, format!("{code}: item `{}` has an incompatible type for trait", prog.name(item))));

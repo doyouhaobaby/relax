@@ -2008,10 +2008,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let max_err: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     if !prog.errors.is_empty() {
+        // reported here, each once: the background item check (typeck_bg.rs) counts them in its
+        // crates' verdicts without saying them again
         for e in &prog.errors {
+            crate::run::first_report(0, e);
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "resolve")); }
         }
-        eprintln!("relax: {} unresolved imports (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
+        eprintln!("relax: {} name resolution errors (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
         for e in prog.errors.iter().take(max_err) {
             eprintln!("  {}", e);
         }

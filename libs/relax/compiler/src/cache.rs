@@ -71,6 +71,8 @@ const COHERENCE_VERSION: u32 = 2;
 /// verdict rests on changes (2: a test check's clean verdict means no warnings -- one with
 /// warnings stores them, KIND_TEST_WARNINGS)
 const CRATE_CHECK_VERSION: u32 = 2;
+/// Cache key mode for a run's item verdict (1 and 2 belong to the plain and harness test checks).
+pub(crate) const ITEMS_KEY_MODE: u8 = 3;
 
 /// Immutable driver view for Gandalf's generic owner discovery. No Unit/cache
 /// callbacks under the front read lock, and no need to construct an instance key
@@ -3658,7 +3660,8 @@ impl Cache {
     /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
-    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The test
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects);
+    /// ITEMS_KEY_MODE, a run's background item check. The test
     /// dependency check keys by its dependencies' interfaces instead (`dep_check_key`). The key:
     /// the Relax build and options (cfg), the crate's fingerprint with the text of the files the
     /// boot skipped (fp_now: its loaded files, those a restored image holds past its boot's, and
@@ -3668,7 +3671,11 @@ impl Cache {
     pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
         let fp = self.fp_now(c as usize)?;
         let mut h = Sip128::new();
-        h.str(if mode == 0 { "run-typeck-crate" } else { "test-check-crate" });
+        h.str(match mode {
+            0 => "run-typeck-crate",
+            ITEMS_KEY_MODE => "run-items-crate",
+            _ => "test-check-crate",
+        });
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
         h.u128(crate::dirs::anchors_key());
         h.u8(mode);

@@ -19,6 +19,7 @@ macro_rules! eprintln {
 use relax_types::next_solver::{Goal, ParamEnvId};
 use crate::jit::{self, FnKey, Unit};
 use crate::program::{DefId, DefKind, Program};
+use crate::tcx::Tcx;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -341,28 +342,10 @@ impl CheckAudit {
     }
 }
 
-/// The item-level errors of `crates` that `makepad check` reports beside the bodies: each
-/// definition's signature checks (an impl's items against its trait, coherence among them), an
-/// impl's unsafety, and -- when those are clean -- well-formedness; in position order, follow-on
-/// errors dropped as the app check drops them. Coherence's E0119 is taken here from the
-/// session diagnostics. A run does not make these before its builds
-/// (jit.rs build_failure asks them once a build has failed inside).
-pub(crate) fn item_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crates: &[u32]) -> Vec<String> {
-    let defs: Vec<_> = prog.defs.iter().enumerate().filter(|(_, def)| crates.contains(&def.krate))
-        .map(|(i, _)| crate::program::DefId(i as u32)).collect();
-    let mut errors = Vec::new();
+/// Include errors emitted to the session by this definition's check (among them coherence's E0119).
+fn with_item_diagnostics(prog: &Program, tcx: &Tcx, check: impl FnOnce() -> Vec<String>) -> Vec<String> {
     let cp = tcx.dcx.checkpoint();
-    for &d in &defs {
-        errors.extend(tcx.check_def_signature(prog, d));
-        if prog.def(d).kind == DefKind::Impl {
-            errors.extend(relax_types::unsafety::check_impl(prog, tcx, d));
-        }
-    }
-    if errors.is_empty() {
-        for d in defs {
-            errors.extend(relax_types::wfcheck::obligations::check_def(prog, tcx, d));
-        }
-    }
+    let mut errors = check();
     let (reported, warnings) = tcx.dcx.take_since(cp);
     for error in reported {
         let cause = error.cause;
@@ -371,6 +354,41 @@ pub(crate) fn item_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx,
         errors.push(message);
     }
     for w in warnings { stderr_line!("warning: {}", w.message); }
+    errors
+}
+
+pub(crate) fn def_item_errors(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    with_item_diagnostics(prog, tcx, || {
+        let mut errors = tcx.check_def_signature(prog, d);
+        if prog.def(d).kind == DefKind::Impl {
+            errors.extend(relax_types::unsafety::check_impl(prog, tcx, d));
+        }
+        errors
+    })
+}
+
+pub(crate) fn def_wf_errors(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    with_item_diagnostics(prog, tcx, || relax_types::wfcheck::obligations::check_def(prog, tcx, d))
+}
+
+/// The loader's name resolution errors in files belonging to the selected crates.
+pub(crate) fn crate_resolve_errors(prog: &Program, crates: &[u32]) -> Vec<String> {
+    if prog.errors.is_empty() { return Vec::new(); }
+    let paths: std::collections::HashSet<&str> = prog.file_paths.iter().zip(&prog.file_crate)
+        .filter(|(_, k)| crates.contains(k)).map(|(p, _)| p.as_str()).collect();
+    prog.errors.iter().filter(|e| paths.contains(error_position(e).0.as_str())).cloned().collect()
+}
+
+/// The item-level errors of `crates` for a failed build. Check well-formedness once all the
+/// signatures are clean, then include resolution errors and drop follow-ons as the app check does.
+pub(crate) fn item_errors(prog: &Program, tcx: &Tcx, crates: &[u32]) -> Vec<String> {
+    let defs = prog.defs.iter().enumerate().filter(|(_, def)| crates.contains(&def.krate))
+        .map(|(i, _)| DefId(i as u32));
+    let mut errors: Vec<_> = defs.clone().flat_map(|d| def_item_errors(prog, tcx, d)).collect();
+    if errors.is_empty() {
+        errors.extend(defs.flat_map(|d| def_wf_errors(prog, tcx, d)));
+    }
+    errors.extend(crate_resolve_errors(prog, crates));
     errors.sort_by_cached_key(|e| error_position(e));
     errors.dedup();
     if errors.iter().any(|e| !is_follow_on(e)) { errors.retain(|e| !is_follow_on(e)); }
@@ -2415,7 +2433,7 @@ fn function_origin(u: &Unit, mut id: u32) -> Option<(u32,u32)> {
 }
 
 /// (path, line, col, text) of a legacy line or a rendered borrow error (no location: first).
-fn error_position(e: &str) -> (String, u32, u32, String) {
+pub(crate) fn error_position(e: &str) -> (String, u32, u32, String) {
     let first = e.lines().find_map(|line| line.trim().strip_prefix("--> ")).unwrap_or_else(|| e.lines().next().unwrap_or(""));
     for (i, _) in first.match_indices(':') {
         let mut it = first[i + 1..].splitn(3, ':');
