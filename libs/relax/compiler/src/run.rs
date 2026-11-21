@@ -6187,6 +6187,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&FAILED_BODIES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PENDING_REPORTS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&LIVE_SESSION, AtomicBool::new(false));
+    reset(&EDITS_PUSHED, AtomicBool::new(false));
     reset(&VERBOSE, AtomicBool::new(false));
     reset(&STARTUP_PATH, relax_session::sync::Mutex::new(String::new()));
     reset(&ROOT_DIR, relax_session::sync::Mutex::new(String::new()));
