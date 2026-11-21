@@ -4821,7 +4821,7 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
         crate::inspect::events::CompileParked::Fixed(a) => a,
         crate::inspect::events::CompileParked::Stop => {
             eprintln!("relax: stopped at a call of code that did not compile ({})", message);
-            std::process::exit(101)
+            crate::os::proc::exit(101)
         }
         crate::inspect::events::CompileParked::Unwind => owner::call(owner::Class::Program, || unsafe {
             let u = &mut *(up as *mut Unit);
@@ -4873,7 +4873,7 @@ pub(crate) fn ice_at_call(message: &str) -> bool {
             },
             crate::inspect::events::UpdateParked::Stop => {
                 eprintln!("relax: stopped at a call the live update could not build ({message})");
-                std::process::exit(101)
+                crate::os::proc::exit(101)
             }
             crate::inspect::events::UpdateParked::Ending => true,
         };
@@ -4925,7 +4925,10 @@ fn fatal_compile_error(p: &PanicInfo, report: &str) {
         if crate::domain::crash_current(&p.message) {
             return;
         }
-        std::process::exit(101);
+        // the program's exit (os::proc::exit), not the C library's: its exit handlers include a
+        // native library's (a GPU driver's teardown), which would run under the program's other
+        // threads still inside that library (a restarted app's GPU work, a segfault in the driver)
+        crate::os::proc::exit(101);
     }
 }
 
@@ -9319,7 +9322,7 @@ impl Unit {
                 if COMPILE_ERRORS_FATAL.load(Ordering::Relaxed) {
                     eprintln!("relax: {} -- the program cannot run past it (rustc rejects it)", m);
                     if !crate::domain::crash_current(&m) {
-                        std::process::exit(101);
+                        crate::os::proc::exit(101);
                     }
                 }
                 // queries.rs:58-108: evaluation errors return to the caller;

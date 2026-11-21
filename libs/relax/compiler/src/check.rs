@@ -1179,7 +1179,7 @@ static BESIDE: (relax_session::sync::Mutex<u8>, relax_session::sync::Condvar) = 
 /// it. Every body is still checked before it first runs (a lazy compile checks its body; a body
 /// with errors is a compile error, which ends the run). The first frame waits for the check
 /// (wait_app_check, from the platform's first window frame); an error ends the run before it,
-/// reported as a build's errors are (`stop`, then exit 101).
+/// reported as a build's errors are (`stop`, then exit 101, the program's exit: os::proc::exit).
 pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::RuntimeOptions, stop: Box<dyn Fn(&[String]) + Send>) {
     *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 1;
     let upn = up as usize;
@@ -1194,7 +1194,10 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
         }
         if !errors.is_empty() {
             stop(&errors);
-            std::process::exit(101);
+            // as the program's own exit ends (os::proc::exit): without the C library's exit
+            // handlers, which a native library registered (a GPU driver's teardown, from the
+            // window's load) and which run while the program's threads go on in that library
+            crate::os::proc::exit(101);
         }
         *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 2;
         BESIDE.1.notify_all();
