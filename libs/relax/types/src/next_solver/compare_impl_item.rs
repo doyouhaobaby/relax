@@ -259,7 +259,11 @@ impl Tcx {
             };
             if !has_value && !(unsized_self && self.generics_require_sized_self(prog, item)) { missing.push(format!("`{}`", prog.name(item))); }
         }
-        if !missing.is_empty() { errors.push(error(imp, format!("E0046: not all trait items implemented, missing: {}", missing.join(", ")))); }
+        if !missing.is_empty() {
+            let self_ty = crate::typeck::ty_to_string(false, prog, self, self.impl_self[&imp]);
+            errors.push(error(imp, format!("E0046: not all trait items implemented, missing: {} -- in `impl {} for {}`",
+                missing.join(", "), prog.def_path(td), self_ty)));
+        }
         errors
     }
 

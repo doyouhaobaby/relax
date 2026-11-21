@@ -134,6 +134,42 @@ pub(crate) fn body_owners(prog: &crate::program::Program, crates: &[u32]) -> Vec
         .filter_map(|d| crate::borrowck::body::CheckedBody::item(prog, d)).map(|b| b.owner).collect()
 }
 
+/// The item-level errors of `crates` that `makepad check` reports beside the bodies: each
+/// definition's signature checks (an impl's items against its trait, coherence among them), an
+/// impl's unsafety, and -- when those are clean -- well-formedness; in position order, follow-on
+/// errors dropped as the app check drops them. Coherence's E0119 is taken here from the
+/// session diagnostics. A run does not make these before its builds
+/// (jit.rs build_failure asks them once a build has failed inside).
+pub(crate) fn item_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crates: &[u32]) -> Vec<String> {
+    let defs: Vec<_> = prog.defs.iter().enumerate().filter(|(_, def)| crates.contains(&def.krate))
+        .map(|(i, _)| crate::program::DefId(i as u32)).collect();
+    let mut errors = Vec::new();
+    let cp = tcx.dcx.checkpoint();
+    for &d in &defs {
+        errors.extend(tcx.check_def_signature(prog, d));
+        if prog.def(d).kind == DefKind::Impl {
+            errors.extend(relax_types::unsafety::check_impl(prog, tcx, d));
+        }
+    }
+    if errors.is_empty() {
+        for d in defs {
+            errors.extend(relax_types::wfcheck::obligations::check_def(prog, tcx, d));
+        }
+    }
+    let (reported, warnings) = tcx.dcx.take_since(cp);
+    for error in reported {
+        let cause = error.cause;
+        let message = if cause.body_id == crate::program::NO_DEF { error.message }
+            else { prog.record_error(prog.def(cause.body_id).file, cause.span, "typeck", error.message) };
+        errors.push(message);
+    }
+    for w in warnings { stderr_line!("warning: {}", w.message); }
+    errors.sort_by_cached_key(|e| error_position(e));
+    errors.dedup();
+    if errors.iter().any(|e| !is_follow_on(e)) { errors.retain(|e| !is_follow_on(e)); }
+    errors
+}
+
 /// The files of each crate the boot's file selection skipped (paths, sorted), as the boot left
 /// them -- with a crate's fingerprint, which covers the files the boot loaded, every file of it
 /// (cache.rs crate_check_key). Taken before main, before the post-boot loader starts (run.rs).
@@ -1943,7 +1979,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     out
 }
 
-fn std_crate(prog: &crate::program::Program, k: u32) -> bool {
+pub(crate) fn std_crate(prog: &crate::program::Program, k: u32) -> bool {
     use crate::vfs::canonical as canon;
     let c = &prog.crates[k as usize];
     if matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro") { return true; }

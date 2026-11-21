@@ -2823,6 +2823,87 @@ fn positioned_fatal(u: &Unit, id: u32, msg: &str) -> String {
     msg.to_string()
 }
 
+/// A build of slot `id` that failed inside the compiler (`ice`: its internal error). A run checks a
+/// body before it runs but not the items around it, so an impl rustc rejects -- E0046 (a trait that
+/// gained a required item before its impl in another crate did), E0053 (a signature), E0119 (an
+/// overlap), E0277 (an unmet supertrait) -- makes the build fail where it resolves through that impl.
+/// Before the internal error is reported, the item checks of the crates the build is of (its fn's
+/// crate and those of the types in its arguments, not the sysroot: check.rs item_errors) run: their
+/// errors are the build's compile error, as a body's errors are. With none, `ice` stands. Only a
+/// failed build pays for it.
+#[cold]
+unsafe fn build_failure(up: *mut Unit, id: u32, ice: String) -> String {
+    use std::collections::HashSet;
+
+    fn type_crates(u: &Unit, ty: TyId, seen: &mut HashSet<TyId>, crates: &mut Vec<u32>) {
+        if !seen.insert(ty) { return; }
+        let tys = &u.tcx.tys;
+        let args = match *tys.kind(ty) {
+            TyKind::Adt(d, args, _) | TyKind::FnDef(d, args, _) => {
+                crates.push(u.prog.def(d).krate);
+                args
+            }
+            TyKind::Dyn(principal, args, bindings, _, _, _, autos) => {
+                if principal != crate::program::NO_DEF && !tys.list(autos).contains(&principal) {
+                    crates.push(u.prog.def(principal).krate);
+                }
+                for &(_, value, _) in tys.list(bindings) { type_crates(u, value, seen, crates); }
+                args
+            }
+            TyKind::Tuple(args) => args,
+            TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => {
+                return type_crates(u, t, seen, crates);
+            }
+            TyKind::FnPtr(params, ret, _, _) => {
+                type_crates(u, ret, seen, crates);
+                params
+            }
+            TyKind::Alias(_, alias) => alias.args,
+            _ => return,
+        };
+        for &t in tys.list(args) { type_crates(u, t, seen, crates); }
+    }
+
+    let u = &*up;
+    let errors = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut crates = Vec::new();
+        let mut slots = HashSet::new();
+        let mut slot = id;
+        while (slot as usize) < u.fns.len() && slots.insert(slot) {
+            let args: &[TyId] = match &u.fns[slot as usize].key {
+                FnKey::Inst(d, args) => {
+                    crates.push(u.prog.def(*d).krate);
+                    args
+                }
+                FnKey::Shim(shim) => &shim.args,
+                FnKey::Glue(GLUE_UNNAMED, _) => break,
+                FnKey::Glue(_, ty) => std::slice::from_ref(ty),
+                FnKey::Closure(file, _, parent) => {
+                    crates.extend(u.prog.file_crate.get(*file as usize).copied());
+                    slot = *parent;
+                    continue;
+                }
+                FnKey::Sandbox(base) | FnKey::Plain(base) | FnKey::Ctfe(base) => {
+                    slot = *base;
+                    continue;
+                }
+            };
+            let mut seen = HashSet::new();
+            for &ty in args { type_crates(u, ty, &mut seen, &mut crates); }
+            break;
+        }
+        crates.sort_unstable();
+        crates.dedup();
+        crates.retain(|&k| !crate::check::std_crate(&u.prog, k));
+        if crates.is_empty() { return Vec::new(); }
+        crate::check::item_errors(&u.prog, &u.tcx, &crates)
+    }));
+    match errors {
+        Ok(errors) if !errors.is_empty() => errors.join("\n"),
+        _ => ice,
+    }
+}
+
 pub fn take_ice_location() -> String {
     ICE_LOC.try_with(|c| std::mem::take(&mut *c.borrow_mut())).unwrap_or_default()
 }
@@ -11277,7 +11358,11 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             };
             end_build(up, id);
             let u = &mut *up;
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+                positioned_fatal(u, id, &fatal.0)
+            } else {
+                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+            })
         }
     };
     Compiled::Code(match r {
@@ -14611,7 +14696,11 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
             };
             let u = &mut *up;
             let at = crate::lifeline::panic_at();
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {} (Relax {}): {} -- Relax bug, report it", u.fns[id as usize].name, at, msg) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+                positioned_fatal(u, id, &fatal.0)
+            } else {
+                build_failure(up, id, format!("internal compiler error in {} (Relax {}): {} -- Relax bug, report it", u.fns[id as usize].name, at, msg))
+            })
         }
     }
 }
@@ -27979,7 +28068,11 @@ unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front,
         Err(p) if p.is::<crate::preempt::OwnerBusy>() || p.is::<crate::preempt::PublishBail>() => std::panic::resume_unwind(p),
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+                positioned_fatal(u, id, &fatal.0)
+            } else {
+                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+            })
         }
     }
 }
