@@ -2758,7 +2758,8 @@ pub(crate) fn install_ice_hook() {
 }
 
 thread_local! {
-    /// builds running on this thread (build_rir_mode): their panics are compile errors, silent
+    /// builds running on this thread (build_rir_mode, compile_slot_locked's compile_fn, the split
+    /// front's prepare_rir_from): their panics are compile errors, silent
     static ICE_SCOPE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -2906,6 +2907,16 @@ unsafe fn build_failure(up: *mut Unit, id: u32, ice: String) -> String {
 
 pub fn take_ice_location() -> String {
     ICE_LOC.try_with(|c| std::mem::take(&mut *c.borrow_mut())).unwrap_or_default()
+}
+
+/// Where the panic a build caught happened: the owner's record of a request's panic
+/// (take_ice_location), else this thread's last panic position (lifeline, recorded by the hook
+/// inside an IceScope too); "" when neither has one.
+fn ice_location() -> String {
+    let loc = take_ice_location();
+    if !loc.is_empty() { return loc; }
+    let at = crate::lifeline::panic_at();
+    if at.is_empty() { String::new() } else { format!(" (at {at})") }
 }
 
 /// A fault at or just below the stack pointer: the stack's guard page was hit (frames
@@ -11343,7 +11354,12 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     // an internal compiler panic (front end or code generator) becomes this function's
     // compile error: the process never goes down for it (rt_compile is extern "C")
     let partial0 = partial_layouts();
-    let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_fn(up, id))) {
+    install_ice_hook();
+    crate::lifeline::clear_panic_at();
+    let scope = IceScope::enter();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_fn(up, id)));
+    drop(scope);
+    let r = match r {
         Ok(r) => r,
         Err(p) => {
             if p.is::<crate::preempt::OwnerBusy>() || p.is::<crate::preempt::PublishBail>() {
@@ -11361,7 +11377,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
                 positioned_fatal(u, id, &fatal.0)
             } else {
-                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, ice_location()))
             })
         }
     };
@@ -28048,7 +28064,11 @@ unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front,
     let child0 = BUILD_CHILD.try_with(|c| c.borrow().len()).unwrap_or(0);
     child_push();
     let t0 = cpu_ns();
+    install_ice_hook();
+    crate::lifeline::clear_panic_at();
+    let scope = IceScope::enter();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, None, mode)));
+    drop(scope);
     if r.is_err() {
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
         for x in open.into_iter().rev() {
@@ -28071,7 +28091,7 @@ unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front,
             Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
                 positioned_fatal(u, id, &fatal.0)
             } else {
-                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+                build_failure(up, id, format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, ice_location()))
             })
         }
     }
