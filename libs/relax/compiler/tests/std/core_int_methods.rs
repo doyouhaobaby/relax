@@ -377,3 +377,78 @@ fn a16_algebraic_floats() {
             a.algebraic_mul(b), a.algebraic_div(b), a.algebraic_rem(b));
     }
 }
+
+#[test]
+fn a17_inherited_overflow_checks() {
+    use std::ops::*;
+    use std::panic::{catch_unwind, UnwindSafe};
+
+    fn show<T: std::fmt::Debug>(label: &str, f: impl FnOnce() -> T + UnwindSafe) {
+        match catch_unwind(f) {
+            Ok(value) => println!("| {} {:?}", label, value),
+            Err(payload) => {
+                let msg = match payload.downcast_ref::<&str>() {
+                    Some(s) => *s,
+                    None => payload.downcast_ref::<String>().unwrap().as_str(),
+                };
+                println!("| {} panicked: {}", label, msg);
+            }
+        }
+    }
+
+    macro_rules! op_cases {
+        ($op:ident, $tr:ident, $sym:tt, $assign:ident, $atr:ident, $asym:tt, $a:expr, $b:expr) => {{
+            fn $op<T: $tr<R>, R>(a: T, b: R) -> T::Output { a $sym b }
+            fn $assign<T: $atr<R>, R>(mut a: T, b: R) -> T {
+                a $asym b;
+                a
+            }
+            show(stringify!($op), || $op($a, $b));
+            show(concat!(stringify!($op), " ref/value"), || $op(&$a, $b));
+            show(concat!(stringify!($op), " value/ref"), || $op($a, &$b));
+            show(concat!(stringify!($op), " ref/ref"), || $op(&$a, &$b));
+            show(stringify!($assign), || $assign($a, $b));
+            show(concat!(stringify!($assign), " ref"), || $assign($a, &$b));
+        }};
+    }
+
+    op_cases!(add, Add, +, add_assign, AddAssign, +=, u8::MAX, 1u8);
+    op_cases!(sub, Sub, -, sub_assign, SubAssign, -=, 0u8, 1u8);
+    op_cases!(mul, Mul, *, mul_assign, MulAssign, *=, i8::MAX, 2i8);
+    op_cases!(shl, Shl, <<, shl_assign, ShlAssign, <<=, 1u8, 8u16);
+    op_cases!(shr, Shr, >>, shr_assign, ShrAssign, >>=, -2i8, 8i8);
+
+    fn neg<T: Neg>(a: T) -> T::Output { -a }
+    show("neg", || neg(i8::MIN));
+    show("neg ref", || neg(&i8::MIN));
+
+    show("sum u8 value", || [u8::MAX, 1].into_iter().sum::<u8>());
+    show("sum u8 ref", || [u8::MAX, 1].iter().sum::<u8>());
+    show("sum i32 value", || [i32::MAX, 1].into_iter().sum::<i32>());
+    show("sum i32 ref", || [i32::MAX, 1].iter().sum::<i32>());
+    show("product u8 value", || [128u8, 2].into_iter().product::<u8>());
+    show("product u8 ref", || [128u8, 2].iter().product::<u8>());
+    show("product i32 value", || [i32::MAX, 2].into_iter().product::<i32>());
+    show("product i32 ref", || [i32::MAX, 2].iter().product::<i32>());
+
+    show("pow unsigned", || 16u8.pow(2));
+    show("pow signed", || (-8i8).pow(3));
+    show("abs", || i8::MIN.abs());
+    show("next_power_of_two", || 200u8.next_power_of_two());
+    show("next_multiple_of", || 250u8.next_multiple_of(16));
+
+    show("range nth", || (250u8..).nth(10));
+    show("range next three", || {
+        let mut it = 254u8..;
+        (it.next(), it.next(), it.next())
+    });
+    show("RangeFromIter nth", || core::range::RangeFrom::from(250u8..).into_iter().nth(10));
+    show("RangeFromIter next to max", || {
+        let mut it = core::range::RangeFrom::from(254u8..).into_iter();
+        (it.next(), it.next())
+    });
+    show("RangeFromIter next three", || {
+        let mut it = core::range::RangeFrom::from(254u8..).into_iter();
+        (it.next(), it.next(), it.next())
+    });
+}

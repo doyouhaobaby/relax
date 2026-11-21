@@ -482,8 +482,21 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn saturating_pow(self, exp: u32) -> {n} {{ match self.checked_pow(exp) {{ Some(v) => v, None => {n}::MAX }} }}");
         let _ = writeln!(o, "    pub const fn saturating_div(self, rhs: {n}) -> {n} {{ self / rhs }}");
     }
-    // pow etc (release semantics: wrapping)
-    let _ = writeln!(o, "    pub const fn pow(self, exp: u32) -> {n} {{ self.wrapping_pow(exp) }}");
+    o.push_str("    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str(\"attempt to exponentiate with overflow\"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
+");
     let _ = writeln!(o, "    pub const fn abs_diff(self, other: {n}) -> {u} {{ if self < other {{ (other as {u}).wrapping_sub(self as {u}) }} else {{ (self as {u}).wrapping_sub(other as {u}) }} }}");
     // library/core/src/num/mod.rs:129-186 midpoint_impl!: a type with a wider integer widens, the
     // 128-bit types use the branchless algorithm (the signed one rounds toward zero)
@@ -496,7 +509,15 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn midpoint(self, rhs: {n}) -> {n} {{ ((self ^ rhs) >> 1) + (self & rhs) }}");
     }
     if t.signed {
-        let _ = writeln!(o, "    pub const fn abs(self) -> {n} {{ if self < 0 {{ self.wrapping_neg() }} else {{ self }} }}");
+        o.push_str("    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
+");
         let _ = writeln!(o, "    pub const fn unsigned_abs(self) -> {u} {{ self.wrapping_abs() as {u} }}");
         let _ = writeln!(o, "    pub const fn signum(self) -> {n} {{ if self < 0 {{ -1 }} else if self == 0 {{ 0 }} else {{ 1 }} }}");
         let _ = writeln!(o, "    pub const fn is_positive(self) -> bool {{ self > 0 }}");
@@ -521,11 +542,23 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn rem_euclid(self, rhs: {n}) -> {n} {{ self % rhs }}");
         let _ = writeln!(o, "    pub const fn div_euclid(self, rhs: {n}) -> {n} {{ self / rhs }}");
         let _ = writeln!(o, "    pub const fn div_ceil(self, rhs: {n}) -> {n} {{ let d = self / rhs; let r = self % rhs; if r > 0 {{ d + 1 }} else {{ d }} }}");
-        let _ = writeln!(o, "    pub const fn next_multiple_of(self, rhs: {n}) -> {n} {{ match self % rhs {{ 0 => self, r => self + (rhs - r) }} }}");
+        let _ = writeln!(o, "    #[rustc_inherit_overflow_checks]\n    pub const fn next_multiple_of(self, rhs: {n}) -> {n} {{ match self % rhs {{ 0 => self, r => self + (rhs - r) }} }}");
         let _ = writeln!(o, "    pub const fn checked_next_multiple_of(self, rhs: {n}) -> Option<{n}> {{ if rhs == 0 {{ return None; }} match self % rhs {{ 0 => Some(self), r => self.checked_add(rhs - r) }} }}");
         let _ = writeln!(o, "    pub const fn is_power_of_two(self) -> bool {{ self.count_ones() == 1 }}");
         let _ = writeln!(o, "    const fn one_less_than_next_power_of_two(self) -> {n} {{ if self <= 1 {{ return 0; }} let p = self - 1; let z = p.leading_zeros(); {n}::MAX >> z }}");
-        let _ = writeln!(o, "    pub const fn next_power_of_two(self) -> {n} {{ self.one_less_than_next_power_of_two().wrapping_add(1) }}");
+        o.push_str("    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
+");
         let _ = writeln!(o, "    pub const fn checked_next_power_of_two(self) -> Option<{n}> {{ self.one_less_than_next_power_of_two().checked_add(1) }}");
         let _ = writeln!(o, "    pub const fn is_multiple_of(self, rhs: {n}) -> bool {{ match rhs {{ 0 => self == 0, _ => self % rhs == 0 }} }}");
         let _ = writeln!(o, "    pub const fn cast_signed(self) -> {s} {{ self as {s} }}");
@@ -780,24 +813,36 @@ fn gen_float(o: &mut String, f: &str) {
 
 fn op_impls(o: &mut String, n: &str, ops: &[(&str, &str, &str)]) {
     for (tr, m, sym) in ops {
-        let _ = writeln!(o, "impl {tr} for {n} {{ type Output = {n}; fn {m}(self, rhs: {n}) -> {n} {{ self {sym} rhs }} }}");
-        let _ = writeln!(o, "impl<'a> {tr}<&'a {n}> for {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {n}) -> {n} {{ self {sym} *rhs }} }}");
-        let _ = writeln!(o, "impl<'a> {tr}<{n}> for &'a {n} {{ type Output = {n}; fn {m}(self, rhs: {n}) -> {n} {{ *self {sym} rhs }} }}");
-        let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {n}> for &'b {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {n}) -> {n} {{ *self {sym} *rhs }} }}");
-        let _ = writeln!(o, "impl {tr}Assign for {n} {{ fn {m}_assign(&mut self, rhs: {n}) {{ *self = *self {sym} rhs; }} }}");
-        let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {n}> for {n} {{ fn {m}_assign(&mut self, rhs: &'a {n}) {{ *self = *self {sym} *rhs; }} }}");
+        let attr = if matches!(*tr, "Add" | "Sub" | "Mul") {
+            "#[rustc_inherit_overflow_checks] "
+        } else {
+            ""
+        };
+        let _ = writeln!(o, "impl {tr} for {n} {{ type Output = {n}; {attr}fn {m}(self, rhs: {n}) -> {n} {{ self {sym} rhs }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}<&'a {n}> for {n} {{ type Output = {n}; {attr}fn {m}(self, rhs: &'a {n}) -> {n} {{ self {sym} *rhs }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}<{n}> for &'a {n} {{ type Output = {n}; {attr}fn {m}(self, rhs: {n}) -> {n} {{ *self {sym} rhs }} }}");
+        let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {n}> for &'b {n} {{ type Output = {n}; {attr}fn {m}(self, rhs: &'a {n}) -> {n} {{ *self {sym} *rhs }} }}");
+        let _ = writeln!(o, "impl {tr}Assign for {n} {{ {attr}fn {m}_assign(&mut self, rhs: {n}) {{ *self = *self {sym} rhs; }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {n}> for {n} {{ {attr}fn {m}_assign(&mut self, rhs: &'a {n}) {{ *self = *self {sym} *rhs; }} }}");
     }
 }
 
 fn shift_impls(o: &mut String, n: &str, r: &str) {
     for (tr, m, sym) in [("Shl", "shl", "<<"), ("Shr", "shr", ">>")] {
-        let _ = writeln!(o, "impl {tr}<{r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ self {sym} rhs }} }}");
+        let _ = writeln!(o, "impl {tr}<{r}> for {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn {m}(self, rhs: {r}) -> {n} {{ self {sym} rhs }} }}");
         // core's forward_ref_binop! / forward_ref_op_assign!: either side by reference
-        let _ = writeln!(o, "impl<'a> {tr}<&'a {r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {r}) -> {n} {{ self {sym} *rhs }} }}");
-        let _ = writeln!(o, "impl<'a> {tr}<{r}> for &'a {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ *self {sym} rhs }} }}");
-        let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {r}> for &'b {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {r}) -> {n} {{ *self {sym} *rhs }} }}");
-        let _ = writeln!(o, "impl {tr}Assign<{r}> for {n} {{ fn {m}_assign(&mut self, rhs: {r}) {{ *self = *self {sym} rhs; }} }}");
-        let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {r}> for {n} {{ fn {m}_assign(&mut self, rhs: &'a {r}) {{ *self = *self {sym} *rhs; }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}<&'a {r}> for {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn {m}(self, rhs: &'a {r}) -> {n} {{ self {sym} *rhs }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}<{r}> for &'a {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn {m}(self, rhs: {r}) -> {n} {{ *self {sym} rhs }} }}");
+        let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {r}> for &'b {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn {m}(self, rhs: &'a {r}) -> {n} {{ *self {sym} *rhs }} }}");
+        let _ = writeln!(o, "impl {tr}Assign<{r}> for {n} {{ #[rustc_inherit_overflow_checks] fn {m}_assign(&mut self, rhs: {r}) {{ *self = *self {sym} rhs; }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {r}> for {n} {{ #[rustc_inherit_overflow_checks] fn {m}_assign(&mut self, rhs: &'a {r}) {{ *self = *self {sym} *rhs; }} }}");
+    }
+}
+
+fn gen_sum_product(o: &mut String, n: &str, zero: &str, one: &str) {
+    for (tr, method, init, op) in [("Sum", "sum", zero, "+"), ("Product", "product", one, "*")] {
+        let _ = writeln!(o, "impl {tr} for {n} {{ fn {method}<I: Iterator<Item = Self>>(iter: I) -> Self {{ iter.fold({init}, #[rustc_inherit_overflow_checks] |a, b| a {op} b) }} }}");
+        let _ = writeln!(o, "impl<'a> {tr}<&'a {n}> for {n} {{ fn {method}<I: Iterator<Item = &'a Self>>(iter: I) -> Self {{ iter.fold({init}, #[rustc_inherit_overflow_checks] |a, b| a {op} b) }} }}");
     }
 }
 
@@ -828,13 +873,10 @@ fn gen_int_traits(o: &mut String, t: &Int) {
     let _ = writeln!(o, "impl Not for {n} {{ type Output = {n}; fn not(self) -> {n} {{ !self }} }}");
     let _ = writeln!(o, "impl<'a> Not for &'a {n} {{ type Output = {n}; fn not(self) -> {n} {{ !*self }} }}");
     if t.signed {
-        let _ = writeln!(o, "impl Neg for {n} {{ type Output = {n}; fn neg(self) -> {n} {{ -self }} }}");
-        let _ = writeln!(o, "impl<'a> Neg for &'a {n} {{ type Output = {n}; fn neg(self) -> {n} {{ -*self }} }}");
+        let _ = writeln!(o, "impl Neg for {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn neg(self) -> {n} {{ -self }} }}");
+        let _ = writeln!(o, "impl<'a> Neg for &'a {n} {{ type Output = {n}; #[rustc_inherit_overflow_checks] fn neg(self) -> {n} {{ -*self }} }}");
     }
-    let _ = writeln!(o, "impl Sum for {n} {{ fn sum<I: Iterator<Item = {n}>>(iter: I) -> {n} {{ crate::iter::sum_from(0 as {n}, iter) }} }}");
-    let _ = writeln!(o, "impl<'a> Sum<&'a {n}> for {n} {{ fn sum<I: Iterator<Item = &'a {n}>>(iter: I) -> {n} {{ crate::iter::sum_from(0 as {n}, iter.copied()) }} }}");
-    let _ = writeln!(o, "impl Product for {n} {{ fn product<I: Iterator<Item = {n}>>(iter: I) -> {n} {{ crate::iter::product_from(1 as {n}, iter) }} }}");
-    let _ = writeln!(o, "impl<'a> Product<&'a {n}> for {n} {{ fn product<I: Iterator<Item = &'a {n}>>(iter: I) -> {n} {{ crate::iter::product_from(1 as {n}, iter.copied()) }} }}");
+    gen_sum_product(o, n, "0", "1");
     let _ = writeln!(o, "impl FromStr for {n} {{ type Err = ParseIntError; fn from_str(src: &str) -> Result<{n}, ParseIntError> {{ {n}::from_str_radix(src, 10) }} }}");
     gen_step(o, t);
     o.push('\n');
@@ -867,11 +909,29 @@ fn gen_step(o: &mut String, t: &Int) {
     } else {
         gen_step_overflowing(o, t, t.pw != 0 || t.bits <= 32, "");
     }
-    // rustc's Step::forward / backward for the integers (#[rustc_inherit_overflow_checks]): an
-    // overflow panics as the program's own `+` / `-` does when its profile has overflow checks, and
-    // wraps when it has none (`Step::forward(-128i8, 255)` is 127)
-    let _ = writeln!(o, "    fn forward(start: {n}, n: usize) -> {n} {{ if crate::intrinsics::overflow_checks() && Self::forward_checked(start, n).is_none() {{ crate::panicking::panic_str(\"attempt to add with overflow\") }} start.wrapping_add(n as {n}) }}");
-    let _ = writeln!(o, "    fn backward(start: {n}, n: usize) -> {n} {{ if crate::intrinsics::overflow_checks() && Self::backward_checked(start, n).is_none() {{ crate::panicking::panic_str(\"attempt to subtract with overflow\") }} start.wrapping_sub(n as {n}) }}");
+    o.push_str("    #[allow(arithmetic_overflow)]
+    #[rustc_inherit_overflow_checks]
+    fn forward(start: Self, n: usize) -> Self {
+        // In debug builds, trigger a panic on overflow.
+        // This should optimize completely out in release builds.
+        if Self::forward_checked(start, n).is_none() {
+            let _ = Self::MAX + 1;
+        }
+        // Do wrapping math to allow e.g. `Step::forward(-128i8, 255)`.
+        start.wrapping_add(n as Self)
+    }
+    #[allow(arithmetic_overflow)]
+    #[rustc_inherit_overflow_checks]
+    fn backward(start: Self, n: usize) -> Self {
+        // In debug builds, trigger a panic on overflow.
+        // This should optimize completely out in release builds.
+        if Self::backward_checked(start, n).is_none() {
+            let _ = Self::MIN - 1;
+        }
+        // Do wrapping math to allow e.g. `Step::backward(127i8, 255)`.
+        start.wrapping_sub(n as Self)
+    }
+");
     // the caller knows the step stays in range (rustc's Step::forward_unchecked): no test
     let _ = writeln!(o, "    unsafe fn forward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_add(n as {n}) }}");
     let _ = writeln!(o, "    unsafe fn backward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_sub(n as {n}) }}");
@@ -912,12 +972,9 @@ fn gen_float_traits(o: &mut String, f: &str) {
     let _ = writeln!(o, "impl PartialEq for {f} {{ fn eq(&self, other: &{f}) -> bool {{ *self == *other }} fn ne(&self, other: &{f}) -> bool {{ *self != *other }} }}");
     let _ = writeln!(o, "impl PartialOrd for {f} {{ fn partial_cmp(&self, other: &{f}) -> Option<Ordering> {{ if *self < *other {{ Some(Ordering::Less) }} else if *self > *other {{ Some(Ordering::Greater) }} else if *self == *other {{ Some(Ordering::Equal) }} else {{ None }} }} fn lt(&self, other: &{f}) -> bool {{ *self < *other }} fn le(&self, other: &{f}) -> bool {{ *self <= *other }} fn gt(&self, other: &{f}) -> bool {{ *self > *other }} fn ge(&self, other: &{f}) -> bool {{ *self >= *other }} }}");
     op_impls(o, f, &[("Add", "add", "+"), ("Sub", "sub", "-"), ("Mul", "mul", "*"), ("Div", "div", "/"), ("Rem", "rem", "%")]);
-    let _ = writeln!(o, "impl Neg for {f} {{ type Output = {f}; fn neg(self) -> {f} {{ -self }} }}");
-    let _ = writeln!(o, "impl<'a> Neg for &'a {f} {{ type Output = {f}; fn neg(self) -> {f} {{ -*self }} }}");
-    let _ = writeln!(o, "impl Sum for {f} {{ fn sum<I: Iterator<Item = {f}>>(iter: I) -> {f} {{ crate::iter::sum_from(-0.0 as {f}, iter) }} }}");
-    let _ = writeln!(o, "impl<'a> Sum<&'a {f}> for {f} {{ fn sum<I: Iterator<Item = &'a {f}>>(iter: I) -> {f} {{ crate::iter::sum_from(-0.0 as {f}, iter.copied()) }} }}");
-    let _ = writeln!(o, "impl Product for {f} {{ fn product<I: Iterator<Item = {f}>>(iter: I) -> {f} {{ crate::iter::product_from(1.0 as {f}, iter) }} }}");
-    let _ = writeln!(o, "impl<'a> Product<&'a {f}> for {f} {{ fn product<I: Iterator<Item = &'a {f}>>(iter: I) -> {f} {{ crate::iter::product_from(1.0 as {f}, iter.copied()) }} }}");
+    let _ = writeln!(o, "impl Neg for {f} {{ type Output = {f}; #[rustc_inherit_overflow_checks] fn neg(self) -> {f} {{ -self }} }}");
+    let _ = writeln!(o, "impl<'a> Neg for &'a {f} {{ type Output = {f}; #[rustc_inherit_overflow_checks] fn neg(self) -> {f} {{ -*self }} }}");
+    gen_sum_product(o, f, "-0.0", "1.0");
     let _ = writeln!(o, "impl FromStr for {f} {{ type Err = crate::num::ParseFloatError; fn from_str(src: &str) -> Result<{f}, crate::num::ParseFloatError> {{ crate::num::dec2flt::parse_{f}(src) }} }}");
     o.push('\n');
 }

@@ -82,17 +82,42 @@ impl u8 {
     pub const fn saturating_mul(self, rhs: u8) -> u8 { match self.checked_mul(rhs) { Some(v) => v, None => u8::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> u8 { match self.checked_pow(exp) { Some(v) => v, None => u8::MAX } }
     pub const fn saturating_div(self, rhs: u8) -> u8 { self / rhs }
-    pub const fn pow(self, exp: u32) -> u8 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: u8) -> u8 { if self < other { (other as u8).wrapping_sub(self as u8) } else { (self as u8).wrapping_sub(other as u8) } }
     pub const fn midpoint(self, rhs: u8) -> u8 { ((self as u16 + rhs as u16) / 2) as u8 }
     pub const fn rem_euclid(self, rhs: u8) -> u8 { self % rhs }
     pub const fn div_euclid(self, rhs: u8) -> u8 { self / rhs }
     pub const fn div_ceil(self, rhs: u8) -> u8 { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: u8) -> u8 { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: u8) -> Option<u8> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> u8 { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); u8::MAX >> z }
-    pub const fn next_power_of_two(self) -> u8 { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<u8> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u8) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i8 { self as i8 }
@@ -210,17 +235,42 @@ impl u16 {
     pub const fn saturating_mul(self, rhs: u16) -> u16 { match self.checked_mul(rhs) { Some(v) => v, None => u16::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> u16 { match self.checked_pow(exp) { Some(v) => v, None => u16::MAX } }
     pub const fn saturating_div(self, rhs: u16) -> u16 { self / rhs }
-    pub const fn pow(self, exp: u32) -> u16 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: u16) -> u16 { if self < other { (other as u16).wrapping_sub(self as u16) } else { (self as u16).wrapping_sub(other as u16) } }
     pub const fn midpoint(self, rhs: u16) -> u16 { ((self as u32 + rhs as u32) / 2) as u16 }
     pub const fn rem_euclid(self, rhs: u16) -> u16 { self % rhs }
     pub const fn div_euclid(self, rhs: u16) -> u16 { self / rhs }
     pub const fn div_ceil(self, rhs: u16) -> u16 { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: u16) -> u16 { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: u16) -> Option<u16> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> u16 { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); u16::MAX >> z }
-    pub const fn next_power_of_two(self) -> u16 { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<u16> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u16) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i16 { self as i16 }
@@ -338,17 +388,42 @@ impl u32 {
     pub const fn saturating_mul(self, rhs: u32) -> u32 { match self.checked_mul(rhs) { Some(v) => v, None => u32::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> u32 { match self.checked_pow(exp) { Some(v) => v, None => u32::MAX } }
     pub const fn saturating_div(self, rhs: u32) -> u32 { self / rhs }
-    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: u32) -> u32 { if self < other { (other as u32).wrapping_sub(self as u32) } else { (self as u32).wrapping_sub(other as u32) } }
     pub const fn midpoint(self, rhs: u32) -> u32 { ((self as u64 + rhs as u64) / 2) as u32 }
     pub const fn rem_euclid(self, rhs: u32) -> u32 { self % rhs }
     pub const fn div_euclid(self, rhs: u32) -> u32 { self / rhs }
     pub const fn div_ceil(self, rhs: u32) -> u32 { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: u32) -> u32 { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: u32) -> Option<u32> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> u32 { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); u32::MAX >> z }
-    pub const fn next_power_of_two(self) -> u32 { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<u32> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u32) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i32 { self as i32 }
@@ -466,17 +541,42 @@ impl u64 {
     pub const fn saturating_mul(self, rhs: u64) -> u64 { match self.checked_mul(rhs) { Some(v) => v, None => u64::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> u64 { match self.checked_pow(exp) { Some(v) => v, None => u64::MAX } }
     pub const fn saturating_div(self, rhs: u64) -> u64 { self / rhs }
-    pub const fn pow(self, exp: u32) -> u64 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: u64) -> u64 { if self < other { (other as u64).wrapping_sub(self as u64) } else { (self as u64).wrapping_sub(other as u64) } }
     pub const fn midpoint(self, rhs: u64) -> u64 { ((self as u128 + rhs as u128) / 2) as u64 }
     pub const fn rem_euclid(self, rhs: u64) -> u64 { self % rhs }
     pub const fn div_euclid(self, rhs: u64) -> u64 { self / rhs }
     pub const fn div_ceil(self, rhs: u64) -> u64 { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: u64) -> u64 { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: u64) -> Option<u64> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> u64 { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); u64::MAX >> z }
-    pub const fn next_power_of_two(self) -> u64 { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<u64> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u64) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i64 { self as i64 }
@@ -608,17 +708,42 @@ impl u128 {
     pub const fn saturating_mul(self, rhs: u128) -> u128 { match self.checked_mul(rhs) { Some(v) => v, None => u128::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> u128 { match self.checked_pow(exp) { Some(v) => v, None => u128::MAX } }
     pub const fn saturating_div(self, rhs: u128) -> u128 { self / rhs }
-    pub const fn pow(self, exp: u32) -> u128 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: u128) -> u128 { if self < other { (other as u128).wrapping_sub(self as u128) } else { (self as u128).wrapping_sub(other as u128) } }
     pub const fn midpoint(self, rhs: u128) -> u128 { ((self ^ rhs) >> 1) + (self & rhs) }
     pub const fn rem_euclid(self, rhs: u128) -> u128 { self % rhs }
     pub const fn div_euclid(self, rhs: u128) -> u128 { self / rhs }
     pub const fn div_ceil(self, rhs: u128) -> u128 { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: u128) -> u128 { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: u128) -> Option<u128> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> u128 { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); u128::MAX >> z }
-    pub const fn next_power_of_two(self) -> u128 { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<u128> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: u128) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> i128 { self as i128 }
@@ -737,17 +862,42 @@ impl usize {
     pub const fn saturating_mul(self, rhs: usize) -> usize { match self.checked_mul(rhs) { Some(v) => v, None => usize::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> usize { match self.checked_pow(exp) { Some(v) => v, None => usize::MAX } }
     pub const fn saturating_div(self, rhs: usize) -> usize { self / rhs }
-    pub const fn pow(self, exp: u32) -> usize { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: usize) -> usize { if self < other { (other as usize).wrapping_sub(self as usize) } else { (self as usize).wrapping_sub(other as usize) } }
     pub const fn midpoint(self, rhs: usize) -> usize { ((self as u128 + rhs as u128) / 2) as usize }
     pub const fn rem_euclid(self, rhs: usize) -> usize { self % rhs }
     pub const fn div_euclid(self, rhs: usize) -> usize { self / rhs }
     pub const fn div_ceil(self, rhs: usize) -> usize { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: usize) -> usize { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: usize) -> Option<usize> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> usize { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); usize::MAX >> z }
-    pub const fn next_power_of_two(self) -> usize { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<usize> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: usize) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> isize { self as isize }
@@ -866,17 +1016,42 @@ impl usize {
     pub const fn saturating_mul(self, rhs: usize) -> usize { match self.checked_mul(rhs) { Some(v) => v, None => usize::MAX } }
     pub const fn saturating_pow(self, exp: u32) -> usize { match self.checked_pow(exp) { Some(v) => v, None => usize::MAX } }
     pub const fn saturating_div(self, rhs: usize) -> usize { self / rhs }
-    pub const fn pow(self, exp: u32) -> usize { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: usize) -> usize { if self < other { (other as usize).wrapping_sub(self as usize) } else { (self as usize).wrapping_sub(other as usize) } }
     pub const fn midpoint(self, rhs: usize) -> usize { ((self as u64 + rhs as u64) / 2) as usize }
     pub const fn rem_euclid(self, rhs: usize) -> usize { self % rhs }
     pub const fn div_euclid(self, rhs: usize) -> usize { self / rhs }
     pub const fn div_ceil(self, rhs: usize) -> usize { let d = self / rhs; let r = self % rhs; if r > 0 { d + 1 } else { d } }
+    #[rustc_inherit_overflow_checks]
     pub const fn next_multiple_of(self, rhs: usize) -> usize { match self % rhs { 0 => self, r => self + (rhs - r) } }
     pub const fn checked_next_multiple_of(self, rhs: usize) -> Option<usize> { if rhs == 0 { return None; } match self % rhs { 0 => Some(self), r => self.checked_add(rhs - r) } }
     pub const fn is_power_of_two(self) -> bool { self.count_ones() == 1 }
     const fn one_less_than_next_power_of_two(self) -> usize { if self <= 1 { return 0; } let p = self - 1; let z = p.leading_zeros(); usize::MAX >> z }
-    pub const fn next_power_of_two(self) -> usize { self.one_less_than_next_power_of_two().wrapping_add(1) }
+    #[rustc_inherit_overflow_checks]
+    pub const fn next_power_of_two(self) -> Self {
+        if let Some(npot) = self.checked_next_power_of_two() {
+            npot
+        } else {
+            #[expect(arithmetic_overflow)]
+            {
+                // Zero but in a way that panics in debug
+                Self::MAX + 1
+            }
+        }
+    }
     pub const fn checked_next_power_of_two(self) -> Option<usize> { self.one_less_than_next_power_of_two().checked_add(1) }
     pub const fn is_multiple_of(self, rhs: usize) -> bool { match rhs { 0 => self == 0, _ => self % rhs == 0 } }
     pub const fn cast_signed(self) -> isize { self as isize }
@@ -1000,10 +1175,30 @@ impl i8 {
     pub const fn saturating_neg(self) -> i8 { if self == i8::MIN { i8::MAX } else { -self } }
     pub const fn saturating_abs(self) -> i8 { if self == i8::MIN { i8::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: i8) -> i8 { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => i8::MAX } }
-    pub const fn pow(self, exp: u32) -> i8 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: i8) -> u8 { if self < other { (other as u8).wrapping_sub(self as u8) } else { (self as u8).wrapping_sub(other as u8) } }
     pub const fn midpoint(self, rhs: i8) -> i8 { ((self as i16 + rhs as i16) / 2) as i8 }
-    pub const fn abs(self) -> i8 { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> u8 { self.wrapping_abs() as u8 }
     pub const fn signum(self) -> i8 { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1127,10 +1322,30 @@ impl i16 {
     pub const fn saturating_neg(self) -> i16 { if self == i16::MIN { i16::MAX } else { -self } }
     pub const fn saturating_abs(self) -> i16 { if self == i16::MIN { i16::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: i16) -> i16 { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => i16::MAX } }
-    pub const fn pow(self, exp: u32) -> i16 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: i16) -> u16 { if self < other { (other as u16).wrapping_sub(self as u16) } else { (self as u16).wrapping_sub(other as u16) } }
     pub const fn midpoint(self, rhs: i16) -> i16 { ((self as i32 + rhs as i32) / 2) as i16 }
-    pub const fn abs(self) -> i16 { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> u16 { self.wrapping_abs() as u16 }
     pub const fn signum(self) -> i16 { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1254,10 +1469,30 @@ impl i32 {
     pub const fn saturating_neg(self) -> i32 { if self == i32::MIN { i32::MAX } else { -self } }
     pub const fn saturating_abs(self) -> i32 { if self == i32::MIN { i32::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: i32) -> i32 { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => i32::MAX } }
-    pub const fn pow(self, exp: u32) -> i32 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: i32) -> u32 { if self < other { (other as u32).wrapping_sub(self as u32) } else { (self as u32).wrapping_sub(other as u32) } }
     pub const fn midpoint(self, rhs: i32) -> i32 { ((self as i64 + rhs as i64) / 2) as i32 }
-    pub const fn abs(self) -> i32 { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> u32 { self.wrapping_abs() as u32 }
     pub const fn signum(self) -> i32 { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1384,10 +1619,30 @@ impl i64 {
     pub const fn saturating_neg(self) -> i64 { if self == i64::MIN { i64::MAX } else { -self } }
     pub const fn saturating_abs(self) -> i64 { if self == i64::MIN { i64::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: i64) -> i64 { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => i64::MAX } }
-    pub const fn pow(self, exp: u32) -> i64 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: i64) -> u64 { if self < other { (other as u64).wrapping_sub(self as u64) } else { (self as u64).wrapping_sub(other as u64) } }
     pub const fn midpoint(self, rhs: i64) -> i64 { ((self as i128 + rhs as i128) / 2) as i64 }
-    pub const fn abs(self) -> i64 { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> u64 { self.wrapping_abs() as u64 }
     pub const fn signum(self) -> i64 { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1520,10 +1775,30 @@ impl i128 {
     pub const fn saturating_neg(self) -> i128 { if self == i128::MIN { i128::MAX } else { -self } }
     pub const fn saturating_abs(self) -> i128 { if self == i128::MIN { i128::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: i128) -> i128 { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => i128::MAX } }
-    pub const fn pow(self, exp: u32) -> i128 { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: i128) -> u128 { if self < other { (other as u128).wrapping_sub(self as u128) } else { (self as u128).wrapping_sub(other as u128) } }
     pub const fn midpoint(self, rhs: i128) -> i128 { let t = ((self ^ rhs) >> 1) + (self & rhs); t + (if t < 0 { 1 } else { 0 } & (self ^ rhs)) }
-    pub const fn abs(self) -> i128 { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> u128 { self.wrapping_abs() as u128 }
     pub const fn signum(self) -> i128 { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1651,10 +1926,30 @@ impl isize {
     pub const fn saturating_neg(self) -> isize { if self == isize::MIN { isize::MAX } else { -self } }
     pub const fn saturating_abs(self) -> isize { if self == isize::MIN { isize::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: isize) -> isize { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => isize::MAX } }
-    pub const fn pow(self, exp: u32) -> isize { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: isize) -> usize { if self < other { (other as usize).wrapping_sub(self as usize) } else { (self as usize).wrapping_sub(other as usize) } }
     pub const fn midpoint(self, rhs: isize) -> isize { ((self as i128 + rhs as i128) / 2) as isize }
-    pub const fn abs(self) -> isize { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> usize { self.wrapping_abs() as usize }
     pub const fn signum(self) -> isize { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }
@@ -1779,10 +2074,30 @@ impl isize {
     pub const fn saturating_neg(self) -> isize { if self == isize::MIN { isize::MAX } else { -self } }
     pub const fn saturating_abs(self) -> isize { if self == isize::MIN { isize::MAX } else { self.abs() } }
     pub const fn saturating_div(self, rhs: isize) -> isize { match self.overflowing_div(rhs) { (r, false) => r, (_, true) => isize::MAX } }
-    pub const fn pow(self, exp: u32) -> isize { self.wrapping_pow(exp) }
+    pub const fn strict_pow(self, exp: u32) -> Self {
+        match self.checked_pow(exp) {
+            Some(x) => x,
+            None => crate::panicking::panic_str("attempt to exponentiate with overflow"),
+        }
+    }
+    #[rustc_inherit_overflow_checks]
+    pub const fn pow(self, exp: u32) -> Self {
+        if crate::intrinsics::overflow_checks() {
+            self.strict_pow(exp)
+        } else {
+            self.wrapping_pow(exp)
+        }
+    }
     pub const fn abs_diff(self, other: isize) -> usize { if self < other { (other as usize).wrapping_sub(self as usize) } else { (self as usize).wrapping_sub(other as usize) } }
     pub const fn midpoint(self, rhs: isize) -> isize { ((self as i64 + rhs as i64) / 2) as isize }
-    pub const fn abs(self) -> isize { if self < 0 { self.wrapping_neg() } else { self } }
+    #[rustc_inherit_overflow_checks]
+    pub const fn abs(self) -> Self {
+        if self.is_negative() {
+            -self
+        } else {
+            self
+        }
+    }
     pub const fn unsigned_abs(self) -> usize { self.wrapping_abs() as usize }
     pub const fn signum(self) -> isize { if self < 0 { -1 } else if self == 0 { 0 } else { 1 } }
     pub const fn is_positive(self) -> bool { self > 0 }

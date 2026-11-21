@@ -160,6 +160,7 @@ pub struct RangeFromIter<A> {
 impl<A: Step> Iterator for RangeFromIter<A> {
     type Item = A;
 
+    #[rustc_inherit_overflow_checks]
     fn next(&mut self) -> Option<A> {
         if self.exhausted {
             // This should panic if overflow checks are enabled, since
@@ -194,6 +195,7 @@ impl<A: Step> Iterator for RangeFromIter<A> {
         (usize::MAX, None)
     }
 
+    #[rustc_inherit_overflow_checks]
     fn nth(&mut self, n: usize) -> Option<A> {
         // Typically `forward` will cause an overflow-check panic here,
         // but unset the exhausted flag to handle the uncommon cases.
