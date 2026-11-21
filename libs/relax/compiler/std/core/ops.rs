@@ -366,12 +366,29 @@ pub struct RangeToInclusive<Idx> {
 #[lang = "RangeFull"]
 pub struct RangeFull;
 
-/// `start..=end`. `exhausted` is set once iteration has yielded `end` (as in real core).
+/// `start..=end`.
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[lang = "RangeInclusive"]
 pub struct RangeInclusive<Idx> {
+    // Note that the fields here are not public to allow changing the
+    // representation in the future; in particular, while we could plausibly
+    // expose start/end, modifying them without changing (future/current)
+    // private fields may lead to incorrect behavior, so we don't want to
+    // support that mode.
     pub(crate) start: Idx,
     pub(crate) end: Idx,
+
+    // This field represents an overflow flag for either bound (start or end):
+    //  - `false` upon construction
+    //  - `false` when iteration has yielded an element and
+    //    neither bound has overflowed the valid range of `Idx`
+    //  - `true` when iteration has caused either bound to
+    //    overflow the valid range of `Idx`
+    //
+    // When this is true, `start` or `end` may be left in an unspecified state,
+    // often wrapping (modular arithmetic) around at the boundary of `Idx`.
+    //
+    // This is required to support PartialEq and Hash without a PartialOrd bound or specialization.
     pub(crate) exhausted: bool,
 }
 
@@ -618,7 +635,11 @@ impl<T> RangeBounds<T> for RangeInclusive<T> {
     }
     fn end_bound(&self) -> Bound<&T> {
         if self.exhausted {
-            Bound::Excluded(&self.end)
+            // When the iterator is exhausted, it might have overflowed,
+            // but we want the range to appear empty, containing nothing.
+            // So in that case, we return bounds which are always empty:
+            // Included(start)..Excluded(start)
+            Bound::Excluded(&self.start)
         } else {
             Bound::Included(&self.end)
         }
@@ -799,6 +820,65 @@ impl<B, C> FromResidual<ControlFlow<B, crate::convert::Infallible>> for ControlF
             ControlFlow::Continue(never) => match never {},
         }
     }
+}
+
+// ported from library/core/src/ops/try_trait.rs (rustc 1.100); its const-trait conditions are cut.
+/// An adapter for implementing non-try methods via the `Try` implementation.
+///
+/// Conceptually the same as `Result<T, !>`, but requiring less work in trait
+/// solving and inhabited-ness checking and such, by being an obvious newtype
+/// and not having `From` bounds lying around.
+///
+/// Not currently planned to be exposed publicly, so just `pub(crate)`.
+#[repr(transparent)]
+pub(crate) struct NeverShortCircuit<T>(pub T);
+
+impl<T> NeverShortCircuit<T> {
+    /// Wraps a unary function to produce one that wraps the output into a `NeverShortCircuit`.
+    ///
+    /// This is useful for implementing infallible functions in terms of the `try_` ones,
+    /// without accidentally capturing extra generic parameters in a closure.
+    #[inline]
+    pub(crate) fn wrap_mut_1<A, F>(mut f: F) -> impl FnMut(A) -> Self
+    where
+        F: FnMut(A) -> T,
+    {
+        move |a| NeverShortCircuit(f(a))
+    }
+
+    #[inline]
+    pub(crate) fn wrap_mut_2<A, B, F>(mut f: F) -> impl FnMut(A, B) -> Self
+    where
+        F: FnMut(A, B) -> T,
+    {
+        move |a, b| NeverShortCircuit(f(a, b))
+    }
+}
+
+pub(crate) enum NeverShortCircuitResidual {}
+
+impl<T> Try for NeverShortCircuit<T> {
+    type Output = T;
+    type Residual = NeverShortCircuitResidual;
+
+    #[inline]
+    fn branch(self) -> ControlFlow<NeverShortCircuitResidual, T> {
+        ControlFlow::Continue(self.0)
+    }
+
+    #[inline]
+    fn from_output(x: T) -> Self {
+        NeverShortCircuit(x)
+    }
+}
+impl<T> FromResidual<NeverShortCircuitResidual> for NeverShortCircuit<T> {
+    #[inline]
+    fn from_residual(never: NeverShortCircuitResidual) -> Self {
+        match never {}
+    }
+}
+impl<T> Residual<T> for NeverShortCircuitResidual {
+    type TryType = NeverShortCircuit<T>;
 }
 
 impl<B, C> ControlFlow<B, C> {

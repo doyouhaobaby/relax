@@ -860,6 +860,13 @@ fn gen_step(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    fn forward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_add(n as {n}) }}");
         let _ = writeln!(o, "    fn backward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_sub(n as {n}) }}");
     }
+    // rustc's step_integer_impls!: u64 and i64 switch forms with the pointer width.
+    if t.bits == 64 && t.pw == 0 {
+        gen_step_overflowing(o, t, true, "    #[cfg(target_pointer_width = \"64\")]\n");
+        gen_step_overflowing(o, t, false, "    #[cfg(target_pointer_width = \"32\")]\n");
+    } else {
+        gen_step_overflowing(o, t, t.pw != 0 || t.bits <= 32, "");
+    }
     // rustc's Step::forward / backward for the integers (#[rustc_inherit_overflow_checks]): an
     // overflow panics as the program's own `+` / `-` does when its profile has overflow checks, and
     // wraps when it has none (`Step::forward(-128i8, 255)` is 127)
@@ -869,6 +876,32 @@ fn gen_step(o: &mut String, t: &Int) {
     let _ = writeln!(o, "    unsafe fn forward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_add(n as {n}) }}");
     let _ = writeln!(o, "    unsafe fn backward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_sub(n as {n}) }}");
     o.push_str("}\n");
+}
+
+fn gen_step_overflowing(o: &mut String, t: &Int, narrower: bool, cfg: &str) {
+    let operand = if t.signed { t.unsigned } else { "Self" };
+    let suffix = if t.signed { "_unsigned" } else { "" };
+    for (direction, op, sign) in [("forward", "add", "+"), ("backward", "sub", "-")] {
+        o.push_str(cfg);
+        o.push_str("    #[inline]\n");
+        let _ = writeln!(o, "    fn {direction}_overflowing(start: Self, n: usize) -> (Self, bool) {{");
+        if narrower {
+            let _ = writeln!(o, "        match {operand}::try_from(n) {{");
+            let _ = writeln!(o, "            Ok(n) => start.overflowing_{op}{suffix}(n),");
+            if t.signed {
+                o.push_str("            // If n is out of range of e.g. u8,\n");
+                o.push_str("            // then it is bigger than the entire range for i8 is wide\n");
+                let _ = writeln!(o, "            // so `any_i8 {sign} n` necessarily overflows i8.");
+            } else {
+                let _ = writeln!(o, "            // if n is out of range, `start {sign} n` must overflow");
+            }
+            let _ = writeln!(o, "            Err(_) => (start.wrapping_{op}{suffix}(n as {operand}), true),");
+            o.push_str("        }\n");
+        } else {
+            let _ = writeln!(o, "        start.overflowing_{op}{suffix}(n as {operand})");
+        }
+        o.push_str("    }\n");
+    }
 }
 
 fn gen_float_traits(o: &mut String, f: &str) {

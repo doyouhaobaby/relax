@@ -160,3 +160,59 @@ fn a04_option_result() {
     let bad: Result<Vec<u32>, u32> = (1..4).map(|x| if x != 2 { Ok(x) } else { Err(x) }).collect();
     println!("| collect-res {}", bad.unwrap_err());
 }
+
+#[test]
+fn a05_range_inclusive_iteration() {
+    use std::ops::RangeBounds;
+
+    let mut r = 1..=2u8;
+    r.next();
+    let second = r.next();
+    println!("| second {:?} {:?} {} {} {} {}", second, r, r.start(), r.end(), r.is_empty(), r == (3..=2));
+    let third = r.next();
+    println!("| third {:?} {:?} {} {} {} {}", third, r, r.start(), r.end(), r.is_empty(), r == (3..=2));
+
+    let mut high = 250..=255u8;
+    while high.next().is_some() {}
+    let mut low = 0..=5u8;
+    while low.next_back().is_some() {}
+    println!("| forward overflow {:?} {} {:?} {:?}", high, high.is_empty(), high.start_bound(), high.end_bound());
+    println!("| backward overflow {:?} {} {:?} {:?}", low, low.is_empty(), low.start_bound(), low.end_bound());
+
+    let full = u8::MIN..=u8::MAX;
+    println!("| full count {} sum {} last {:?}", full.clone().count(),
+        full.clone().map(|x| x as u32).sum::<u32>(), full.clone().last());
+    let mut copy = full.clone();
+    let mut visited = 0;
+    for _ in copy.by_ref() {
+        visited += 1;
+    }
+    println!("| full loop {} {:?} {} original {:?}", visited, copy, copy.is_empty(), full);
+
+    let mut past = 3..=6u8;
+    let mut exact = past.clone();
+    let mut back = past.clone();
+    let skipped = past.nth(4);
+    let end = exact.nth(3);
+    let start = back.nth_back(3);
+    println!("| nth past {:?} {:?} at end {:?} {:?} back {:?} {:?}", skipped, past, end, exact, start, back);
+    println!("| reversed {:?}", (3..=6u8).rev().collect::<Vec<_>>());
+
+    let mut signed = i8::MAX - 1..=i8::MAX;
+    let values = [signed.next(), signed.next(), signed.next()];
+    println!("| signed edge {:?} {:?} {}", values, signed, signed.is_empty());
+    let mut letters = 'a'..='c';
+    let chars = [letters.next(), letters.next(), letters.next(), letters.next()];
+    let mut char_max = char::MAX..=char::MAX;
+    let mut char_min = char::MIN..=char::MIN;
+    let upper = char_max.next();
+    let lower = char_min.next_back();
+    println!("| chars {:?} {:?} edges {:?} {:?} {:?} {:?}", chars, letters, upper, char_max, lower, char_min);
+
+    let mut folding = 1..=10;
+    let stopped = folding.try_fold(0, |a, x| if x > 5 { None } else { Some(a + x) });
+    println!("| try_fold stopped {:?} {:?}", stopped, folding);
+    let completed = folding.try_rfold(0, |a, x| Some(a + x));
+    println!("| try_rfold completed {:?} {:?}", completed, folding);
+    println!("| fold order {} {}", (1..=3).fold(0, |a, x| 10 * a + x), (1..=3).rfold(0, |a, x| 10 * a + x));
+}
