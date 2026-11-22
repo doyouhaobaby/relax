@@ -3978,6 +3978,14 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
             crate::inspect::events::on_panic(&at, regs);
         }
     }
+    // the run ended meanwhile (a parked panic resumed as a restart, or another thread's end): its
+    // frames' cleanups are code of the ended run, which never runs again, and their unwind
+    // trailers are gone with it. The thread leaves the run from here, holding nothing.
+    if crate::domain::current_is_ending() {
+        CLEANING.with(|c| c.set(0));
+        UNWINDING.with(|c| c.set(false));
+        unsafe { leave_ended_run() }
+    }
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
         let mut v = f.borrow_mut();
