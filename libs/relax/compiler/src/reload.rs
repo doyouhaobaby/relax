@@ -13173,6 +13173,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));
     reset(&PROGRAM_READS, relax_session::sync::Mutex::new(None));
     reset(&RESTART_REQUESTED, std::sync::atomic::AtomicBool::new(false));
+    reset(&RESTART_ANYWAY, std::sync::atomic::AtomicBool::new(false));
     reset(&PINNED, std::sync::atomic::AtomicBool::new(false));
     reset(&CATCH_UP, std::sync::atomic::AtomicBool::new(false));
     reset(&LANDING_HOLD, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
