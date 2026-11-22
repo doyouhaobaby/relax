@@ -1223,6 +1223,13 @@ fn cmd_threads(out: &mut Out) {
         if instrument::held_now(t.os_id) {
             wait.push_str(",\"held\":true");
         }
+        // where the OS tells them: the priority it runs at now and its CPU by core type
+        if let Some(pri) = t.pri {
+            wait.push_str(&format!(",\"pri\":{pri}"));
+        }
+        if let Some([p, e]) = threads::core_ns(t.os_id) {
+            wait.push_str(&format!(",\"p_ms\":{},\"e_ms\":{}", p / 1_000_000, e / 1_000_000));
+        }
         out.line(&format!(
             "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
             tid_label(t.os_id),
