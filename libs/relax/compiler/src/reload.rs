@@ -5019,15 +5019,30 @@ fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
     let FnKey::Closure(file, ce, parent) = u.fns[slot as usize].key else {
         return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
     };
+    let at = closure_at(u, slot);
     // (by the source types of the vtables this run lowered, and by the code those linked from the
     // cache or the startup image hold: a warm session's)
     let ty_hit = |t: TyId| holds_closure(&u.tcx.tys, t, (file, ce)).then(|| (String::new(), 0));
     let slot_hit = |sl: u32| (sl == slot || key_types(u, sl).into_iter().any(|t| holds_closure(&u.tcx.tys, t, (file, ce)))).then(String::new);
     if stored_in_objects(u, &ty_hit, &slot_hit).is_some() {
-        format!("{HELD}stored values of a closure of `{}` ({}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
+        format!("{HELD}stored values of a closure of `{}` ({}{at}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
     } else {
-        format!("kept: closure {} keeps its old code where it runs on ({why})", u.fns[slot as usize].name)
+        format!("kept: closure {}{at} keeps its old code where it runs on ({why})", u.fns[slot as usize].name)
     }
+}
+
+/// " at <path>:<line>:<col> in `<fn>`": where closure `slot` is written (in the text it was
+/// lowered from: for a kept one, the text before the edit) and the fn it is a closure of, so a
+/// line that names it by its key (`{closure#<expr>}@<slot>`) can be read without the session.
+/// "" for a coroutine body or a text without the expression.
+fn closure_at(u: &Unit, slot: u32) -> String {
+    let FnKey::Closure(file, ce, parent) = u.fns[slot as usize].key else { return String::new() };
+    let (Some(pf), Some(path)) = (u.prog.files.get(file as usize), u.prog.file_paths.get(file as usize)) else { return String::new() };
+    if ce & crate::tcx::ASYNC_FN_BODY != 0 || !pf.ast.has_expr(crate::ast::ExprId(ce)) {
+        return String::new();
+    }
+    let (l, c) = pf.line_col(pf.ast.expr(crate::ast::ExprId(ce)).lo);
+    format!(" at {path}:{l}:{c} in `{}`", u.fns[parent as usize].name)
 }
 
 /// Whether a value of type `t` holds a value of closure `at` (its file and expression): the
@@ -8227,7 +8242,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             u.fns[o as usize].patched.store(true, Ordering::Relaxed);
             if let Some(e) = u.kept_old.get_mut(&o) {
                 e.0 = gen;
-                eprintln!("relax live: kept `{}` on the code of a text the program no longer has (patch gen {gen}: {})", u.fns[o as usize].name, e.1);
+                let why = e.1;
+                eprintln!("relax live: kept `{}`{} on the code of a text the program no longer has (patch gen {gen}: {why})", u.fns[o as usize].name, closure_at(u, o));
             }
         }
     }
