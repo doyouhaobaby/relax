@@ -3161,7 +3161,8 @@ fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
 /// third edit on, an edit also builds again the once shim of the version it replaces (the edit
 /// that made that version built it with the body inline; its copy would run the old body): an
 /// edit installs exactly make, the code holding a copy of make and that shim, however many came
-/// before.
+/// before. A boxed closure a fn makes and drops: an edit that keeps a version of it holds that
+/// version for a restart only once the fn ran it (a trait object of it was made).
 #[test]
 fn stored_closure_follows_edits_with_flat_work() {
     const CHILD: &str = "RELAX_STORED_CLOSURE_TEST";
@@ -3299,6 +3300,33 @@ pub fn value(out: &mut u32) {{
     // declares items it pairs with neither (a name the block binds can make it other code). Each
     // edit installs at most two forwarders per lineage (its cell and its previous version).
     files.push(o.files[0]);
+    // A boxed closure `w` in make, which runs again only when value calls it: an edit that keeps
+    // a boxed closure w that a fn of its own makes and drops (make's closures are the z steps'):
+    // the version side ran is held when an edit keeps it; the one only a patch built, which never
+    // ran, made no trait object and holds nothing back (a kept line, no held one)
+    let with_w = |w: &str, calls: bool| {
+        let t = format!("{}fn side() -> u32 {{\n    let k = 3;\n    let w: Box<dyn Fn(u32) -> u32> = Box::new({w});\n    w(0) + k\n}}\n", src(7));
+        if calls { t.replace("        if h.borrow().is_none()", "        let _ = side();\n        if h.borrow().is_none()") } else { t }
+    };
+    let w_steps = [
+        ("side added, and value calls it", with_w("move |x: u32| x + 50", true), 0),
+        ("w's captures changed and value stops calling side: the version side ran is kept", with_w("move |x: u32| x * k + 50", false), 1),
+        ("w's captures changed back: the version side never ran is kept, the one it ran takes the new code", with_w("move |x: u32| x + 51", false), 0),
+        ("side deleted, value as it was", src(7), 0),
+    ];
+    for (what, text, held) in w_steps {
+        let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: text.into_bytes() }]) };
+        assert_eq!(o.rung, Rung::Patch, "{what}: {:?}", o.lines);
+        files.push(o.files[0]);
+        assert_eq!(run(), 22, "{what}: the stored box's value");
+        let lines: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
+        assert_eq!(lines.len(), held, "{what}: held lines: {:?}", o.lines);
+        if what.contains("is kept") {
+            let why = "its captures or signature changed";
+            let kept = if held > 0 { lines.iter().all(|l| l.contains(why)) } else { o.lines.iter().any(|l| l.starts_with("kept: closure") && l.contains(why)) };
+            assert!(kept, "{what}: w's old version is kept ({why}): {:?}", o.lines);
+        }
+    }
     let z = "    let z = move |x: u32| x * k + 100;\n    let _ = z(0);\n";
     let with = |body: String| src(7).replace("    Box::new(move |x| x * k + 7)\n", &body);
     let twice = "    let b: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x * k + 9);\n    let _ = { let c = move |x| x * k + 9; c(0) };\n";

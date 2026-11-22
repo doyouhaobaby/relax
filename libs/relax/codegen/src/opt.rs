@@ -371,7 +371,19 @@ fn inline_inst_count(f: &Func) -> usize {
 
 /// ... and its blocks, likewise.
 fn inline_block_count(f: &Func) -> usize {
-    guard_blocks(f).map_or(f.blocks.len(), |g| g.iter().filter(|x| !**x).count())
+    let n = guard_blocks(f).map_or(f.blocks.len(), |g| g.iter().filter(|x| !**x).count());
+    n.saturating_sub(f.guard_size.blocks as usize)
+}
+
+/// The share (`Func::guard_size`) of code a body's callers price it without: `insts`, the
+/// `branches` that end its blocks, and the `blocks` it adds.
+pub fn priced_out<'a>(insts: impl IntoIterator<Item = &'a Inst>, branches: usize, blocks: usize) -> GuardSize {
+    let (mut n, mut cost) = (0, branches * RUSTC_INSTR_COST);
+    for i in insts {
+        n += 1;
+        cost += rustc_inst_cost(i, false);
+    }
+    GuardSize { insts: n as u32, cost: cost as u32, blocks: blocks as u32 }
 }
 
 /// The blocks of `f` that hold a live session's guards: their slow calls' blocks (with what sroa
@@ -1371,7 +1383,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         };
         let n = at_site.len();
         // its share of the body (`Func::guard_size`): the compare and the branch
-        let size = GuardSize { insts: n as u32, cost: (at_site.iter().map(|i| rustc_inst_cost(i, false)).sum::<usize>() + RUSTC_INSTR_COST) as u32 };
+        let size = priced_out(&at_site, 1, 0);
         f.guard_size.add(size);
         let added = n + check.as_ref().map_or(0, |(_, b)| b.insts.len()) + 1;
         let blk = &mut f.blocks[bi];
@@ -1724,7 +1736,7 @@ pub fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
                     ren[h.0 as usize] = Some(h0);
                     b.insts.truncate(j);
                     b.pos.truncate(j);
-                    let mut gone = GuardSize { insts: 2, cost: (2 * RUSTC_INSTR_COST) as u32 };
+                    let mut gone = GuardSize { insts: 2, cost: (2 * RUSTC_INSTR_COST) as u32, blocks: 0 };
                     // the word's address, when it was this site's own
                     if uses[a.0 as usize] == 1 && matches!(b.insts.last(), Some(Inst::Addr(x, _)) if *x == a) {
                         b.insts.pop();

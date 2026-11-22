@@ -3039,10 +3039,19 @@ fn key_types(u: &Unit, slot: u32) -> Vec<TyId> {
 /// linked from the disk cache or placed from the startup image, by the slots they hold: their
 /// source type is not kept): the object's type and what was found. `ty_hit` ranks what it finds
 /// (lower first, 0: take it): of several lowered vtables the lowest, then by the object's type.
+/// Only trait objects that were made count (their vtables' made cells, MadeVtables): one only
+/// code that never ran would make holds nothing, so nothing waits for a restart for it.
 fn stored_in_objects(u: &Unit, ty_hit: &dyn Fn(TyId) -> Option<(String, u64)>, slot_hit: &dyn Fn(u32) -> Option<String>) -> Option<(String, String)> {
     let lowered = u.vtables.snapshot();
+    // the source types a trait object of which was made, as any of its traits (an upcast reaches
+    // the supertraits' vtables through it): a type ty_hit can hit holds code an edit retires, so
+    // every coercion of it sets its vtable's made cell (lower.rs note_made)
+    let made_src: crate::fxhash::HashSet<TyId> = lowered.iter().filter(|(_, &a)| u.syms.data_at(a).is_some_and(|s| u.syms.is_made(s))).map(|((src, _), _)| *src).collect();
     let mut best: Option<(u64, String, String)> = None;
     for (src, _) in lowered.keys() {
+        if !made_src.contains(src) && may_hold_code(&u.tcx.tys, *src, 0) {
+            continue;
+        }
         let Some((h, rank)) = ty_hit(*src) else { continue };
         let of = object_type_name(u, *src);
         if best.as_ref().is_none_or(|b| (rank, &of) < (b.0, &b.1)) {
@@ -3056,19 +3065,86 @@ fn stored_in_objects(u: &Unit, ty_hit: &dyn Fn(TyId) -> Option<(String, u64)>, s
         return Some((of, h));
     }
     let lowered: crate::fxhash::HashSet<u64> = lowered.values().copied().collect();
+    let cached = u.syms.vtable_objs();
+    let mut made = MadeVtables::default();
     let mut thunks = Vec::new();
-    for (a, n) in u.syms.vtable_objs() {
-        if lowered.contains(&a) {
+    for (a, n) in &cached {
+        let a = *a;
+        if lowered.contains(&a) || !made.is_made(u, &cached, a) {
             continue;
         }
         thunks.clear();
         crate::syms::data_thunks(u, a, &mut thunks);
         if let Some(h) = thunks.iter().find_map(|&sl| slot_hit(sl)) {
-            let of = stored_vtable_type_name(u, a).unwrap_or_else(|| format!("`{}`", vtable_name_types(&n).map_or_else(|| n.clone(), |t| t.0)));
+            let of = stored_vtable_type_name(u, a).unwrap_or_else(|| format!("`{}`", vtable_name_types(n).map_or_else(|| n.clone(), |t| t.0)));
             return Some((of, h));
         }
     }
     None
+}
+
+/// Whether trait objects with a vtable the disk cache or the startup image linked may exist, by
+/// address: its made cell is set (code made one, a twin that can make one was built, or linked
+/// data points at it), or a made vtable points at it (a supertrait's, which an upcast reaches), or
+/// it has no cell and none points at it (its makers set none: a type that holds no code an edit
+/// retires). A vtable only code that never ran would make is not. Asked per patch, per vtable.
+#[derive(Default)]
+struct MadeVtables {
+    /// vtable -> the vtables that point at it (made on first need: one pass over them all)
+    parents: Option<crate::fxhash::HashMap<u64, Vec<u64>>>,
+}
+
+impl MadeVtables {
+    fn is_made(&mut self, u: &Unit, all: &[(u64, String)], a: u64) -> bool {
+        self.made_in(u, all, a, 0)
+    }
+
+    fn made_in(&mut self, u: &Unit, all: &[(u64, String)], a: u64, depth: u32) -> bool {
+        let Some(s) = u.syms.data_at(a) else { return true };
+        if u.syms.is_made(s) {
+            return true;
+        }
+        let parents = self.parents.get_or_insert_with(|| {
+            let mut m: crate::fxhash::HashMap<u64, Vec<u64>> = Default::default();
+            let mut sup = Vec::new();
+            for (p, _) in all {
+                sup.clear();
+                crate::syms::vtable_supers(u, *p, &mut sup);
+                for &x in &sup {
+                    m.entry(x).or_default().push(*p);
+                }
+            }
+            m
+        });
+        let ps = parents.get(&a).cloned().unwrap_or_default();
+        if ps.is_empty() {
+            return !u.syms.has_made_cell(s);
+        }
+        // (a trait's supertraits are few and acyclic: the depth only guards a malformed chain)
+        depth < 64 && ps.into_iter().any(|p| self.made_in(u, all, p, depth + 1))
+    }
+}
+
+/// Whether a value of type `t` can hold code an edit can retire: a closure or a fn item, by the
+/// walk retired_hit makes (a type nested past its cap counts). A coercion of such a value to a
+/// trait object sets the vtable's made cell (lower.rs note_made); one of any other type sets
+/// none, and its trait objects count as made (stored_in_objects).
+pub(crate) fn may_hold_code(tys: &crate::types::Types, t: TyId, depth: u32) -> bool {
+    use crate::types::TyKind::*;
+    if depth > 16 {
+        return true;
+    }
+    let any = |l: crate::types::TyList| tys.list(l).iter().any(|a| may_hold_code(tys, *a, depth + 1));
+    match tys.kind(t).clone() {
+        Closure(..) | FnDef(..) => true,
+        Adt(_, args, _) => any(args),
+        Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => may_hold_code(tys, x, depth + 1),
+        Tuple(v) => any(v),
+        FnPtr(ps, r, _, _) => any(ps) || may_hold_code(tys, r, depth + 1),
+        Dyn(_, args, bounds, ..) => any(args) || tys.list(bounds).iter().any(|b| may_hold_code(tys, b.1, depth + 1)),
+        Alias(_, a) => any(a.args),
+        _ => false,
+    }
 }
 
 /// K3: a value that can run code of retired text may be stored where no frame shows it, so a
@@ -5192,9 +5268,9 @@ fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
         return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
     };
     let at = closure_at(u, slot);
-    // (by the source types of the vtables this run lowered, and by the code those linked from the
-    // cache or the startup image hold: a warm session's; of every version of its lineage that
-    // runs its code, as a box made under any of them does)
+    // (by the trait objects made: of the source types of the vtables this run lowered, and by the
+    // code those linked from the cache or the startup image hold, a warm session's; of every
+    // version of its lineage that runs its code, as a box made under any of them does)
     let versions: Vec<(u32, (u32, u32))> = lineage_of(u, slot).into_iter().filter_map(|v| match u.fns[v as usize].key {
         FnKey::Closure(f, e, _) => Some((v, (f, e))),
         _ => None,

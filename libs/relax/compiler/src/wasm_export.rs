@@ -1011,6 +1011,9 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             Some(SymKind::Site(i)) => i as u64,
             Some(SymKind::Rt("tls_base")) => tls,
             Some(SymKind::Rt("web_memory_base")) => 0,
+            // a vtable's made cell (syms.rs made_cell): a byte of the module's own, which nothing
+            // outside it reads
+            Some(SymKind::Made(_)) => m.place(1, 1),
             _ => {
                 n_unlinked += 1;
                 if stats_on() {

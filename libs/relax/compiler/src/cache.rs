@@ -4016,6 +4016,12 @@ impl Cache {
                 e.u8(19);
                 e.str(&n);
             }
+            // a vtable's made cell: by the vtable, so the link gives the cell of the vtable it links
+            // (20-27 and 31 are relocation tags of the list around it)
+            SymKind::Made(v) => {
+                e.u8(28);
+                self.enc_sym(u, Sym::new(v), e, rw)?;
+            }
         }
         e.u64(s.off as u64);
         Some(())
@@ -12204,6 +12210,13 @@ impl Linker {
                 crate::sandbox::host_sym(u, name)?
             }
             19 => u.syms.note(d.str()?.to_string()),
+            28 => {
+                let vt = self.link_symbol(u, d, rw)?;
+                if !u.syms.is_vtable_sym(vt) {
+                    return None;
+                }
+                u.syms.made_sym(vt)
+            }
             _ => return None,
         };
         s.off = d.u64()? as i64;
@@ -12249,9 +12262,15 @@ impl Linker {
         if d.p != payload.len() {
             return None;
         }
+        // an object that is no vtable and points at one (a constant holding a `&dyn`): the trait
+        // object exists, though no code made it this run (Syms::made_cell)
+        let made: Vec<Sym> = if name.as_deref().is_some_and(|n| n.starts_with(crate::syms::VTABLE_NAME)) { Vec::new() } else { ptrs.iter().map(|p| p.1).filter(|&t| u.syms.is_vtable_sym(t)).collect() };
         let a = u.data(&bytes, align, DataKind::Relocs(ptrs));
         if let Some(name) = name {
             u.syms.set_data_name(a, name);
+        }
+        for t in made {
+            u.syms.set_made(t);
         }
         self.cache().data_addr.insert(key, a);
         Some(a)

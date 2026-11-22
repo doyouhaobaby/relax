@@ -2382,6 +2382,17 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                             emit(Inst::Addr(d, thunk_sym(up, t)?.plus(sym.off)), &mut insts, &mut pos);
                         }
                         Some(SymKind::Site(_)) | Some(SymKind::Rt("null")) => emit(Inst::Addr(d, sym), &mut insts, &mut pos),
+                        // a vtable's made cell (syms.rs made_cell) is the host's, out of the
+                        // window: a twin that can make the trait object counts as making it (set
+                        // as it is built), and its code reads a set cell of its own (a byte 1 in
+                        // the data image), so it never stores to one
+                        Some(SymKind::Made(v)) => {
+                            u.syms.set_made(Sym::new(v));
+                            let one = u.lit_sym(&[1]);
+                            let o = f.vreg(Cls::I);
+                            emit(Inst::Addr(o, place_sym(up, one.id)?), &mut insts, &mut pos);
+                            emit(Inst::IBin(IOp::Add, U64, d, ar, o), &mut insts, &mut pos);
+                        }
                         // std's "makepad inspect records" flag (sync/raw.rs): never for twins, a
                         // word of the thread's that stays zero (its thread block's first)
                         Some(SymKind::Foreign(n)) if n == "__relax_recording" => {

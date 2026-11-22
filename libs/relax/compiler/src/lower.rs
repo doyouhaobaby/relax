@@ -4022,6 +4022,31 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// Sets the made cell of the vtable at `vt` (syms.rs made_cell) the first time this runs: a
+    /// patch then tells a trait object that was made from one that only code that never ran would
+    /// make (reload.rs MadeVtables). A load and a branch each time, the store once. The inliner
+    /// prices the body without it (`Func::guard_size`): a fn that makes a boxed closure inlines
+    /// where it did before the cells.
+    fn note_made(&mut self, vt: u64) {
+        let (cell, b, one) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I), self.f.vreg(Cls::I));
+        let sym = self.u.syms.made_sym(self.u.data_sym(vt));
+        let check = [Inst::Addr(cell, sym), Inst::Load(Mem::Int(1, false), b, cell, 0)];
+        let store = [Inst::Iconst(one, 1), Inst::Store(Mem::Int(1, false), cell, 0, one)];
+        self.f.guard_size.add(relax_codegen::opt::priced_out(check.iter().chain(&store), 1, 2));
+        for i in check {
+            self.emit(i);
+        }
+        let set = self.f.block();
+        let join = self.f.block();
+        self.term(Term::Branch(b, join, set));
+        self.switch(set);
+        for i in store {
+            self.emit(i);
+        }
+        self.goto(join);
+        self.switch(join);
+    }
+
     fn drop_local_if_live(&mut self, li: u32) {
         // nothing runs after a diverging expression
         if self.dead_blk == Some(self.cur) {
@@ -7216,6 +7241,9 @@ impl<'a> Lcx<'a> {
                 match self.u.vtable_shared(src, dy) {
                     Ok(Some(addr)) => {
                         self.u.note_vtable_maker(addr, self.cur_fn);
+                        if crate::reload::may_hold_code(&self.u.tcx.tys, src, 0) {
+                            self.note_made(addr);
+                        }
                         self.emit(Inst::Addr(vt, self.u.data_sym(addr)))
                     }
                     // a front that goes on to note the body's other values; this lowering is dropped
