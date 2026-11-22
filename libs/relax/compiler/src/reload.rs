@@ -7907,10 +7907,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 // (what the parent's lowering makes now: of this edit's new files, or of the
                 // version an earlier edit moved its def to when this patch rebuilt it for a
                 // constant it reads or a body it inlined; an async fn's body is the poll block's)
-                // An old one has code of its own, or its body is inline in code this patch does not
-                // rebuild (an instance over its type: `pump::<C>`, an iterator adapter's)
+                // Every old one: with code of its own, with its body inline in code this patch does
+                // not rebuild (an instance over its type: `pump::<C>`, an iterator adapter's), or
+                // with no code yet (a stored value of it, or an old frame that makes one, builds its
+                // old text at its first call unless it is paired: a callback boxed and not yet run)
                 if lowered_now(u, id) { news_c.push(id); }
-                else if (f.compiled || f.history().inlined_into.iter().any(|h| !rebuilt.contains(h))) && !matches!(u.forward_of(id), Some((_, false))) && *ce & crate::tcx::ASYNC_FN_BODY == 0 { olds_c.push(id); }
+                else if !matches!(u.forward_of(id), Some((_, false))) && *ce & crate::tcx::ASYNC_FN_BODY == 0 { olds_c.push(id); }
             }
         }
         {
@@ -7926,6 +7928,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // the old closures this pairs: each one's own, and a cell's through its target (the
         // code it runs), by the parent and the old version of its text
         let u = &*up;
+        // (whether code runs it now: its own, or a copy in code this patch does not rebuild)
+        let has_code = |o: u32| { let f = &u.fns[o as usize]; f.compiled || f.history().inlined_into.iter().any(|h| !rebuilt.contains(h)) };
         let target = |o: u32| match u.forward_of(o) { Some((t, true)) => t, _ => o };
         let parent_of = |c: u32| match u.fns[c as usize].key { FnKey::Closure(f, _, p) => (p, f), _ => (u32::MAX, u32::MAX) };
         let new_file = |p: u32, o: u32| news_c.iter().find_map(|&n| match u.fns[n as usize].key { FnKey::Closure(f, _, q) if q == p => Some(f), _ => None })
@@ -7976,7 +7980,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // (a closure the new text removed, or that no new closure was matched to:
                     // no line while only its parent's old frame runs it, which finishes on its old
                     // code as any removed code does; a HELD line when values of it were stored)
-                    if target(o) == o && [KEPT_SHAPE, KEPT_COUNT, KEPT_REPEAT, KEPT_UNDER_KEPT].contains(&w) {
+                    // (one with no code: only the HELD line, as no frame runs it)
+                    if target(o) == o && has_code(o) && [KEPT_SHAPE, KEPT_COUNT, KEPT_REPEAT, KEPT_UNDER_KEPT].contains(&w) {
                         out.lines.push(kept_closure_line(u, o, w));
                     } else if target(o) == o {
                         out.lines.extend(held_closure_line(u, o, w));
@@ -7991,19 +7996,22 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for o in u.closures_of_slots(u.slots_of_defs(removed_defs.iter().copied())) {
             let f = &u.fns[o as usize];
             let body = matches!(f.key, FnKey::Closure(_, ce, _) if ce & crate::tcx::ASYNC_FN_BODY != 0);
-            if f.compiled && !body && target(o) == o && !olds_c.contains(&o) {
+            if !body && target(o) == o && !olds_c.contains(&o) {
                 out.lines.extend(held_closure_line(u, o, KEPT_NO_PLACE));
             }
         }
         // (an old version that already forwards to its pair: the parent was rebuilt again with
         // its file unchanged, and the forwarder runs that slot's new code as it is)
         let mut settled: Vec<u32> = Vec::new();
+        // (one with no code and no copy forwards to its pair as that slot is: the pair builds at
+        // its first call, as any new code this patch did not build)
+        let codeless: Vec<u32> = pairs.iter().map(|p| p.0).filter(|&o| !has_code(o)).collect();
         for (o, n) in pairs {
             if matches!((&*up).forward_of(o), Some((t, _)) if t == n) {
                 settled.push(o);
                 continue;
             }
-            let built = pre.iter().any(|(id, r)| *id == n && r.is_ok()) || staged.iter().any(|(id, _)| *id == n);
+            let built = pre.iter().any(|(id, r)| *id == n && r.is_ok()) || staged.iter().any(|(id, _)| *id == n) || codeless.contains(&o);
             if !built {
                 match compile_guarded(up, n) {
                     Ok(c) => pre.push((n, Ok(c))),

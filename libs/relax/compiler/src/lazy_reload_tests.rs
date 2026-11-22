@@ -3995,30 +3995,49 @@ pub fn start(p: *mut u64) {
 /// T3c T4: a closure an edit kept on its old code is stored as a trait object, and no thread
 /// runs it. Edit 1 changes its captures, edit 2 takes `S` out of the text; a field added to `S`
 /// is refused naming edit 1 (a stored value runs that code at its next call), and the call
-/// made after reads 5.
+/// made after reads 5. Two more are stored and never called before edit 1 (no code of theirs
+/// exists, as a callback's that has not fired): edit 1 changes the first one's body, which its
+/// stored value then runs, and the second one's captures, which holds it for a restart (its
+/// stored value builds the old text at its first call).
 #[test]
 fn a_stored_kept_closure_blocks_a_layout_patch() {
     isolated_test!(a_stored_kept_closure_blocks_a_layout_patch);
     let lib = format!("{KEPT_FLAGS}{}", r#"static mut STORED: Option<Box<dyn Fn() -> u64>> = None;
+static mut UNRUN: Option<Box<dyn Fn() -> u64>> = None;
+static mut UNRUN_KEPT: Option<Box<dyn Fn() -> u64>> = None;
 pub fn start(_p: *mut u64) {
     let k = 0u64;
     let c: Box<dyn Fn() -> u64> = Box::new(move || { let s = S { n: 5 }; read(&s) + k });
     unsafe { STORED = Some(c); }
+    let d: Box<dyn Fn() -> u64> = Box::new(move || 7 + k);
+    let e: Box<dyn Fn() -> u64> = Box::new(move || 9 + k);
+    unsafe { UNRUN = Some(d); UNRUN_KEPT = Some(e); }
 }
 pub fn later(p: *mut u64) {
     let a = unsafe { &*(p as *const [AtomicU64; 4]) };
     a[2].store(unsafe { (*std::ptr::addr_of!(STORED)).as_ref().unwrap()() }, Ordering::SeqCst);
 }
+pub fn unrun(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    a[1].store(unsafe { (*std::ptr::addr_of!(UNRUN)).as_ref().unwrap()() }, Ordering::SeqCst);
+    a[3].store(unsafe { (*std::ptr::addr_of!(UNRUN_KEPT)).as_ref().unwrap()() }, Ordering::SeqCst);
+}
 "#);
-    let mut rig = KeptRig::new("stored", &[("lib.rs", &lib)], &["start", "later"]);
+    let unrun_kept_at = format!("lib.rs:{}:", lib.lines().position(|l| l.contains("move || 9 + k")).unwrap() + 1);
+    let mut rig = KeptRig::new("stored", &[("lib.rs", &lib)], &["start", "later", "unrun"]);
     rig.call("start");
     rig.call("later");
     assert_eq!(rig.flag(2), 5, "the stored closure runs");
     let old = rig.closures("start");
     assert_eq!(old.len(), 1, "the stored closure has code");
     let name = rig.shown(old[0]);
-    let o = rig.edit("lib.rs", &[("let k = 0u64;", "let k = 0u64;\n    let j = 0u64;"), ("read(&s) + k }", "read(&s) + k + j }")]);
+    let o = rig.edit("lib.rs", &[("let k = 0u64;", "let k = 0u64;\n    let j = 0u64;"), ("read(&s) + k }", "read(&s) + k + j }"), ("7 + k", "8 + k"), ("9 + k", "10 + k + j")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the captures edit applies: {:?}", o.lines);
+    let unrun_held = o.lines.iter().any(|l| l.starts_with(crate::reload::HELD) && l.contains(&unrun_kept_at) && l.contains("its captures or signature changed"));
+    assert!(unrun_held, "a stored closure that never ran, its captures changed, is held for a restart ({unrun_kept_at}): {:?}", o.lines);
+    rig.call("unrun");
+    assert_eq!(rig.flag(1), 8, "a stored closure that never ran, its body changed, runs the new body");
+    assert_eq!(rig.flag(3), 9, "the held one runs the text it was stored with");
     let o = rig.edit("lib.rs", &[("{ let s = S { n: 5 }; read(&s) + k + j }", "5u64 + k + j")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the closure without S applies: {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);
