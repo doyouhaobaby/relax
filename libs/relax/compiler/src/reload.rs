@@ -4971,11 +4971,11 @@ fn referenced_slots(relocs: &[relax_backend::rir::RelocAt], out: &mut Vec<u32>) 
 
 type Code = (Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>);
 
-/// A closure's identity across versions of its parent: its ordinal among the closure
-/// expressions of the parent's item (source order), with its signature, captures and owner
-/// types. Coroutines (async blocks and bodies) are not matched: their suspended states keep
-/// the old poll code until coroutine versioning exists.
-fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
+/// What an old closure's values need of the new closure they are paired with
+/// ([`align_closures`] says which that is): its signature, its captures' types (the
+/// environment's layout) and its owner's types. Coroutines (async blocks and bodies) have none:
+/// their suspended states keep the old poll code until coroutine versioning exists.
+fn closure_shape(u: &Unit, slot: u32) -> Option<(TyId, Vec<TyId>, TyId)> {
     let (file, ce, parent) = match &u.fns[slot as usize].key {
         FnKey::Closure(f, e, p) => (*f, *e, *p),
         _ => return None,
@@ -4991,23 +4991,147 @@ fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
     if !body.has_expr(crate::ast::ExprId(ce)) {
         return None;
     }
-    // the closures before it in the body's expressions (the item's own range, then its lazily
-    // parsed body's)
-    let mut ord = 0;
-    for i in 0..body.expr_ix(crate::ast::ExprId(ce)) {
-        let e = body.expr_at(i);
-        if ast.has_expr(e) && matches!(ast.expr(e).kind, crate::ast::ExprKind::Closure { .. }) {
-            ord += 1;
-        }
-    }
     let ty = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), body.ty(crate::ast::ExprId(ce)));
     match u.tcx.tys.kind(ty).clone() {
         crate::types::TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, closure_sig_as_fn_ptr_ty: sig, .. }) => {
             let storage = crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, &body, ce);
-            Some((ord, sig, storage.fields, owner))
+            Some((sig, storage.fields, owner))
         },
         _ => None,
     }
+}
+
+/// Why an old closure keeps its old code (the kept and held lines say it).
+const KEPT_NO_PLACE: &str = "the new text has no closure at its place";
+const KEPT_SHAPE: &str = "its captures or signature changed";
+const KEPT_UNMATCHED: &str = "no closure of the new text was matched to it";
+const KEPT_COUNT: &str = "the edit changed how many closures stand between its unchanged neighbours, so its new version is not known";
+const KEPT_UNDER_KEPT: &str = "the closure around it keeps its old code";
+
+/// The closures of one version of a fn item (its checked body for that file version): each
+/// closure expression in ExprId order (source order among siblings), the smallest other closure
+/// around it, and its text: its tokens over its whole span, nested closures included, as the
+/// item classifier compares them (toks_norm: whitespace, comments and a macro expansion's form
+/// do not count).
+struct ClosureTree {
+    exprs: Vec<u32>,
+    up: Vec<Option<usize>>,
+    texts: Vec<Vec<u8>>,
+}
+
+impl ClosureTree {
+    fn of(u: &Unit, parent: u32, file: u32) -> Option<ClosureTree> {
+        let body = u.body_of(parent, file)?;
+        let pf = u.prog.files.get(file as usize)?;
+        let (mut exprs, mut spans) = (Vec::new(), Vec::new());
+        for i in 0..body.expr_ty.len() {
+            let e = body.expr_at(i);
+            if pf.ast.has_expr(e) {
+                let x = pf.ast.expr(e);
+                if matches!(x.kind, crate::ast::ExprKind::Closure { .. }) {
+                    exprs.push(e.0);
+                    spans.push((x.lo, x.hi));
+                }
+            }
+        }
+        // (equal spans, a macro's: the later expression is the one around, as a closure's node
+        // comes after its body's)
+        let size = |i: usize| (spans[i].1.saturating_sub(spans[i].0), exprs[i]);
+        let up = (0..exprs.len())
+            .map(|c| (0..exprs.len()).filter(|&d| size(d) > size(c) && pf.expands_within(spans[c].0, spans[d].0, spans[d].1)).min_by_key(|&d| size(d)))
+            .collect();
+        let texts = spans.iter().map(|&(lo, hi)| toks_norm(pf, lo, hi, &[]).pop().unwrap_or_default()).collect();
+        Some(ClosureTree { exprs, up, texts })
+    }
+
+    fn len(&self) -> usize {
+        self.exprs.len()
+    }
+
+    fn children(&self, of: Option<usize>) -> Vec<usize> {
+        (0..self.len()).filter(|&i| self.up[i] == of).collect()
+    }
+
+    /// The closures inside closure `c`, in order.
+    fn inside(&self, c: usize) -> Vec<usize> {
+        (0..self.len()).filter(|&i| { let mut a = self.up[i]; while let Some(x) = a { if x == c { return true; } a = self.up[x]; } false }).collect()
+    }
+}
+
+/// Which closure of the new version of a fn item each closure of an old version is (an index
+/// into `new`), or why none is. Syntax only; the caller checks each pair's shape
+/// ([`closure_shape`]). Per group of siblings (the closures with the same closure around them),
+/// from the top level down:
+/// - the same text pairs, at any place: the k-th old closure of a text with the k-th new one,
+///   and the closures inside a pair with the ones at the same place inside it (the same text);
+/// - then the rest by place: between the same two paired neighbours (or a group's start or
+///   end), an equal number of old and new closures pair in order (their bodies changed), and
+///   their own siblings are aligned the same way; a changed number keeps every old closure
+///   there (which one became which is not known);
+/// - a closure inside a kept one is kept.
+fn align_closures(old: &ClosureTree, new: &ClosureTree) -> Vec<Result<usize, &'static str>> {
+    let mut out = vec![Err(KEPT_UNDER_KEPT); old.len()];
+    let mut groups: Vec<(Option<usize>, Option<usize>)> = vec![(None, None)];
+    while let Some((po, pn)) = groups.pop() {
+        let (os, ns) = (old.children(po), new.children(pn));
+        // the same text: the old one at position i to the new one at position pair[i]
+        let mut pair: Vec<Option<usize>> = vec![None; os.len()];
+        let mut taken: Vec<Option<usize>> = vec![None; ns.len()];
+        for (i, &o) in os.iter().enumerate() {
+            let k = os[..i].iter().filter(|&&x| old.texts[x] == old.texts[o]).count();
+            if let Some(j) = (0..ns.len()).filter(|&j| new.texts[ns[j]] == old.texts[o]).nth(k) {
+                pair[i] = Some(j);
+                taken[j] = Some(i);
+                out[o] = Ok(ns[j]);
+                for (a, b) in old.inside(o).into_iter().zip(new.inside(ns[j])) {
+                    out[a] = Ok(b);
+                }
+            }
+        }
+        // the rest by place: a gap is named by the paired old closures around it
+        let gap_old = |i: usize| ((0..i).rev().find(|&k| pair[k].is_some()), (i + 1..os.len()).find(|&k| pair[k].is_some()));
+        let gap_new = |j: usize| ((0..j).rev().find_map(|k| taken[k]), (j + 1..ns.len()).find_map(|k| taken[k]));
+        let mut gaps: Vec<((Option<usize>, Option<usize>), Vec<usize>, Vec<usize>)> = Vec::new();
+        for i in (0..os.len()).filter(|&i| pair[i].is_none()) {
+            let g = gap_old(i);
+            match gaps.iter_mut().find(|x| x.0 == g) {
+                Some(x) => x.1.push(os[i]),
+                None => gaps.push((g, vec![os[i]], Vec::new())),
+            }
+        }
+        for j in (0..ns.len()).filter(|&j| taken[j].is_none()) {
+            let g = gap_new(j);
+            if let Some(x) = gaps.iter_mut().find(|x| x.0 == g) {
+                x.2.push(ns[j]);
+            }
+        }
+        for (_, olds, news) in gaps {
+            if olds.len() == news.len() {
+                for (a, b) in olds.into_iter().zip(news) {
+                    out[a] = Ok(b);
+                    groups.push((Some(a), Some(b)));
+                }
+            } else {
+                for a in olds {
+                    out[a] = Err(if news.is_empty() { KEPT_NO_PLACE } else { KEPT_COUNT });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The versions of closure `slot`'s lineage that run its code: itself, the lineage's cell when
+/// it jumps to `slot`, and the older versions that jump to that cell. A box made under any of
+/// them runs `slot`'s code.
+fn lineage_of(u: &Unit, slot: u32) -> Vec<u32> {
+    let FnKey::Closure(_, _, parent) = u.fns[slot as usize].key else { return vec![slot] };
+    let sibs = u.closures_of_slots([parent]);
+    let cells: Vec<u32> = sibs.iter().copied().filter(|&c| u.forward_of(c) == Some((slot, true))).collect();
+    let mut v = vec![slot];
+    v.extend(cells.iter().copied());
+    v.extend(sibs.iter().copied().filter(|&c| matches!(u.forward_of(c), Some((t, false)) if cells.contains(&t))));
+    v
 }
 
 /// The line of an old closure that keeps its code (`why` its new version does not take over).
@@ -5016,14 +5140,19 @@ fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
 /// for it ([`HELD`]: the restart is offered and `session view` lists it). A closure only called
 /// in its parent's frame is not run again once its parent's new code runs: that line only says so.
 fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
-    let FnKey::Closure(file, ce, parent) = u.fns[slot as usize].key else {
+    let FnKey::Closure(_, _, parent) = u.fns[slot as usize].key else {
         return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
     };
     let at = closure_at(u, slot);
     // (by the source types of the vtables this run lowered, and by the code those linked from the
-    // cache or the startup image hold: a warm session's)
-    let ty_hit = |t: TyId| holds_closure(&u.tcx.tys, t, (file, ce)).then(|| (String::new(), 0));
-    let slot_hit = |sl: u32| (sl == slot || key_types(u, sl).into_iter().any(|t| holds_closure(&u.tcx.tys, t, (file, ce)))).then(String::new);
+    // cache or the startup image hold: a warm session's; of every version of its lineage that
+    // runs its code, as a box made under any of them does)
+    let versions: Vec<(u32, (u32, u32))> = lineage_of(u, slot).into_iter().filter_map(|v| match u.fns[v as usize].key {
+        FnKey::Closure(f, e, _) => Some((v, (f, e))),
+        _ => None,
+    }).collect();
+    let ty_hit = |t: TyId| versions.iter().any(|x| holds_closure(&u.tcx.tys, t, x.1)).then(|| (String::new(), 0));
+    let slot_hit = |sl: u32| (versions.iter().any(|x| x.0 == sl) || key_types(u, sl).into_iter().any(|t| versions.iter().any(|x| holds_closure(&u.tcx.tys, t, x.1)))).then(String::new);
     if stored_in_objects(u, &ty_hit, &slot_hit).is_some() {
         format!("{HELD}stored values of a closure of `{}` ({}{at}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
     } else {
@@ -7624,13 +7753,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     // closures stored by the running version (handlers, callbacks): an old closure whose parent
-    // was rebuilt runs the new version of itself when the new parent has a closure at the same
-    // place with the same signature and captures (same environment layout); otherwise it keeps
-    // its own code (memory-safe; reported, and waiting for a restart when values of it may be
-    // stored: kept_closure_line). The new code is built now if the edit's precompile
-    // did not reach it. An older version that forwards to its lineage's cell (install_forward)
-    // follows the cell and is not looked at again: an edit's work stays the same however many
-    // edits came before.
+    // was rebuilt runs the new version of itself when the alignment of the parent's two texts
+    // says which new closure that is (align_closures: by text, then by place between unchanged
+    // neighbours) and it has the same signature and captures (same environment layout);
+    // otherwise it keeps its own code (memory-safe; reported, and waiting for a restart when
+    // values of it may be stored: kept_closure_line). The new code is built now if the edit's
+    // precompile did not reach it. A lineage's cell is paired through the code it runs (its
+    // target's pair), and an older version that forwards to the cell (install_forward) follows
+    // the cell and is not looked at again: an edit's work stays the same however many edits came
+    // before.
     let mut rebind: Vec<(u32, u32)> = Vec::new();
     // The old closures of a rebuilt parent this patch does not rebind, by complement (every old
     // closure the blocks below look at that is not rebound, whatever the reason): entered in
@@ -7665,35 +7796,60 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 UNLOWERED_PARENTS.fetch_add(unlowered.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        // a new closure's identity is read from its parent's checked body, which the parent's
-        // build may have dropped already (the closure was lowered with it)
-        if !olds_c.is_empty() {
-            for &n in &news_c {
-                if let FnKey::Closure(file, _, parent) = (&*up).fns[n as usize].key {
-                    let _ = jit::ensure_parent_body(up, parent, file, 0);
-                }
+        // the old closures this pairs: each one's own, and a cell's through its target (the
+        // code it runs), by the parent and the old version of its text
+        let u = &*up;
+        let target = |o: u32| match u.forward_of(o) { Some((t, true)) => t, _ => o };
+        let parent_of = |c: u32| match u.fns[c as usize].key { FnKey::Closure(f, _, p) => (p, f), _ => (u32::MAX, u32::MAX) };
+        let new_file = |p: u32, o: u32| news_c.iter().find_map(|&n| match u.fns[n as usize].key { FnKey::Closure(f, _, q) if q == p => Some(f), _ => None })
+            .or_else(|| closure_owner_def(u, o).map(|d| u.prog.def(d).file));
+        let mut groups: Vec<(u32, u32, u32)> = Vec::new();
+        for &o in &olds_c {
+            let t = target(o);
+            let (p, f) = parent_of(t);
+            if p != u32::MAX && !lowered_now(u, t) && !groups.iter().any(|g| (g.0, g.1) == (p, f)) {
+                if let Some(nf) = new_file(p, t) { groups.push((p, f, nf)); }
             }
         }
+        // a closure's text and place are read from its parent's checked bodies, which the parent's
+        // build may have dropped already (the closure was lowered with it)
+        for &(p, _, nf) in &groups {
+            let _ = jit::ensure_parent_body(up, p, nf, 0);
+        }
         let u = &*up;
-        let new_ids: Vec<(u32, Option<(u32, TyId, Vec<TyId>, TyId)>)> = news_c.iter().map(|&n| (n, closure_ident(u, n))).collect();
+        trace_count("closure_trees", groups.len());
+        // (an old closure's (file, expression)) -> its new slot, or why there is none
+        let mut aligned: crate::fxhash::HashMap<(u32, u32), Result<u32, &'static str>> = Default::default();
+        for &(p, f, nf) in &groups {
+            let (Some(old), Some(new)) = (ClosureTree::of(u, p, f), ClosureTree::of(u, p, nf)) else { continue };
+            for (i, r) in align_closures(&old, &new).into_iter().enumerate() {
+                let r = r.and_then(|j| news_c.iter().copied().find(|&n| u.fns[n as usize].key == FnKey::Closure(nf, new.exprs[j], p)).ok_or(KEPT_UNMATCHED));
+                aligned.insert((f, old.exprs[i]), r);
+            }
+        }
+        let pair_of = |s: u32| -> Result<u32, &'static str> {
+            if lowered_now(u, s) {
+                return Ok(s);
+            }
+            let FnKey::Closure(f, ce, _) = u.fns[s as usize].key else { return Err(KEPT_UNMATCHED) };
+            let n = aligned.get(&(f, ce)).copied().unwrap_or(Err(KEPT_UNMATCHED))?;
+            match closure_shape(u, s) {
+                None => Err(KEPT_UNMATCHED),
+                Some(shape) if Some(&shape) == closure_shape(u, n).as_ref() => Ok(n),
+                Some(_) => Err(KEPT_SHAPE),
+            }
+        };
         let mut pairs = Vec::new();
         let mut why: Vec<(u32, &'static str)> = Vec::new();
         for &o in &olds_c {
-            let oi = closure_ident(u, o);
-            let FnKey::Closure(_, _, parent) = u.fns[o as usize].key else { unreachable!("olds_c holds closures") };
-            let hit = new_ids.iter().find(|(n, ni)| {
-                matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.is_some() && *ni == oi
-            });
-            match hit {
-                Some((n, _)) => pairs.push((o, *n)),
-                None if oi.is_none() => why.push((o, "no closure of the new text was matched to it")),
-                None => {
-                    if new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
-                        out.lines.push(kept_closure_line(u, o, "its captures or signature changed"));
-                        why.push((o, "its captures or signature changed"));
-                    } else {
-                        why.push((o, "the new text has no closure at its place"));
+            match pair_of(target(o)) {
+                Ok(n) => pairs.push((o, n)),
+                Err(w) => {
+                    // (a cell that keeps forwarding to its kept target is that target's line)
+                    if target(o) == o && [KEPT_SHAPE, KEPT_COUNT, KEPT_UNDER_KEPT].contains(&w) {
+                        out.lines.push(kept_closure_line(u, o, w));
                     }
+                    why.push((o, w));
                 }
             }
         }
@@ -7720,7 +7876,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for o in olds_c {
             if !rebind.iter().any(|x| x.0 == o) && !settled.contains(&o) {
-                kept_closures.push((o, why.iter().find(|x| x.0 == o).map_or("no closure of the new text was matched to it", |x| x.1)));
+                kept_closures.push((o, why.iter().find(|x| x.0 == o).map_or(KEPT_UNMATCHED, |x| x.1)));
             }
         }
     }
@@ -8240,10 +8396,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for &o in &staged_keeps {
             // (never inlined again: no build takes a superseded body, I3)
             u.fns[o as usize].patched.store(true, Ordering::Relaxed);
+            // (a cell that keeps forwarding to its kept target is that target's line)
+            let cell = matches!(u.forward_of(o), Some((_, true)));
             if let Some(e) = u.kept_old.get_mut(&o) {
                 e.0 = gen;
                 let why = e.1;
-                eprintln!("relax live: kept `{}`{} on the code of a text the program no longer has (patch gen {gen}: {why})", u.fns[o as usize].name, closure_at(u, o));
+                if !cell {
+                    eprintln!("relax live: kept `{}`{} on the code of a text the program no longer has (patch gen {gen}: {why})", u.fns[o as usize].name, closure_at(u, o));
+                }
             }
         }
     }

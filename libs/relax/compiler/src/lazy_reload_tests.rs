@@ -3174,7 +3174,7 @@ fn stored_closure_follows_edits_with_flat_work() {
         return;
     }
     use crate::jit::{FnKey, Unit};
-    use crate::reload::{apply, Edit, Rung};
+    use crate::reload::{apply, Edit, Rung, HELD};
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
     std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-stored-closure-{}", std::process::id()));
@@ -3289,6 +3289,40 @@ pub fn value(out: &mut u32) {{
     assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
     assert_eq!(run(), 22, "an edit after the rollback reaches the stored box");
     assert_eq!(u.forward_of(previous), Some((first, false)), "edit 5's closure forwards to the cell");
+    // the lineage is paired by the code it runs, as the parent's two texts align: a closure of the
+    // same shape above the box (`z`, whose place a pairing by order would give the box), the box's
+    // body changed beside it, the two swapped, `z` deleted, then a new closure and a changed body
+    // in one gap (which became which is not known: the box keeps its code and waits for a
+    // restart), then `z` deleted again: the box's kept version and that text are one to one (the
+    // box follows; z's old closure has no place, which says nothing). Each edit installs at most
+    // two forwarders per lineage (its cell and its previous version), the box's and z's.
+    files.push(o.files[0]);
+    let z = "    let z = move |x: u32| x * k + 100;\n    let _ = z(0);\n";
+    let with = |body: String| src(7).replace("    Box::new(move |x| x * k + 7)\n", &body);
+    let steps = [
+        ("z inserted above the box", with(format!("{z}    Box::new(move |x| x * k + 7)\n")), 22, false),
+        ("the box's body changed below z", with(format!("{z}    Box::new(move |x| x * k + 8)\n")), 23, false),
+        ("the box and z swapped", with(format!("    let b: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x * k + 8);\n{z}    b\n")), 23, false),
+        ("z deleted", with("    Box::new(move |x| x * k + 8)\n".to_string()), 23, false),
+        ("z inserted and the box's body changed in one gap", with(format!("{z}    Box::new(move |x| x * k + 9)\n")), 23, true),
+        ("z deleted: the box's kept version and the text one to one again", with("    Box::new(move |x| x * k + 9)\n".to_string()), 24, false),
+    ];
+    for (what, text, want, held) in steps {
+        let (before, cell) = (u.forwards.len(), u.forward_of(first));
+        let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: text.into_bytes() }]) };
+        assert_eq!(o.rung, Rung::Patch, "{what}: {:?}", o.lines);
+        files.push(o.files[0]);
+        assert_eq!(run(), want, "{what}: the stored box's value");
+        let lines: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
+        if held {
+            assert!(lines.len() == 1 && lines[0].contains("how many closures stand between its unchanged neighbours"), "{what}: one held line, for the box: {:?}", o.lines);
+            assert_eq!(u.forward_of(first), cell, "{what}: the box's cell jumps to the code the box ran");
+        } else {
+            assert!(lines.is_empty(), "{what}: nothing waits for a restart: {:?}", o.lines);
+            assert!(matches!(u.forward_of(first), Some((t, true)) if Some(t) != cell.map(|c| c.0)), "{what}: the box's cell jumps to its new version: {:?} (was {cell:?})", u.forward_of(first));
+        }
+        assert!(u.forwards.len() - before <= 4, "{what}: {} forwarders installed", u.forwards.len() - before);
+    }
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -3355,8 +3389,15 @@ pub fn value(out: &mut u32) {{
     };
     // 16 from the stored closure, 0 + 2 + 4 summed
     assert_eq!(run(), 1606);
-    let file = u.prog.def(value).file;
-    let edited = src("let j = 4;\n    Box::new(move |x| x * k + j)", "let j = 1;\n    (0..3u32).map(|x| x * k + j).sum()");
+    // a closure of the box's shape put above it is not the box's new version: the box runs on
+    let z = "let z = move |x: u32| x * k + 9;\n    let _ = z(0);\n    ";
+    let above = src(&format!("{z}Box::new(move |x| x * k + 1)"), "(0..3u32).map(|x| x * k).sum()");
+    let o = unsafe { apply(up, vec![Edit { file: u.prog.def(value).file, path: app.clone(), src: above.into_bytes() }]) };
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert!(!o.lines.iter().any(|l| l.starts_with(HELD)), "a closure inserted above the box holds nothing back: {:?}", o.lines);
+    assert_eq!(run(), 1606, "the stored box after a closure of its shape was put above it");
+    let file = o.files[0];
+    let edited = src(&format!("{z}let j = 4;\n    Box::new(move |x| x * k + j)"), "let j = 1;\n    (0..3u32).map(|x| x * k + j).sum()");
     let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: edited.into_bytes() }]) };
     assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
     let held: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
@@ -4011,11 +4052,19 @@ pub fn later(p: *mut u64) {
     rig.flags[3].store(0, std::sync::atomic::Ordering::SeqCst);
     rig.call("later");
     let layout = (rig.flag(2), rig.flag(3));
+    // a third closure of their shape between them: each stored one stays itself
+    let edit3 = rig.edit("lib.rs", &[("read(&s) + k + 1 };\n    let own", "read(&s) + k + 1 };\n    let _mid = move || { let s = S { m: 0, n: 6 }; read(&s) + k + 1 };\n    let own")]);
+    rig.flags[2].store(0, std::sync::atomic::Ordering::SeqCst);
+    rig.flags[3].store(0, std::sync::atomic::Ordering::SeqCst);
+    rig.call("later");
+    let inserted = (rig.flag(2), rig.flag(3));
     assert_eq!((pumps.len(), copies.len(), only_code, tiered), (2, 2, 1, (5, 7)), "both instances of pump have O3 code holding their closure's body, one closure has no code of its own");
     assert_eq!(edit1.rung, crate::reload::Rung::Patch, "the bodies' edit applies: {:?}", edit1.lines);
     assert_eq!(rebound, (6, 8), "the calls through pump's hosts run the new bodies (the one only inline, the one with code): {:?}", edit1.lines);
     assert_eq!(edit2.rung, crate::reload::Rung::Patch, "the field applies: {:?}", edit2.lines);
     assert_eq!(layout, (6, 8), "the calls after the field, by the new bodies in the new layout");
+    assert_eq!(edit3.rung, crate::reload::Rung::Patch, "the closure between them applies: {:?}", edit3.lines);
+    assert_eq!(inserted, (6, 8), "after a closure of their shape went between them, each stored closure runs its own body");
 }
 
 /// A C ABI body's call in tail position became a sibling call (a jump that frees its frame first)
