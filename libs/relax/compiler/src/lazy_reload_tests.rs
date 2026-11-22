@@ -905,6 +905,11 @@ fn specv_twin_calls_reach_bases_only_from_code_that_needs_no_check() {
     assert_eq!(u.twin_link_target(pair_call, twin_bump, |_| true), twin_bump, "code without its disjoint-index check keeps the twin");
     assert_eq!(u.twin_link_target(twin_mid, twin_bump, |_| true), twin_bump, "a twin's calls stay twin calls");
     assert_eq!(u.twin_link_target(pair_locals, twin_mid, |_| true), mid, "a clean caller that needs no check calls the base");
+    // the kept calls say which clause kept them (inspect: the exit line, why-tier of the twin)
+    use crate::jit::TwinKept;
+    assert_eq!(u.twin_kept(pair_call, bump, |_| true), Some(TwinKept::CallerChecks), "kept: the caller needs a disjoint-index check");
+    assert_eq!(u.twin_kept(twin_mid, bump, |_| true), Some(TwinKept::CallerTwin), "kept: the caller is a twin");
+    assert_eq!(u.twin_kept(pair_locals, mid, |_| false), Some(TwinKept::BaseNoCode), "kept: the base (it never ran) has no code and no entry");
     // the image written now: the bases' own entries, then the startup slots (the callers' unverified
     // code); a twin call it sends to the base is one TWIN_RETARGETS
     let retargets = crate::owner::call(crate::owner::Class::Program, || {

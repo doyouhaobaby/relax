@@ -600,6 +600,9 @@ pub fn warm_summary() -> String {
     if g(REC_UNVERIFIED) + g(SPECV_LATE) > 0 {
         s.push_str(&format!("; SPEC-V: {} records of unverified lowerings, {} compiled slots below O3 verified after their build, {} base slots ran their twins' code until their own build (none compiled on a program thread for it), {} of them have their own code now, {} callees built ahead of a replacement's install, {} calls of linked code sent to a twin's base, {} bases of hot twins built for their own entry", k(g(REC_UNVERIFIED)), k(g(SPECV_LATE)), k(crate::jit::SPECV_BORROWS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_BORROWS_OWN.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_PREBUILT.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::TWIN_RETARGETS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::TWIN_BASE_BUILDS.load(std::sync::atomic::Ordering::Relaxed))));
     }
+    if let Some(kept) = crate::jit::twin_kept_summary() {
+        s.push_str(&format!("; {kept}"));
+    }
     if g(O3_QUEUED) + g(O3_UNVERIFIED) + g(O3_FRAME) + g(O3_SPEC) > 0 {
         s.push_str(&format!("; O3 installs kept as entries: {} queued (written {}, same as stored {}, not encodable {}, stale {}, dropped {}; {} deferred records waiting, last drain {} with {}), not kept: unverified {}, frame too big {}, speculative/inspect {}; O2 entries written {}",
             k(g(O3_QUEUED)), k(g(O3_WRITTEN)), k(g(O3_SAME)), k(g(O3_UNENCODABLE)), k(g(O3_STALE)), k(g(O3_DROPPED)), k(g(RECORDS_WAITING)), g(DRAIN_WHY), k(g(DRAIN_LEN)), k(g(O3_UNVERIFIED)), k(g(O3_FRAME)), k(g(O3_SPEC)), k(g(O2_WRITTEN))));

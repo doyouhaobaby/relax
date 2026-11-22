@@ -10060,24 +10060,11 @@ impl Unit {
         self.fn_map.get(&FnKey::Plain(id))
     }
 
-    /// SPEC-V: whether code of slot `caller` lowered before its verdict (its aliasing-prone calls going
-    /// to twins, no run-time disjoint-index checks) may call the twins' bases instead: the bases are
-    /// built with `noalias`, so only when that code passes them no aliased `&mut`. That holds when the
-    /// caller's verdict is clean and asks for no run-time disjoint-index checks: index borrows the
-    /// checker accepted only with such a check may overlap in code that lacks it. Never a twin: its
-    /// callers may pass it aliased arguments, which its calls pass on, so its calls stay twin calls.
-    /// (A verdict that asks for the checks is never stored: on a warm launch such a body is not clean
-    /// until this run's checker has it, and then its checks are known.)
-    /// Used where that code is linked (twin_link_target) and where the image is written (build_image).
-    pub(crate) fn unverified_code_calls_bases(&self, caller: u32) -> bool {
-        !matches!(self.fns[caller as usize].key, FnKey::Plain(_)) && self.verdict_clean(caller) && self.disjoint_checks(caller).is_none()
-    }
-
     /// SPEC-V: where linked (cached) code of slot `caller` sends its call / reference to slot `target`.
     /// A twin exists for callers whose aliasing is not known yet; cached code lowered in an earlier run
     /// before its verdict still names twins. When the caller's own body is verified clean now (a warm
     /// launch knows the stored verdict before the first link) without run-time disjoint-index checks
-    /// (unverified_code_calls_bases), its calls go to the twin's base: the verified body, sound for a
+    /// (twin_caller_kept), its calls go to the twin's base: the verified body, sound for a
     /// caller that passes no aliased `&mut` (the image does the same when it is written: build_image).
     /// Without it every warm launch
     /// ran the race's draw path (draw_view .. set_uniform, find_appendable_drawcall) as twins built at
@@ -10091,15 +10078,49 @@ impl Unit {
         let n = self.fns.len();
         if target as usize >= n || caller as usize >= n { return target }
         let FnKey::Plain(base) = self.fns[target as usize].key else { return target };
-        if (base as usize) < self.fns.len() && self.unverified_code_calls_bases(caller) && !matches!(self.verdict_state(base), Verdict::Failed(_))
-            && self.fns[base as usize].build_err.is_none()
-            && (self.fns[base as usize].compiled || stored(base))
-            && !relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") {
-            TWIN_RETARGETS.fetch_add(1, Ordering::Relaxed);
-            base
-        } else {
-            target
+        match self.twin_kept(caller, base, stored) {
+            None => {
+                TWIN_RETARGETS.fetch_add(1, Ordering::Relaxed);
+                base
+            }
+            Some(why) => {
+                note_twin_kept(self, caller, target, why);
+                target
+            }
         }
+    }
+
+    /// SPEC-V: why linked code of `caller` keeps its call to the twin of `base` a twin call: the
+    /// first clause of the retarget rule (twin_link_target) that fails, in the rule's order. None:
+    /// the call goes to the base.
+    pub(crate) fn twin_kept(&self, caller: u32, base: u32, stored: impl FnOnce(u32) -> bool) -> Option<TwinKept> {
+        if let Some(why) = self.twin_caller_kept(caller) { return Some(why); }
+        if base as usize >= self.fns.len() { return Some(TwinKept::BaseNoCode); }
+        if matches!(self.verdict_state(base), Verdict::Failed(_)) || self.fns[base as usize].build_err.is_some() { return Some(TwinKept::BaseFailed); }
+        if !self.fns[base as usize].compiled && !stored(base) { return Some(TwinKept::BaseNoCode); }
+        if relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") { return Some(TwinKept::Off); }
+        None
+    }
+
+    /// SPEC-V: why code of slot `caller` lowered before its verdict (its aliasing-prone calls going
+    /// to twins, no run-time disjoint-index checks) may not call the twins' bases instead (None: it
+    /// may, `twin_kept`'s caller clauses in their order): the bases are
+    /// built with `noalias`, so only when that code passes them no aliased `&mut`. That holds when the
+    /// caller's verdict is clean and asks for no run-time disjoint-index checks: index borrows the
+    /// checker accepted only with such a check may overlap in code that lacks it. Never a twin: its
+    /// callers may pass it aliased arguments, which its calls pass on, so its calls stay twin calls.
+    /// (A verdict that asks for the checks is never stored: on a warm launch such a body is not clean
+    /// until this run's checker has it, and then its checks are known.)
+    /// Used where that code is linked (twin_link_target) and where the image is written (build_image).
+    pub(crate) fn twin_caller_kept(&self, caller: u32) -> Option<TwinKept> {
+        if matches!(self.fns[caller as usize].key, FnKey::Plain(_)) { return Some(TwinKept::CallerTwin); }
+        match self.verdict_state(caller) {
+            Verdict::Clean => {}
+            Verdict::Pending => return Some(TwinKept::CallerPending),
+            Verdict::Unverifiable(_) => return Some(TwinKept::CallerUnverifiable),
+            Verdict::Failed(_) => return Some(TwinKept::CallerFailed),
+        }
+        self.disjoint_checks(caller).is_some().then_some(TwinKept::CallerChecks)
     }
 
     /// SPEC-V: whether slot `id` may get O3 code. Verified code does; so does unverified code (twins,
@@ -21388,6 +21409,36 @@ unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
 const PREBUILD_MAX: usize = 256;
 /// SPEC-V: calls of linked code sent to a twin's base instead of the twin (twin_link_target)
 pub(crate) static TWIN_RETARGETS: AtomicU64 = AtomicU64::new(0);
+
+/// SPEC-V (inspect): why linked code's call to a twin stays a twin call, the first clause of the
+/// retarget rule that fails (Unit::twin_kept), in its order
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TwinKept { CallerTwin, CallerPending, CallerUnverifiable, CallerFailed, CallerChecks, BaseFailed, BaseNoCode, Off }
+pub(crate) const TWIN_KEPT_NAMES: [&str; 8] = ["caller is a twin", "caller pending", "caller unverifiable", "caller failed", "caller needs disjoint-index checks", "base failed", "base has no code and no entry", "-twinlink"];
+/// Twin calls kept, by clause: [0] at the lazy link of stored code (twin_link_target), [1] in the
+/// startup image this run wrote (build_image: "base has no code" there is a base not in the image)
+pub(crate) static TWIN_KEPT: [[AtomicU64; 8]; 2] = [const { [const { AtomicU64::new(0) }; 8] }; 2];
+/// The lazy link's kept twin calls, (unit, caller, twin) -> clause at the link: why-tier of the twin
+static TWIN_KEPT_AT: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize, u32, u32), TwinKept>>> = std::sync::LazyLock::new(Default::default);
+
+fn note_twin_kept(u: &Unit, caller: u32, twin: u32, why: TwinKept) {
+    TWIN_KEPT[0][why as usize].fetch_add(1, Ordering::Relaxed);
+    let new = crate::zone_alloc::kept_with(|| TWIN_KEPT_AT.lock().unwrap_or_else(|e| e.into_inner()).insert((u as *const Unit as usize, caller, twin), why).is_none());
+    if new && specv_trace() {
+        eprintln!("specv @{:.3} linked #{} {} keeps its call to twin #{} {}: {}", wall_ns() as f64 / 1e9, caller, short_name(&u.fns[caller as usize].name), twin, short_name(&u.fns[twin as usize].name), TWIN_KEPT_NAMES[why as usize]);
+    }
+}
+
+/// The exit line's part: twin calls kept, by clause (`TWIN_KEPT`), at the link and in the image.
+pub(crate) fn twin_kept_summary() -> Option<String> {
+    let part = |i: usize| {
+        let n: Vec<u64> = TWIN_KEPT[i].iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let total: u64 = n.iter().sum();
+        (total, n.iter().zip(TWIN_KEPT_NAMES).filter(|x| *x.0 > 0).map(|(c, w)| format!("{w} {c}")).collect::<Vec<_>>().join(", "))
+    };
+    let ((l, ls), (i, is)) = (part(0), part(1));
+    (l + i > 0).then(|| format!("twin calls kept as twin calls: {l} at links ({ls}), {i} in the image written ({is})"))
+}
 /// callees built ahead of a replacement's install (inspect stats)
 pub(crate) static SPECV_PREBUILT: AtomicU64 = AtomicU64::new(0);
 
@@ -22387,6 +22438,15 @@ fn tier_explain_at(u: &Unit, id: u32, place: Option<(queue::TierEntry, usize, us
                 _ => vstate(id).to_string(),
             }, left.len(),
             left.iter().take(6).map(|&c| format!("#{} {} {}{}", c, short_name(&u.fns[c as usize].name), vstate(c), if u.fns[c as usize].unverified.load(Ordering::Relaxed) { " flagged" } else { "" })).collect::<Vec<_>>().join(", "), kept)));
+    }
+    if let FnKey::Plain(_) = f.key {
+        // the linked code that kept its call to this twin, the clause at its link and its verdict now
+        let key = u as *const Unit as usize;
+        let mut kept: Vec<(u32, TwinKept)> = TWIN_KEPT_AT.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0.0 == key && x.0.2 == id).map(|x| (x.0.1, *x.1)).collect();
+        kept.sort_by_key(|x| x.0);
+        if !kept.is_empty() {
+            rows.push(("twin calls kept".into(), format!("{} linked caller(s): {}", kept.len(), kept.iter().take(12).map(|&(c, why)| format!("#{} {} ({}; now {})", c, short_name(&u.fns[c as usize].name), TWIN_KEPT_NAMES[why as usize], u.twin_caller_kept(c).map_or("clean, no checks", |w| TWIN_KEPT_NAMES[w as usize]))).collect::<Vec<_>>().join(", "))));
+        }
     }
     if !allowed || awaiting {
         rows.push(("verdict".into(), format!("O3 {}; {}", if allowed { "allowed" } else { "not allowed" }, match u.verdict_state(id) { Verdict::Clean => "clean".to_string(), Verdict::Failed(e) => format!("failed, {} events", e.len()), Verdict::Pending => "pending".to_string(), Verdict::Unverifiable(w) => format!("unverifiable: {}", w) })));
@@ -35933,6 +35993,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TWINS_RAN, AtomicU64::new(0));
     reset(&LAZY_FRONTS, AtomicU64::new(0));
     reset(&TWIN_RETARGETS, AtomicU64::new(0));
+    reset(&TWIN_KEPT, [const { [const { AtomicU64::new(0) }; 8] }; 2]);
+    reset(&TWIN_KEPT_AT, std::sync::LazyLock::new(Default::default));
     reset(&SPECV_PREBUILT, AtomicU64::new(0));
     reset(&TWIN_BASE_BUILDS, AtomicU64::new(0));
     reset(&TWIN_O3_BASES, relax_session::sync::Mutex::new(Vec::new()));
