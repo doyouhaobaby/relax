@@ -241,9 +241,10 @@ pub struct Rt {
     /// `thread_run(entry: fn(*mut u8), arg) -> u64`: runs `entry(arg)` under a recovery point
     /// on the calling thread; 0 = returned, 1 = panicked/faulted (report printed)
     pub thread_run: u64,
-    /// `catch_panic(f: fn(*mut u8), data) -> u64` (core::intrinsics_rt::catch_panic): runs
-    /// `f(data)` under a recovery point on this thread (nested in any outer one); 1 = it
-    /// panicked or faulted (report printed, the stack reset to here), 0 = returned
+    /// `catch_panic(f: fn(*mut u8), data, caught: bool) -> u64` (core::intrinsics_rt::
+    /// catch_panic): runs `f(data)` under a recovery point on this thread (nested in any outer
+    /// one); `caught`: std's catch_unwind, whose panic the program handles (rt_catch_panic);
+    /// 1 = it panicked or faulted (the stack reset to here), 0 = returned
     pub catch_panic: u64,
     /// `args() -> (argc, argv)`: the program's C argv (NUL-terminated strings, argv[argc] = null)
     pub args: u64,
@@ -4992,19 +4993,6 @@ pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
 }
 }
 
-thread_local! {
-    /// The next recovery point this thread enters is std's catch_unwind (relax_catch_caught).
-    static CATCH_CAUGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// `__relax_catch_caught`, which std's catch_unwind calls just before its recovery point: the
-/// panic that point catches goes back to the program, which handles it, and no report follows
-/// std's message (rustc prints only that). A panic that ends a thread or a test keeps its
-/// `report:` line, which a log's readers (land_gate.sh's test_failures, jit_misses) count.
-pub extern "C" fn relax_catch_caught() {
-    let _ = CATCH_CAUGHT.try_with(|c| c.set(true));
-}
-
 /// What a recovery point (rt_catch_panic) does with a panic that unwinds to it.
 #[derive(Clone, Copy, PartialEq)]
 enum Catch {
@@ -5052,10 +5040,15 @@ impl Drop for InRecovery {
 rt_fn! {
 /// core::intrinsics_rt::catch_panic: `f(data)` under a recovery point (std::panic::
 /// catch_unwind, std::thread's start routine). The panic message itself was printed by
-/// std's hook; the report adds where it happened.
-pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
+/// std's hook; the report adds where it happened. `caught` (a bool) is set by std's
+/// catch_unwind: the panic goes back to the program, which handles it, and no report follows
+/// std's message (rustc prints only that). A panic that ends a thread or a test (std's own
+/// boundaries pass false) keeps its `report:` line, which a log's readers (land_gate.sh's
+/// test_failures, jit_misses) count.
+pub(crate) fn rt_catch_panic(f: u64, data: u64, caught: u64) -> u64 {
     ensure_altstack();
-    let caught = CATCH_CAUGHT.try_with(|c| c.replace(false)).unwrap_or(false);
+    // a bool argument: its low byte
+    let caught = caught as u8 != 0;
     let u = cur_unit();
     let retry = crate::inspect::events::take_retry_next();
     let recovery = InRecovery::enter(match (caught, retry) {
@@ -27626,7 +27619,6 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_id" => Some(crate::domain::relax_domain_id as *const () as usize),
         b"__relax_thread_spawn" => Some(crate::domain_threads::spawn as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
-        b"__relax_catch_caught" => Some(relax_catch_caught as *const () as usize),
         b"__relax_test_inherit" => Some(crate::harness::reach::inherit as *const () as usize),
         b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
         b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),

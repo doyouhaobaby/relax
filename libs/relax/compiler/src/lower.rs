@@ -13054,15 +13054,16 @@ impl<'a> Lcx<'a> {
                 Some(Val::L(vec![r]))
             }
             "catch_panic" => {
-                // intrinsics_rt::catch_panic(f, data) -> bool: Rt::catch_panic runs f(data) under
-                // a recovery point on this thread (1 = panicked: reported, stack reset here)
-                if a.len() != 2 {
-                    self.err(self.pos, "intrinsic `catch_panic` takes (f: fn(*mut u8), data: *mut u8)".to_string());
+                // intrinsics_rt::catch_panic(f, data, caught) -> bool: Rt::catch_panic runs f(data)
+                // under a recovery point on this thread (1 = panicked: stack reset here); `caught`:
+                // std's catch_unwind, whose panic the program handles (no runtime report)
+                if a.len() != 3 {
+                    self.err(self.pos, "intrinsic `catch_panic` takes (f: fn(*mut u8), data: *mut u8, caught: bool)".to_string());
                     return Some(self.unit());
                 }
                 let r = self.f.vreg(Cls::I);
                 let rt = self.u.rs.catch_panic;
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], a[1]], vec![r]));
+                self.emit(Inst::Call(Callee::Host(rt), a, vec![r]));
                 let z = self.f.vreg(Cls::I);
                 self.emit(Inst::ICmpI(Cond::Ne, false, z, r, 0));
                 Some(Val::L(vec![z]))

@@ -5,8 +5,8 @@ use core::ffi::c_char;
 
 /// Runs `f(data)`; true if it panicked (live mode: the panic was reported and the stack
 /// reset to this frame; AOT: panics abort, so this returns false or never returns).
-pub fn catch_panic(f: fn(*mut u8), data: *mut u8) -> bool {
-    unsafe { core::intrinsics_rt::catch_panic(f, data) }
+pub fn catch_panic(f: fn(*mut u8), data: *mut u8, caught: bool) -> bool {
+    unsafe { core::intrinsics_rt::catch_panic(f, data, caught) }
 }
 
 /// argc/argv as the process received them (the runtime records them at boot).

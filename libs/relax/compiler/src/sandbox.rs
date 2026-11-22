@@ -1649,8 +1649,8 @@ pub(crate) fn call_in_arena(f: u64, arg: u64) {
         return;
     }
     let s = save();
-    let g: rt_fn_ty!(fn(u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
-    g(arena_fn(f), m(arg));
+    let g: rt_fn_ty!(fn(u64, u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
+    g(arena_fn(f), m(arg), 0);
     restore(s);
 }
 
@@ -2108,11 +2108,11 @@ fn sb_fmt_pop() -> jit::StrRet {
 
 rt_fn! {
 /// catch_unwind inside a module: the target and data are masked; the shadow stack comes back.
-fn sb_catch_panic(f: u64, data: u64) -> u64 {
+fn sb_catch_panic(f: u64, data: u64, caught: u64) -> u64 {
     let s = save();
     let fm = arena_fn(f);
-    let g: rt_fn_ty!(fn(u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
-    let r = g(fm, m(data));
+    let g: rt_fn_ty!(fn(u64, u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
+    let r = g(fm, m(data), caught);
     restore(s);
     r
 }
@@ -2229,8 +2229,6 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         "pthread_getname_np" => Some(("sb_getname_np", sb_getname_np as *const () as u64)),
         "getpid" => Some(("sb_getpid", sb_getpid as *const () as u64)),
         "abort" => Some(("abort", 0)),
-        // std's catch_unwind names its recovery point (jit.rs relax_catch_caught: a thread-local flag)
-        "relax_catch_caught" => None,
         _ => return None,
     })
 }
