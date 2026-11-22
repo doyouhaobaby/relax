@@ -6522,7 +6522,7 @@ impl Unit {
     }
 
     pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
-        let at = self.code_bump(WIN_CODE, code.len() as u64, 16);
+        let at = self.code_bump(WIN_CODE, code.len() as u64, code_start_align());
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
@@ -6539,15 +6539,18 @@ impl Unit {
             return self.emit_linked(code, relocs);
         }
         let need = (code.len() as u64 + 15) & !15;
+        let align = hot_align();
         let at = {
             let mut h = self.hot_code.lock().unwrap_or_else(|e| e.into_inner());
-            if h.0 + need > h.1 {
+            let mut at = (h.0 + align - 1) & !(align - 1);
+            if at + need > h.1 {
                 let size = need.max(HOT_CHUNK);
-                let c = self.code_bump(WIN_HOT, size, 64);
+                let c = self.code_bump(WIN_HOT, size, align.max(64));
                 *h = (c, c + size);
+                at = c;
             }
-            let at = h.0;
-            h.0 += need;
+            HOT_PAD.fetch_add(at - h.0, Ordering::Relaxed);
+            h.0 = at + need;
             at
         };
         let mut c = code.to_vec();
@@ -6561,7 +6564,7 @@ impl Unit {
     pub(crate) fn emit_grouped(&self, g: Option<crate::invalid::Group>, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let Some(g) = g else { return self.emit_linked(code, relocs) };
         // a chunk is page-aligned and page-sized: no other code shares its pages
-        let at = crate::invalid::alloc(self, g, code.len() as u64, |size, page| self.code_bump(WIN_GROUPS, size, page))?;
+        let at = crate::invalid::alloc(self, g, code.len() as u64, code_start_align(), |size, page| self.code_bump(WIN_GROUPS, size, page))?;
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
@@ -6681,10 +6684,10 @@ impl Unit {
         at
     }
 
-    /// A block of `len` bytes of code memory, 16-byte aligned, not written (the startup image:
-    /// cache.rs prelink links its code for this address and writes it whole).
+    /// A block of `len` bytes of code memory, aligned for O3 code (hot_align), not written (the
+    /// startup image: cache.rs prelink links its code for this address and writes it whole).
     pub(crate) fn code_block(&self, len: u64) -> u64 {
-        let at = self.code_bump(WIN_GLUE, len, 16);
+        let at = self.code_bump(WIN_GLUE, len, hot_align());
         // filled whole right away (the startup image's code)
         os::mem::prefault(at, len as usize);
         at
@@ -6976,7 +6979,7 @@ impl Unit {
         } else {
             String::new()
         };
-        format!("code window {:.1} of {:.0} MB used: {}, alignment {:.1} MB{}", mb(used), mb(self.exec_size), by.join(", "), mb(used.saturating_sub(counted)), lean)
+        format!("code window {:.1} of {:.0} MB used: {}, alignment {:.1} MB (O3 chunks: {:.1} KB to start O3 code at {} bytes){}", mb(used), mb(self.exec_size), by.join(", "), mb(used.saturating_sub(counted)), HOT_PAD.load(Ordering::Relaxed) as f64 / 1024.0, hot_align(), lean)
     }
 
     /// What the slots' first code has taken of the code window: their code (`first_code`), their
@@ -30935,6 +30938,26 @@ const WIN_NAMES: [&str; WIN_KINDS] = ["slot code", "O3 chunks", "group pages", "
 
 /// the size of one O3 code chunk (`Unit::emit_hot`)
 const HOT_CHUNK: u64 = 1 << 20;
+
+/// Where O3 code starts: on a line of the CPU's instruction fetch, so a body's loops lie where its
+/// own layout put them, not where the code placed before it left them. Placed 16-aligned, the
+/// same O3 body ran at two speeds from launch to launch (its install order differs): on a Zen 4
+/// part a 25-byte loop over a 64-byte line ran at IPC 4.5, inside one at 7.7 (zz kernels of
+/// relax-bench-rt, 0.73 vs 1.27 ms). x64: 64-byte lines (the op cache's and the uop cache's fetch
+/// windows); other targets 16, as before. RELAX_OPT=-hotalign: 16.
+pub(crate) fn hot_align() -> u64 {
+    static A: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *A.get_or_init(|| if cfg!(target_arch = "x86_64") && !relax_backend::stats::opt_env_off("-hotalign") { 64 } else { 16 })
+}
+
+/// The start alignment of the code this thread installs now: O3 code's (`hot_align`), 16 for the
+/// rest (most bodies are lower-tier code that runs cold: a line each would only grow the code window).
+fn code_start_align() -> u64 {
+    if code_as_now().is_some_and(|k| matches!(k.tier, tier::O3 | tier::INSTRUMENTED_O3)) { hot_align() } else { 16 }
+}
+
+/// Bytes the O3 chunks skipped to start O3 code at `hot_align` (`Unit::window_line`)
+static HOT_PAD: AtomicU64 = AtomicU64::new(0);
 
 fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     let a = align.max(1);

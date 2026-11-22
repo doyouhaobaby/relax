@@ -1877,8 +1877,8 @@ impl Linker {
     }
 
     /// Places the code of resolved slots `keep` (that still have no code) in one block of code
-    /// memory, each 16-byte aligned without its unwind trailer, links it there in one pass and
-    /// writes the block with one write.
+    /// memory, each 16-byte aligned (O3 code on a fetch line: jit::hot_align) without its unwind
+    /// trailer, links it there in one pass and writes the block with one write.
     fn img_place(&mut self, u: &mut Unit, im: &mut Img, keep: Vec<(usize, u32)>) -> Vec<PrelinkedSlot> {
         let mut out = Vec::new();
         let mut layout = Vec::with_capacity(keep.len());
@@ -1901,7 +1901,9 @@ impl Linker {
                 if (hot_first && (im.slots[e.0].tier == super::TIER_O3) != pass) || (!hot_first && !pass) {
                     continue;
                 }
-                e.2 = (total + 15) & !15;
+                // O3 code starts on a fetch line (jit::hot_align), the rest 16-aligned
+                let a = if im.slots[e.0].tier == super::TIER_O3 { crate::jit::hot_align() as usize } else { 16 };
+                e.2 = (total + a - 1) & !(a - 1);
                 total = e.2 + e.3;
             }
         }
