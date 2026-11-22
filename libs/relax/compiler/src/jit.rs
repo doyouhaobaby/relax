@@ -5005,9 +5005,22 @@ enum Catch {
     Retry,
 }
 
+/// A recovery point on its rt_catch_panic frame, linked to the enclosing point.
+struct Recovery {
+    prev: *const Recovery,
+    catch: Catch,
+}
+
 thread_local! {
-    /// The recovery points this thread runs inside (rt_catch_panic), innermost last.
-    static RECOVERY: std::cell::RefCell<Vec<Catch>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The innermost recovery point on this thread, or null outside a catch.
+    static RECOVERY: std::cell::Cell<*const Recovery> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+impl Drop for Recovery {
+    fn drop(&mut self) {
+        // Restoring the saved head after the call also unlinks any inner frames a leave skipped.
+        let _ = RECOVERY.try_with(|head| head.set(self.prev));
+    }
 }
 
 /// Whether a panic raised on this thread now goes back to the program, which handles it: the
@@ -5018,23 +5031,11 @@ thread_local! {
 /// (a thread's start, the test harness), none does (a program's main, a callback the host runs),
 /// or a retry boundary does (it rethrows unless asked to retry).
 pub(crate) fn panic_caught_here() -> bool {
-    RECOVERY.try_with(|r| r.borrow().last() == Some(&Catch::Program)).unwrap_or(false)
-}
-
-/// The thread is inside a recovery point (`RECOVERY`) until this drops.
-struct InRecovery;
-impl InRecovery {
-    fn enter(catch: Catch) -> InRecovery {
-        // (the thread's list outlives the program heap's resets)
-        let _k = crate::zone_alloc::kept();
-        let _ = RECOVERY.try_with(|r| r.borrow_mut().push(catch));
-        InRecovery
-    }
-}
-impl Drop for InRecovery {
-    fn drop(&mut self) {
-        let _ = RECOVERY.try_with(|r| r.borrow_mut().pop());
-    }
+    RECOVERY.try_with(|head| {
+        let p = head.get();
+        // The enclosing rt_catch_panic frame keeps this record alive during the nested call.
+        !p.is_null() && unsafe { (*p).catch == Catch::Program }
+    }).unwrap_or(false)
 }
 
 rt_fn! {
@@ -5051,13 +5052,17 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64, caught: u64) -> u64 {
     let caught = caught as u8 != 0;
     let u = cur_unit();
     let retry = crate::inspect::events::take_retry_next();
-    let recovery = InRecovery::enter(match (caught, retry) {
+    let catch = match (caught, retry) {
         (false, _) => Catch::Ends,
         (true, false) => Catch::Program,
         (true, true) => Catch::Retry,
-    });
-    let r = unsafe { call_jit_nested(u, f, data) };
-    drop(recovery);
+    };
+    let r = {
+        let prev = RECOVERY.try_with(|head| head.get()).unwrap_or(std::ptr::null());
+        let recovery = Recovery { prev, catch };
+        let _ = RECOVERY.try_with(|head| head.set(&recovery));
+        unsafe { call_jit_nested(u, f, data) }
+    };
     match r {
         Ok(_) => 0,
         // `process::exit` in an app domain (domain.rs exit_current) is no panic: catch_unwind
