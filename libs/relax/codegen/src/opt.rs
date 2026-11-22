@@ -2384,14 +2384,19 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 ///   itself can touch the field;
 /// * every access in the loop through a pointer based on the parameter is a plain load or store
 ///   through the parameter, and every one overlapping the field has its exact offset and type;
-/// * no call, atomic or fence in the loop for a stored field (a call may unwind with the memory
-///   stale; a store is not delayed past one), calls are fine for a field that is only loaded when
-///   none is given a based-on pointer, and for a stored field of a by-value argument's private copy
-///   (`Func::owned`) when the loop has no Invoke (LLVM's `isNotVisibleOnUnwind`);
+/// * no atomic or fence in the loop but relaxed loads (a live session's patch guard reads its
+///   flags so in every loop that took a patchable copy in) through pointers not based on the
+///   parameter: a relaxed load orders no other memory, and nothing it reads reaches the field;
+/// * calls are fine for a field that is only loaded when none is given a based-on pointer; a stored
+///   field is written back before every call in the loop (the call may unwind, and an unwind must
+///   find the memory current), which the call cannot read or write otherwise: it is given no
+///   based-on pointer and none is captured. A by-value argument's private copy (`Func::owned`) needs
+///   no write-back at a call when the loop has no Invoke (LLVM's `isNotVisibleOnUnwind`);
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
-/// Most fields promoted in one loop, and most exit write-back stores (exit targets x stored fields).
+/// Most fields promoted in one loop, and most write-back stores (exit targets and calls in the
+/// loop, times stored fields).
 const PROMOTE_MAX_FIELDS: usize = 4;
 const PROMOTE_MAX_WRITEBACKS: usize = 8;
 
@@ -2437,7 +2442,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
     }
     // anything in the loop that stops every promotion, and what stops only stored fields
     let mut atomic_or_fence = false;
-    let mut has_call = false;
+    let mut calls = 0usize;
     let mut has_invoke = false;
     for bi in 0..n {
         if !body[bi] {
@@ -2446,8 +2451,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         has_invoke |= matches!(f.blocks[bi].term, Term::Invoke(..));
         for i in &f.blocks[bi].insts {
             match i {
+                // RELAX_OPT=-promoterelaxed: any atomic stops the promotion (bisection)
+                Inst::AtomicLoad(_, AtomOrd::Relaxed, ..) if !relax_backend::stats::opt_env_off("-promoterelaxed") => {}
                 Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) | Inst::FpEnv(..) => atomic_or_fence = true,
-                Inst::Call(..) => has_call = true,
+                Inst::Call(..) => calls += 1,
                 _ => {}
             }
         }
@@ -2541,8 +2548,9 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                         }
                     }
                     Inst::Call(_, args, _) => bad |= args.iter().any(|a| based[a.0 as usize]),
-                    // any other dereference of a based-on pointer
-                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) => bad |= based[base.0 as usize],
+                    // any other dereference of a based-on pointer (a relaxed atomic load of the
+                    // field too: it is a read the register would not answer)
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) | Inst::AtomicLoad(_, _, _, base) => bad |= based[base.0 as usize],
                     Inst::Copy(d, s, _) => bad |= based[d.0 as usize] || based[s.0 as usize],
                     _ => {}
                 }
@@ -2556,10 +2564,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         let mut take: Vec<(i32, Mem, bool, bool, u32)> = Vec::new();
         for x in &fields {
             let clash = fields.iter().any(|y| !(y.0 == x.0 && y.1 == x.1) && y.0 < x.0 + size(x.1) && x.0 < y.0 + size(y.1));
-            // a stored field stays stale in memory over a call: fine for the private copy of a
-            // by-value argument (Func::owned) when every call is plain -- an unwind leaves this
-            // function at once and nobody reads the copy after (an Invoke's cleanup might)
-            if clash || (x.3 && has_call && !(owned && !has_invoke)) {
+            if clash {
                 continue;
             }
             // dereferenceable in the preheader
@@ -2622,11 +2627,16 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             };
             exit_targets.retain(|&t| !quiet_dead_end(t));
         }
+        // a stored field is written back before each call in the loop (an unwind finds it current);
+        // the private copy of a by-value argument (Func::owned) needs none when every call is plain:
+        // an unwind leaves this function at once and nobody reads the copy after (an Invoke's
+        // cleanup might)
+        let call_writebacks = if owned && !has_invoke { 0 } else { calls };
         let mut stored_n = 0;
         take.retain(|x| {
             if x.3 {
                 stored_n += 1;
-                exit_targets.len() * stored_n <= PROMOTE_MAX_WRITEBACKS
+                (exit_targets.len() + call_writebacks) * stored_n <= PROMOTE_MAX_WRITEBACKS
             } else {
                 true
             }
@@ -2678,8 +2688,28 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             }
         }
         // write-back of the stored fields on every edge out of the loop: one block per distinct
-        // target (LoopSimplify's dedicated exits), the loop's edges to it redirected
+        // target (LoopSimplify's dedicated exits), the loop's edges to it redirected; and before
+        // every call in the loop
         let stored: Vec<usize> = (0..take.len()).filter(|t| take[*t].3).collect();
+        if !stored.is_empty() && call_writebacks > 0 {
+            for bi in 0..n {
+                if !body[bi] || !f.blocks[bi].insts.iter().any(|i| matches!(i, Inst::Call(..))) {
+                    continue;
+                }
+                let blk = &mut f.blocks[bi];
+                let (insts, pos) = (std::mem::take(&mut blk.insts), std::mem::take(&mut blk.pos));
+                for (i, at) in insts.into_iter().zip(pos) {
+                    if matches!(i, Inst::Call(..)) {
+                        for &k in &stored {
+                            blk.insts.push(Inst::Store(take[k].1, p, take[k].0, regs[k]));
+                            blk.pos.push(at);
+                        }
+                    }
+                    blk.insts.push(i);
+                    blk.pos.push(at);
+                }
+            }
+        }
         if !stored.is_empty() {
             for &t in &exit_targets {
                 let x = f.blocks.len() as u32;
