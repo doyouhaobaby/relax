@@ -296,6 +296,13 @@ pub fn restart_requested() -> bool {
     unsafe { __relax_restart_requested() != 0 }
 }
 
+/// The due restart was asked for without asking the app (`session relaunch anyway=1`). The app
+/// restarts at its next safe point without a postponement, as when the person takes the window
+/// caption's restart, and its state is still carried over.
+pub fn restart_anyway() -> bool {
+    unsafe { __relax_restart_requested() == 2 }
+}
+
 /// Why the restart is due (the edit and the reason it could not apply in place).
 pub fn restart_reason() -> String {
     unsafe {

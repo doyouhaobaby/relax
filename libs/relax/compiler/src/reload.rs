@@ -8348,6 +8348,10 @@ pub(crate) fn unit_suspect() -> Option<String> {
 }
 /// A restart is due (an edit needs one); the program polls this at its safe point.
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The due restart is not the app's to postpone (`session relaunch anyway=1`): the app skips its
+/// `can_restart` and unsaved-work check, as for the window caption's restart. A relaunch without
+/// `anyway` clears it, and so do the app's restart point (`__relax_restart_now`) and the run's end.
+static RESTART_ANYWAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The app is pinned: the live watch stands still and a rebuilt makepad waits.
 static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Unpinned: the watch's next round looks at every file.
@@ -8581,6 +8585,7 @@ pub fn domain_stopping(id: u32) {
     *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     RESTART_SUPPORTED.store(false, std::sync::atomic::Ordering::SeqCst);
     RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    RESTART_ANYWAY.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 // the first domain of a restarted run gets the state the previous run left
@@ -8813,9 +8818,12 @@ pub extern "C" fn __relax_restart_supported() {
     })
 }
 
+/// 0: no restart is due; 1: one is, the app's to allow (`can_restart`); 2: one is, asked for
+/// without asking the app ([`RESTART_ANYWAY`]: std::relax::restart_anyway).
 pub extern "C" fn __relax_restart_requested() -> u32 {
     crate::jit::host_boundary("__relax_restart_requested", move || {
-        RESTART_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) as u32
+        let requested = RESTART_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        requested + (requested == 1 && RESTART_ANYWAY.load(std::sync::atomic::Ordering::Relaxed)) as u32
     })
 }
 
@@ -8882,6 +8890,8 @@ pub extern "C" fn __relax_hot_load_failed(why: *const u8, len: usize) {
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     crate::jit::host_boundary("__relax_restart_now", move || {
         let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
+        // (the app reached its restart point: a later request is the app's to allow again)
+        RESTART_ANYWAY.store(false, std::sync::atomic::Ordering::SeqCst);
         // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
         if host::restart_now(st) { return; }
         RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -9684,32 +9694,38 @@ fn note_restart_pending_in(why: &str, files: Vec<String>) {
 /// `session relaunch`: applies the edits waiting for a restart (restart_in_place). Returns how.
 /// `who` asked, said in the log with every request: a click in the run window, or the inspect
 /// client's process ([`inspect_asker`]). A restart nobody could name read as the person's own
-/// click (three apps restarted for a landing, 11-06).
-pub fn relaunch_pending(who: &str) -> Result<String, String> {
+/// click (three apps restarted for a landing, 11-06). `anyway` (`anyway=1`): the app is not asked
+/// whether it can restart now ([`RESTART_ANYWAY`]); without it a blocker the app names postpones it.
+pub fn relaunch_pending(who: &str, anyway: bool) -> Result<String, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
+    RESTART_ANYWAY.store(anyway, Ordering::SeqCst);
     let why = restart_pending().join("; ");
-    eprintln!("{}", relaunch_line(who, &why, host::restart_asked()));
+    eprintln!("{}", relaunch_line(who, &why, host::restart_asked(), anyway));
     if let Some(result) = host::relaunch() { return result; }
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why }).map(str::to_string)
 }
 
 /// `session relaunch process=1`, asked by `who`: the run starts again on the loader binary it
-/// runs, nothing rebuilt (host::relaunch_process), with the edits that wait.
-pub fn relaunch_process(who: &str) -> Result<String, String> {
+/// runs, nothing rebuilt (host::relaunch_process), with the edits that wait; `anyway` as for
+/// [`relaunch_pending`].
+pub fn relaunch_process(who: &str, anyway: bool) -> Result<String, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
+    RESTART_ANYWAY.store(anyway, Ordering::SeqCst);
     let why = restart_pending().join("; ");
-    eprintln!("{} (process=1: on the same binary, nothing rebuilt)", relaunch_line(who, &why, host::restart_asked()));
+    eprintln!("{} (process=1: on the same binary, nothing rebuilt)", relaunch_line(who, &why, host::restart_asked(), anyway));
     host::relaunch_process()
 }
 
 /// The log's line of a `session relaunch` that `who` asked for, `why` the edits it applies (a
-/// repeat while the restart is on its way changes nothing, and says so).
-fn relaunch_line(who: &str, why: &str, again: bool) -> String {
+/// repeat while the restart is on its way changes nothing, and says so); `anyway`: the app's
+/// blockers do not postpone it.
+fn relaunch_line(who: &str, why: &str, again: bool, anyway: bool) -> String {
     let what = if why.is_empty() { "nothing waits" } else { why };
+    let anyway = if anyway { "; anyway: the app is not asked whether it can restart now" } else { "" };
     if again {
-        format!("relax live: session relaunch, asked by {who} again: the restart is on its way ({what})")
+        format!("relax live: session relaunch, asked by {who} again: the restart is on its way ({what}){anyway}")
     } else {
-        format!("relax live: session relaunch, asked by {who}: {what}")
+        format!("relax live: session relaunch, asked by {who}: {what}{anyway}")
     }
 }
 
@@ -12193,8 +12209,10 @@ mod watch_wait_tests {
     #[test]
     fn a_relaunch_says_who_asked() {
         let why = "the Splash VM changed";
-        assert_eq!(relaunch_line("a click on the ring's dot (Update ready)", why, false), "relax live: session relaunch, asked by a click on the ring's dot (Update ready): the Splash VM changed");
-        assert_eq!(relaunch_line("the R key in the run window", "", true), "relax live: session relaunch, asked by the R key in the run window again: the restart is on its way (nothing waits)");
+        assert_eq!(relaunch_line("a click on the ring's dot (Update ready)", why, false, false), "relax live: session relaunch, asked by a click on the ring's dot (Update ready): the Splash VM changed");
+        assert_eq!(relaunch_line("the R key in the run window", "", true, false), "relax live: session relaunch, asked by the R key in the run window again: the restart is on its way (nothing waits)");
+        // `anyway=1` (devhub's --anyway): the line says the app's blockers do not hold it
+        assert_eq!(relaunch_line("an agent", why, false, true), "relax live: session relaunch, asked by an agent: the Splash VM changed; anyway: the app is not asked whether it can restart now");
         // no command is answered on this thread: its asker is not known
         assert_eq!(inspect_asker(), "an inspect client whose process its connection does not name");
     }
