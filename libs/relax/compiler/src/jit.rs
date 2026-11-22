@@ -2413,8 +2413,16 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             let mut arm = Vec::with_capacity(slots.len());
             let up: *mut Unit = u;
             let mut verdicts = Vec::new();
+            let mut twins = Vec::new();
             for s in slots {
+                if matches!((&*up).fns[s.id as usize].key, FnKey::Plain(_)) {
+                    twins.push((s.id, s.o3));
+                }
                 install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm, &mut verdicts);
+            }
+            // (after the whole image: a twin's base may be in it, later than the twin)
+            for (t, o3) in twins {
+                twin_stored(up, t, o3);
             }
             (&mut *up).arm_counters(&arm);
             // (a call reaches each through its count stub: startup_set_called reads which were called)
@@ -10075,8 +10083,9 @@ impl Unit {
     /// RELAX_OPT=-twinlink keeps the twins (A/B).
     /// `stored`: whether the base (no code yet) has a stored code entry: its first call links that
     /// entry, as the twin's would (a base that never ran anywhere would compile on the program
-    /// thread instead: the twin it is). The bases of hot twins get that entry in the background
-    /// (twin_base_build), so the next launch's callers call them.
+    /// thread instead: the twin it is). The bases of twins that get code (a fresh O3 build, a link
+    /// of the twin's stored code: twin_stored) get that entry in the background (twin_base_build),
+    /// so the next launch's callers call them.
     pub(crate) fn twin_link_target(&self, caller: u32, target: u32, stored: impl FnOnce(u32) -> bool) -> u32 {
         let n = self.fns.len();
         if target as usize >= n || caller as usize >= n { return target }
@@ -11384,6 +11393,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
         if let Some(inl) = &t1 {
             cached_tier1(up, id, inl, &kept);
         }
+        twin_stored(up, id, t1.is_some());
         if (&mut *up).cache.as_mut().is_some_and(|c| std::mem::take(&mut c.last_o2)) {
             o2_cached(up, id);
         }
@@ -21445,33 +21455,64 @@ pub(crate) fn twin_kept_summary() -> Option<String> {
 /// callees built ahead of a replacement's install (inspect stats)
 pub(crate) static SPECV_PREBUILT: AtomicU64 = AtomicU64::new(0);
 
-/// SPEC-V: bases of hot twins given their own build (twin_base_build)
+/// SPEC-V: bases of twins given their own build (twin_base_build), and of those the ones asked for
+/// at a link of the twin's stored code (twin_stored)
 pub(crate) static TWIN_BASE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TWIN_BASE_STORED: AtomicU64 = AtomicU64::new(0);
 
-/// SPEC-V: twin `t` reached O3 and its base has no code: the base gets its own (verified) build in
-/// the background, so it has a code entry. A hot twin whose base never ran is called by linked code
+/// SPEC-V: twin `t` got code and its base has none: the base gets its own (verified) build in the
+/// background, so it has a code entry. A twin whose base never ran is called by linked code
 /// (startup image, cache entries lowered before the caller's verdict) that no relowering here
 /// reaches; with the base's entry the next launch's image and links send those calls to the base
-/// (build_image, twin_link_target) instead of running the twin and building it at O3 again (twins
-/// are never cached). Owner thread.
-unsafe fn twin_base_build(up: *mut Unit, t: u32) {
+/// (build_image, twin_link_target) instead of running the twin. `hot`: the twin proved the body
+/// hot (its O3 build, or stored O3 code): the base is built at O3 too, after its O2 build gives it
+/// code, so the next launch links O3 code for it instead of building it. True: asked for now.
+/// Owner thread.
+unsafe fn twin_base_build(up: *mut Unit, t: u32, hot: bool) -> bool {
     let u = &*up;
-    let FnKey::Plain(b) = u.fns[t as usize].key else { return };
+    let FnKey::Plain(b) = u.fns[t as usize].key else { return false };
     if (b as usize) >= u.fns.len() || relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink") {
-        return;
+        return false;
     }
     let f = &u.fns[b as usize];
     if f.compiled || f.build_err.is_some() || !matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)) || matches!(u.verdict_state(b), Verdict::Failed(_)) {
-        return;
+        return false;
     }
     TWIN_BASE_BUILDS.fetch_add(1, Ordering::Relaxed);
     if specv_trace() {
-        eprintln!("specv @{:.3} #{} {}: base of hot twin #{} built in the background", wall_ns() as f64 / 1e9, b, short_name(&u.fns[b as usize].name), t);
+        eprintln!("specv @{:.3} #{} {}: base of {}twin #{} built in the background", wall_ns() as f64 / 1e9, b, short_name(&u.fns[b as usize].name), if hot { "hot " } else { "" }, t);
     }
-    // the twin proved the body hot, and twins are never cached: the base is built at O3 too (after
-    // its O2 build gives it code), so the next launch links O3 code for it instead of building it
-    crate::zone_alloc::kept_with(|| TWIN_O3_BASES.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, b)));
+    if hot {
+        crate::zone_alloc::kept_with(|| TWIN_O3_BASES.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, b)));
+    }
     o2_base(up, b);
+    true
+}
+
+/// SPEC-V: twin `t`'s stored code is linked (startup image, disk cache, speculative link; `o3`: O3
+/// code): its base is asked for as a fresh O3 build's install asks (twin_base_build), unless it has
+/// code or a stored entry (clean callers' links then go to it: twin_link_target). Twins are cached,
+/// so a store whose first session ended before the base had an entry linked the twin on every
+/// later launch and never asked again: the callers' links kept their twin calls ("base has no code
+/// and no entry"), and the twins' own calls stay twin calls ("caller is a twin"), session after
+/// session. With the base's entry the next launch's links of those callers call the base, and the
+/// base's code calls bases. Stored O3 code proves the body hot (the base gets O3 too); below O3
+/// the base gets an O2 build, O3 only by its own heat. Owner thread.
+unsafe fn twin_stored(up: *mut Unit, t: u32, o3: bool) {
+    let u = &mut *up;
+    let FnKey::Plain(b) = u.fns[t as usize].key else { return };
+    if (b as usize) >= u.fns.len() || u.fns[b as usize].compiled {
+        return;
+    }
+    let mut c = u.cache.take();
+    let stored = c.as_mut().is_some_and(|c| c.has_stored_entry(u, b));
+    u.cache = c;
+    if stored {
+        return;
+    }
+    if twin_base_build(up, t, o3) {
+        TWIN_BASE_STORED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// SPEC-V: base `b` takes its twin `t`'s heat: the twin ran in its place (the same body), so the
@@ -25160,7 +25201,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         u.retier(c);
                     }
                     relower_twin_callers(up, &tc);
-                    twin_base_build(up, id);
+                    twin_base_build(up, id, true);
                 }
                 o3_owner(5, tt);
                 bail_done(up, id);
@@ -28411,6 +28452,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 if let Some(inl) = &t1 {
                     cached_tier1(up, id, inl, &kept);
                 }
+                twin_stored(up, id, t1.is_some());
                 let u = &mut *up;
                 // a seeded slot (spec_seed: the previous run's manifest -- code that ran there)
                 // is installed now, as its first call would: that call then finds it ready instead
@@ -36020,6 +36062,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TWIN_KEPT_AT, std::sync::LazyLock::new(Default::default));
     reset(&SPECV_PREBUILT, AtomicU64::new(0));
     reset(&TWIN_BASE_BUILDS, AtomicU64::new(0));
+    reset(&TWIN_BASE_STORED, AtomicU64::new(0));
     reset(&TWIN_O3_BASES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&TWIN_USERS, std::sync::LazyLock::new(Default::default));
     reset(&O3_BUILD_NOTES, std::sync::LazyLock::new(Default::default));
