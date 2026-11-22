@@ -10719,10 +10719,28 @@ thread_local! {
 }
 
 /// std::relax::realtime_thread: the calling thread counts as real-time from now on (as one
-/// RELAX_RT_THREADS names, or one with a real-time policy).
+/// RELAX_RT_THREADS names, or one with a real-time policy), and as a thread that holds a core
+/// against a deadline in the CPU budget (its placement of builds: `fast_room`).
 pub(crate) extern "C" fn __relax_realtime_thread() {
     RT_THREAD.with(|t| t.set(true));
+    makepad_cpu_budget::set_thread_deadline(true);
     realtime_live(None);
+}
+
+/// The calling thread's Background work is behind while it lives (`set_thread_work`), and the kind
+/// it had again after.
+struct WorkBehind(u8);
+impl WorkBehind {
+    fn on() -> WorkBehind {
+        let was = makepad_cpu_budget::thread_work();
+        makepad_cpu_budget::set_thread_work(makepad_cpu_budget::WORK_BEHIND);
+        WorkBehind(was)
+    }
+}
+impl Drop for WorkBehind {
+    fn drop(&mut self) {
+        makepad_cpu_budget::set_thread_work(self.0);
+    }
 }
 
 /// A real-time thread is live in this process: from then on the queue's tier-up builds run at the
@@ -13619,6 +13637,15 @@ unsafe fn release_base(up: *mut Unit) {
 /// Queues baseline slot `id` for its O2 build (once; not glue or sandbox twins, as o2_hot).
 /// True: queued now.
 unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
+    o2_base_as(up, id, queue::O2Kind::Base)
+}
+
+/// `o2_base` of a twin's base (`queue::O2Kind::TwinBase`: nothing calls it until it links).
+unsafe fn o2_twin_base(up: *mut Unit, id: u32) -> bool {
+    o2_base_as(up, id, queue::O2Kind::TwinBase)
+}
+
+unsafe fn o2_base_as(up: *mut Unit, id: u32, kind: queue::O2Kind) -> bool {
     let u = &*up;
     if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || u.cache.is_none() {
         return false;
@@ -13631,7 +13658,7 @@ unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
     }
     u.fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 0, 0, 0);
-    queue::o2(up as usize, id, queue::O2Kind::Base, wall_ns());
+    queue::o2(up as usize, id, kind, wall_ns());
     true
 }
 
@@ -21485,7 +21512,7 @@ unsafe fn twin_base_build(up: *mut Unit, t: u32, hot: bool) -> bool {
     if hot {
         crate::zone_alloc::kept_with(|| TWIN_O3_BASES.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, b)));
     }
-    o2_base(up, b);
+    o2_twin_base(up, b);
     true
 }
 
@@ -21562,6 +21589,10 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
     if !past_startup() {
         return;
     }
+    // builds ahead of the install: nothing calls them before it, so they run behind (on Apple
+    // silicon off the performance cores while the person's work runs), and the O3 job's own kind
+    // comes back for its install
+    let _behind = WorkBehind::on();
     let calls = |relocs: &[relax_backend::rir::RelocAt]| -> Vec<u32> {
         let mut v: Vec<u32> = relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) => Some(c), _ => None }).collect();
         v.sort_unstable();
@@ -21794,7 +21825,7 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     }
     for &c in &tc.below {
         O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(key, c));
-        o2_base(up, c);
+        o2_twin_base(up, c);
     }
     let u = &*up;
     if !tc.unverified.is_empty() {
@@ -24504,16 +24535,24 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // (CAND_TAKE candidates per take: a publish is bounded by its item count)
     let (mut preps, mut gave): (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>) = (Vec::new(), Vec::new());
     for chunk in ids.chunks(CAND_TAKE) {
-        match owner::publish_or_bail(|| {
-            let (p, g) = o3_candidates_begin(up, chunk);
-            (p, g, owner::take_needs())
-        }) {
-            Ok((p, g, n)) => {
-                preps.extend(p);
-                gave.extend(g);
-                needs.extend(n);
+        // (a take that stopped for a program request: the rest in the next)
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            match owner::publish_or_bail(|| {
+                let (p, g, looked) = o3_candidates_begin(up, rest);
+                (p, g, looked, owner::take_needs())
+            }) {
+                Ok((p, g, looked, n)) => {
+                    preps.extend(p);
+                    gave.extend(g);
+                    needs.extend(n);
+                    rest = &rest[looked..];
+                }
+                Err(_) => {
+                    gave.extend(rest.iter().map(|x| (x.0, Vec::new())));
+                    rest = &[];
+                }
             }
-            Err(_) => gave.extend(chunk.iter().map(|x| (x.0, Vec::new()))),
         }
     }
     {
@@ -26419,9 +26458,12 @@ pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0
 
 /// An O3 build's inline candidates (`ids`, their bodies checked and lowered ahead): the fronts of
 /// their O1 builds, deferring the optimisation (a publish; o2_begin's pattern). Returns the
-/// preparations, and the slots left out with the fronts they bailed on: they needed a front the
-/// take may not run (rule I-PURE), or the process ends on another thread.
-unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>) {
+/// preparations, the slots left out with the fronts they bailed on (they needed a front the take
+/// may not run, rule I-PURE, or the process ends on another thread), and how many of `ids` it
+/// looked at: a background take stops between candidates once a program request waits (the
+/// main thread's frame among them: a take of many candidates held the owner 13.4 ms while the UI
+/// waited, 11-22), and the caller takes the rest in its next publish, after the owner served it.
+unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>, usize) {
     let mut preps = Vec::new();
     let mut gave = Vec::new();
     let _kept = KeptCopies;
@@ -26440,7 +26482,12 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
     impl Drop for Renote {
         fn drop(&mut self) { owner::note_needs(std::mem::take(&mut self.0)); }
     }
-    for &(c, mode) in ids {
+    let mut looked = ids.len();
+    for (i, &(c, mode)) in ids.iter().enumerate() {
+        if i > 0 && owner::bailing() && owner::program_waiting() {
+            looked = i;
+            break;
+        }
         let _renote = Renote(owner::take_needs());
         let outcome = Outcome(cpu_ns(), std::cell::Cell::new(10));
         let preps0 = O3_OWNER[20].load(Ordering::Relaxed);
@@ -26530,7 +26577,7 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
             _ => cand_skip(12),
         }
     }
-    (preps, gave)
+    (preps, gave, looked)
 }
 
 /// (instrument) what o3_candidates_begin / o3_candidates_finish did with each candidate: begin left
@@ -27017,10 +27064,30 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
     // a build whose preparation needed fronts (its inline candidates') is tried again after this
     // thread made them (take_prefronted's rounds), not left to the caller's take on the owner
     for _ in 0..PREFRONT_ROUNDS {
-        let Ok((preps, gave, needs)) = owner::publish_or_bail(|| {
-            let (p, g) = o3_candidates_begin(up, &todo);
-            (p, g, owner::take_needs())
-        }) else { return };
+        // the take, CAND_TAKE candidates a publish as the snapshot's (a publish is bounded by its
+        // item count), and each stops for a program request (o3_candidates_begin): what it
+        // prepared before a bail is still built
+        let (mut preps, mut gave, mut needs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut rest = &todo[..];
+        let mut bailed = false;
+        while !rest.is_empty() {
+            let piece = &rest[..rest.len().min(CAND_TAKE)];
+            match owner::publish_or_bail(|| {
+                let (p, g, looked) = o3_candidates_begin(up, piece);
+                (p, g, looked, owner::take_needs())
+            }) {
+                Ok((p, g, looked, n)) => {
+                    preps.extend(p);
+                    gave.extend(g);
+                    needs.extend(n);
+                    rest = &rest[looked..];
+                }
+                Err(_) => {
+                    bailed = true;
+                    break;
+                }
+            }
+        }
         if !preps.is_empty() {
             let mut done: Vec<Deferred> = Vec::new();
             for (c, prep) in preps {
@@ -27029,8 +27096,11 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
             }
             owner::publish(|| o3_candidates_finish(up, epoch0, done));
         }
+        if bailed {
+            return;
+        }
         todo.retain(|x| gave.iter().any(|g| g.0 == x.0));
-        if todo.is_empty() || needs.is_empty() || needs.iter().any(|s| fronted.contains(s)) {
+        if todo.is_empty() || needs.is_empty() || needs.iter().any(|s: &u32| fronted.contains(s)) {
             return;
         }
         for s in needs {
