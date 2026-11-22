@@ -57,9 +57,9 @@ static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
 static LINK_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The file name of this run's link
 static NAME: OnceLock<String> = OnceLock::new();
-/// The run a launch of its link from a shell is (`relaunched`): its pid and where its build
-/// environment's descriptor is
-static RELAUNCH: OnceLock<(u32, Option<(i32, u64, u64)>)> = OnceLock::new();
+/// The run a launch of its link from a shell is (`relaunched`): its pid, where its build
+/// environment's descriptor is, and whether its line is `--silent`
+static RELAUNCH: OnceLock<(u32, Option<(i32, u64, u64)>, bool)> = OnceLock::new();
 /// The links runs start from (`launch_link`), in a loader key's folder: a name no link has
 const LAUNCH: &str = crate::dirs::LAUNCH_DIR;
 /// The loader's copies the links are made of where the loader is on another volume
@@ -519,10 +519,10 @@ fn holds(fd: i32, dev: u64, ino: u64) -> bool {
 /// line, when neither is there.
 #[cfg(unix)]
 pub fn relaunch_build() -> Option<Vec<u8>> {
-    let &(pid, handed) = RELAUNCH.get()?;
+    let &(pid, handed, silent) = RELAUNCH.get()?;
     let build = handed.and_then(|(fd, dev, ino)| read_handed(&[(pid, fd, dev, ino)], pid));
     if build.is_none() {
-        eprintln!("relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
+        note_unhanded(silent, "relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
     }
     build
 }
@@ -545,9 +545,27 @@ pub fn spawned_build() -> Option<Vec<u8>> {
     });
     let build = at.and_then(|(pid, fd, dev, ino)| read_handed(&[(pid, fd, dev, ino)], pid));
     if build.is_none() {
-        eprintln!("relax: the build environment of the run that started this process did not reach it (its descriptor was closed on the way); it builds with its own");
+        note_unhanded(silent_words(&crate::os::proc::args_bytes()), "relax: the build environment of the run that started this process did not reach it (its descriptor was closed on the way); it builds with its own");
     }
     build
+}
+
+/// Says that a handed build environment did not reach this process (it builds with its own), on
+/// stderr, unless its run is `--silent` (a binary's wrapper script, a program re-running itself):
+/// that keeps everything of Relax's own but errors off the program's stderr, which a native
+/// binary's toolchain leaves empty; RELAX_VERBOSE says it there too. (On macOS a session
+/// leader's exit waits for output its terminal has not read: a pty child that started this way
+/// left the line there and outlived its SIGKILL until its parent closed the terminal.)
+#[cfg(unix)]
+fn note_unhanded(silent: bool, line: &str) {
+    if !silent || std::env::var_os("RELAX_VERBOSE").is_some() {
+        eprintln!("{line}");
+    }
+}
+
+/// A run's own words (those before its program's `--`) hold `--silent`.
+fn silent_words(words: &[Vec<u8>]) -> bool {
+    words.iter().take_while(|w| w.as_slice() != b"--").any(|w| w == b"--silent")
 }
 
 /// The first of the handed build environments `at` (runs' entries: pid, descriptor, device, inode) whose descriptor this
@@ -606,7 +624,7 @@ pub fn prepared_build(args: &[Vec<u8>]) -> Option<Vec<u8>> {
     at.sort_by_key(|h| h.0 != parent);
     let build = read_handed(&at, parent);
     if build.is_none() {
-        eprintln!("relax: the build environment of the test run that prepared this binary did not reach it (a launcher cleared the environment and closed its descriptor); it builds with its own");
+        note_unhanded(silent_words(args), "relax: the build environment of the test run that prepared this binary did not reach it (a launcher cleared the environment and closed its descriptor); it builds with its own");
     }
     build
 }
@@ -626,7 +644,7 @@ pub fn spawned_build() -> Option<Vec<u8>> {
 
 #[cfg(windows)]
 pub fn relaunch_build() -> Option<Vec<u8>> {
-    let &(pid, _) = RELAUNCH.get()?;
+    let &(pid, _, _) = RELAUNCH.get()?;
     std::fs::read(std::env::current_exe().ok()?.parent()?.join(RUNS).join(format!("{pid}.build"))).ok()
 }
 
@@ -736,7 +754,7 @@ pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
             std::process::exit(2);
         }
     };
-    let _ = RELAUNCH.set((run.pid, run.handed));
+    let _ = RELAUNCH.set((run.pid, run.handed, silent_words(&run.line)));
     let mut out = run.line.clone();
     out[0] = args.first()?.clone();
     out.extend(rest.iter().cloned());
