@@ -26,7 +26,7 @@ use relax_backend::x64;
 use crate::os;
 use crate::owner;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FnKey {
@@ -18520,15 +18520,35 @@ static SAMPLER: std::sync::Once = std::sync::Once::new();
 
 /// The CPU sampler runs for a profile (RELAX_PROFILE) and for a wasm export's run (its
 /// samples pick the shipping O3 set: wasm_export::sampled_hot).
+/// Both settings are read once per process, so concurrent first readers cache the same answer.
+#[inline]
 fn sampling_on() -> bool {
-    profile_path().is_some() || crate::wasm_export::enabled()
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    const OFF: u8 = 1;
+    const ON: u8 = 2;
+    match STATE.load(Ordering::Relaxed) {
+        OFF => false,
+        ON => true,
+        _ => {
+            let on = profile_path().is_some() || crate::wasm_export::enabled();
+            STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
+#[inline]
 fn sampler_enter(exec_base: u64, exec_size: u64) {
+    // A catch inside an export can be the process's first entry here.
     progress_start();
     if !sampling_on() {
         return;
     }
+    sampler_register(exec_base, exec_size);
+}
+
+#[inline(never)]
+fn sampler_register(exec_base: u64, exec_size: u64) {
     EXEC_LO.store(exec_base, Ordering::Relaxed);
     EXEC_HI.store(exec_base + exec_size, Ordering::Relaxed);
     let me = os::thread::current();
@@ -18550,10 +18570,16 @@ fn sampler_enter(exec_base: u64, exec_size: u64) {
     });
 }
 
+#[inline]
 fn sampler_leave() {
     if !sampling_on() {
         return;
     }
+    sampler_unregister();
+}
+
+#[inline(never)]
+fn sampler_unregister() {
     let me = os::thread::current();
     let mut g = SAMPLED.lock().unwrap();
     if let Some(k) = g.iter().position(|x| x.0 == me) {
@@ -18909,7 +18935,17 @@ static PROGRESS: std::sync::Once = std::sync::Once::new();
 
 /// RELAX_O3_PROGRESS: a thread writes the progress file (o3_progress_write) from the first
 /// JIT call on.
+#[inline]
 fn progress_start() {
+    if PROGRESS.is_completed() {
+        return;
+    }
+    progress_start_once();
+}
+
+#[cold]
+#[inline(never)]
+fn progress_start_once() {
     PROGRESS.call_once(|| {
         if std::env::var_os("RELAX_O3_PROGRESS").is_none_or(|v| v.is_empty()) {
             return;
