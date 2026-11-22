@@ -3626,7 +3626,7 @@ fn set_tls_block(b: *mut u8) {
 /// This thread's thread-local block (allocated on first use).
 #[inline]
 pub fn tls_block() -> u64 {
-    let b = TLS_BLOCK_COPY.with(|c| c.get());
+    let b = TLS_BLOCK_COPY.try_with(|c| c.get()).unwrap_or(0);
     if b != 0 {
         return b;
     }
@@ -3636,7 +3636,7 @@ pub fn tls_block() -> u64 {
 /// This thread's thread-local block, 0 when it has none (it never ran JIT code): nothing is
 /// allocated.
 pub fn tls_block_if_any() -> u64 {
-    let b = TLS_BLOCK_COPY.with(|c| c.get());
+    let b = TLS_BLOCK_COPY.try_with(|c| c.get()).unwrap_or(0);
     if b != 0 {
         return b;
     }
