@@ -10172,8 +10172,14 @@ mod rotate_tests {
     #[test]
     fn rotation_keeps_a_header_value_the_body_reads() {
         let (mut f, i, c) = counted_loop();
+        // a counted build's counts: one entry, 100 iterations
+        for (b, n) in [1.0, 101.0, 100.0, 1.0].into_iter().enumerate() {
+            f.blocks[b].count = n;
+        }
         rotate_loops(&mut f);
         f.verify().unwrap();
+        // the header runs on entry only now, the latch's copy of its test each iteration
+        assert_eq!((f.blocks[1].count, f.blocks[2].count), (1.0, 100.0), "the rotated header keeps only its entries' count");
         // the latch runs the test itself: i keeps its vreg (the body reads it), c gets a fresh one
         let l = &f.blocks[2];
         assert!(matches!(l.term, Term::Branch(c2, 2, 3) if c2 != c));
