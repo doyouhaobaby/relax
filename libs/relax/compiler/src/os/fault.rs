@@ -1690,12 +1690,17 @@ pub fn watchdog_signal() -> i32 { SIG_WATCHDOG }
 /// default action (it ends the process), and nothing when the program ignores it.
 #[cfg(unix)]
 unsafe fn not_a_kick(sig: i32, info: *mut u8, uc: *mut u8) {
+    // a kick of a thread that ended first, handed to this one (Darwin): nothing to do here
+    if crate::os::thread::take_moved_kick() {
+        return;
+    }
     if imp::chain(sig, info, uc) || imp::chained_handler(sig) == 1 {
         return;
     }
     extern "C" {
         fn raise(sig: i32) -> i32;
     }
+    crate::jit::raw_not_a_kick(sig);
     imp::default_action(sig);
     // (blocked while this handler runs: it is delivered as the handler returns, by default)
     raise(sig);

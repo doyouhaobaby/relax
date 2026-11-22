@@ -1659,6 +1659,21 @@ fn raw_report_frames(f: &os::fault::Fault, raw: &[u64], scanned: bool) {
 /// set for the signal (none, or its handler and how many changes the entry saw) against what the
 /// kernel and the host's chain hold.
 #[cfg(unix)]
+/// The watchdog's signal reached a thread with no kick counted for it, and the program has no
+/// handler of its own for it: the process ends by its default action. Said first, with what the
+/// kick count knows (os::thread::kick_counts), and the program's disposition (signal context).
+#[cfg(unix)]
+pub(crate) fn raw_not_a_kick(sig: i32) {
+    let (pending, freed, ended, on_the_way) = os::thread::kick_counts();
+    let mut name = [0u8; 64];
+    let n = os::thread::own_name(&mut name);
+    let mut l = RawLine::new();
+    l.put(b"relax: signal ").dec(sig as u64).put(b", the JIT's kick signal, reached thread `").put(&name[..n.min(64)]).put(b"` (").hex(os::thread::current()).put(b") with no kick counted for it: the process ends by it. Kicks counted on threads now ").dec(pending);
+    l.put(b", entries given back with kicks counted ").dec(freed).put(b", kicks counted on threads that ended ").dec(ended).put(b", kicks sent and not taken ").dec(on_the_way);
+    l.flush();
+    raw_no_handler(sig);
+}
+
 fn raw_no_handler(sig: i32) {
     let (h, domain, changes) = os::progsig::program_disposition(sig);
     let kernel = os::progsig::kernel_handler(sig);
