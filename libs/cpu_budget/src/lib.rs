@@ -1144,7 +1144,9 @@ const BACKGROUND_DEFERRED: u8 = 6;
 /// CAP_SYS_NICE could not come back from a lower class for the pool's next job), Windows
 /// Background's normal priority (strict priority would starve it), and wasm has no OS classes. A
 /// thread at the idle policy, a hot one, or the UI's stays where it is. Called at a job's start and
-/// end; O(1), an OS call only on a change.
+/// end; O(1), an OS call only on a change. An op of the crate: a JIT-compiled app's pool job
+/// calls it, and the class it keeps is the provided crate's, with `set_thread_class`'s.
+#[relax_api]
 pub fn set_thread_deferred(deferred: bool) -> bool {
     if DEFERRED.with(|d| d.replace(deferred)) == deferred { return true; }
     match THREAD_CLASS.with(Cell::get) {
