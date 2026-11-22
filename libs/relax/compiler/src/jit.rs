@@ -36110,6 +36110,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MAIN_LOWER_WHY, [const { AtomicU64::new(0) }; 14]);
     reset(&CODE_GROWTH, [const { AtomicU64::new(0) }; 5]);
     reset(&CODE_INSTALLS, [const { AtomicU64::new(0) }; 5]);
+    reset(&HOT_PAD, AtomicU64::new(0));
     reset(&CACHE_AHEAD, std::sync::atomic::AtomicU64::new(0));
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     reset(&NC_WINDOWS, relax_session::sync::Mutex::new(Vec::new()));
