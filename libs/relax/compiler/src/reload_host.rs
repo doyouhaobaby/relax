@@ -57,7 +57,7 @@ static LOADED: std::sync::OnceLock<Option<(u64, u64, std::time::SystemTime)>> = 
 /// a change of what it is built from. Its restart then goes into that file, built first so cargo
 /// finds it current ([`route`], [`relaunch`]); a restart of the run alone would keep the replaced
 /// code. False while the path, or the file it held at startup, is unknown. One `stat`.
-fn loader_replaced() -> bool {
+pub fn loader_replaced() -> bool {
     loader().is_some_and(|p| replaced(LOADED.get().copied().flatten(), &p))
 }
 

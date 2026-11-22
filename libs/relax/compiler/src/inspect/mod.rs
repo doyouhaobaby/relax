@@ -1506,13 +1506,17 @@ fn cmd_live(req: &Req, out: &mut Out) {
 /// `loaded_heads`, each repository its sources are in (worktree and commit, the workspace's own
 /// first, whose commit is the sha); the oldest edit waiting for a restart (`pending_since_ms`,
 /// `pending_why`). A run outside git, or one that read its sources during a git operation, has no
-/// loaded_sha.
+/// loaded_sha. `inputs_changed`: what the JIT itself is built from changed since the binary it runs
+/// (its update waits for a restart: reload_host inputs_changed); `loader_replaced`: a build put
+/// another file at the loader's path, which a rebuild for sources this run does not use does too
+/// (a tool linked into the binary): alone, nothing the run runs is older than its tree.
 fn runs_what() -> String {
     let h = crate::reload::loaded_heads();
     let sha = h.as_ref().and_then(|(v, _)| v.first()).map_or("null".to_string(), |(_, s)| json_str(s));
     let all = h.as_ref().map_or(String::new(), |(v, _)| v.iter().map(|(r, s)| format!("[{},{}]", json_str(r), json_str(s))).collect::<Vec<_>>().join(","));
     let (since, why) = crate::reload::restart_pending_since().unwrap_or((0, String::new()));
-    format!("\"loaded_sha\":{sha},\"loaded_ms\":{},\"loaded_heads\":[{all}],\"pending_since_ms\":{since},\"pending_why\":{}", h.as_ref().map_or(0, |(_, t)| *t), json_str(&why))
+    format!("\"loaded_sha\":{sha},\"loaded_ms\":{},\"loaded_heads\":[{all}],\"pending_since_ms\":{since},\"pending_why\":{},\"inputs_changed\":{},\"loader_replaced\":{}", h.as_ref().map_or(0, |(_, t)| *t), json_str(&why),
+        crate::reload::host::inputs_changed(), crate::reload::host::loader_replaced())
 }
 
 /// The `jit` answer from two looks `ms` apart.
