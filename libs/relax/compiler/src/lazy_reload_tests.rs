@@ -3312,7 +3312,7 @@ pub fn value(out: &mut u32) {{
         ("side added, and value calls it", with_w("move |x: u32| x + 50", true), 0),
         ("w's captures changed and value stops calling side: the version side ran is kept", with_w("move |x: u32| x * k + 50", false), 1),
         ("w's captures changed back: the version side never ran is kept, the one it ran takes the new code", with_w("move |x: u32| x + 51", false), 0),
-        ("side deleted, value as it was", src(7), 0),
+        ("side deleted, value as it was: the version the box side made runs is kept", src(7), 1),
     ];
     for (what, text, held) in w_steps {
         let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: text.into_bytes() }]) };
@@ -3322,7 +3322,7 @@ pub fn value(out: &mut u32) {{
         let lines: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
         assert_eq!(lines.len(), held, "{what}: held lines: {:?}", o.lines);
         if what.contains("is kept") {
-            let why = "its captures or signature changed";
+            let why = if what.contains("deleted") { "the new text has no closure at its place" } else { "its captures or signature changed" };
             let kept = if held > 0 { lines.iter().all(|l| l.contains(why)) } else { o.lines.iter().any(|l| l.starts_with("kept: closure") && l.contains(why)) };
             assert!(kept, "{what}: w's old version is kept ({why}): {:?}", o.lines);
         }

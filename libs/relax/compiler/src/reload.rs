@@ -5264,9 +5264,16 @@ fn lineage_of(u: &Unit, slot: u32) -> Vec<u32> {
 /// for it ([`HELD`]: the restart is offered and `session view` lists it). A closure only called
 /// in its parent's frame is not run again once its parent's new code runs: that line only says so.
 fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
-    let FnKey::Closure(_, _, parent) = u.fns[slot as usize].key else {
-        return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
-    };
+    held_closure_line(u, slot, why).unwrap_or_else(|| match u.fns[slot as usize].key {
+        FnKey::Closure(..) => format!("kept: closure {}{} keeps its old code where it runs on ({why})", u.fns[slot as usize].name, closure_at(u, slot)),
+        _ => format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name),
+    })
+}
+
+/// The [`HELD`] line of an old closure that keeps its code (`why`), when trait objects of a value
+/// holding it were made (stored values of it may run the old code); None when none was.
+fn held_closure_line(u: &Unit, slot: u32, why: &str) -> Option<String> {
+    let FnKey::Closure(_, _, parent) = u.fns[slot as usize].key else { return None };
     let at = closure_at(u, slot);
     // (by the trait objects made: of the source types of the vtables this run lowered, and by the
     // code those linked from the cache or the startup image hold, a warm session's; of every
@@ -5277,11 +5284,7 @@ fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
     }).collect();
     let ty_hit = |t: TyId| versions.iter().any(|x| holds_closure(&u.tcx.tys, t, x.1)).then(|| (String::new(), 0));
     let slot_hit = |sl: u32| (versions.iter().any(|x| x.0 == sl) || key_types(u, sl).into_iter().any(|t| versions.iter().any(|x| holds_closure(&u.tcx.tys, t, x.1)))).then(String::new);
-    if stored_in_objects(u, &ty_hit, &slot_hit).is_some() {
-        format!("{HELD}stored values of a closure of `{}` ({}{at}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
-    } else {
-        format!("kept: closure {}{at} keeps its old code where it runs on ({why})", u.fns[slot as usize].name)
-    }
+    stored_in_objects(u, &ty_hit, &slot_hit).map(|_| format!("{HELD}stored values of a closure of `{}` ({}{at}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name))
 }
 
 /// " at <path>:<line>:<col> in `<fn>`": where closure `slot` is written (in the text it was
@@ -7970,11 +7973,26 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Ok(n) => pairs.push((o, n)),
                 Err(w) => {
                     // (a cell that keeps forwarding to its kept target is that target's line)
+                    // (a closure the new text removed, or that no new closure was matched to:
+                    // no line while only its parent's old frame runs it, which finishes on its old
+                    // code as any removed code does; a HELD line when values of it were stored)
                     if target(o) == o && [KEPT_SHAPE, KEPT_COUNT, KEPT_REPEAT, KEPT_UNDER_KEPT].contains(&w) {
                         out.lines.push(kept_closure_line(u, o, w));
+                    } else if target(o) == o {
+                        out.lines.extend(held_closure_line(u, o, w));
                     }
                     why.push((o, w));
                 }
+            }
+        }
+        // the closures of a fn the edit removed: no new text is theirs, and the parent is not
+        // rebuilt, so the loop above never sees them (a HELD line when values of them were stored;
+        // an old frame that still runs one finishes on it, as on any removed code)
+        for o in u.closures_of_slots(u.slots_of_defs(removed_defs.iter().copied())) {
+            let f = &u.fns[o as usize];
+            let body = matches!(f.key, FnKey::Closure(_, ce, _) if ce & crate::tcx::ASYNC_FN_BODY != 0);
+            if f.compiled && !body && target(o) == o && !olds_c.contains(&o) {
+                out.lines.extend(held_closure_line(u, o, KEPT_NO_PLACE));
             }
         }
         // (an old version that already forwards to its pair: the parent was rebuilt again with
