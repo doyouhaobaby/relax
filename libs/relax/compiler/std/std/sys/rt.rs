@@ -118,8 +118,14 @@ pub fn set_panic_trampoline(f: fn(&str, &core::panic::Location<'_>)) {
 }
 
 /// Makes core::panicking call `core_hook` (payload recording) even without a std hook, and
-/// count panic nesting per thread.
+/// count panic nesting per thread. Once: every catch_unwind asks (its catch must record the
+/// payload), and what it sets stays set (set_hook replaces STD_HOOK, nothing takes the rest back),
+/// so each later ask is a load.
 pub fn install_core_hook() {
+    static INSTALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     #[cfg(not(relax_web))]
     unsafe {
         relax_set_panic_hook(runtime_panic_hook);
@@ -149,6 +155,7 @@ pub fn install_core_hook() {
     if core::panicking::hook_fn().is_none() {
         core::panicking::set_hook_fn(Some(core_hook));
     }
+    INSTALLED.store(true, core::sync::atomic::Ordering::Release);
 }
 }
 
