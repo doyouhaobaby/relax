@@ -5301,6 +5301,64 @@ fn closure_at(u: &Unit, slot: u32) -> String {
     format!(" at {path}:{l}:{c} in `{}`", u.fns[parent as usize].name)
 }
 
+/// The kept closures with no trait object made when the last patch was decided (Unit::kept_old
+/// without a HELD line), with why each is kept: an old frame, or kept code, can still make one
+/// (`late_held` says them then).
+static LATE: std::sync::Mutex<Vec<(u32, &'static str)>> = std::sync::Mutex::new(Vec::new());
+/// LATE holds some: a vtable's first trait object (lower.rs note_made) asks the live loop to look.
+static LATE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A vtable's first trait object was made while LATE_WATCH was set.
+static LATE_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A vtable's first trait object (lower.rs rt_made_late, once per vtable): after a patch that
+/// kept closures with no trait object made, the live loop looks at them. Atomics and a wake; a
+/// real-time thread only marks it (the wake takes a lock on macOS), and the loop's next wake
+/// looks. Cannot panic (a leaf runtime entry calls it).
+pub(crate) fn made_late() {
+    if LATE_WATCH.load(Ordering::Acquire) {
+        LATE_MADE.store(true, Ordering::Release);
+        if !crate::jit::realtime_thread_entry() {
+            watch_events::kick();
+        }
+    }
+}
+
+/// After a patch transaction: the kept closures that wait for a trait object of theirs (LATE).
+/// One held check per kept closure.
+fn note_late(u: &Unit) {
+    let mut late: Vec<(u32, &'static str)> = u.kept_old.iter().map(|(&o, e)| (o, e.1)).filter(|&(o, why)| {
+        !matches!(u.forward_of(o), Some((t, true)) if t != o) && held_closure_line(u, o, why).is_none()
+    }).collect();
+    late.sort_unstable();
+    let mut cur = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    LATE_WATCH.store(!late.is_empty(), Ordering::Release);
+    *cur = late;
+}
+
+/// The kept closures of LATE a trait object of which was made since their patch (by an old frame,
+/// or kept code): their HELD lines with their files, each said once. Nothing unless a vtable's
+/// first trait object was made since the last look.
+pub(crate) unsafe fn late_held(up: *mut Unit) -> Vec<(String, String)> {
+    if !LATE_MADE.swap(false, Ordering::AcqRel) {
+        return Vec::new();
+    }
+    crate::owner::call(crate::owner::Class::Program, || {
+        let u = &*up;
+        let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        late.retain(|&(o, why)| match held_closure_line(u, o, why) {
+            Some(l) => {
+                let path = match u.fns[o as usize].key { FnKey::Closure(f, _, _) => u.prog.file_paths.get(f as usize).cloned().unwrap_or_default(), _ => String::new() };
+                out.push((path, l));
+                false
+            }
+            None => true,
+        });
+        LATE_WATCH.store(!late.is_empty(), Ordering::Release);
+        out
+    })
+}
+
 /// Whether a value of type `t` holds a value of closure `at` (its file and expression): the
 /// closure itself, or a field, element or capture of `t` that holds it.
 fn holds_closure(tys: &crate::types::Types, t: TyId, at: (u32, u32)) -> bool {
@@ -5636,7 +5694,10 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
                 // epoch. Neither may make this snapshot stale while the parser runs off the unit.
                 if std::sync::Arc::ptr_eq(&macro_table, &(*up).prog.macros) && epoch == (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire) {
                     drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
-                    return Ok(apply_locked(up, edits, pre, t0, partial, 8, module, &base));
+                    let o = apply_locked(up, edits, pre, t0, partial, 8, module, &base);
+                    // (the kept closures a trait object of which may come later: late_held)
+                    note_late(&*up);
+                    return Ok(o);
                 }
                 // a module load or a rollback moved the program while this parsed: parse again
                 // against it. Each pass follows such a move, and loads end (the parse itself
@@ -11421,6 +11482,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             _ => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
         let woke = Instant::now();
+        // a kept closure's first trait object, made after its patch (by an old frame, or kept
+        // code): held for a restart from now
+        for (path, l) in unsafe { late_held(up) } {
+            let what = short(&path).to_string();
+            eprintln!("relax live: {what}: {l}");
+            let held: Vec<String> = l.strip_prefix(HELD).map(str::to_string).into_iter().collect();
+            restart_for_edit(&what, &held, &[path]);
+        }
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
@@ -13532,6 +13601,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SOURCES_WAIT, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_CONFIRMED, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_PENDING, std::sync::Mutex::new(Vec::new()));
+    reset(&LATE, std::sync::Mutex::new(Vec::new()));
+    reset(&LATE_WATCH, std::sync::atomic::AtomicBool::new(false));
+    reset(&LATE_MADE, std::sync::atomic::AtomicBool::new(false));
     reset(&HELD_FROM, std::sync::Mutex::new(Vec::new()));
     reset(&LOADED_HEADS, std::sync::Mutex::new(None));
     reset(&RELAUNCH_ASKED, std::sync::atomic::AtomicBool::new(false));

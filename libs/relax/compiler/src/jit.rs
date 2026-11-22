@@ -6312,6 +6312,7 @@ impl Unit {
         // function of this run was lowered (the cache links them by name)
         let _ = u.syms.intern(crate::syms::SymKind::Rt("divrem128"), crate::lower::divrem128_addr());
         let _ = u.syms.intern(crate::syms::SymKind::Rt("cannot_unwind"), crate::lower::cannot_unwind_addr());
+        let _ = u.syms.intern(crate::syms::SymKind::Rt("made_late"), crate::lower::made_late_addr());
         for (name, addr) in ["wide_f32", "wide_f64"].into_iter().zip(crate::lower::wide_float_addrs()) {
             let _ = u.syms.intern(crate::syms::SymKind::Rt(name), addr);
         }
@@ -10691,6 +10692,12 @@ pub(crate) fn rt_named(name: &str) -> bool {
 /// The calling thread runs under a real-time policy, marked itself (std::relax::realtime_thread),
 /// or RELAX_RT_THREADS=name,.. names it. Asked at each lazy compile, not cached: a thread's
 /// policy and name are set after it starts.
+/// is_realtime_thread for a runtime entry that must not panic: a thread past its locals'
+/// teardown counts as one.
+pub(crate) fn realtime_thread_entry() -> bool {
+    RT_THREAD.try_with(|t| t.get()).unwrap_or(true) || os::thread::realtime() || !rt_names().is_empty() && rt_named(&os::thread::name(os::thread::current()))
+}
+
 pub fn is_realtime_thread() -> bool {
     if RT_THREAD.with(|t| t.get()) || os::thread::realtime() {
         return true;

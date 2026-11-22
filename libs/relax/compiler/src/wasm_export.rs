@@ -946,6 +946,8 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "memset" => HostBind::Builtin(Builtin::Memset),
                 "catch_panic" => HostBind::Builtin(Builtin::CatchPanic),
                 "panicking" if abort => HostBind::Builtin(Builtin::Nop),
+                // (a vtable's first trait object tells the live loop: no patch reaches a module)
+                "made_late" => HostBind::Builtin(Builtin::Nop),
                 "rethrow" if abort => HostBind::Trap,
                 n => HostBind::Import("r".into(), n.to_string()),
             },
@@ -1741,6 +1743,7 @@ pub(crate) fn prepare_shipping(u: &Unit, f: &mut Func) {
                 Inst::Call(Callee::Host(s) | Callee::CHost(s, _), _, _) => match u.syms.kind(s.id) {
                     Some(SymKind::Foreign(n)) if single => single_thread(&n),
                     Some(SymKind::Rt("panicking")) if abort => Some(HostBind::Builtin(Builtin::Nop)),
+                    Some(SymKind::Rt("made_late")) => Some(HostBind::Builtin(Builtin::Nop)),
                     Some(SymKind::Rt("rethrow")) if abort => Some(HostBind::Trap),
                     _ => None,
                 },

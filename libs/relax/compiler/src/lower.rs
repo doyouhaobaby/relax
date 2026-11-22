@@ -4031,7 +4031,10 @@ impl<'a> Lcx<'a> {
         let (cell, b, one) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I), self.f.vreg(Cls::I));
         let sym = self.u.syms.made_sym(self.u.data_sym(vt));
         let check = [Inst::Addr(cell, sym), Inst::Load(Mem::Int(1, false), b, cell, 0)];
-        let store = [Inst::Iconst(one, 1), Inst::Store(Mem::Int(1, false), cell, 0, one)];
+        // (and the first time, a call that tells the live loop: rt_made_late, for a closure a patch
+        // kept that no trait object held yet)
+        let late = self.u.syms.intern(crate::syms::SymKind::Rt("made_late"), made_late_addr());
+        let store = [Inst::Iconst(one, 1), Inst::Store(Mem::Int(1, false), cell, 0, one), Inst::Call(Callee::Host(late), Vec::new(), Vec::new())];
         self.f.guard_size.add(relax_codegen::opt::priced_out(check.iter().chain(&store), 1, 2));
         for i in check {
             self.emit(i);
@@ -14567,6 +14570,21 @@ struct WideRet {
     hi: u64,
 }
 
+rt_fn! {
+/// A made cell's set block (note_made), once per vtable: after a patch that kept closures with no
+/// trait object made, the live loop looks at them (reload::made_late: atomics and a wake, no
+/// panic).
+leaf fn rt_made_late() {
+    crate::reload::made_late();
+}
+}
+
+/// The address code calls for `rt_made_late` (SymKind::Rt("made_late")).
+pub fn made_late_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_made_late;
+    f as usize as u64
+}
+
 /// The address of the 128-bit division helper (its runtime symbol is interned at unit start).
 pub fn divrem128_addr() -> u64 {
     let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128;
@@ -16704,6 +16722,7 @@ fn arithmetic_overflow_message(op: BinOp) -> &'static str {
 pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::rir::Sym> {
     let (kind, addr) = match name {
         "web_memory_base" => ("web_memory_base", crate::web::BASE),
+        "made_late" => ("made_late", made_late_addr()),
         "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
         // the loop counters' helper (a trampoline in the code area)
         "loop_hot" => return Some(crate::jit::loop_hot_sym(u)),
