@@ -4046,17 +4046,21 @@ pub(crate) fn host_boundary<R>(entry: &'static str, f: impl FnOnce() -> R) -> R 
     }
 }
 
-/// The frame pointer of this native frame (frame pointers are kept on every target Relax runs on).
-#[inline(always)]
-fn own_frame_pointer() -> u64 {
-    let fp: u64;
-    #[cfg(target_arch = "x86_64")]
-    unsafe { std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
-    #[cfg(target_arch = "aarch64")]
-    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { fp = 0; }
-    fp
+/// The frame pointer of the function this is written in (frame pointers are kept on every target
+/// Relax runs on). A macro, not a fn: the register is the frame of the function the asm is in,
+/// and `#[inline(always)]` does not promise which one that is (the JIT's first tier inlines
+/// nothing): a fn of its own gave its own frame, popped by the time its caller used it.
+macro_rules! own_frame_pointer {
+    () => {{
+        let fp: u64;
+        #[cfg(target_arch = "x86_64")]
+        unsafe { std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        { fp = 0; }
+        fp
+    }};
 }
 
 /// A native panic reached a runtime entry JIT code called (rt_fn!, rt_abi.rs). It must not unwind
@@ -4083,7 +4087,7 @@ pub(crate) fn rt_boundary_panic(entry: &str, p: Box<dyn std::any::Any + Send>) -
     eprintln!("relax: {}", message);
     crate::inspect::flightrec::event("rt.boundary", &message, 0, 0);
     drop(p);
-    let fp = own_frame_pointer();
+    let fp = own_frame_pointer!();
     let ret = if fp == 0 { 0 } else { unsafe { *((fp + 8) as *const u64) } };
     raise_with("panic", message, 0, 0, fp, ret, std::ptr::null())
 }
@@ -5608,7 +5612,7 @@ pub(crate) fn watchdog_at_wait(leave_wait: impl FnOnce()) {
 /// chain from here, from the first return address into JIT code on (the JIT frame is the pc).
 #[inline(never)]
 unsafe fn record_hang_here() {
-    let fp = own_frame_pointer();
+    let fp = own_frame_pointer!();
     let here = &fp as *const u64 as u64;
     let _ = FAULT_REC.try_with(|r| {
         let r = &mut *r.get();
