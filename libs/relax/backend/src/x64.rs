@@ -3043,8 +3043,9 @@ impl<'a> Gen<'a> {
     fn loop_heads(&self, reach: &[bool]) -> Vec<bool> {
         let nb = self.f.blocks.len();
         let mut a = vec![false; nb];
-        // (no frequencies, e.g. after the allocator split loops: no padding -- aligning every head
-        // of every loop, cold ones included, cost reconcile 3.5% of its bytes in nops)
+        // (no frequencies, as in builds below O3: no padding -- aligning every head of every loop,
+        // cold ones included, cost reconcile 3.5% of its bytes in nops; the allocator's loop split
+        // hands on frequencies for its blocks)
         if !self.align_loops || self.freq.is_none() {
             return a;
         }
@@ -6897,8 +6898,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     }
     let _cost_ra = crate::probe::phase(9);
     let t_ra = crate::stats::pass_clock();
-    let (split, al) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
+    let (split, al, split_freq) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
     let f = split.as_ref().unwrap_or(f);
+    // the loop split's made blocks have frequencies too: its loop heads are aligned as any other's
+    // (RELAX_OPT=-splitfreq: a split function gets none, its heads no padding; A/B)
+    let freq = if split.is_none() { freq } else if crate::stats::opt_off(options, "-splitfreq") { None } else { split_freq.as_deref() };
     if split.is_some() {
         f.verify_after("split_loops")?;
     }
