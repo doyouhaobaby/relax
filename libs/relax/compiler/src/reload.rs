@@ -9121,17 +9121,28 @@ struct Patched {
     /// the count of the last patch that changed more than item bodies (an item added or removed,
     /// a const, a layout): to a program that has not seen it every item changed
     whole: u64,
+    /// each file the program read that a save changed (a resource: no compiled input), with the
+    /// count it was told at and the program's read tick then ([`ProgramReads`]): whether it read
+    /// the file again since ([`told_resources`])
+    resources: Vec<(u64, String, u64)>,
+    /// the resources a settled round found changed while its save's code patch had not landed:
+    /// told with that patch ([`Self::land`]), so a resource that needs the save's new code is
+    /// never taken in by the old (or alone, [`Self::land_resources`], once no patch of the tree
+    /// is in the way)
+    waiting: Vec<String>,
 }
 
 impl Patched {
     const fn new() -> Self {
-        Self { count: 0, files: Vec::new(), items: Vec::new(), whole: 0 }
+        Self { count: 0, files: Vec::new(), items: Vec::new(), whole: 0, resources: Vec::new(), waiting: Vec::new() }
     }
 
-    /// A patch of `paths` that changed the bodies of `items` (None: more than bodies).
+    /// A patch of `paths` that changed the bodies of `items` (None: more than bodies), and the
+    /// resources waiting for it.
     fn land(&mut self, paths: impl Iterator<Item = String>, items: Option<Vec<String>>) {
         self.count += 1;
         let n = self.count;
+        self.tell(n);
         for path in paths {
             self.files.retain(|(_, q)| *q != path);
             self.files.push((n, path));
@@ -9145,8 +9156,33 @@ impl Patched {
         }
     }
 
+    /// The waiting resources told alone (no code patch: the settled rounds since they were found
+    /// changed no compiled input, and none is refused): a count of its own, the one the program,
+    /// a grab's `patch` and devhub's wait read, which installs no code. False: none waited.
+    fn land_resources(&mut self) -> bool {
+        if self.waiting.is_empty() {
+            return false;
+        }
+        self.count += 1;
+        self.tell(self.count);
+        true
+    }
+
+    /// The waiting resources, told at count `n`.
+    fn tell(&mut self, n: u64) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let tick = PROGRAM_READS.lock().unwrap().as_ref().map_or(0, |r| r.tick);
+        for path in std::mem::take(&mut self.waiting) {
+            self.resources.retain(|(_, q, _)| *q != path);
+            self.resources.push((n, path, tick));
+        }
+    }
+
     /// What changed after count `since`: "<count> <1 when every item>\n", a path per line, then
-    /// a tab and an item name per line.
+    /// a tab and an item name per line, then a record separator (0x1e) and a resource's path per
+    /// line. (A std from before resources takes a resource line for a file no design is of.)
     fn since(&self, since: u64) -> String {
         let mut s = format!("{} {}\n", self.count, u8::from(self.whole > since));
         for (n, path) in &self.files {
@@ -9154,6 +9190,9 @@ impl Patched {
         }
         for (n, item) in &self.items {
             if *n > since { s.push('\t'); s.push_str(item); s.push('\n'); }
+        }
+        for (n, path, _) in &self.resources {
+            if *n > since { s.push('\u{1e}'); s.push_str(path); s.push('\n'); }
         }
         s
     }
@@ -9178,6 +9217,46 @@ unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
 fn patch_landed(paths: impl Iterator<Item = String>, items: Option<Vec<String>>) {
     PATCHED.lock().unwrap_or_else(|e| e.into_inner()).land(paths, items);
     wake_program();
+}
+
+/// Files the program read that a settled round found changed ([`Resources`]): they wait for the
+/// round's patch ([`Patched::waiting`]).
+fn resources_found(paths: Vec<String>) {
+    let mut p = PATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    for path in paths {
+        if !p.waiting.contains(&path) { p.waiting.push(path); }
+    }
+}
+
+/// The resources waiting told alone, no code installed ([`Patched::land_resources`]), the program
+/// woken; said in the session's log as resources, never as a patch.
+fn resources_alone() {
+    let (told, n) = {
+        let mut p = PATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        if p.waiting.is_empty() { return; }
+        let names: Vec<String> = p.waiting.iter().take(3).map(|q| q.rsplit('/').take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/")).collect();
+        let more = p.waiting.len().saturating_sub(3);
+        let told = p.land_resources().then(|| format!("{}{}", names.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() }));
+        (told, p.count)
+    };
+    if let Some(names) = told {
+        eprintln!("relax live: {names}: read by the program and changed (no compiled input): told it (resources {n}, no code)");
+        wake_program();
+    }
+}
+
+/// Of `asked` (workspace-relative paths, `read_by_program`'s), those the program was told changed
+/// ([`Patched::resources`]): (path, the count it was told at, whether it read the file again
+/// since).
+pub(crate) fn told_resources<'a>(asked: impl Iterator<Item = &'a str>, at: &dyn Fn(&str, &str) -> bool) -> Vec<(&'a str, u64, bool)> {
+    let p = PATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    let r = PROGRAM_READS.lock().unwrap();
+    asked.filter_map(|a| {
+        let rel = a.trim_start_matches("../");
+        let (n, path, tick) = p.resources.iter().rev().find(|(_, q, _)| at(q, rel))?;
+        let again = r.as_ref().and_then(|r| r.paths.get(path)).is_some_and(|t| t > tick);
+        Some((a, *n, again))
+    }).collect()
 }
 
 /// How many patches are installed (std::relax::patched's count): a grab's `patch` that is lower
@@ -10886,11 +10965,17 @@ pub(crate) fn outside_packages<'a>(asked: impl Iterator<Item = &'a str>) -> Vec<
 
 /// What a live session's program looked at (std's fs_vfs `note`), on the disk or in a virtual
 /// folder, absolute and normalized: the files it opened for reading or probed, and the folders it
-/// listed.
+/// listed, each with the tick of its last look (a count of the program's looks: whether it read a
+/// file again after it was told the file changed, [`told_resources`]).
 #[derive(Default)]
 struct ProgramReads {
-    paths: std::collections::HashSet<String>,
-    dirs: std::collections::HashSet<String>,
+    paths: std::collections::HashMap<String, u64>,
+    dirs: std::collections::HashMap<String, u64>,
+    tick: u64,
+    /// the paths looked at for the first time since the watcher last took them ([`Resources`]),
+    /// a folder's with `true`: the watcher maps each to its place in the edits folder outside the
+    /// lock, so a program thread never waits on the watcher's work here
+    fresh: Vec<(bool, String)>,
 }
 
 static PROGRAM_READS: relax_session::sync::Mutex<Option<ProgramReads>> = relax_session::sync::Mutex::new(None);
@@ -10915,7 +11000,16 @@ pub(crate) extern "C" fn relax_vfs_note(p: *const u8, n: usize, kind: u32) {
     let path = crate::vfs::normalize_path(&abs);
     let mut g = PROGRAM_READS.lock().unwrap();
     let r = g.get_or_insert_with(ProgramReads::default);
-    if kind == b'd' as u32 { r.dirs.insert(path); } else { r.paths.insert(path); }
+    r.tick += 1;
+    let (tick, dir) = (r.tick, kind == b'd' as u32);
+    let looked = if dir { &mut r.dirs } else { &mut r.paths };
+    match looked.get_mut(&path) {
+        Some(t) => *t = tick,
+        None => {
+            looked.insert(path.clone(), tick);
+            r.fresh.push((dir, path));
+        }
+    }
 }
 
 /// Of `asked` (workspace-relative paths), those the program opened or probed, or whose folder it
@@ -10926,7 +11020,7 @@ pub(crate) fn read_by_program<'a>(asked: impl Iterator<Item = &'a str>, at: &dyn
     let Some(r) = g.as_ref() else { return Vec::new() };
     asked.filter(|a| {
         let rel = a.trim_start_matches("../");
-        r.paths.iter().any(|p| at(p, rel)) || rel.rsplit_once('/').is_some_and(|(dir, _)| r.dirs.iter().any(|p| at(p, dir)))
+        r.paths.keys().any(|p| at(p, rel)) || rel.rsplit_once('/').is_some_and(|(dir, _)| r.dirs.keys().any(|p| at(p, dir)))
     }).collect()
 }
 
@@ -11005,11 +11099,20 @@ impl Virtual {
 /// virtual files' from one walk of the edits folder at the round's first virtual file, matched to
 /// them by their place there. A round over thousands of virtual files costs the few edits, not a
 /// path lookup and a failing stat each (two looks on every edit took 11-29 ms on a large app's 5,500).
-struct Look(std::cell::OnceCell<std::collections::HashMap<usize, (std::time::SystemTime, u64)>>);
+struct Look {
+    edits: std::cell::OnceCell<Option<crate::vfs::EditsLook>>,
+    watched: std::cell::OnceCell<std::collections::HashMap<usize, (std::time::SystemTime, u64)>>,
+}
 
 impl Look {
     fn new() -> Look {
-        Look(std::cell::OnceCell::new())
+        Look { edits: std::cell::OnceCell::new(), watched: std::cell::OnceCell::new() }
+    }
+
+    /// The edits folder as this look walked it (once), None without one: the watched files'
+    /// stamps and the read resources' ([`Resources::changed`]) come from the one walk.
+    fn edits(&self) -> Option<&crate::vfs::EditsLook> {
+        self.edits.get_or_init(crate::vfs::EditsLook::now).as_ref()
     }
 
     /// Watched file `k` (`path`); one added since `virt` was taken is stat'ed on its own.
@@ -11017,10 +11120,84 @@ impl Look {
         if !virt.is.get(k).copied().unwrap_or(false) {
             return stamp(path);
         }
-        let edits = self.0.get_or_init(|| {
-            crate::vfs::EditsLook::now().map(|l| l.entries().filter_map(|(rel, s)| Some((*virt.rels.get(rel)?, s))).collect()).unwrap_or_default()
+        let edits = self.watched.get_or_init(|| {
+            self.edits().map(|l| l.entries().filter_map(|(rel, s)| Some((*virt.rels.get(rel)?, s))).collect()).unwrap_or_default()
         });
         Some(edits.get(&k).copied().unwrap_or((std::time::UNIX_EPOCH, 0)))
+    }
+}
+
+/// The files of a mounted store the program read that are no compiled input (a kit, a level, a
+/// shader file it loads at run time: resources), watched through the edits folder: a round that
+/// sees the ledger move compares the folder's entries, from the round's one walk of it, with the
+/// last such round's, and the changed ones the program read, probed or whose folder it listed are
+/// the save's resources ([`Patched::waiting`]). The read paths are mapped to their place in the
+/// edits folder once each, as they come ([`ProgramReads::fresh`]); a round costs the folder's
+/// entries, whatever the program read. Its content is never read and it never reaches a compile
+/// or a cache key: the program is told, and decides. Disk files (a checkout's) are not watched
+/// here.
+#[derive(Default)]
+struct Resources {
+    /// read files by their place in the edits folder: their path as the program read it
+    files: std::collections::HashMap<String, String>,
+    /// listed folders by their place in the edits folder: their path
+    dirs: std::collections::HashMap<String, String>,
+    /// the edits folder's entries as the last round that looked saw them, and the whiteouts
+    stamps: std::collections::HashMap<String, (std::time::SystemTime, u64)>,
+    deleted: std::collections::BTreeSet<String>,
+}
+
+impl Resources {
+    /// The edits folder and whiteouts as they are at the watcher's start: what the program reads
+    /// from now on is what they hold.
+    fn now(look: &Look) -> Resources {
+        let mut r = Resources::default();
+        r.stamps = look.edits().map(|l| l.entries().map(|(rel, s)| (rel.to_string(), s)).collect()).unwrap_or_default();
+        r.deleted = crate::vfs::edits_deleted();
+        r
+    }
+
+    /// The paths the program looked at first since the last call, mapped to the edits folder.
+    fn take_reads(&mut self) {
+        let fresh = match PROGRAM_READS.lock().unwrap().as_mut() {
+            Some(r) => std::mem::take(&mut r.fresh),
+            None => return,
+        };
+        for (dir, path) in fresh {
+            if !crate::vfs::in_store(&path) { continue; }
+            let Some(rel) = crate::vfs::edit_rel(&path) else { continue };
+            if dir { self.dirs.insert(rel, path); } else { self.files.insert(rel, path); }
+        }
+    }
+
+    /// The read files (and listed folders) that changed since the last call, by `look`'s walk of
+    /// the edits folder: an edit added, rewritten or taken back, a whiteout added or dropped, a
+    /// file added to or removed from a listed folder (its path and the folder's); none the
+    /// program wrote, removed or made itself ([`crate::vfs::program_edited`]).
+    fn changed(&mut self, look: &Look) -> Vec<String> {
+        self.take_reads();
+        let now: std::collections::HashMap<String, (std::time::SystemTime, u64)> =
+            look.edits().map(|l| l.entries().map(|(rel, s)| (rel.to_string(), s)).collect()).unwrap_or_default();
+        let deleted = crate::vfs::edits_deleted();
+        let mut moved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        moved.extend(now.iter().filter(|(rel, s)| self.stamps.get(*rel) != Some(*s)).map(|(rel, _)| rel.as_str()));
+        moved.extend(self.stamps.keys().filter(|rel| !now.contains_key(*rel)).map(String::as_str));
+        moved.extend(deleted.symmetric_difference(&self.deleted).map(String::as_str));
+        // (the program's own writes, removals and folders: no save's change)
+        moved.retain(|rel| !crate::vfs::program_edited(rel));
+        let mut out = std::collections::BTreeSet::new();
+        for rel in moved {
+            if let Some(path) = self.files.get(rel) { out.insert(path.clone()); }
+            if let Some((dir, name)) = rel.rsplit_once('/') {
+                if let Some(path) = self.dirs.get(dir) {
+                    out.insert(path.clone());
+                    out.insert(format!("{path}/{name}"));
+                }
+            }
+        }
+        self.stamps = now;
+        self.deleted = deleted;
+        out.into_iter().collect()
     }
 }
 
@@ -11407,6 +11584,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // which files are a mounted store's (asked once per watch set: the lookup normalizes the path
     // and walks the mounts)
     let mut ledger = Ledger::now();
+    // the files the program read that are no compiled input, as the edits folder holds them now
+    let mut resources = Resources::now(&Look::new());
     let mut cost = WatchCost::new();
     let mut virt = Virtual::default();
     let mut startup_scan = true;
@@ -11675,6 +11854,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let look = Look::new();
         let mut changed: Vec<usize> = ids.into_iter().filter(|&k| look.stamp(&virt, k, &files[k].0) != files[k].2).collect();
+        // the files the program read that the save changed and are no compiled input: told with
+        // the save's patch, or alone once no patch is in the way (`resources_alone`). Only a
+        // round that saw the ledger move can find one: a ship and the program's writes move it.
+        if ledger.0 != ledger_was {
+            let found = resources.changed(&look);
+            if !found.is_empty() { resources_found(found); }
+        }
         // what a held landing's take or release names, whatever its stamp says
         let forced = std::mem::take(&mut *LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()));
         if !forced.is_empty() {
@@ -11698,6 +11884,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         changed.retain(|&k| !held_back(&files[k].0, false));
         let mut quiet_retry = changed.is_empty() && retry_due;
         if changed.is_empty() && !quiet_retry {
+            // no compiled input changed: the resources go alone, unless a refused text of the
+            // tree waits (they go with its patch, or once it returned to the running text)
+            if stalled.is_empty() { resources_alone(); }
             continue;
         }
         changed.extend(stalled.keys().copied());
@@ -12266,6 +12455,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if patched && !awaits_check {
             patch_verified_event(&what, group, &[], &held);
         }
+        // a round that installed nothing and left no refused text: what it found the program read
+        // goes alone (a restart re-reads everything)
+        if !patched && stalled.is_empty() && !restart_required { resources_alone(); }
     }
 }
 
@@ -12535,7 +12727,7 @@ mod folder_mount_watch_tests {
         assert_eq!(virt.is, [false], "no store file: no edits ledger");
         let look = Look::new();
         assert_eq!(look.stamp(&virt, 0, &path), disk());
-        assert!(look.0.get().is_none(), "no walk of an edits folder");
+        assert!(look.edits.get().is_none(), "no walk of an edits folder");
         std::fs::write(&main, "fn main() { println!(); }").unwrap();
         assert_eq!(stamp(&path), disk(), "a save moves it");
         assert!(!committed_by_ledger(std::iter::once(path.as_str())), "a checkout's save is no ledger's edit");
@@ -13394,6 +13586,50 @@ mod program_reads_tests {
                 assert!(!read.contains(&"app/src/lib.rs"), "the compiler's reads of the sources are not the program's: {read:?}");
                 assert!(read.contains(&"res/race.splash"), "a file a virtual folder served: {read:?}");
                 assert!(read.contains(&"res/levels/two.splash"), "a file new in a virtual folder the program listed: {read:?}");
+                // Each look moves its path's tick; a path is fresh for the watcher once.
+                let race = |r: &super::ProgramReads| r.paths.iter().find(|(p, _)| p.ends_with("res/race.splash")).map(|(p, t)| (p.clone(), *t)).expect("the virtual file read");
+                let (path, tick) = race(super::PROGRAM_READS.lock().unwrap().as_ref().unwrap());
+                // A save of a file the program read reaches it as a resource through the edits
+                // folder ([`Resources`]): an edit of a read file or one new in a listed folder, once;
+                // an edit of a file it never looked at, never.
+                let edits = dir.join("edits");
+                std::fs::create_dir_all(&edits).unwrap();
+                crate::vfs::set_edits(Some(edits.clone()));
+                let mut res = super::Resources::now(&super::Look::new());
+                assert_eq!(res.changed(&super::Look::new()), Vec::<String>::new(), "nothing saved since");
+                let place = |p: &str| edits.join(crate::vfs::edit_rel(p).expect("a store file has a place in the edits folder"));
+                let other = path.replace("res/race.splash", "res/other.splash");
+                let level = path.replace("res/race.splash", "res/levels/two.splash");
+                for p in [&path, &other, &level] {
+                    std::fs::create_dir_all(place(p).parent().unwrap()).unwrap();
+                    std::fs::write(place(p), "edited").unwrap();
+                }
+                let found = res.changed(&super::Look::new());
+                assert!(found.contains(&path), "a read file's edit: {found:?}");
+                assert!(found.contains(&level), "a file new in a folder the program listed: {found:?}");
+                assert!(!found.contains(&other), "a file the program never looked at: {found:?}");
+                assert_eq!(res.changed(&super::Look::new()), Vec::<String>::new(), "each edit once");
+                // The program's own writes are no save's: a read file it writes and one it adds in
+                // a listed folder are never told it, a save of another read file still is.
+                let write = |p: &str| {
+                    let (mut out, mut len) = (std::ptr::null(), 0usize);
+                    let id = crate::vfs::relax_vfs_edit(p.as_ptr(), p.len(), 2, &mut out, &mut len);
+                    assert_ne!(id, 0, "{p}: the program can write it");
+                    let disk = String::from_utf8(unsafe { std::slice::from_raw_parts(out, len) }.to_vec()).unwrap();
+                    crate::vfs::relax_vfs_release(id);
+                    std::fs::write(disk, "the program's own").unwrap();
+                };
+                let added = path.replace("res/race.splash", "res/levels/three.splash");
+                write(&path);
+                write(&added);
+                assert_eq!(res.changed(&super::Look::new()), Vec::<String>::new(), "the program's own writes are not told it");
+                std::fs::write(place(&level), "saved again").unwrap();
+                let folder = path.replace("res/race.splash", "res/levels");
+                assert_eq!(res.changed(&super::Look::new()), vec![folder, level.clone()], "a save of a file in the folder beside them is, and the folder");
+                crate::vfs::set_edits(None);
+                assert_eq!(call("look"), 125_110, "read again without the edits, the program sees what it saw");
+                let (_, again) = race(super::PROGRAM_READS.lock().unwrap().as_ref().unwrap());
+                assert!(again > tick, "a look again moves the path's tick: {tick} then {again}");
             });
         });
     }
@@ -13416,6 +13652,18 @@ mod patched_tests {
         p.land(v(&["b.rs"]).into_iter(), None);
         assert_eq!(p.since(2), "3 1\nb.rs\n");
         assert_eq!(p.since(3), "3 0\n");
+        // A file the program read that the save changed (a kit) waits for the save's patch and is
+        // told with it; one whose save changed no compiled input is told alone, at a count of its
+        // own that installs no code (no file, no item, not every item); with none waiting, nothing.
+        p.waiting.push("/m/kits/hud.splash".into());
+        p.land(v(&["a.rs"]).into_iter(), Some(v(&["handle_event"])));
+        assert_eq!(p.since(3), "4 0\na.rs\n\thandle_event\n\u{1e}/m/kits/hud.splash\n", "the resource rides with its save's patch");
+        assert!(!p.land_resources(), "nothing waits: nothing is told");
+        assert_eq!(p.count, 4);
+        p.waiting.push("/m/kits/steel.splash".into());
+        assert!(p.land_resources());
+        assert_eq!(p.since(4), "5 0\n\u{1e}/m/kits/steel.splash\n", "told alone: a count of its own, no code");
+        assert!(p.waiting.is_empty());
     }
 }
 

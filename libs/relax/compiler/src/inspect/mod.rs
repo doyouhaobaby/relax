@@ -452,6 +452,11 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                     for path in crate::reload::read_by_program(of.iter().copied().filter(|a| !paths.iter().any(|p| p == a)), &ends_with_rel) {
                         out.line(&format!("{{\"read\":{}}}", json_str(path)));
                     }
+                    // a read file the program was told changed: the count it was told at, and
+                    // whether it read the file again since (devhub live's verdict of a resource)
+                    for (path, n, again) in crate::reload::told_resources(of.iter().copied().filter(|a| !paths.iter().any(|p| p == a)), &ends_with_rel) {
+                        out.line(&format!("{{\"told\":{},\"at\":{n},\"again\":{again}}}", json_str(path)));
+                    }
                     for path in paths {
                         if out.cancelled() { break; }
                         out.line(&format!("{{\"path\":{}}}", json_str(&path)));

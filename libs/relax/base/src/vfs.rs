@@ -116,6 +116,12 @@ static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
 /// edits folder holds later.
 static STD_VIEW: RwLock<BTreeMap<String, Option<Arc<[u8]>>>> = RwLock::new(BTreeMap::new());
 static ANY_STD_VIEW: AtomicBool = AtomicBool::new(false);
+/// The places in the edits folder the program wrote, removed or made ([`relax_vfs_edit`]), and
+/// their folders: a live session tells the program of a file it read that a save changed, never of
+/// its own writes ([`program_edited`]). A game that keeps its store in its home was told of 17 of
+/// its own writes (its objects, their temporary parts, its session files) in its first minute
+/// (11-22).
+static PROGRAM_EDITS: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
 
 /// Verify a complete subtree directly from the store (no disk/edits reads), then protect it
 /// from the app's edit overlay. Paths and bytes use the same digest as the compiler build.
@@ -533,6 +539,12 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
 
 /// The whiteout list changes on disk during a live run; stat it, parse only when it changes.
 static WHITEOUTS: RwLock<Option<(std::path::PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>> = RwLock::new(None);
+
+/// The edits folder's whiteouts (`.makepad-run-deleted`): each deleted file's place there, as
+/// [`edit_rel`] gives it; none without an edits folder. One read of the list.
+pub fn edits_deleted() -> BTreeSet<String> {
+    EDITS.read().unwrap().clone().map(|d| load_deleted(&d)).unwrap_or_default()
+}
 
 fn load_deleted(dir: &std::path::Path) -> BTreeSet<String> {
     std::fs::read_to_string(dir.join(".makepad-run-deleted")).unwrap_or_default().lines()
@@ -1847,10 +1859,33 @@ fn reconcile_seeded(dir: &std::path::Path) {
     }
 }
 
+/// Whether the program wrote, removed or made the edits folder's `rel` (or a file in it, for a
+/// folder): its change there is the program's own, no save's.
+pub fn program_edited(rel: &str) -> bool {
+    PROGRAM_EDITS.read().unwrap().contains(rel)
+}
+
+/// The program's write, removal or new folder at `disk` ([`PROGRAM_EDITS`]): its place in the
+/// edits folder and the folders above it (none for a folder mount's path, which writes in place).
+fn program_edit(disk: &std::path::Path) {
+    let Some(dir) = EDITS.read().unwrap().clone() else { return };
+    let Ok(rel) = disk.strip_prefix(&dir) else { return };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if PROGRAM_EDITS.read().unwrap().contains(&rel) { return; }
+    let mut edited = PROGRAM_EDITS.write().unwrap();
+    let mut at = rel.as_str();
+    // (a place's folders went in with it)
+    while !at.is_empty() && !edited.contains(at) {
+        edited.insert(at.to_string());
+        at = at.rsplit_once('/').map_or("", |(up, _)| up);
+    }
+}
+
 /// std's write into a virtual path (fs_vfs.rs): mode 0 the edited file or folder if any, 1 a
 /// write keeping the content, 2 a write replacing it, 3 a folder; and its read-only open, mode 4:
 /// the disk file it opens ([`read_disk_path`]). The disk path, held until `relax_vfs_release`; 0
-/// when there is none (the path cannot be written, or a read-only open reads a copy).
+/// when there is none (the path cannot be written, or a read-only open reads a copy). A write,
+/// removal or folder (modes 0 to 3) is the program's own ([`program_edited`]).
 pub extern "C" fn relax_vfs_edit(p: *const u8, n: usize, mode: u32, out: *mut *const u8, out_len: *mut usize) -> u64 {
     let path = unsafe { path_arg(p, n) };
     let r = match mode {
@@ -1861,6 +1896,7 @@ pub extern "C" fn relax_vfs_edit(p: *const u8, n: usize, mode: u32, out: *mut *c
         4 => read_disk_path(path).ok_or_else(|| not_found(path)),
         _ => Err(io::Error::new(io::ErrorKind::Unsupported, "an unknown edit mode")),
     };
+    if let (Ok(disk), 0..=3) = (&r, mode) { program_edit(disk); }
     match r {
         Ok(d) => hold(d.to_string_lossy().into_owned().into_bytes(), out, out_len),
         Err(_) => 0,
@@ -2355,4 +2391,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&ANY_LANDING_READ, AtomicBool::new(false));
     reset(&STD_VIEW, RwLock::new(BTreeMap::new()));
     reset(&ANY_STD_VIEW, AtomicBool::new(false));
+    reset(&PROGRAM_EDITS, RwLock::new(BTreeSet::new()));
 }
