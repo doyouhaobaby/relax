@@ -1652,13 +1652,6 @@ fn raw_report_frames(f: &os::fault::Fault, raw: &[u64], scanned: bool) {
     }
 }
 
-/// os/fault.rs `fatal_signal`'s report (from a signal handler: no allocation, no lock): the
-/// signal, the thread and what it was doing, the stack the fault came on and its room (`alt`: the
-/// thread's signal stack), the frames.
-/// Why a fault the host passes on finds no program handler behind the host's: what the program
-/// set for the signal (none, or its handler and how many changes the entry saw) against what the
-/// kernel and the host's chain hold.
-#[cfg(unix)]
 /// The watchdog's signal reached a thread with no kick counted for it, and the program has no
 /// handler of its own for it: the process ends by its default action. Said first, with what the
 /// kick count knows (os::thread::kick_counts), and the program's disposition (signal context).
@@ -1674,6 +1667,13 @@ pub(crate) fn raw_not_a_kick(sig: i32) {
     raw_no_handler(sig);
 }
 
+/// os/fault.rs `fatal_signal`'s report (from a signal handler: no allocation, no lock): the
+/// signal, the thread and what it was doing, the stack the fault came on and its room (`alt`: the
+/// thread's signal stack), the frames.
+/// Why a fault the host passes on finds no program handler behind the host's: what the program
+/// set for the signal (none, or its handler and how many changes the entry saw) against what the
+/// kernel and the host's chain hold.
+#[cfg(unix)]
 fn raw_no_handler(sig: i32) {
     let (h, domain, changes) = os::progsig::program_disposition(sig);
     let kernel = os::progsig::kernel_handler(sig);
