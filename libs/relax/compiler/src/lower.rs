@@ -2779,7 +2779,7 @@ impl<'a> Lcx<'a> {
         self.switch(head);
         let usize_ = self.u.tcx.tys.usize_;
         let scratch0 = self.f.slots.len() as u32;
-        let r = self.emit_instance(instance, vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll);
+        let r = self.emit_instance_on(instance, vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll, Some(fut_t));
         let rp = self.val_to_place(r);
         let pending = self.f.block();
         let vi_ready = self.variant_index(out_poll, LangItem::PollReady);
@@ -7345,7 +7345,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::ClosureFn) => {
                 // rustc_codegen_ssa/src/mir/rvalue.rs:536-550.
                 let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
-                let id = self.u.instance_fn_id(instance);
+                let id = self.u.instance_fn_id_for(instance, from);
                 let r = self.f.vreg(Cls::I);
                 self.emit(Inst::FnAddr(r, id));
                 Val::L(vec![r])
@@ -10173,7 +10173,7 @@ impl<'a> Lcx<'a> {
             TyKind::FnDef(d, args, _) if matches!(tk, TyKind::FnPtr(..) | TyKind::Int(_) | TyKind::Ptr(..)) => Some(Ok((*d, args.clone()))),
             TyKind::Closure(..) if matches!(tk, TyKind::FnPtr(..)) => {
                 let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
-                Some(Err(self.u.instance_fn_id(instance)))
+                Some(Err(self.u.instance_fn_id_for(instance, from)))
             },
             _ => None,
         };
@@ -11370,7 +11370,15 @@ impl<'a> Lcx<'a> {
 
     /// rustc_codegen_ssa/src/mir/block.rs: native instance dispatch. Closure
     /// bodies receive their environment and untupled inputs (abi.rs:61-73).
-    fn emit_instance(&mut self, instance: Instance, mut vals: Vec<(Val, TyId)>, ret: TyId) -> Val {
+    fn emit_instance(&mut self, instance: Instance, vals: Vec<(Val, TyId)>, ret: TyId) -> Val {
+        let on = vals.first().map(|v| v.1);
+        self.emit_instance_on(instance, vals, ret, on)
+    }
+
+    /// emit_instance with the type the instance was resolved for (`on`: the receiver's, which a
+    /// poll passes as an address): a closure's slot is the one its type names
+    /// (Unit::instance_fn_id_for).
+    fn emit_instance_on(&mut self, instance: Instance, mut vals: Vec<(Val, TyId)>, ret: TyId, on: Option<TyId>) -> Val {
         let args = instance.compact_args(&self.u.tcx);
         match instance.def {
             InstanceKind::Virtual(d, index) => {
@@ -11393,8 +11401,12 @@ impl<'a> Lcx<'a> {
                     crate::def_collector::NodeId::Closure(expr) => self.u.tcx.coroutines.contains(&(file, expr.0)),
                     _ => unreachable!(),
                 };
+                let id = match on {
+                    Some(t) => self.u.instance_fn_id_for(instance, t),
+                    None => self.u.instance_fn_id(instance),
+                };
                 // EXCEPTION(M7): Future::poll uses the existing coroutine slot ABI.
-                if coroutine { return self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret); }
+                if coroutine { return self.emit_call(Callee::Fn(id), vals, ret); }
                 assert_eq!(vals.len(), 2, "closure call receiver and tuple");
                 let tuple = vals.pop().unwrap();
                 let TyKind::Tuple(inputs) = self.kind(tuple.1) else { panic!("closure input tuple") };
@@ -11403,7 +11415,7 @@ impl<'a> Lcx<'a> {
                     let (field, ty) = self.project(&place, tuple.1, 0, i as u32);
                     vals.push((self.read_place(&field, ty), ty));
                 }
-                self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret)
+                self.emit_call(Callee::Fn(id), vals, ret)
             }
             InstanceKind::Item(d) if vals.len() == 1 && self.trivial_clone(d, ret) => {
                 // `Clone::clone` of a `TrivialClone` type is a bitwise copy by that trait's contract

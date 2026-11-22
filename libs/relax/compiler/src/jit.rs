@@ -7696,6 +7696,41 @@ impl Unit {
         })
     }
 
+    /// The slot `instance` resolves to for a value of type `t` (the closure itself, a reference
+    /// or pointer to it, or a `Pin` of one: a call's receiver, a vtable's or a fn pointer's
+    /// source): a closure's is the one its type names (closure_fn_id), as the code that made the
+    /// value names it. A live edit retargets the closure's def to the new text (commit_version),
+    /// so the def (instance_fn_id) names the closure as written now; code built from an earlier
+    /// version after the patch (a kept closure that never ran, a generic instance over an old
+    /// closure type) holds values of that version's closures, whose captures and body are the
+    /// old ones. An `async fn`'s body stays with the def: the fn's own slot makes it, which
+    /// follows the def to the current text (and a caller's view of its type may name an older
+    /// version, Instance::resolve_closure).
+    pub fn instance_fn_id_for(&self, instance: Instance, t: TyId) -> u32 {
+        if let InstanceKind::Item(d) = instance.def {
+            if self.prog.def(d).kind == DefKind::Closure {
+                let c = self.closure_in(t).filter(|&c| matches!(self.tcx.tys.kind(c), TyKind::Closure(_, ce, _) if ce & crate::tcx::ASYNC_FN_BODY == 0));
+                if let Some(id) = c.and_then(|c| self.closure_fn_id(c)) {
+                    return id;
+                }
+            }
+        }
+        self.instance_fn_id(instance)
+    }
+
+    /// The closure type `t` is, or refers to (through references, pointers and a `Pin`).
+    fn closure_in(&self, mut t: TyId) -> Option<TyId> {
+        let pin = self.tcx.lang_items.get(LangItem::Pin);
+        loop {
+            match self.tcx.tys.kind(t) {
+                TyKind::Closure(..) => return Some(t),
+                TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => t = *inner,
+                TyKind::Adt(d, args, _) if Some(*d) == pin => t = *self.tcx.tys.list(*args).first()?,
+                _ => return None,
+            }
+        }
+    }
+
     /// The function of a closure type (its body is lowered from the owner instance's).
     pub fn closure_fn_id(&self, t: TyId) -> Option<u32> {
         if let TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = self.tcx.tys.kind(t).clone() {
@@ -7801,7 +7836,7 @@ impl Unit {
                 }
                 let args = Instance::new_raw(method, args).compact_args(&self.tcx);
                 let instance = Instance::expect_resolve_for_vtable(&self.tcx, &self.prog, method, &args);
-                let id = self.instance_fn_id(instance);
+                let id = self.instance_fn_id_for(instance, src);
                 words.push(self.entry(id));
                 wsyms.push(Some(self.syms.intern(crate::syms::SymKind::Thunk(id), self.entry(id))));
             }

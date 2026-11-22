@@ -3920,8 +3920,9 @@ pub fn start(p: *mut u64) {
 /// added to `S` is refused naming the instance and the closure. The instance's O3 code, built
 /// before edit 1 with the closure inline (no build takes in a kept closure's body), is then the
 /// frame of a second wait: refused naming the copy. Both second calls read 5. Edit 1 also changes
-/// the captures of a closure the frame boxes after its waits: held for a restart only once the old
-/// code makes that box (`late_held`, the live loop's look). (O1 inlines nothing
+/// the captures of a closure the frame boxes after its waits (and of the two written inside it):
+/// held for a restart only once the old code makes that box (`late_held`, the live loop's look),
+/// and the box runs the old text, its inner closures included. (O1 inlines nothing
 /// into `pump` and no closure anywhere, so its first code calls the closure; O3 inlines as a
 /// session does.)
 #[test]
@@ -3942,11 +3943,12 @@ pub fn worker() {
     let a = flags();
     let k = 0u64;
     let c = move || { let s = S { n: 5 }; read(&s) + k };
-    let late = move || 11 + k;
+    let late = move || { let mid = move || { let inner = move || 11 + k; inner() + 10 }; mid() + 100 };
     let x = pump(&c, a, 1);
     a[2].store(x + pump(&c, a, 2), Ordering::SeqCst);
     let b: Box<dyn Fn() -> u64> = Box::new(late);
     unsafe { LATE_BOX = Some(b); }
+    a[1].store(unsafe { (*std::ptr::addr_of!(LATE_BOX)).as_ref().unwrap()() }, Ordering::SeqCst);
     a[3].store(1, Ordering::SeqCst);
 }
 pub fn start(p: *mut u64) {
@@ -3980,7 +3982,7 @@ pub fn start(p: *mut u64) {
     assert!(copied, "the instance's O3 code holds a copy of the closure");
     let o = rig.edit("lib.rs", &[("let k = 0u64;", "let k = 0u64;\n    let j = 0u64;"), ("read(&s) + k }", "read(&s) + k + j }"), ("11 + k;", "12 + k + j;")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the captures edit applies: {:?}", o.lines);
-    let late_at = format!("lib.rs:{}:", lib.lines().position(|l| l.contains("move || 11 + k")).unwrap() + 1);
+    let late_at = format!("lib.rs:{}:", lib.lines().position(|l| l.contains("let late = move ||")).unwrap() + 1);
     let held_late = |lines: &[String]| lines.iter().any(|l| l.starts_with(crate::reload::HELD) && l.contains(&late_at) && l.contains("its captures or signature changed"));
     assert!(!held_late(&o.lines), "the frame boxes the closure only later: no trait object of it to hold yet ({late_at}): {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("{ let s = S { n: 5 }; read(&s) + k + j }", "5u64 + k + j")]);
@@ -3998,6 +4000,7 @@ pub fn start(p: *mut u64) {
     let late: Vec<String> = unsafe { crate::reload::late_held(rig.up) }.into_iter().map(|x| x.1).collect();
     assert!(refused.0, "a frame of an instance over the closure edit 1 kept refuses the layout patch, naming it and the closure ({name}): {}", refused.1);
     assert!(held_late(&late) && late.len() == 1, "the old frame's box of the closure edit 1 kept, made after the patch, holds it for a restart then ({late_at}): {late:?}");
+    assert_eq!(rig.flag(1), 121, "the box runs the text the old frame made it with, the closures written inside it too (their captures changed: a new one would read past the old captures)");
     assert!(kept, "the edits leave the instance's O3 code in place");
     assert!(tiered.0, "a frame in the instance's O3 code, which holds a copy of the closure, refuses it naming the copy ({name}): {}", tiered.1);
     assert_eq!(rig.flag(2), 10, "the second calls, by the code the closure was made with");
