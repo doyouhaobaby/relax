@@ -3998,7 +3998,8 @@ pub fn start(p: *mut u64) {
 /// made after reads 5. Two more are stored and never called before edit 1 (no code of theirs
 /// exists, as a callback's that has not fired): edit 1 changes the first one's body, which its
 /// stored value then runs, and the second one's captures, which holds it for a restart (its
-/// stored value builds the old text at its first call).
+/// stored value builds the old text at its first call); an edit of another fn of the file says
+/// that one again (a patch of the file that held nothing back would end its wait for a restart).
 #[test]
 fn a_stored_kept_closure_blocks_a_layout_patch() {
     isolated_test!(a_stored_kept_closure_blocks_a_layout_patch);
@@ -4038,6 +4039,10 @@ pub fn unrun(p: *mut u64) {
     rig.call("unrun");
     assert_eq!(rig.flag(1), 8, "a stored closure that never ran, its body changed, runs the new body");
     assert_eq!(rig.flag(3), 9, "the held one runs the text it was stored with");
+    let o = rig.edit("lib.rs", &[("pub fn unrun(p: *mut u64) {", "pub fn unrun(p: *mut u64) {\n    let _ = 0u64;")]);
+    assert_eq!(o.rung, crate::reload::Rung::Patch, "the edit of another fn applies: {:?}", o.lines);
+    let still_held = o.lines.iter().any(|l| l.starts_with(crate::reload::HELD) && l.contains(&unrun_kept_at));
+    assert!(still_held, "a patch of another fn of the file says the held closure again, or the file's wait for a restart would end ({unrun_kept_at}): {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("{ let s = S { n: 5 }; read(&s) + k + j }", "5u64 + k + j")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the closure without S applies: {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);

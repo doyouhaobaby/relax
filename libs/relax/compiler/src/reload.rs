@@ -8000,6 +8000,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 out.lines.extend(held_closure_line(u, o, KEPT_NO_PLACE));
             }
         }
+        // the closures earlier patches of these files kept: said again while they are held (a
+        // patch of a file that holds nothing back ends that file's wait for a restart:
+        // reverted_waits), as a held item is held again by each save of its file
+        let reached: Vec<u32> = olds.iter().map(|&f| u.prog.first_version(f)).collect();
+        let mut again: Vec<u32> = u.kept_old.keys().copied().filter(|&o| {
+            !olds_c.contains(&o) && target(o) == o && matches!(u.fns[o as usize].key, FnKey::Closure(f, _, _) if reached.contains(&u.prog.first_version(f)))
+        }).collect();
+        again.sort_unstable();
+        for o in again {
+            out.lines.extend(held_closure_line(u, o, u.kept_old[&o].1));
+        }
         // (an old version that already forwards to its pair: the parent was rebuilt again with
         // its file unchanged, and the forwarder runs that slot's new code as it is)
         let mut settled: Vec<u32> = Vec::new();
