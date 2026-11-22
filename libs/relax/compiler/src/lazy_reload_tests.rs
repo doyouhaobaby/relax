@@ -3294,18 +3294,23 @@ pub fn value(out: &mut u32) {{
     // body changed beside it, the two swapped, `z` deleted, then a new closure and a changed body
     // in one gap (which became which is not known: the box keeps its code and waits for a
     // restart), then `z` deleted again: the box's kept version and that text are one to one (the
-    // box follows; z's old closure has no place, which says nothing). Each edit installs at most
-    // two forwarders per lineage (its cell and its previous version), the box's and z's.
+    // box follows; z's old closure has no place, which says nothing). Then the box's text twice:
+    // in a plain block the first one is the box (the same text is the same code), in a block that
+    // declares items it pairs with neither (a name the block binds can make it other code). Each
+    // edit installs at most two forwarders per lineage (its cell and its previous version).
     files.push(o.files[0]);
     let z = "    let z = move |x: u32| x * k + 100;\n    let _ = z(0);\n";
     let with = |body: String| src(7).replace("    Box::new(move |x| x * k + 7)\n", &body);
+    let twice = "    let b: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x * k + 9);\n    let _ = { let c = move |x| x * k + 9; c(0) };\n";
     let steps = [
-        ("z inserted above the box", with(format!("{z}    Box::new(move |x| x * k + 7)\n")), 22, false),
-        ("the box's body changed below z", with(format!("{z}    Box::new(move |x| x * k + 8)\n")), 23, false),
-        ("the box and z swapped", with(format!("    let b: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x * k + 8);\n{z}    b\n")), 23, false),
-        ("z deleted", with("    Box::new(move |x| x * k + 8)\n".to_string()), 23, false),
-        ("z inserted and the box's body changed in one gap", with(format!("{z}    Box::new(move |x| x * k + 9)\n")), 23, true),
-        ("z deleted: the box's kept version and the text one to one again", with("    Box::new(move |x| x * k + 9)\n".to_string()), 24, false),
+        ("z inserted above the box", with(format!("{z}    Box::new(move |x| x * k + 7)\n")), 22, None),
+        ("the box's body changed below z", with(format!("{z}    Box::new(move |x| x * k + 8)\n")), 23, None),
+        ("the box and z swapped", with(format!("    let b: Box<dyn Fn(u32) -> u32> = Box::new(move |x| x * k + 8);\n{z}    b\n")), 23, None),
+        ("z deleted", with("    Box::new(move |x| x * k + 8)\n".to_string()), 23, None),
+        ("z inserted and the box's body changed in one gap", with(format!("{z}    Box::new(move |x| x * k + 9)\n")), 23, Some("how many closures stand between its unchanged neighbours")),
+        ("z deleted: the box's kept version and the text one to one again", with("    Box::new(move |x| x * k + 9)\n".to_string()), 24, None),
+        ("the box's text again in a plain block", with(format!("{twice}    b\n")), 24, None),
+        ("the box's text again in a block that declares items", with(format!("{}    b\n", twice.replace("{ let c", "{ use std::ops::Add; let c").replace("c(0) }", "c(0).add(0) }"))), 24, Some("occurs more than once in a block that declares items")),
     ];
     for (what, text, want, held) in steps {
         let (before, cell) = (u.forwards.len(), u.forward_of(first));
@@ -3314,8 +3319,8 @@ pub fn value(out: &mut u32) {{
         files.push(o.files[0]);
         assert_eq!(run(), want, "{what}: the stored box's value");
         let lines: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
-        if held {
-            assert!(lines.len() == 1 && lines[0].contains("how many closures stand between its unchanged neighbours"), "{what}: one held line, for the box: {:?}", o.lines);
+        if let Some(why) = held {
+            assert!(lines.len() == 1 && lines[0].contains(why), "{what}: one held line, for the box: {:?}", o.lines);
             assert_eq!(u.forward_of(first), cell, "{what}: the box's cell jumps to the code the box ran");
         } else {
             assert!(lines.is_empty(), "{what}: nothing waits for a restart: {:?}", o.lines);

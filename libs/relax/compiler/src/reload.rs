@@ -5007,16 +5007,19 @@ const KEPT_SHAPE: &str = "its captures or signature changed";
 const KEPT_UNMATCHED: &str = "no closure of the new text was matched to it";
 const KEPT_COUNT: &str = "the edit changed how many closures stand between its unchanged neighbours, so its new version is not known";
 const KEPT_UNDER_KEPT: &str = "the closure around it keeps its old code";
+const KEPT_REPEAT: &str = "its text occurs more than once in a block that declares items, where the same text can be other code";
 
 /// The closures of one version of a fn item (its checked body for that file version): each
 /// closure expression in ExprId order (source order among siblings), the smallest other closure
 /// around it, and its text: its tokens over its whole span, nested closures included, as the
 /// item classifier compares them (toks_norm: whitespace, comments and a macro expansion's form
-/// do not count).
+/// do not count); and whether it stands in a block of the fn that declares items (its body
+/// block aside), whose names its text may resolve to.
 struct ClosureTree {
     exprs: Vec<u32>,
     up: Vec<Option<usize>>,
     texts: Vec<Vec<u8>>,
+    scoped: Vec<bool>,
 }
 
 impl ClosureTree {
@@ -5041,7 +5044,9 @@ impl ClosureTree {
             .map(|c| (0..exprs.len()).filter(|&d| size(d) > size(c) && pf.expands_within(spans[c].0, spans[d].0, spans[d].1)).min_by_key(|&d| size(d)))
             .collect();
         let texts = spans.iter().map(|&(lo, hi)| toks_norm(pf, lo, hi, &[]).pop().unwrap_or_default()).collect();
-        Some(ClosureTree { exprs, up, texts })
+        let blocks = spans.first().map_or_else(Vec::new, |&(at, _)| item_blocks(u, pf, file, at));
+        let scoped = spans.iter().map(|&(lo, _)| blocks.iter().any(|&(bl, bh)| pf.expands_within(lo, bl, bh))).collect();
+        Some(ClosureTree { exprs, up, texts, scoped })
     }
 
     fn len(&self) -> usize {
@@ -5058,6 +5063,35 @@ impl ClosureTree {
     }
 }
 
+/// The spans of the blocks that declare items in the fn item around byte `at` of file `file`
+/// (its parse's index of them: Program::body_blocks), the fn's body block left out: its items
+/// are in scope for every closure of the fn. Outside a fn body (a const's), every such block
+/// of the file.
+fn item_blocks(u: &Unit, pf: &crate::parser::ParsedFile, file: u32, at: u32) -> Vec<(u32, u32)> {
+    let Some(index) = u.prog.body_blocks(file).filter(|b| !b.is_empty()) else { return Vec::new() };
+    let span = |b: crate::ast::BlockId| { let k = pf.ast.block(b); (k.lo, k.hi) };
+    // the innermost fn body around `at`
+    let body = pf.ast.items.iter()
+        .filter_map(|it| match &it.kind { crate::ast::ItemKind::Fn(_, body, _) => body.get(), _ => None })
+        .map(|b| (b, span(b)))
+        .filter(|&(_, (lo, hi))| pf.expands_within(at, lo, hi))
+        .min_by_key(|&(_, (lo, hi))| hi - lo);
+    let Some((body, _)) = body else {
+        return index.iter().filter(|(_, (items, _))| !items.is_empty()).map(|(&b, _)| span(crate::ast::BlockId(b))).collect();
+    };
+    let mut out = Vec::new();
+    let mut todo: Vec<crate::ast::BlockId> = index.get(&body.0).map_or_else(Vec::new, |x| x.1.clone());
+    while let Some(b) = todo.pop() {
+        if let Some((items, below)) = index.get(&b.0) {
+            if !items.is_empty() {
+                out.push(span(b));
+            }
+            todo.extend(below.iter().copied());
+        }
+    }
+    out
+}
+
 /// Which closure of the new version of a fn item each closure of an old version is (an index
 /// into `new`), or why none is. Syntax only; the caller checks each pair's shape
 /// ([`closure_shape`]). Per group of siblings (the closures with the same closure around them),
@@ -5068,16 +5102,30 @@ impl ClosureTree {
 ///   end), an equal number of old and new closures pair in order (their bodies changed), and
 ///   their own siblings are aligned the same way; a changed number keeps every old closure
 ///   there (which one became which is not known);
+/// - a text that occurs more than once among the siblings on either side, one of them in a
+///   block that declares items, pairs neither way: the same text there and elsewhere can be other
+///   code (a name the block's items bind), so its closures are kept;
 /// - a closure inside a kept one is kept.
 fn align_closures(old: &ClosureTree, new: &ClosureTree) -> Vec<Result<usize, &'static str>> {
     let mut out = vec![Err(KEPT_UNDER_KEPT); old.len()];
     let mut groups: Vec<(Option<usize>, Option<usize>)> = vec![(None, None)];
     while let Some((po, pn)) = groups.pop() {
         let (os, ns) = (old.children(po), new.children(pn));
+        // a repeated text with one of its closures in a block that declares items
+        let ambiguous = |t: &[u8]| {
+            let (o, n) = (os.iter().filter(|&&x| old.texts[x] == t), ns.iter().filter(|&&x| new.texts[x] == t));
+            (o.clone().count() > 1 || n.clone().count() > 1) && (o.clone().any(|&x| old.scoped[x]) || n.clone().any(|&x| new.scoped[x]))
+        };
+        let skip_old: Vec<bool> = os.iter().map(|&o| ambiguous(&old.texts[o])).collect();
+        let skip_new: Vec<bool> = ns.iter().map(|&n| ambiguous(&new.texts[n])).collect();
         // the same text: the old one at position i to the new one at position pair[i]
         let mut pair: Vec<Option<usize>> = vec![None; os.len()];
         let mut taken: Vec<Option<usize>> = vec![None; ns.len()];
         for (i, &o) in os.iter().enumerate() {
+            if skip_old[i] {
+                out[o] = Err(KEPT_REPEAT);
+                continue;
+            }
             let k = os[..i].iter().filter(|&&x| old.texts[x] == old.texts[o]).count();
             if let Some(j) = (0..ns.len()).filter(|&j| new.texts[ns[j]] == old.texts[o]).nth(k) {
                 pair[i] = Some(j);
@@ -5092,14 +5140,14 @@ fn align_closures(old: &ClosureTree, new: &ClosureTree) -> Vec<Result<usize, &'s
         let gap_old = |i: usize| ((0..i).rev().find(|&k| pair[k].is_some()), (i + 1..os.len()).find(|&k| pair[k].is_some()));
         let gap_new = |j: usize| ((0..j).rev().find_map(|k| taken[k]), (j + 1..ns.len()).find_map(|k| taken[k]));
         let mut gaps: Vec<((Option<usize>, Option<usize>), Vec<usize>, Vec<usize>)> = Vec::new();
-        for i in (0..os.len()).filter(|&i| pair[i].is_none()) {
+        for i in (0..os.len()).filter(|&i| pair[i].is_none() && !skip_old[i]) {
             let g = gap_old(i);
             match gaps.iter_mut().find(|x| x.0 == g) {
                 Some(x) => x.1.push(os[i]),
                 None => gaps.push((g, vec![os[i]], Vec::new())),
             }
         }
-        for j in (0..ns.len()).filter(|&j| taken[j].is_none()) {
+        for j in (0..ns.len()).filter(|&j| taken[j].is_none() && !skip_new[j]) {
             let g = gap_new(j);
             if let Some(x) = gaps.iter_mut().find(|x| x.0 == g) {
                 x.2.push(ns[j]);
@@ -7846,7 +7894,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Ok(n) => pairs.push((o, n)),
                 Err(w) => {
                     // (a cell that keeps forwarding to its kept target is that target's line)
-                    if target(o) == o && [KEPT_SHAPE, KEPT_COUNT, KEPT_UNDER_KEPT].contains(&w) {
+                    if target(o) == o && [KEPT_SHAPE, KEPT_COUNT, KEPT_REPEAT, KEPT_UNDER_KEPT].contains(&w) {
                         out.lines.push(kept_closure_line(u, o, w));
                     }
                     why.push((o, w));
