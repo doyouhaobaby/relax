@@ -1,5 +1,6 @@
 // Repros for rustc tests/ui run-pass failures (conformance lane). Each test names the rustc
-// suite file it was reduced from; all of them pass under rustc (`rustc --test conform.rs`).
+// suite file it was reduced from; all of them pass under rustc (`rustc --test conform.rs`) and
+// under the JIT: tools/run/fixture/agree.sh runs the file among its named cases.
 use std::process::{ExitCode, Termination};
 use std::rc::Rc;
 
