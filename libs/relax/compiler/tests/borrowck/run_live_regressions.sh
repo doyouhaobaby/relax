@@ -89,7 +89,12 @@ import re, sys
 log, name = open(sys.argv[1], errors="replace").read().splitlines(), sys.argv[2]
 blocks, cur = [], None
 for l in log:
-    if re.match(r"(error|warning)\b", l) or l.startswith("relax "):
+    # one line, a diagnostic of its own: `<file>:<line>:<col>: E0425: ..` (or `..: warning: ..`)
+    flat = re.match(r"\s*\S+\.rs:\d+:\d+: (\S+)", l)
+    if flat:
+        cur = None
+        if re.match(r"(E\d{4}|error)\b", flat[1]): blocks.append([l])
+    elif re.match(r"(error|warning)\b", l) or l.startswith("relax "):
         cur = [l] if l.startswith("error") else None
         if cur is not None: blocks.append(cur)
     elif cur is not None:
