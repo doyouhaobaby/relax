@@ -186,14 +186,42 @@ pub fn current() -> u64 {
 
 /// Puts the calling thread in the domain whose block is `base`; returns the one it was in.
 pub fn enter(base: u64) -> u64 {
-    let slot = crate::jit::tls_block() as *mut u64;
     register_current(base);
+    select(base)
+}
+
+/// Switches the static block and heap together, preserving the thread's registrations.
+pub(crate) fn select(base: u64) -> u64 {
+    let slot = crate::jit::tls_block() as *mut u64;
     let heap = domains().iter().find(|d| d.info.base == base && base != 0)
         .and_then(|d| d.heap.as_deref()).map_or(std::ptr::null(), |h| h as *const _);
     unsafe {
         crate::zone_alloc::domain::enter(heap);
         std::mem::replace(&mut *slot, base)
     }
+}
+
+/// An initializer borrows the compiler thread. Its scope owns only a registration it added.
+pub(crate) fn enter_initializer(base: u64, previous: u64) -> impl Drop {
+    struct Initializer {
+        base: u64,
+        previous: u64,
+        token: u64,
+        _thread: std::marker::PhantomData<*mut ()>,
+    }
+    impl Drop for Initializer {
+        fn drop(&mut self) {
+            if current() != self.previous { select(self.previous); }
+            if self.token != 0 {
+                let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+                t.registrations.retain(|&r| r != (self.base, self.token));
+                thread_finished(self.base, self.token);
+            }
+        }
+    }
+    let scope = Initializer { base, previous, token: register_current(base), _thread: std::marker::PhantomData };
+    if base != previous { select(base); }
+    scope
 }
 
 /// A domain's code as something native calls it back with (`foreign_scope`): its static block
@@ -349,11 +377,11 @@ pub extern "C" fn relax_domain_enter(base: u64, token: u64) {
     })
 }
 
-fn register_current(base: u64) {
-    if base == 0 { return; }
+fn register_current(base: u64) -> u64 {
+    if base == 0 { return 0; }
     let _kept = crate::zone_alloc::kept();
     let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
-    if t.registrations.iter().any(|r| r.0 == base) { return; }
+    if t.registrations.iter().any(|r| r.0 == base) { return 0; }
     let token = relax_domain_reserve(base);
     if token != 0 {
         t.registrations.push((base, token));
@@ -365,6 +393,7 @@ fn register_current(base: u64) {
             }
         }
     }
+    token
 }
 
 static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -439,8 +468,8 @@ pub extern "C" fn relax_domain_name(name: *const u8) {
     })
 }
 
-/// Called after the TLS block and every Relax std TLS destructor are finished (also on a
-/// failed OS spawn, while the parent still holds its own registration).
+/// Releases one reservation when a thread finishes its TLS destructors, its spawn fails, or
+/// the initializer that reserved it returns. The last release can complete domain teardown.
 pub extern "C" fn thread_finished(base: u64, token: u64) {
     crate::jit::host_boundary("thread_finished", move || {
         if token == 0 { return; }
@@ -1994,6 +2023,59 @@ mod tests {
     use super::*;
     use crate::jit::FnKey;
     use crate::program::DefId;
+
+    #[test]
+    fn initializer_scopes_only_retire_their_own_registration() {
+        isolated_test!(initializer_scopes_only_retire_their_own_registration);
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 0x7000_0000;
+        let saved = current();
+        register_boot("fixture", base);
+        let harness = crate::inspect::threads::self_os_id();
+        std::thread::spawn(move || {
+            let previous = current();
+            let count = || threads_besides(base, harness).len();
+            {
+                let _outer = enter_initializer(base, previous);
+                assert_eq!(current(), base);
+                assert_eq!(count(), 1, "outer initializer owns one reservation");
+                {
+                    let _inner = enter_initializer(base, base);
+                    assert_eq!(count(), 1, "nested initializer shares the reservation");
+                }
+                assert_eq!(current(), base);
+                assert_eq!(count(), 1, "outer initializer is still running");
+            }
+            assert_eq!(current(), previous);
+            assert_eq!(count(), 0, "return releases the outer reservation");
+
+            let panic = std::panic::catch_unwind(|| {
+                let _scope = enter_initializer(base, previous);
+                panic!("unwind through the initializer");
+            });
+            assert!(panic.is_err());
+            assert_eq!(current(), previous);
+            assert_eq!(count(), 0, "unwinding releases the reservation");
+
+            select(base);
+            {
+                let _scope = enter_initializer(base, base);
+                assert_eq!(count(), 1, "an already selected domain can still need a reservation");
+            }
+            assert_eq!(count(), 0, "the scope owned that reservation");
+            { let _scope = enter_initializer(previous, base); }
+            assert_eq!(current(), base);
+            assert_eq!(count(), 0, "restoring a selected domain must leave it unregistered");
+            enter(base);
+            { let _scope = enter_initializer(base, base); }
+            assert_eq!(count(), 1, "a plain entry lasts until thread exit");
+        }).join().unwrap();
+        assert!(threads_besides(base, harness).is_empty(), "the worker's TLS retired its plain entry");
+        select(saved);
+        let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+        t.registrations.retain(|&(b, _)| b != base);
+        domains().retain(|d| d.info.base != base);
+    }
 
     /// Two domains on the same compiled code: each has its own statics, a pointer inside a static
     /// image points into its own block, a static laid out after a domain exists is copied into it.

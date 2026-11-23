@@ -8863,7 +8863,7 @@ impl Unit {
                 let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
                 let result = {
                     let _scope = ConstEvalScope::enter(&self.prog, body.def, true);
-                    unsafe { call_jit(self as *mut Unit, entry, buf) }
+                    unsafe { call_jit_initializer(self as *mut Unit, entry, buf) }
                 };
                 if BUSY_PENDING.with(|b| b.replace(false)) {
                     std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
@@ -9310,7 +9310,7 @@ impl Unit {
                     let entry = self.entry(id);
                     self.exec_note(id, crate::exec_profile::CALL);
                     self.exec_event(id, "call");
-                    let result = { let _scope = ConstEvalScope::enter(&self.prog, d, limited); unsafe { call_jit(self as *mut Unit, entry, buf) } };
+                    let result = { let _scope = ConstEvalScope::enter(&self.prog, d, limited); unsafe { call_jit_initializer(self as *mut Unit, entry, buf) } };
                     match result {
                         Ok(_) if crate::ctfe::same_value(self, t, tmp, buf, 0) => return Some(buf),
                         Ok(_) => self.note_error(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
@@ -9377,7 +9377,7 @@ impl Unit {
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
             r = {
                 let _scope = ConstEvalScope::enter(&self.prog, d, limited);
-                let r = unsafe { call_jit(self as *mut Unit, entry, buf) };
+                let r = unsafe { call_jit_initializer(self as *mut Unit, entry, buf) };
                 #[cfg(test)]
                 note_native_steps(&self.prog, d);
                 r
@@ -10388,6 +10388,12 @@ pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicI
     call_jit_in(u, (&*u).syms.dom0(), entry, arg)
 }
 
+/// `call_jit` for a constant or static initializer the compiler runs on its own thread: the
+/// thread is in the unit's domain for the call only (call_jit_with_domain).
+unsafe fn call_jit_initializer(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
+    call_jit_with_domain(u, (&*u).syms.dom0(), entry, arg, true)
+}
+
 /// A recovery point inside running JIT code (core::intrinsics_rt::catch_panic: std's
 /// catch_unwind, every script VM call): `entry(arg)` runs in the unit, domain and heap phase of
 /// the code around it, which an entry through `call_jit_in` set up and noted (owner diagnostics,
@@ -10406,7 +10412,7 @@ unsafe fn call_jit_nested(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pan
     let r = call_jit_inner(u, entry, arg);
     if r.is_err() {
         if crate::domain::current() != here {
-            crate::domain::enter(here);
+            crate::domain::select(here);
         }
         let _ = CUR_UNIT.try_with(|c| c.set(u));
     }
@@ -10419,6 +10425,10 @@ unsafe fn call_jit_nested(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pan
 /// `call_jit` in the domain whose static block is at `domain` (domain.rs): the code runs on the
 /// calling thread, whose domain comes back after the call.
 pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
+    call_jit_with_domain(u, domain, entry, arg, false)
+}
+
+unsafe fn call_jit_with_domain(u: *mut Unit, domain: u64, entry: u64, arg: u64, initializer: bool) -> Result<u64, PanicInfo> {
     // the innermost host activity of the thread is this call, not a compile around it
     let _innermost = CompileInnermost::set(false);
     // JIT code and the runtime helpers it calls allocate in the program's heap (zone_alloc.rs)
@@ -10439,16 +10449,24 @@ pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Re
     // in the domain the thread is in does not enter it again (that re-registers the thread and
     // re-selects the same heap under the registry lock). A call that returned put back whatever
     // it switched; after a panic or fault the domain is checked, not assumed: it unwound past the
-    // restores of the nested calls it crossed.
+    // restores of the nested calls it crossed. Putting the domain back only selects it: the
+    // thread was registered there when it entered, so a restore adds no registration. A constant
+    // or static initializer (`call_jit_initializer`) borrows the compiler's thread: it registers
+    // it only for the call and retires that registration after (domain::enter_initializer), so a
+    // proc-macro return or a failed call leaves no stale thread in the domain.
     let here = crate::domain::current();
-    let switch = domain != here;
-    if switch {
-        crate::domain::enter(domain);
-    }
-    let r = call_jit_inner(u, entry, arg);
-    if switch || (r.is_err() && crate::domain::current() != here) {
-        crate::domain::enter(here);
-    }
+    let r = if initializer {
+        let _scope = crate::domain::enter_initializer(domain, here);
+        call_jit_inner(u, entry, arg)
+    } else {
+        let switch = domain != here;
+        if switch { crate::domain::enter(domain); }
+        let r = call_jit_inner(u, entry, arg);
+        if switch || (r.is_err() && crate::domain::current() != here) {
+            crate::domain::select(here);
+        }
+        r
+    };
     if sampled {
         sampler_leave();
     }
