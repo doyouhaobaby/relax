@@ -229,11 +229,16 @@ fn guard_filters_non_app() {
     assert!(app_crate(&prog, 0));
     set_app_scope(Vec::new());
     assert!(!app_crate(&prog, 0));
-    // The one all-crates switch applies on top of the compiled default.
+    // The one all-crates switch applies on top of the compiled default. It is read once a run: a
+    // change of the environment is seen after the run's end (reset_statics), as a fresh process
+    // sees it.
     assert!(!admit(&prog, 0));
     std::env::set_var("RELAX_GANDALF_ALL", "1");
+    assert!(!admit(&prog, 0), "the switch is read once a run");
+    unsafe { super::super::event::reset_statics() };
     assert!(admit(&prog, 0));
     std::env::set_var("RELAX_GANDALF_ALL", "0");
+    unsafe { super::super::event::reset_statics() };
     assert!(!admit(&prog, 0));
     std::env::remove_var("RELAX_GANDALF_ALL");
     unsubscribe(id);

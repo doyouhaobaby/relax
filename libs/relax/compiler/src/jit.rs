@@ -13099,7 +13099,7 @@ fn o2_noop(why: usize) {
 static O2_TAKEN: AtomicU64 = AtomicU64::new(0);
 /// O2 takes dropped by take_prefronted, by cause (TD_*), and for failed fronts by AF_* reason
 /// (own slot, a candidate's)
-static O2_TAKE_DROPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static O2_TAKE_DROPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static O2_FRONT_FAILS: [[AtomicU64; 15]; 2] = [[const { AtomicU64::new(0) }; 15], [const { AtomicU64::new(0) }; 15]];
 
 /// Counts a dropped O2 build of slot `id` (`why`: D_*); RELAX_O2_TRACE names it. A unit
@@ -15157,6 +15157,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     };
     let from_ahead = lowered.is_none();
     if owner::bailing() { O3_OWNER[20].fetch_add(1, Ordering::Relaxed); }
+    // (inside a build tree's take: what this preparation asks for comes after these, tree_bail)
+    let asks0 = tree_asks_len();
     let r = match lowered {
         Some(f) => Ok(f),
         None => {
@@ -15381,9 +15383,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if want && u.fns[*c as usize].rir.is_none() && u.fns[*c as usize].building && !open_here(*c) {
                 TAINTED.with(|t| t.set(true));
             }
-            let open = u.fns[*c as usize].building;
+            // (an ancestor of this build tree's take is open as the recursion's own are: tree_open)
+            let open = u.fns[*c as usize].building || tree_open(*c);
             if want && u.fns[*c as usize].rir.is_none() && relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
-                let why = if open { if open_here(*c) { "open on this request: own recursion" } else { "open lower on the owner's stack: tainted" } } else if u.fns[*c as usize].build_err.is_some() { "build error" } else { "" };
+                let why = if open { if open_here(*c) || !u.fns[*c as usize].building { "open on this request: own recursion" } else { "open lower on the owner's stack: tainted" } } else if u.fns[*c as usize].build_err.is_some() { "build error" } else { "" };
                 if !why.is_empty() {
                     eprintln!("inline-trace-o1 {}: out fn#{} {} ({})", u.fns[id as usize].name, c, u.fns[*c as usize].name, why);
                 }
@@ -15394,7 +15397,15 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     skipped.push((*c, why));
                 }
             }
-            if want && u.fns[*c as usize].rir.is_none() && !open && u.fns[*c as usize].build_err.is_none() {
+            // inside a build tree's take the candidate is asked for, not built here (tree_ask): its
+            // thread builds it first, in its own takes, and takes this body again
+            let asked = if want && u.fns[*c as usize].rir.is_none() && !open && u.fns[*c as usize].build_err.is_none() && tree_askable(u, *c, defer) {
+                tree_ask(*c, if defer || baseline { HOW_NEW } else { HOW_T0 })
+            } else { TREE_OUT };
+            if asked == TREE_LEFT {
+                left.push(*c);
+            }
+            if want && u.fns[*c as usize].rir.is_none() && !open && u.fns[*c as usize].build_err.is_none() && asked == TREE_OUT {
                 let tn = cpu_ns();
                 if baseline && !defer {
                     // a baseline caller inlines the callee's normal body too (never a start
@@ -15433,7 +15444,14 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // (a caller below O2 whose callee's RIR is an O2 build's full body: the callee's normal
             // body, built from a fresh lowering and kept beside the full one)
             let fresh = !full && needs_normal(&(&*up).fns[*c as usize]);
-            if want && ((&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) || fresh) {
+            // (an open ancestor of a build tree's take is not upgraded, as split_upgrade does not
+            // upgrade a slot being built)
+            let up_wanted = want && ((&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) || fresh) && !tree_open(*c);
+            let asked = if up_wanted && (&*up).fns[*c as usize].build_err.is_none() && tree_askable(&*up, *c, defer) { tree_ask(*c, if fresh { HOW_BESIDE } else { HOW_UP }) } else { TREE_OUT };
+            if asked == TREE_LEFT {
+                left.push(*c);
+            }
+            if up_wanted && asked == TREE_OUT {
                 let tn = cpu_ns();
                 if defer {
                     // the upgrade's preparation now, its optimisation with the caller's back end
@@ -15544,6 +15562,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     if owner::bailing() {
         left.extend(bail_for_fronts(Vec::new()));
     }
+    // inside a build tree's take: the candidates and fact callees it asked for are built first
+    // (its lowering goes back: GiveBack)
+    tree_bail(id, asks0);
     left.sort_unstable();
     left.dedup();
     func.pending = left;
@@ -15795,17 +15816,34 @@ unsafe fn rir_for_fact(up: *mut Unit, c: u32, unknown: &std::cell::RefCell<Vec<u
         wait_inflight(up, c);
     }
     let e = &(&*up).fns[c as usize];
-    if e.rir.is_none() && e.building {
+    // (an ancestor of a build tree's take is open as one being built here is: tree_open)
+    let open = e.building || tree_open(c);
+    if e.rir.is_none() && open {
         // open in an earlier request lower on the owner's stack: this build depends on that timing
-        if !open_here(c) {
+        if e.building && !open_here(c) {
             TAINTED.with(|t| t.set(true));
         }
         return None;
     }
-    if stale(e) && !e.building {
-        let _w = BuildWhy::enter(2);
-        if build_rir_mode(up, c, RirMode::Normal).is_err() && (&*up).fns[c as usize].rir.is_none() {
-            return None;
+    if stale(e) && !open {
+        // inside a build tree's take it is asked for (tree_ask), as an inline candidate is: built
+        // first by the take's thread, in its own takes (build_rir_mode builds no normal body
+        // beside a full one for an O2 build: nothing to ask)
+        let would = (e.rir.as_ref().is_none_or(|r| upgradable(r)) || !o2_build()) && tree_askable(&*up, c, false);
+        let how = if e.rir.is_none() { HOW_NEW } else if e.rir.as_ref().is_some_and(|r| upgradable(r)) { HOW_UP } else { HOW_BESIDE };
+        match if would { tree_ask(c, how) } else { TREE_OUT } {
+            TREE_OUT => {
+                let _w = BuildWhy::enter(2);
+                if build_rir_mode(up, c, RirMode::Normal).is_err() && (&*up).fns[c as usize].rir.is_none() {
+                    return None;
+                }
+            }
+            TREE_LEFT => {
+                unknown.borrow_mut().push(c);
+                return None;
+            }
+            TREE_ASKED => return None,
+            _ => {}
         }
     }
     let r = inline_body(&(&*up).fns[c as usize]).cloned();
@@ -23551,9 +23589,15 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
         // The O3 build that follows finds the RIR built (no second build).
         let missing = |up: *mut Unit| needs_rir(up) || (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| to_upgrade(r));
         if owner::publish(|| missing(up)) {
+            // (a build tree's takes: its inline candidates are built first, off the owner,
+            // build_children; the slot's own build is all that is left on the owner)
+            let mut tree = Tree::default();
+            let epoch = PATCH_EPOCH.load(Ordering::SeqCst);
             for _ in 0..PREFRONT_ROUNDS {
-                let Ok((left, needs)) = owner::publish_or_bail(|| {
+                let tree_ref = &tree;
+                let (left, needs) = match owner::publish_or_bail(|| {
                     let _ = owner::take_needs();
+                    let _t = TreeTake::enter(tree_ref, &[]);
                     if needs_rir(up) {
                         let _ = build_rir_or_skip(up, id, RirMode::Tier0);
                     }
@@ -23561,7 +23605,16 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
                         let _ = build_rir_or_skip(up, id, RirMode::Normal);
                     }
                     (missing(up), owner::take_needs())
-                }) else { break };
+                }) {
+                    Ok(r) => r,
+                    Err(b) if b.what == "build" => {
+                        if !build_children(up, &front, epoch, &[], id, &b.builds, &mut tree) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 if !left || needs.is_empty() {
                     break;
                 }
@@ -24171,6 +24224,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // assembly read these, off the owner when prefronted; and "the publish stopped at a level end"
     let views: std::cell::RefCell<HashMap<u32, O3View>> = Default::default();
     let scan = std::cell::Cell::new(false);
+    // the candidates' takes are a build tree's: a candidate's own inline candidates are built first,
+    // each in its own takes (build_children), and the candidate goes again
+    let mut tree = Tree::default();
     let snapped = loop {
     if !resume.replace(false) {
     fronts.borrow_mut().clear();
@@ -24546,18 +24602,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // snapshot as before, or left out of it.
     // (a take: a candidate needing a front bails alone, inside, and is left to the snapshot)
     // (CAND_TAKE candidates per take: a publish is bounded by its item count)
-    let (mut preps, mut gave): (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>) = (Vec::new(), Vec::new());
+    let (mut preps, mut gave, mut asked): (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>, Vec<(u32, Vec<(u32, u8)>)>) = (Vec::new(), Vec::new(), Vec::new());
     for chunk in ids.chunks(CAND_TAKE) {
         // (a take that stopped for a program request: the rest in the next)
         let mut rest = chunk;
         while !rest.is_empty() {
+            let tree_ref = &tree;
             match owner::publish_or_bail(|| {
-                let (p, g, looked) = o3_candidates_begin(up, rest);
-                (p, g, looked, owner::take_needs())
+                let _t = TreeTake::enter(tree_ref, &[]);
+                let (p, g, a, looked) = o3_candidates_begin(up, rest);
+                (p, g, a, looked, owner::take_needs())
             }) {
-                Ok((p, g, looked, n)) => {
+                Ok((p, g, a, looked, n)) => {
                     preps.extend(p);
                     gave.extend(g);
+                    asked.extend(a);
                     needs.extend(n);
                     rest = &rest[looked..];
                 }
@@ -24568,10 +24627,36 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         }
     }
+    let prepped: Vec<u32> = preps.iter().map(|p| p.0).collect();
+    if !preps.is_empty() {
+        let to = cpu_ns();
+        let mut done: Vec<Deferred> = Vec::new();
+        for (c, prep) in std::mem::take(&mut preps) {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
+            done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
+        }
+        TIER1_SNAP_OFF[0].fetch_add(done.iter().filter(|d| d.1.is_ok()).count() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
+        owner::publish(|| o3_candidates_finish(up, epoch0, done));
+    }
+    // the candidates that asked for their own inline candidates: those built first (after this
+    // round's finish stored what it prepared), each in its own takes; the candidate goes again in
+    // the next round, as one that gave back, and a round that built some made progress
+    // (a tree that ended -- a patch landed, the process ends -- builds no more this round)
+    let (mut drove, mut ended) = (false, false);
+    for (c, asks) in asked {
+        if !ended {
+            match build_children(up, &front, epoch0, &[], c, &asks, &mut tree) {
+                true => drove = true,
+                false => ended = true,
+            }
+        }
+        gave.push((c, Vec::new()));
+    }
     {
         let mut so = split_out.borrow_mut();
         for x in &ids { so.insert(x.0, 3); }
-        for p in &preps { so.insert(p.0, 2); }
+        for &c in &prepped { so.insert(c, 2); }
         for c in &gave { so.insert(c.0, 1); }
     }
     // the fronts this round's builds asked for: the next round makes them (each slot up to
@@ -24579,7 +24664,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // inline candidates per round, as deep as they go: a bound on the tries left the deeper ones
     // out, the build installed incomplete and was built again when their bodies came (an app's
     // warm run: 277 incomplete O3 builds, the big ones built 3-5 times)
-    let progress = needs.iter().any(|s| refronted.get(s).is_none_or(|n| *n < FRONT_TRIES));
+    let progress = drove || needs.iter().any(|s| refronted.get(s).is_none_or(|n| *n < FRONT_TRIES));
     for (c, wanted) in gave {
         let mut l = left_out.borrow_mut();
         let n = l.entry(c).or_insert(0);
@@ -24601,17 +24686,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             split_tried.borrow_mut().remove(&(c, false));
             split_tried.borrow_mut().remove(&(c, true));
         }
-    }
-    if !preps.is_empty() {
-        let to = cpu_ns();
-        let mut done: Vec<Deferred> = Vec::new();
-        for (c, prep) in preps {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-            done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
-        }
-        TIER1_SNAP_OFF[0].fetch_add(done.iter().filter(|d| d.1.is_ok()).count() as u64, Ordering::Relaxed);
-        TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
-        owner::publish(|| o3_candidates_finish(up, epoch0, done));
     }
     };
     // lowerings ahead that no snapshot build took (a candidate built meanwhile, or given way):
@@ -26472,13 +26546,15 @@ pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0
 /// An O3 build's inline candidates (`ids`, their bodies checked and lowered ahead): the fronts of
 /// their O1 builds, deferring the optimisation (a publish; o2_begin's pattern). Returns the
 /// preparations, the slots left out with the fronts they bailed on (they needed a front the take
-/// may not run, rule I-PURE, or the process ends on another thread), and how many of `ids` it
-/// looked at: a background take stops between candidates once a program request waits (the
+/// may not run, rule I-PURE, or the process ends on another thread), the slots that asked for their
+/// own inline candidates first (inside a build tree's take: build_children, then they go again),
+/// and how many of `ids` it looked at: a background take stops between candidates once a program request waits (the
 /// main thread's frame among them: a take of many candidates held the owner 13.4 ms while the UI
 /// waited, 11-22), and the caller takes the rest in its next publish, after the owner served it.
-unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>, usize) {
+unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u32, Prep)>, Vec<(u32, Vec<u32>)>, Vec<(u32, Vec<(u32, u8)>)>, usize) {
     let mut preps = Vec::new();
     let mut gave = Vec::new();
+    let mut asked = Vec::new();
     let _kept = KeptCopies;
     // (instrument) owner cpu per candidate by outcome: prepared, gave back (bailed), skipped
     struct Outcome(u64, std::cell::Cell<usize>);
@@ -26573,24 +26649,33 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
                 if tier1_trace() { eprintln!("O3 cand #{} {} gave back: {}", c, short_name(&(&*up).fns[c as usize].name), if e == YIELDED { "yielded" } else { "needs a front" }); }
                 cand_skip(10); outcome.1.set(9); count_preps(17); gave.push((c, Vec::new()))
             }
-            // the fronts it needs go to the snapshot's next round (owner::take_needs)
+            // the fronts it needs go to the snapshot's next round (owner::take_needs); the inline
+            // candidates it asked for are built first (build_children)
             Err(p) if p.is::<crate::preempt::PublishBail>() => {
                 let mut slots = Vec::new();
+                let mut builds = None;
                 if let Ok(b) = p.downcast::<crate::preempt::PublishBail>() {
-                    if tier1_trace() { eprintln!("O3 cand #{} {} gave back: bail {} (slots {:?})", c, short_name(&(&*up).fns[c as usize].name), b.what, b.slots); }
-                    slots = b.slots.clone();
-                    owner::note_needs(b.slots);
+                    if tier1_trace() { eprintln!("O3 cand #{} {} gave back: bail {} (slots {:?}, builds {})", c, short_name(&(&*up).fns[c as usize].name), b.what, b.slots, b.builds.len()); }
+                    if b.what == "build" {
+                        builds = Some(b.builds);
+                    } else {
+                        slots = b.slots.clone();
+                        owner::note_needs(b.slots);
+                    }
                 }
                 cand_skip(11);
                 outcome.1.set(9);
                 count_preps(17);
-                gave.push((c, slots));
+                match builds {
+                    Some(b) => asked.push((c, b)),
+                    None => gave.push((c, slots)),
+                }
             }
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
             _ => cand_skip(12),
         }
     }
-    (preps, gave, looked)
+    (preps, gave, asked, looked)
 }
 
 /// (instrument) what o3_candidates_begin / o3_candidates_finish did with each candidate: begin left
@@ -27074,24 +27159,31 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
     let front = owner::publish(|| (&*up).front.clone());
     let mut todo = ids.to_vec();
     let mut fronted: Vec<u32> = Vec::new();
-    // a build whose preparation needed fronts (its inline candidates') is tried again after this
-    // thread made them (take_prefronted's rounds), not left to the caller's take on the owner
+    // (its takes are a build tree's: a build's inline candidates are built first, each in its own
+    // takes, build_children)
+    let mut tree = Tree::default();
+    // a build whose preparation needed fronts (its own) is tried again after this thread made
+    // them (take_prefronted's rounds), not left to the caller's take on the owner; one that asked
+    // for its inline candidates is tried again once they are built
     for _ in 0..PREFRONT_ROUNDS {
         // the take, CAND_TAKE candidates a publish as the snapshot's (a publish is bounded by its
         // item count), and each stops for a program request (o3_candidates_begin): what it
         // prepared before a bail is still built
-        let (mut preps, mut gave, mut needs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut preps, mut gave, mut asked, mut needs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut rest = &todo[..];
         let mut bailed = false;
         while !rest.is_empty() {
             let piece = &rest[..rest.len().min(CAND_TAKE)];
+            let tree_ref = &tree;
             match owner::publish_or_bail(|| {
-                let (p, g, looked) = o3_candidates_begin(up, piece);
-                (p, g, looked, owner::take_needs())
+                let _t = TreeTake::enter(tree_ref, &[]);
+                let (p, g, a, looked) = o3_candidates_begin(up, piece);
+                (p, g, a, looked, owner::take_needs())
             }) {
-                Ok((p, g, looked, n)) => {
+                Ok((p, g, a, looked, n)) => {
                     preps.extend(p);
                     gave.extend(g);
+                    asked.extend(a);
                     needs.extend(n);
                     rest = &rest[looked..];
                 }
@@ -27112,15 +27204,28 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
         if bailed {
             return;
         }
-        todo.retain(|x| gave.iter().any(|g| g.0 == x.0));
-        if todo.is_empty() || needs.is_empty() || needs.iter().any(|s: &u32| fronted.contains(s)) {
-            return;
-        }
-        for s in needs {
-            fronted.push(s);
-            if !prefront_slot(&front, s) {
+        for (c, asks) in &asked {
+            if !build_children(up, &front, epoch0, &[], *c, asks, &mut tree) {
                 return;
             }
+        }
+        todo.retain(|x| gave.iter().any(|g| g.0 == x.0) || asked.iter().any(|a| a.0 == x.0));
+        // the builds that gave back on fronts go again only after new fronts
+        let mut fronts_made = !needs.is_empty() && !needs.iter().any(|s: &u32| fronted.contains(s));
+        if fronts_made {
+            for s in needs {
+                fronted.push(s);
+                if !prefront_slot(&front, s) {
+                    fronts_made = false;
+                    break;
+                }
+            }
+        }
+        if !fronts_made {
+            todo.retain(|x| asked.iter().any(|a| a.0 == x.0));
+        }
+        if todo.is_empty() {
+            return;
         }
     }
 }
@@ -27337,7 +27442,7 @@ pub fn stop_background_tiers() {
 pub static SPEC_PANICS: AtomicU64 = AtomicU64::new(0);
 /// Speculative builds whose take gave up and that were dropped whole (spec_take_dropped), by the
 /// take's reason (TD_NAMES)
-pub static SPEC_TAKE_DROPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+pub static SPEC_TAKE_DROPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// The run summary's count of the speculative builds that ended without their code: the takes
 /// that gave up, by reason, and the panics.
@@ -29173,23 +29278,39 @@ fn prefronted(id: u32) {
 /// FRONTS_DONE, as O3's snapshot leaves them out). None: the build bails (a front lowering ahead
 /// cannot make, an initializer, JIT code, a wait; counted in owner::BAILS and, with its cause, in
 /// TAKE_DROP), and is dropped whole. `leave_out`: the O2 build's slot.
+/// Its takes are a build tree's: the build's inline candidates (and the callees its facts read)
+/// are built first, bottom-up, each in its own takes (build_children), and the build is taken
+/// again; such a round is no front round (its depth no longer spends PREFRONT_ROUNDS).
 #[track_caller]
 fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: impl FnMut() -> R) -> Option<R> {
     let mut fronted: Vec<(u32, u8)> = Vec::new();
     let mut why = (TD_ROUNDS, AF_OK, u32::MAX);
     let mut last = false;
-    for _ in 0..PREFRONT_ROUNDS {
+    let mut tree = Tree::default();
+    let mut rounds = 0;
+    while rounds < PREFRONT_ROUNDS {
+        let tree_ref = &tree;
         let r = owner::publish_or_bail(|| {
             // (on the owner, for this take only) lowerings this round takes go back if it bails
             let _back = TakenBack::start();
             let _done = FrontsDone::set(last);
+            let _tree = TreeTake::enter(tree_ref, &[]);
             let r = take();
             TakenBack::keep();
             r
         });
         match r {
             Ok(r) => return Some(r),
+            Err(b) if b.what == "build" => {
+                let up = front.unit.load(Ordering::Acquire);
+                let asker = b.slots.first().copied().unwrap_or(u32::MAX);
+                if !unsafe { build_children(up, front, PATCH_EPOCH.load(Ordering::SeqCst), &[], asker, &b.builds, &mut tree) } {
+                    why = (TD_TREE, AF_OK, asker);
+                    break;
+                }
+            }
             Err(b) => {
+                rounds += 1;
                 if b.slots.is_empty() {
                     why = (match b.what { "front" => TD_NO_SLOT, "initializer" => TD_INITIALIZER, "jit" => TD_JIT, _ => TD_WAIT }, AF_OK, u32::MAX);
                     break;
@@ -29244,6 +29365,394 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: imp
 
 /// Fronts of one slot a take may ask for (take_prefronted)
 const FRONT_TRIES: u8 = 3;
+
+// ------------------------------------------------------------ build trees (one body per take)
+//
+// A background build's take prepares one body (rule I-PUB: a take is bounded). Inside a build
+// tree's take (TreeTake) a preparation builds none of its inline candidates or fact callees
+// itself: one without the body it would inline is asked for (tree_ask), the preparation reports
+// all of them and bails ("build"), and its thread builds them first, bottom-up, each in its own
+// takes (build_children), as the preparation would have built them; then it takes the body again,
+// which now snapshots their stored RIR. Before, every candidate was built inside the take, and a
+// candidate that needed a front bailed the whole tree: rounds of the inline depth, each preparing
+// every level again (an O2 build of a deep tree held the owner 20 ms a round, 11-22).
+
+/// How a build tree's child is built (its take, tree_child): the call the preparation that asked
+/// for it would have made inside its own take. Low bits: split_front_as Tier0 (a locked build's
+/// `build_rir`), split_front_as Normal, split_upgrade, split_normal; flags: the O2 flag of the asking
+/// preparation (its `full`: O2Scope), RT_KEEP
+const HOW_T0: u8 = 0;
+const HOW_NEW: u8 = 1;
+const HOW_UP: u8 = 2;
+const HOW_BESIDE: u8 = 3;
+const HOW_O2: u8 = 4;
+const HOW_RT: u8 = 8;
+
+/// One root build's tree (take_prefronted, build_off_owner, compile_tier1, counted_build): the
+/// children its thread ran (built, or nothing to build), by slot and whether it was the slot's
+/// upgrade (HOW_UP, HOW_BESIDE: a locked build's candidate is built, then upgraded, in one
+/// preparation; tree_class), and those it could not build now (`left`: left out of their callers,
+/// whose bodies are provisional, as FRONTS_DONE leaves a candidate out)
+#[derive(Default)]
+struct Tree {
+    done: std::collections::HashSet<(u32, bool)>,
+    left: std::collections::HashSet<u32>,
+}
+
+/// A child's `done` key: its slot, and whether `how` upgrades it
+fn tree_class(c: u32, how: u8) -> (u32, bool) {
+    (c, how & 3 >= HOW_UP)
+}
+
+/// (owner) the build tree a take belongs to: its requester's Tree (the requester waits for the
+/// take), the ancestors open in it, what its preparations asked for
+struct TreeScope {
+    tree: *const Tree,
+    open: *const [u32],
+    asks: Vec<(u32, u8)>,
+}
+
+thread_local! {
+    /// (owner, inside a take of a build tree) TreeTake
+    static TREE: std::cell::RefCell<Option<TreeScope>> = const { std::cell::RefCell::new(None) };
+}
+
+/// (owner) TREE for one take; the scope it replaced comes back after it
+struct TreeTake(Option<TreeScope>);
+impl TreeTake {
+    fn enter(tree: &Tree, open: &[u32]) -> TreeTake {
+        TreeTake(TREE.with(|t| t.borrow_mut().replace(TreeScope { tree, open, asks: Vec::new() })))
+    }
+}
+impl Drop for TreeTake {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = TREE.try_with(|t| *t.borrow_mut() = prev);
+    }
+}
+
+/// tree_ask: not inside a build tree's take (build it as before); open; run already; left out; asked
+const TREE_OUT: u8 = 0;
+const TREE_OPEN: u8 = 1;
+const TREE_DONE: u8 = 2;
+const TREE_LEFT: u8 = 3;
+const TREE_ASKED: u8 = 4;
+
+/// Slot `c` is an ancestor in this build tree's take: open, as a slot this request builds is
+/// (open_here), so a child never asks for the body that asked for it (cycles resolve as they do
+/// in the recursion, inline_cycle).
+fn tree_open(c: u32) -> bool {
+    owner::bailing() && TREE.try_with(|t| t.borrow().as_ref().is_some_and(|s| unsafe { (*s.open).contains(&c) })).unwrap_or(false)
+}
+
+/// (a preparation) inline candidate or fact callee `c` would be built now (`how`): inside a build
+/// tree's take it is not. Run already (TREE_DONE): as a build that made nothing, what it has now
+/// is what the preparation reads. Left out (TREE_LEFT): the caller's body is pending on it.
+/// Asked (TREE_ASKED): its thread builds it first (with the O2 and real-time flags of this
+/// preparation), and the preparation bails at its end (tree_bail).
+fn tree_ask(c: u32, how: u8) -> u8 {
+    if !owner::bailing() {
+        return TREE_OUT;
+    }
+    TREE.try_with(|t| {
+        let mut t = t.borrow_mut();
+        let Some(s) = t.as_mut() else { return TREE_OUT };
+        let tree = unsafe { &*s.tree };
+        if unsafe { (*s.open).contains(&c) } {
+            TREE_OPEN
+        } else if tree.left.contains(&c) {
+            TREE_LEFT
+        } else if tree.done.contains(&tree_class(c, how)) {
+            TREE_DONE
+        } else {
+            let how = how | if o2_build() { HOW_O2 } else { 0 } | if RT_KEEP.with(|k| k.get()) { HOW_RT } else { 0 };
+            if !s.asks.iter().any(|x| x.0 == c) {
+                s.asks.push((c, how));
+            }
+            TREE_ASKED
+        }
+    }).unwrap_or(TREE_OUT)
+}
+
+/// Whether a preparation inside a build tree's take may ask for `c` (tree_ask) in place of the
+/// build the recursion runs: a child's take makes the split calls (tree_child), which refuse a
+/// constant-evaluation twin (split_normal a sandbox body too); a build that is not deferred, and a
+/// fact's build, make those on the owner in place, as before
+fn tree_askable(u: &Unit, c: u32, defer: bool) -> bool {
+    defer || !matches!(u.fns[c as usize].key, FnKey::Ctfe(_) | FnKey::Sandbox(_))
+}
+
+/// The asks of this build tree's take so far (a preparation's own start after them)
+fn tree_asks_len() -> usize {
+    TREE.try_with(|t| t.borrow().as_ref().map_or(0, |s| s.asks.len())).unwrap_or(0)
+}
+
+/// The end of slot `id`'s preparation inside a build tree's take: what it asked for since `n0`
+/// bails the take ("build"), every child at once.
+fn tree_bail(id: u32, n0: usize) {
+    let asks = TREE.try_with(|t| t.borrow_mut().as_mut().map(|s| s.asks.split_off(n0.min(s.asks.len())))).ok().flatten().unwrap_or_default();
+    if !asks.is_empty() {
+        TREE_STATS[TS_ASKED].fetch_add(1, Ordering::Relaxed);
+        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "build", slots: vec![id], builds: asks }));
+    }
+}
+
+/// (instrument) build trees (build_children): trees, their takes, children prepared, children with
+/// nothing to build, children left out, nodes, preparations that asked, the deepest chain
+pub static TREE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const TS_TREES: usize = 0;
+const TS_TAKES: usize = 1;
+const TS_PREPARED: usize = 2;
+const TS_NOTHING: usize = 3;
+const TS_LEFT: usize = 4;
+const TS_NODES: usize = 5;
+const TS_ASKED: usize = 6;
+const TS_DEEPEST: usize = 7;
+pub(crate) fn tree_summary() -> String {
+    const N: [&str; 8] = ["trees", "takes", "prepared", "nothing to build", "left out", "nodes", "preparations that asked", "deepest"];
+    N.iter().enumerate().map(|(i, n)| format!("{} {}", n, TREE_STATS[i].load(Ordering::Relaxed))).collect::<Vec<_>>().join(", ")
+}
+
+/// What one node of a build tree's take came to (tree_take)
+enum TreeOut {
+    Prepared(Prep),
+    /// it has RIR now, or an error, or no upgrade applies
+    Nothing,
+    /// its own children first
+    Asked(Vec<(u32, u8)>),
+    /// fronts only this thread can make (rule I-PURE)
+    Fronts(Vec<u32>),
+    /// it cannot be built now (an initializer, JIT code, a wait, a panic)
+    Failed,
+    /// the process ends on another thread
+    Yielded,
+}
+
+/// (owner, a build tree's take) child `c`'s preparation, the call `how` names (tree_ask), under
+/// the asking preparation's O2 and real-time flags. None: nothing to build.
+unsafe fn tree_child(up: *mut Unit, c: u32, how: u8) -> Result<Option<Prep>, String> {
+    let _o2 = O2Scope::set(how & HOW_O2 != 0);
+    let _rt = (how & HOW_RT != 0).then(RtKeepOn::on);
+    match how & 3 {
+        HOW_T0 | HOW_NEW => match split_front_as(up, c, if how & 3 == HOW_T0 { RirMode::Tier0 } else { RirMode::Normal }) {
+            Ok(Front::Opt(p, _)) => Ok(Some(p)),
+            Ok(Front::Codegen(_)) => Ok(None),
+            Err(e) if e == YIELDED => Err(e),
+            Err(_) => Ok(None),
+        },
+        HOW_UP => Ok(split_upgrade(up, c)),
+        _ => Ok(split_normal(up, c)),
+    }
+}
+
+/// (owner) a build tree's take of `nodes`: their preparations one after another, stopping between
+/// them once a program request waits (the caller takes the rest in its next take).
+unsafe fn tree_take(up: *mut Unit, nodes: &[(u32, u8)]) -> Vec<TreeOut> {
+    let _kept = KeptCopies;
+    let _done = FrontsDone::set(false);
+    let mut out = Vec::with_capacity(nodes.len());
+    for (i, &(c, how)) in nodes.iter().enumerate() {
+        if i > 0 && owner::program_waiting() {
+            break;
+        }
+        let _ = owner::take_needs();
+        let back = TakenBack::start();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tree_child(up, c, how)));
+        let o = match r {
+            Ok(Ok(Some(p))) => {
+                TakenBack::keep_for_copies();
+                TreeOut::Prepared(p)
+            }
+            Ok(Ok(None)) => TreeOut::Nothing,
+            Ok(Err(_)) => TreeOut::Yielded,
+            Err(p) => match p.downcast::<crate::preempt::PublishBail>() {
+                Ok(b) if b.what == "build" => TreeOut::Asked(b.builds),
+                Ok(b) if b.what == "front" && !b.slots.is_empty() => TreeOut::Fronts(b.slots),
+                Ok(_) => TreeOut::Failed,
+                Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
+                Err(_) => TreeOut::Failed,
+            },
+        };
+        drop(back);
+        out.push(o);
+    }
+    let _ = owner::take_needs();
+    out
+}
+
+/// The fronts of a build tree's new children (`ids`), made before their takes, in one batch: of the
+/// bodies their takes lower (an instance's or a closure's, not lowered ahead yet). An accelerator
+/// only: a take still asks for any front it needs.
+fn prefront_kids(front: &FrontShared, ids: &[(u32, u8)]) {
+    for &(c, how) in ids {
+        if how & 3 == HOW_UP || !matches!(front.slot_keys.get(&c), Some(FnKey::Inst(..) | FnKey::Closure(..))) {
+            continue;
+        }
+        if matches!(front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&c), Some(LoweredState::Ready(_) | LoweredState::Running)) {
+            continue;
+        }
+        let _ = prefront_slot(front, c);
+    }
+}
+
+/// Builds the children `asks` of slot `asker` (its own ancestors `anc`) off the owner, bottom-up:
+/// each in its own take, as the asker's preparation would have built it inside its take
+/// (tree_child), optimised here and stored by a finish (o3_candidates_finish: `epoch0` and its
+/// checks: no other store), so the asker's next take snapshots it. A child that asks for its own
+/// children goes back under them; one that needs fronts gets them (FRONT_TRIES each, as a take's
+/// rounds do) and goes again; one that cannot be built now is left out (`tree.left`). False: the
+/// tree ends (a patch landed, the process ends, a take bailed whole, the unit is gone) and the
+/// caller drops its build.
+unsafe fn build_children(up: *mut Unit, front: &FrontShared, epoch0: u64, anc: &[u32], asker: u32, asks: &[(u32, u8)], tree: &mut Tree) -> bool {
+    if owner::is_owner() || up.is_null() {
+        return false;
+    }
+    TREE_STATS[TS_TREES].fetch_add(1, Ordering::Relaxed);
+    let session = unit_session(up);
+    let options = &session.options;
+    struct Node {
+        id: u32,
+        how: u8,
+        /// the node whose take asked for it (usize::MAX: `asker`)
+        parent: usize,
+        /// fronts its takes needed, with their tries
+        tries: Vec<(u32, u8)>,
+    }
+    let base: Vec<u32> = anc.iter().copied().chain([asker]).collect();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut kids: Vec<(u32, u8)> = Vec::new();
+    for &(c, how) in asks {
+        if !tree.done.contains(&tree_class(c, how)) && !base.contains(&c) && !kids.iter().any(|k| tree_class(k.0, k.1) == tree_class(c, how)) {
+            kids.push((c, how));
+        }
+    }
+    prefront_kids(front, &kids);
+    for &(c, how) in kids.iter().rev() {
+        nodes.push(Node { id: c, how, parent: usize::MAX, tries: Vec::new() });
+        stack.push(nodes.len() - 1);
+    }
+    TREE_STATS[TS_NODES].fetch_add(kids.len() as u64, Ordering::Relaxed);
+    while let Some(&top) = stack.last() {
+        // a piece: the nodes on top with one parent (siblings), CAND_TAKE at most, as a take of
+        // O3 candidates (a publish is bounded by its item count)
+        let parent = nodes[top].parent;
+        let mut piece: Vec<usize> = Vec::new();
+        while let Some(&i) = stack.last() {
+            if nodes[i].parent != parent || piece.len() == CAND_TAKE {
+                break;
+            }
+            stack.pop();
+            // (built meanwhile for another node of this tree)
+            if !tree.done.contains(&tree_class(nodes[i].id, nodes[i].how)) {
+                piece.push(i);
+            }
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        // open in its take: the asker's ancestors and the asker, then the chain down to the piece
+        let mut chain = Vec::new();
+        let mut p = parent;
+        while p != usize::MAX {
+            chain.push(nodes[p].id);
+            p = nodes[p].parent;
+        }
+        TREE_STATS[TS_DEEPEST].fetch_max(chain.len() as u64 + 1, Ordering::Relaxed);
+        let mut open = base.clone();
+        open.extend(chain.iter().rev());
+        let ask: Vec<(u32, u8)> = piece.iter().map(|&i| (nodes[i].id, nodes[i].how)).collect();
+        let tree_ref: &Tree = tree;
+        let r = owner::publish_or_bail(|| {
+            if !front.alive.load(Ordering::SeqCst) || front.unit.load(Ordering::Acquire) != up {
+                return None;
+            }
+            let _t = TreeTake::enter(tree_ref, &open);
+            Some(tree_take(up, &ask))
+        });
+        let Ok(Some(outs)) = r else { return false };
+        TREE_STATS[TS_TAKES].fetch_add(1, Ordering::Relaxed);
+        // (the nodes it did not reach, a program request waiting: again as they were)
+        for &i in piece[outs.len()..].iter().rev() {
+            stack.push(i);
+        }
+        let mut done: Vec<Deferred> = Vec::new();
+        let mut again: Vec<usize> = Vec::new();
+        let mut new_kids: Vec<(u32, u8, usize)> = Vec::new();
+        for (k, o) in outs.into_iter().enumerate() {
+            let i = piece[k];
+            let c = nodes[i].id;
+            let key = tree_class(c, nodes[i].how);
+            match o {
+                TreeOut::Prepared(prep) => {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
+                    done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
+                    tree.done.insert(key);
+                    TREE_STATS[TS_PREPARED].fetch_add(1, Ordering::Relaxed);
+                }
+                TreeOut::Nothing => {
+                    tree.done.insert(key);
+                    TREE_STATS[TS_NOTHING].fetch_add(1, Ordering::Relaxed);
+                }
+                TreeOut::Yielded => return false,
+                TreeOut::Failed => {
+                    tree.done.insert(key);
+                    tree.left.insert(c);
+                    TREE_STATS[TS_LEFT].fetch_add(1, Ordering::Relaxed);
+                }
+                TreeOut::Asked(asks) => {
+                    again.push(i);
+                    // (not done, not open in its take: one that another node asked for and is not
+                    // built yet gets a node here too; the first of them to run builds it)
+                    for (g, how) in asks {
+                        if !tree.done.contains(&tree_class(g, how)) && !new_kids.iter().any(|x| tree_class(x.0, x.1) == tree_class(g, how) && x.2 == i) {
+                            new_kids.push((g, how, i));
+                        }
+                    }
+                }
+                TreeOut::Fronts(slots) => {
+                    let mut made = true;
+                    for s in slots {
+                        let tries = match nodes[i].tries.iter_mut().find(|x| x.0 == s) {
+                            Some(x) => { x.1 += 1; x.1 }
+                            None => { nodes[i].tries.push((s, 1)); 1 }
+                        };
+                        if tries > FRONT_TRIES || !prefront_slot(front, s) {
+                            made = false;
+                            break;
+                        }
+                    }
+                    if made {
+                        again.push(i);
+                    } else {
+                        tree.done.insert(key);
+                        tree.left.insert(c);
+                        TREE_STATS[TS_LEFT].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if !done.is_empty() {
+            owner::publish(|| o3_candidates_finish(up, epoch0, done));
+        }
+        // a patch landed: nothing prepared before it is stored, and the tree ends
+        if PATCH_EPOCH.load(Ordering::SeqCst) != epoch0 {
+            return false;
+        }
+        // a node that asked goes back under its new children
+        for &i in again.iter().rev() {
+            stack.push(i);
+        }
+        let batch: Vec<(u32, u8)> = new_kids.iter().map(|x| (x.0, x.1)).collect();
+        prefront_kids(front, &batch);
+        for &(g, how, i) in new_kids.iter().rev() {
+            nodes.push(Node { id: g, how, parent: i, tries: Vec::new() });
+            stack.push(nodes.len() - 1);
+        }
+        TREE_STATS[TS_NODES].fetch_add(new_kids.len() as u64, Ordering::Relaxed);
+    }
+    true
+}
 
 /// (owner, inside a take) FRONTS_DONE for this take only
 struct FrontsDone(bool);
@@ -29340,7 +29849,9 @@ const TD_JIT: u8 = 3;
 const TD_WAIT: u8 = 4;
 const TD_REFRONT: u8 = 5;
 const TD_FRONT: u8 = 6;
-const TD_NAMES: [&str; 7] = ["rounds", "front without slot", "initializer", "jit", "wait", "front again", "front failed"];
+/// its build tree ended (build_children: a patch landed, the process ends, the unit is gone)
+const TD_TREE: u8 = 7;
+const TD_NAMES: [&str; 8] = ["rounds", "front without slot", "initializer", "jit", "wait", "front again", "front failed", "tree ended"];
 
 thread_local! {
     /// this thread's last take_prefronted that dropped its build: (TD_*, AF_*, slot)
@@ -29392,7 +29903,7 @@ fn bail_for_fronts(mut needs: Vec<u32>) -> Vec<u32> {
         return needs;
     }
     if !needs.is_empty() {
-        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "front", slots: needs }));
+        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "front", slots: needs, builds: Vec::new() }));
     }
     Vec::new()
 }
@@ -29412,12 +29923,14 @@ thread_local! {
 }
 
 /// `build_rir_mode` inside a background build's take: a candidate whose front only the owner could
-/// run is left out (None; rule I-PURE: an O2/O3/PGO build goes on without it).
+/// run is left out (None; rule I-PURE: an O2/O3/PGO build goes on without it). Inside a build
+/// tree's take, one that asked for its inline candidates bails the take (they are built first).
 unsafe fn build_rir_or_skip(up: *mut Unit, id: u32, mode: RirMode) -> Option<Result<(), String>> {
     let _w = BuildWhy::enter(1);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_rir_mode(up, id, mode))) {
         Ok(r) => Some(r),
         Err(p) => match p.downcast::<crate::preempt::PublishBail>() {
+            Ok(b) if b.what == "build" => std::panic::resume_unwind(b),
             // the fronts it needs: the take's thread makes them for its next round (take_needs)
             Ok(b) => {
                 owner::note_needs(b.slots);
@@ -36079,7 +36592,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&O2_DROPS, [const { AtomicU64::new(0) }; 9]);
     reset(&O2_NOOPS, [const { AtomicU64::new(0) }; 3]);
     reset(&O2_TAKEN, AtomicU64::new(0));
-    reset(&O2_TAKE_DROPS, [const { AtomicU64::new(0) }; 7]);
+    reset(&O2_TAKE_DROPS, [const { AtomicU64::new(0) }; 8]);
     reset(&O2_FRONT_FAILS, [[const { AtomicU64::new(0) }; 15], [const { AtomicU64::new(0) }; 15]]);
     reset(&OFFERED, std::sync::OnceLock::new());
     reset(&BASE, relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() }));
@@ -36208,6 +36721,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TIER1_SNAP_FRONTS, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&TIER1_SNAP_OFF, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&CAND_SKIP, [const { AtomicU64::new(0) }; 27]);
+    reset(&TREE_STATS, [const { AtomicU64::new(0) }; 8]);
     reset(&INLINE_STATE, [const { AtomicU64::new(0) }; 30]);
     reset(&O3_INSTALL_REC, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&O3_OWNER, [const { AtomicU64::new(0) }; 24]);
@@ -36216,7 +36730,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SPEC_STOP, AtomicBool::new(false));
     reset(&DRAIN_ANYWAY, AtomicBool::new(false));
     reset(&SPEC_PANICS, AtomicU64::new(0));
-    reset(&SPEC_TAKE_DROPS, [const { AtomicU64::new(0) }; 7]);
+    reset(&SPEC_TAKE_DROPS, [const { AtomicU64::new(0) }; 8]);
     reset(&BG_DRAINED, AtomicBool::new(false));
     reset(&BG_PAUSE, AtomicBool::new(false));
     reset(&BG_PAUSER, AtomicU64::new(0));

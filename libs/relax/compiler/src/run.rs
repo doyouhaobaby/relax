@@ -5824,6 +5824,7 @@ fn summary_inner(why: &str) {
             verbose!("relax: owner by site: {}", crate::owner::sites_summary(14));
             verbose!("relax: publish O1 on the owner by kind: {}", jit::publish_opt_summary());
             verbose!("relax: O3 candidate takes: {}", jit::cand_skip_summary());
+            verbose!("relax: build trees off the owner (one body per take): {}", jit::tree_summary());
             verbose!("relax: O1 inline candidates by callee RIR (callers baseline/O1/full): {}", jit::inline_state_summary());
             verbose!("relax: provisional bodies (pending slots): {}", jit::provisional_summary());
             verbose!("relax: fronts off the owner by job: {}", jit::prefront_site_summary());

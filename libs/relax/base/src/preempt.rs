@@ -123,10 +123,14 @@ pub struct OwnerBusy;
 /// others it is no result: a query it crosses records nothing, and the background build whose take
 /// it ends fronts `slots` off the owner (empty: no front can help) and takes again, or is dropped.
 /// A take collects every inline candidate needing a front before it bails (compiler jit.rs
-/// `fronts_or_bail`), so its rounds are the inline depth, not the candidate count.
+/// `bail_for_fronts`). `what` "build": a preparation inside a build tree's take met inline
+/// candidates without the body it inlines (compiler jit.rs `tree_ask`): `slots` is its own slot,
+/// `builds` the candidates with how each is built; its thread builds them first, each in its own
+/// takes, and takes it again.
 pub struct PublishBail {
     pub what: &'static str,
     pub slots: Vec<u32>,
+    pub builds: Vec<(u32, u8)>,
 }
 
 /// Whether a caught unwind payload is work to be redone rather than a failure: a preemption,

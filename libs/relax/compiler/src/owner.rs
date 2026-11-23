@@ -714,10 +714,11 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             };
             BAILS[cause].fetch_add(1, Ordering::Relaxed);
             // RELAX_BAIL_TRACE: where a background take bailed (diagnosis of the bail rate)
-            if std::env::var_os("RELAX_BAIL_TRACE").is_some() {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| std::env::var_os("RELAX_BAIL_TRACE").is_some()) {
                 eprintln!("relax bail: {} (slot {}) at\n{}", what, slot, std::backtrace::Backtrace::force_capture());
             }
-            std::panic::resume_unwind(Box::new(PublishBail { what, slots: if slot == u32::MAX { Vec::new() } else { vec![slot] } }))
+            std::panic::resume_unwind(Box::new(PublishBail { what, slots: if slot == u32::MAX { Vec::new() } else { vec![slot] }, builds: Vec::new() }))
         }
         _ => {
             // said here, before it unwinds: on the owner the panic hook is silent (a request's
