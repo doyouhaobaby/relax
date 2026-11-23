@@ -628,6 +628,46 @@ fn a_second_jit_job_waits_for_a_token() {
     assert_eq!(b.state.lock().unwrap().running, 0);
 }
 
+/// A waiter whose job is raised while it waits (a strand job a person's work queued behind) waits
+/// from then on for a token of its new class, beside a JIT build that waits with no room: it takes
+/// the first token its new class may take, ahead of the build. The pool's own tests run on a budget
+/// of their own; this keeps the case the global budget has.
+#[test]
+fn a_waiter_raised_while_parked_takes_the_first_token_its_new_class_may_take() {
+    let b = budget(2);
+    let held = [b.admit(INTERACTIVE, APP, "held"), b.admit(INTERACTIVE, APP, "held")];
+    let above = b.admit(BACKGROUND, JIT, "tier-up");
+    let (tx, rx) = mpsc::channel();
+    let build = worker(&b, BACKGROUND, JIT, 1, &tx);
+    until(&b, |s| s.waiters.len() == 1);
+    let desired = Arc::new(AtomicU8::new(BACKGROUND));
+    let (go, done) = mpsc::channel::<()>();
+    let raised = {
+        let (b, desired, tx) = (b.clone(), desired.clone(), tx.clone());
+        thread::spawn(move || {
+            let permit = b.admit_following(&desired, APP, "raised");
+            tx.send(2).unwrap();
+            done.recv().unwrap();
+            b.release(permit);
+        })
+    };
+    until(&b, |s| s.waiters.len() == 2);
+    // as the pool's `Raised::raise`: the class, then the waiting thread woken
+    desired.fetch_min(INTERACTIVE, Relaxed);
+    raised.thread().unpark();
+    until(&b, |s| s.waiters.iter().any(|w| w.client == APP && w.class == INTERACTIVE));
+    assert!(rx.try_recv().is_err(), "every token Interactive may take is held");
+    b.release(held[0]);
+    let first = rx.recv_timeout(std::time::Duration::from_secs(30));
+    assert_eq!(first, Ok(2), "the raised waiter takes the token that came free, not the build");
+    finish((go, raised));
+    b.release(held[1]);
+    b.release(above);
+    assert_eq!(rx.recv().unwrap(), 1, "the build runs once the JIT's running job ends");
+    finish(build);
+    assert_eq!(b.state.lock().unwrap().running, 0);
+}
+
 /// set_thread_idle: the thread runs at SCHED_IDLE, Background work leaves it there (it reads as
 /// Background), and UI protection refuses a later request to lower its policy.
 #[cfg(any(target_os = "linux", target_os = "android"))]

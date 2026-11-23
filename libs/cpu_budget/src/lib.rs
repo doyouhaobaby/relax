@@ -418,6 +418,16 @@ impl Budget {
         s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
         self.acquire(s, Job::new(class, client, label, ticket), None)
     }
+    /// `admit` at the class `desired` holds, read again each time the waiting thread wakes: whoever
+    /// raises it unparks the thread.
+    fn admit_following(&self, desired: &AtomicU8, client: u8, label: &str) -> u32 {
+        let class = desired.load(Relaxed);
+        valid(class, client);
+        let mut s = self.lock();
+        let ticket = s.ticket;
+        s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
+        self.acquire(s, Job::new(class, client, label, ticket), Some(desired))
+    }
     fn should_yield(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
         class & NEVER_YIELDS == 0 && self.yield_classes.load(Relaxed) & Self::bit(class) != 0
@@ -942,13 +952,7 @@ pub fn park_admission(class: u8) {
 #[relax_api]
 pub fn admit_following(desired: *const u8, client: u8, label: &str) -> u32 {
     let desired = unsafe { &*(desired as *const AtomicU8) };
-    let b = global();
-    let class = desired.load(Relaxed);
-    valid(class, client);
-    let mut s = b.lock();
-    let ticket = s.ticket;
-    s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
-    b.acquire(s, Job::new(class, client, label, ticket), Some(desired))
+    global().admit_following(desired, client, label)
 }
 
 /// Native workers whose waiters may promote them while they are parked. Like
