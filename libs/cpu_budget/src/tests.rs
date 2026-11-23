@@ -32,6 +32,44 @@ fn finish(worker: (Sender<()>, thread::JoinHandle<()>)) {
 }
 
 #[test]
+fn permits_and_admissions_belong_to_the_budget_that_issued_them() {
+    let a = BudgetHandle::of_cores(2);
+    let b = BudgetHandle::of_cores(2);
+    assert_ne!(a.id(), b.id(), "separate live budgets have different IDs");
+    assert_eq!(a.clone().id(), a.id(), "a clone identifies the same budget");
+    assert_eq!(BudgetHandle::process().id(), 0, "zero identifies the process budget");
+
+    let a_first = a.admit(INTERACTIVE, APP, "first");
+    let b_first = b.admit(INTERACTIVE, APP, "first");
+    assert_eq!((a_first, b_first), (0, 0), "each budget issues row zero first");
+    a.release(a_first);
+    assert_eq!((a.tokens().running, b.tokens().running), (0, 1), "releasing a's row leaves b's held");
+    b.release(b_first);
+
+    // Each budget has issued one ticket. On two cores one Background job fills the Visible limit.
+    let a_held = a.admit(BACKGROUND, APP, "held");
+    let b_held = b.admit(BACKGROUND, APP, "held");
+    let mut a_wait = a.admission();
+    let mut b_wait = b.admission();
+    assert_eq!(a_wait.poll(VISIBLE, APP, "waiting"), None, "a's Visible job waits at its limit");
+    assert_eq!(b_wait.poll(VISIBLE, APP, "waiting"), None, "b's Visible job waits at its limit");
+    drop(a_wait);
+    assert!(a.tokens().waiting.is_empty(), "dropping a's admission removes its waiter");
+    assert_eq!(b.tokens().waiting.len(), 1, "b keeps its waiter with the same ticket");
+    assert!(b.should_yield(b_held), "b's Visible waiter needs its Background holder to yield");
+    assert!(!a.should_yield(a_held), "b's waiter leaves a's holder running");
+    assert_eq!(a.admission().checkpoint(a_held, 0, ""), Some(a_held), "a's admission checkpoint keeps its row");
+    let a_next = a.checkpoint(a_held, 0, "");
+    assert_eq!(a_next, a_held, "a keeps its row at a worker checkpoint");
+
+    b.release(b_held);
+    let b_next = b_wait.poll(VISIBLE, APP, "waiting").expect("b admits its waiter on the first poll after release");
+    b.release(b_next);
+    a.release(a_next);
+    assert_eq!((a.tokens().running, b.tokens().running), (0, 0), "both budgets finish with every token released");
+}
+
+#[test]
 fn highest_class_first_across_clients() {
     let b = budget(1);
     let p = b.admit(INTERACTIVE, APP, "blocker");

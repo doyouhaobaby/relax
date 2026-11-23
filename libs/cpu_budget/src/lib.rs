@@ -30,7 +30,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, Thread};
 
 relax_api::option_layouts! {
@@ -919,6 +919,79 @@ pub fn jit_first() -> bool { global().jit_first.load(Relaxed) }
 #[relax_api]
 pub fn jit_floor() -> u32 { global().jit_floor as u32 }
 
+#[derive(Clone)]
+enum Which { Process, Own(Arc<Budget>) }
+impl Which {
+    fn get(&self) -> &Budget {
+        match self { Self::Process => global(), Self::Own(budget) => budget }
+    }
+}
+
+/// A CPU budget shared by its workers. Each permit belongs to the budget that issued it.
+#[relax_api(handle, clone)]
+#[derive(Clone)]
+pub struct BudgetHandle(Which);
+
+#[relax_api]
+impl BudgetHandle {
+    /// The budget shared by the process.
+    pub fn process() -> Self { Self(Which::Process) }
+    /// A separate budget with the given positive number of cores.
+    pub fn of_cores(cores: u32) -> Self {
+        let cores = cores as usize;
+        Self(Which::Own(Arc::new(Budget::new(cores, cores))))
+    }
+    /// Identifies a live budget. The process budget has ID zero.
+    pub fn id(&self) -> u64 {
+        match &self.0 { Which::Process => 0, Which::Own(budget) => Arc::as_ptr(budget) as u64 }
+    }
+    pub fn cores(&self) -> u32 { self.0.get().cores as u32 }
+    pub fn limit(&self) -> u32 { self.0.get().limit as u32 }
+    pub fn background_limit(&self) -> u32 { self.0.get().background_limit as u32 }
+    pub fn pool_cores(&self) -> u32 {
+        match &self.0 { Which::Process => pool_cores(), Which::Own(budget) => budget.cores as u32 }
+    }
+    pub fn admit(&self, class: u8, client: u8, label: &str) -> u32 { self.0.get().admit(class, client, label) }
+    /// `desired` must point to the job's live `AtomicU8` for the duration of the call.
+    pub fn admit_following(&self, desired: *const u8, client: u8, label: &str) -> u32 {
+        let desired = unsafe { &*(desired as *const AtomicU8) };
+        self.0.get().admit_following(desired, client, label)
+    }
+    pub fn checkpoint(&self, permit: u32, held_locks: u32, lock_site: &str) -> u32 {
+        self.0.get().checkpoint(permit, held_locks, lock_site)
+    }
+    /// `desired` must point to the job's live `AtomicU8` for the duration of the call.
+    pub fn checkpoint_following(&self, permit: u32, held_locks: u32, lock_site: &str, desired: *const u8) -> u32 {
+        let desired = unsafe { &*(desired as *const AtomicU8) };
+        self.0.get().checkpoint_following(permit, held_locks, lock_site, Some(desired))
+    }
+    pub fn should_yield(&self, permit: u32) -> bool { self.0.get().should_yield(permit) }
+    pub fn contended(&self, permit: u32) -> bool { self.0.get().contended(permit) }
+    pub fn release(&self, permit: u32) { self.0.get().release(permit); }
+    pub fn reclass(&self, permit: u32, class: u8) { self.0.get().reclass(permit, class); }
+    pub fn lend_permit(&self, permit: u32) { self.0.get().lend_permit(permit); }
+    pub fn take_back_permit(&self, permit: u32) { self.0.get().take_back_permit(permit); }
+    pub fn queued(&self, class: u8, client: u8, delta: i32) {
+        valid(class, client);
+        self.0.get().queued[class as usize][client as usize].fetch_add(delta as i64, Relaxed);
+    }
+    pub fn waited(&self, class: u8, client: u8, ns: u64, label: &str) { self.0.get().waited(class, client, ns, label); }
+    pub fn strand_waited(&self, class: u8, ns: u64, label: &str) { self.0.get().strand_waited(class, ns, label); }
+    pub fn changes(&self) -> u64 { self.0.get().lock().changes }
+    pub fn wait_for_change(&self, seen: u64) -> u64 {
+        match &self.0 { Which::Process => wait_for_change(seen), Which::Own(budget) => budget.wait_for_change(seen) }
+    }
+    pub fn tokens_text(&self, out: &mut [u8]) -> usize { write_tokens(self.0.get(), out) }
+    pub fn report(&self, out: &mut [u8]) -> usize { write_report(self.0.get(), out) }
+    /// A request for a permit from this budget.
+    pub fn admission(&self) -> Admission { Admission { budget: self.0.clone(), ticket: None } }
+}
+
+impl BudgetHandle {
+    pub fn tokens(&self) -> Tokens { read_tokens(|out| self.tokens_text(out)) }
+    pub fn report_string(&self) -> String { read_text(|out| self.report(out)) }
+}
+
 /// The budget's native park token. JIT and native std have different thread-local
 /// parkers; queue notifications and admission notifications must wake the same one.
 #[relax_api(handle, clone)]
@@ -951,16 +1024,14 @@ pub fn park_admission(class: u8) {
 /// `AtomicU8::as_ptr`, alive for the call: the byte crosses the Relax op boundary, std's type doesn't.
 #[relax_api]
 pub fn admit_following(desired: *const u8, client: u8, label: &str) -> u32 {
-    let desired = unsafe { &*(desired as *const AtomicU8) };
-    global().admit_following(desired, client, label)
+    BudgetHandle::process().admit_following(desired, client, label)
 }
 
 /// Native workers whose waiters may promote them while they are parked. Like
 /// `checkpoint`, with a live class and an unpark from the promoting waiter.
 #[relax_api]
 pub fn checkpoint_following(permit: u32, held_locks: u32, lock_site: &str, desired: *const u8) -> u32 {
-    let desired = unsafe { &*(desired as *const AtomicU8) };
-    global().checkpoint_following(permit, held_locks, lock_site, Some(desired))
+    BudgetHandle::process().checkpoint_following(permit, held_locks, lock_site, desired)
 }
 
 /// A native pool's admission request. The pool may change its head class while
@@ -968,16 +1039,16 @@ pub fn checkpoint_following(permit: u32, held_locks: u32, lock_site: &str, desir
 /// `poll` never parks: budget changes unpark the requesting thread.
 /// The request keeps its FIFO ticket across class changes and cancels on drop.
 #[relax_api(handle)]
-pub struct Admission { ticket: Option<u64> }
+pub struct Admission { budget: Which, ticket: Option<u64> }
 #[relax_api]
 impl Default for Admission {
-    fn default() -> Self { Self { ticket: None } }
+    fn default() -> Self { Self { budget: Which::Process, ticket: None } }
 }
 #[relax_api]
 impl Admission {
     pub fn poll(&mut self, class: u8, client: u8, label: &str) -> Option<u32> {
         valid(class, client);
-        let b = global();
+        let b = self.budget.get();
         let mut s = b.lock();
         let ticket = *self.ticket.get_or_insert_with(|| {
             let ticket = s.ticket;
@@ -1004,7 +1075,7 @@ impl Admission {
     /// jobs running, and one parked inside a checkpoint was counted as running).
     pub fn checkpoint(&mut self, permit: u32, held_locks: u32, lock_site: &str) -> Option<u32> {
         assert!(self.ticket.is_none(), "a checkpoint on an admission that waits already");
-        let b = global();
+        let b = self.budget.get();
         let mut s = b.lock();
         let Some(job) = b.yields(&mut s, permit, held_locks, lock_site) else {
             let class = s.slots[permit as usize].as_ref().expect("released CPU permit").class;
@@ -1021,7 +1092,7 @@ impl Admission {
 impl Drop for Admission {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
-            let b = global();
+            let b = self.budget.get();
             let mut s = b.lock();
             s.waiters.retain(|w| w.ticket != ticket);
             b.refresh(&mut s);
@@ -1112,8 +1183,9 @@ pub struct Tokens {
 }
 /// `tokens`, one row a line: its strings and vectors do not cross the Relax op boundary.
 #[relax_api]
-pub fn tokens_text(out: &mut [u8]) -> usize {
-    let t = global().tokens();
+pub fn tokens_text(out: &mut [u8]) -> usize { write_tokens(global(), out) }
+fn write_tokens(budget: &Budget, out: &mut [u8]) -> usize {
+    let t = budget.tokens();
     let mut text = format!("{} {} {} {}\n", t.running, t.limits[0], t.limits[1], t.limits[2]);
     for h in &t.holders {
         text += &format!("h {} {} {} {} {} {} {}\n", h.thread, h.class, h.client, u8::from(h.lent), u8::from(h.above), h.held_ns, h.label.replace('\n', " "));
@@ -1123,8 +1195,9 @@ pub fn tokens_text(out: &mut [u8]) -> usize {
     }
     fill(out, &text)
 }
-pub fn tokens() -> Tokens {
-    let text = read_text(tokens_text);
+pub fn tokens() -> Tokens { read_tokens(tokens_text) }
+fn read_tokens(op: impl Fn(&mut [u8]) -> usize) -> Tokens {
+    let text = read_text(op);
     let mut lines = text.lines();
     let mut head = lines.next().unwrap().split(' ').map(|n| n.parse().unwrap());
     let mut next = || head.next().unwrap();
@@ -1153,8 +1226,7 @@ pub fn set_wait_hook(hook: extern "C" fn(u8)) { let _ = WAIT_HOOK.set(hook); }
 pub fn thread_class() -> Option<u8> { THREAD_CLASS.with(Cell::get).map(|class| match class { 3 => INTERACTIVE, IDLE | BACKGROUND_HOT | BACKGROUND_BEHIND => BACKGROUND, class => class }) }
 #[relax_api]
 pub fn queued(class: u8, client: u8, delta: i32) {
-    valid(class, client);
-    global().queued[class as usize][client as usize].fetch_add(delta as i64, Relaxed);
+    BudgetHandle::process().queued(class, client, delta);
 }
 #[relax_api]
 pub fn waited(class: u8, client: u8, ns: u64, label: &str) { global().waited(class, client, ns, label); }
@@ -1169,7 +1241,8 @@ pub fn jit_settled() -> bool { !JIT_UNSETTLED.load(Relaxed) }
 #[relax_api]
 pub fn set_jit_settled(settled: bool) { JIT_UNSETTLED.store(!settled, Relaxed); }
 #[relax_api]
-pub fn report(out: &mut [u8]) -> usize { fill(out, &global().report()) }
+pub fn report(out: &mut [u8]) -> usize { write_report(global(), out) }
+fn write_report(budget: &Budget, out: &mut [u8]) -> usize { fill(out, &budget.report()) }
 /// Native convenience wrapper; strings do not cross the Relax op boundary.
 pub fn report_string() -> String { read_text(report) }
 fn fill(out: &mut [u8], text: &str) -> usize {
@@ -1178,7 +1251,7 @@ fn fill(out: &mut [u8], text: &str) -> usize {
     out[..len].copy_from_slice(&text.as_bytes()[..len]);
     len
 }
-fn read_text(op: fn(&mut [u8]) -> usize) -> String {
+fn read_text(op: impl Fn(&mut [u8]) -> usize) -> String {
     let mut out = vec![0; 4096];
     loop {
         let len = op(&mut out);
