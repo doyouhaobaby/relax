@@ -952,14 +952,64 @@ pub struct Arena {
 // sets what is not zero at the first use (`init_zeroed`), as `create` does for a domain arena.
 // SAFETY: every field has a valid all-zero representation (create relies on it too).
 static DEFAULT: Arena = unsafe { std::mem::zeroed() };
-/// Close every arena before releasing any inherited guards in the child of a plain fork.
+/// The heaps' true bounds in the child of a plain fork, which opened HEAPS_LOW/HIGH to every
+/// address (`close_for_fork_child`): the parent's, and those of regions reserved since.
+static PARENT_LOW: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PARENT_HIGH: AtomicUsize = AtomicUsize::new(0);
+/// In the child of a plain fork: whether `p` may be a block of a domain heap (the true bounds).
+#[inline]
+pub fn in_parent_heaps(p: *mut u8) -> bool {
+    let a = p as usize;
+    a >= PARENT_LOW.load(Ordering::Acquire) && a < PARENT_HIGH.load(Ordering::Acquire)
+}
+/// Close every arena before releasing any inherited guards in the child of a plain fork. The
+/// paths a parent takes read nothing new for it: the closing changes what they read already.
+/// The calling thread, the child's only one, forgets its chunks ([`forget_thread_chunks`]), so
+/// its allocations and frees miss the fast paths and reach the slow ones, where the closed flag
+/// is read, before any arena lock (`alloc_slow`, `dealloc_slow`). The heaps' bounds open to
+/// every address, so every free that is not an arena's reaches `dealloc_other` (domain.rs),
+/// which finds the child's own system blocks first and leaves the rest to the true bounds
+/// (`in_parent_heaps`). A check at the head of every allocation and free cost a burst arena's
+/// frees 7% and a cold JIT compile 1% (11-23).
 pub fn close_for_fork_child() {
-    super::ARENAS_CLOSED.store(true, Ordering::Relaxed);
+    // (a nested fork's child: the bounds were opened by its parent, the true ones kept)
+    if !super::ARENAS_CLOSED.swap(true, Ordering::AcqRel) {
+        PARENT_LOW.fetch_min(HEAPS_LOW.swap(0, Ordering::AcqRel), Ordering::AcqRel);
+        PARENT_HIGH.fetch_max(HEAPS_HIGH.swap(usize::MAX, Ordering::AcqRel), Ordering::AcqRel);
+    }
+    forget_thread_chunks();
+}
+
+/// The calling thread's chunk caches, forgotten in the child of a plain fork: nothing is handed
+/// back (that takes the locks), the chunks stay as they are for good.
+pub fn forget_thread_chunks() {
+    let mine = CURRENT.try_with(|c| c.replace([NO_CURRENT; CLASSES]));
+    let domain = DOMAIN.try_with(|t| t.current.replace([NO_CURRENT; CLASSES]));
+    // (a test's simulated child: its thread takes them back as it reopens)
+    #[cfg(test)]
+    let _ = FORGOTTEN.try_with(|f| f.set(Some((mine.unwrap_or([NO_CURRENT; CLASSES]), domain.unwrap_or([NO_CURRENT; CLASSES])))));
+    #[cfg(not(test))]
+    let _ = (mine, domain);
+}
+
+#[cfg(test)]
+thread_local! { static FORGOTTEN: Cell<Option<([Current; CLASSES], [Current; CLASSES])>> = const { Cell::new(None) }; }
+
+/// The chunks `forget_thread_chunks` made this thread forget, its own again (a test's reopen).
+#[cfg(test)]
+pub(super) fn remember_thread_chunks() {
+    if let Some((mine, domain)) = FORGOTTEN.try_with(|f| f.take()).ok().flatten() {
+        let _ = CURRENT.try_with(|c| c.set(mine));
+        let _ = DOMAIN.try_with(|t| t.current.set(domain));
+    }
 }
 
 #[cfg(test)]
 pub(super) fn reopen_after_test() {
     super::ARENAS_CLOSED.store(false, Ordering::Relaxed);
+    HEAPS_LOW.store(PARENT_LOW.swap(usize::MAX, Ordering::AcqRel), Ordering::Release);
+    HEAPS_HIGH.store(PARENT_HIGH.swap(0, Ordering::AcqRel), Ordering::Release);
+    remember_thread_chunks();
 }
 
 #[cfg(test)]
@@ -1196,7 +1246,6 @@ impl Arena {
     }
     #[inline]
     pub unsafe fn alloc_counted(&self, l: Layout, requested: usize) -> *mut u8 {
-        if arenas_closed() { return null_mut(); }
         self.alloc_inner(l, requested)
     }
     /// The calling thread is now inside this domain arena (`enter_domain`).
@@ -1566,6 +1615,10 @@ impl Arena {
         if base != 0 && self.dynamic {
             HEAPS_LOW.fetch_min(base, Ordering::Release);
             HEAPS_HIGH.fetch_max(base + self.reach(), Ordering::Release);
+            if arenas_closed() {
+                PARENT_LOW.fetch_min(base, Ordering::AcqRel);
+                PARENT_HIGH.fetch_max(base + self.reach(), Ordering::AcqRel);
+            }
         }
         self.base.store(base, Ordering::Release);
     }
@@ -2341,6 +2394,12 @@ impl Arena {
     #[cold]
     /// `may_grow`: a domain heap that has no room here tries its other regions (`grow`).
     unsafe fn alloc_slow(&self, l: Layout, small: bool, class: usize, requested: usize, may_grow: bool) -> *mut u8 {
+        // the child of a plain fork comes here for every allocation (its thread forgot its
+        // chunks) and takes no arena lock: a program heap's block comes from the system heap,
+        // any other arena refuses (its caller falls back to the system heap)
+        if arenas_closed() {
+            return if self.dynamic { super::domain::child_alloc(l, false) } else { null_mut() };
+        }
         if self.hand_back_due() {
             let _ = HAND_SEEN.try_with(|e| e.set(HAND_BACK.load(Ordering::Relaxed)));
             self.detach_thread();
@@ -2510,6 +2569,11 @@ impl Arena {
         if !(COMPILER && l.size().max(l.align()).max(16) > 1 << MAX_SHIFT) {
             std::ptr::write_bytes(p, 0, l.size());
         } else if self.dynamic {
+            // (a fork child's block is the system heap's, `alloc_slow`: no region's)
+            if arenas_closed() {
+                std::ptr::write_bytes(p, 0, l.size());
+                return p;
+            }
             // a large block from the warm large list holds old bytes (the region that gave it: a
             // full heap's block may come from another, `grow`)
             let r = self.region_of(p).unwrap_or(self);
@@ -2597,7 +2661,6 @@ impl Arena {
     }
     #[inline(always)]
     pub unsafe fn dealloc_counted(&self, p: *mut u8, l: Layout, requested: usize) {
-        if arenas_closed() { return; }
         let index = (p as usize - self.base.load(Ordering::Relaxed)) / CHUNK;
         if COMPILER {
             // a block of the thread's own current chunk of its class goes back on the owned list
@@ -2614,6 +2677,9 @@ impl Arena {
     }
     #[cold]
     unsafe fn dealloc_slow(&self, p: *mut u8, l: Layout, requested: usize, index: usize) {
+        // the child of a plain fork comes here for every free of an arena block (its thread forgot
+        // its chunks): the block stays where it is, no arena lock taken
+        if arenas_closed() { return; }
         let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
         let h = &self.headers[index];
         if !self.mark(p as usize, false) {
@@ -3118,12 +3184,12 @@ pub unsafe fn enter_domain(a: *const Arena) {
 /// chunk (a cache miss each), and threads that wait thousands of times a second paid 20-30 ms/s
 /// of CPU for it at every wait (an app).
 pub unsafe fn domain_wait() {
-    if arenas_closed() { return; }
     // (a wait inside the thread's thread-local destructors finds no record: nothing to do)
     let _ = DOMAIN.try_with(|t| {
         if let Some(a) = t.arena.get().as_ref() {
             let epoch = a.trim_epoch.load(Ordering::Relaxed);
-            if t.pass.get() != epoch {
+            // (a fork child's thread forgot its chunks: nothing to pass over, no lock taken)
+            if t.pass.get() != epoch && !arenas_closed() {
                 t.pass.set(epoch);
                 a.owner_pass(t);
             }
@@ -3135,7 +3201,6 @@ pub unsafe fn domain_wait() {
 /// The wait `domain_wait` announced has ended: the thread takes its chunks back (it waits while
 /// the monitor settles one of them, a bounded pass under that chunk's lock).
 pub fn domain_wait_done() {
-    if arenas_closed() { return; }
     let _ = DOMAIN.try_with(|t| {
         while t.quiet.load(Ordering::Relaxed) != QUIET_RUNNING {
             if t.quiet.compare_exchange(QUIET_WAITING, QUIET_RUNNING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
@@ -3155,7 +3220,6 @@ pub fn domain_here() -> Option<&'static Arena> {
 /// no registers.
 #[inline(always)]
 pub unsafe fn domain_alloc(l: Layout, none: unsafe extern "C" fn(usize, usize) -> *mut u8) -> *mut u8 {
-    if arenas_closed() { return none(l.size(), l.align()); }
     let Some(t) = program_tls() else {
         return domain_alloc_fill(l.size(), l.align(), none);
     };
@@ -3178,7 +3242,6 @@ unsafe extern "C" fn domain_alloc_fill(size: usize, align: usize, none: unsafe e
 /// `other` (in a tail call, as every path but the fast one).
 #[inline(always)]
 pub unsafe fn domain_free(p: *mut u8, l: Layout, other: unsafe extern "C" fn(*mut u8, usize, usize)) {
-    if arenas_closed() { return other(p, l.size(), l.align()); }
     let Some(t) = program_tls() else {
         return domain_free_fill(p, l.size(), l.align(), other);
     };
@@ -3214,7 +3277,6 @@ unsafe extern "C" fn free_elsewhere(p: *mut u8, size: usize, align: usize, a: &A
 /// one (the caller finds its owner).
 #[inline(always)]
 pub unsafe fn domain_dealloc(p: *mut u8, l: Layout) -> bool {
-    if arenas_closed() { return domain_here().is_some_and(|a| a.region_of(p).is_some()); }
     let t = domain_tls();
     let Some(a) = t.arena.get().as_ref() else {
         return false;

@@ -184,24 +184,26 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        if IN_FORK_CHILD.load(Relaxed) { return self.lock_in_child(); }
-        let result = self.inner.lock();
-        wrap_guard(result, held::HeldLock::new(), &self.holder)
+        // An uncontended lock is the one acquire std's own `lock` starts with: only a lock found
+        // taken asks whether this is a fork child that inherited it held (`lock_contended`). A
+        // check of the child flag at every lock cost a cold JIT compile 1% with the arenas' (11-23).
+        match self.try_lock() {
+            Ok(g) => Ok(g),
+            Err(TryLockError::Poisoned(e)) => Err(e),
+            Err(TryLockError::WouldBlock) => self.lock_contended(),
+        }
     }
 
     #[cold]
     #[track_caller]
-    fn lock_in_child(&self) -> LockResult<MutexGuard<'_, T>> {
-        match self.try_lock() {
-            Ok(g) => return Ok(g),
-            Err(TryLockError::Poisoned(e)) => return Err(e),
-            Err(TryLockError::WouldBlock) => {}
-        }
-        // Order the holder read after the failed try_lock observed the backend lock word.
-        fence(Acquire);
-        let holder = self.holder.load(Relaxed);
-        if holder != 0 && holder <= FORK_MARK.load(Relaxed) && holder != FORKER.load(Relaxed) {
-            inherited_lock();
+    fn lock_contended(&self) -> LockResult<MutexGuard<'_, T>> {
+        if IN_FORK_CHILD.load(Relaxed) {
+            // Order the holder read after the failed try_lock observed the backend lock word.
+            fence(Acquire);
+            let holder = self.holder.load(Relaxed);
+            if holder != 0 && holder <= FORK_MARK.load(Relaxed) && holder != FORKER.load(Relaxed) {
+                inherited_lock();
+            }
         }
         let result = self.inner.lock();
         wrap_guard(result, held::HeldLock::new(), &self.holder)

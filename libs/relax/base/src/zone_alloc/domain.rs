@@ -211,6 +211,8 @@ enum Owner {
     Domain(Arc<Heap>, *const Arena),
     System,
     Unknown,
+    /// a fork child's system block for its program (`child_alloc`): headerless, as a domain one
+    Child,
 }
 
 #[cfg(test)]
@@ -221,12 +223,21 @@ impl Owner {
 #[cfg(test)]
 pub(super) fn hold_registry() -> impl Drop { Registry::lock() }
 
+/// Whether the owner lookup places `p` in the system heap (a test's look at a fork child's free).
+#[cfg(test)]
+pub(super) unsafe fn system_owned(p: *mut u8) -> bool { owner(p).is_none() }
+
 /// The heap holding `p` and its region, kept alive by the lease.
 unsafe fn owner(p: *mut u8) -> Owner {
     // Conservative bounds only widen: ordinary native frees need no registry lock. Actual
     // ownership is still checked against live ranges, so recycled addresses are never stale.
     if !in_heaps(p) { return Owner::System; }
+    // (a fork child opened the bounds to every address, arena.rs `close_for_fork_child`: its own
+    // system blocks are found here, past the bounds every free of a parent stops at, and the
+    // rest outside the true bounds are the system's without the registry: it may be held)
     let _registry = if super::arenas_closed() {
+        if child_system::find(p, false) { return Owner::Child; }
+        if !compiler::in_parent_heaps(p) { return Owner::System; }
         let Some(g) = Registry::try_lock() else { return Owner::Unknown };
         g
     } else {
@@ -301,7 +312,7 @@ mod child_system {
     }
 }
 
-unsafe fn child_alloc(l: Layout, zero: bool) -> *mut u8 {
+pub(super) unsafe fn child_alloc(l: Layout, zero: bool) -> *mut u8 {
     let p = if zero { System.alloc_zeroed(l) } else { System.alloc(l) };
     if !p.is_null() && crate::memstat::enabled() && !child_system::record(p) {
         System.dealloc(p, l);
@@ -375,6 +386,7 @@ pub unsafe fn dealloc(p: *mut u8) -> bool {
     match owner(p) {
         Owner::Domain(_heap, r) => { release(&*r, p); true }
         Owner::Unknown => true,
+        Owner::Child => { child_system::find(p, true); false }
         Owner::System => false,
     }
 }
@@ -386,7 +398,7 @@ pub unsafe fn realloc_owned(p: *mut u8, size: usize) -> Option<*mut u8> {
         Owner::Domain(_heap, r) => Some(reallocate(&*r, p, size)),
         // The bounds include system blocks. Only a proven domain C block has a Header.
         Owner::Unknown => Some(std::ptr::null_mut()),
-        Owner::System => None,
+        Owner::Child | Owner::System => None,
     }
 }
 unsafe fn reallocate(heap: &Arena, p: *mut u8, size: usize) -> *mut u8 {
@@ -426,7 +438,7 @@ unsafe extern "C" fn system_alloc(size: usize, align: usize) -> *mut u8 {
 }
 pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
     let l = Layout::from_size_align_unchecked(size, align);
-    if super::arenas_closed() { return child_alloc(l, true); }
+    // (a fork child's domain block is the system heap's, arena.rs `alloc_slow`)
     match compiler::domain_here() {
         Some(a) => a.alloc_zeroed(l),
         None => System.alloc_zeroed(l),
@@ -442,7 +454,6 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
         return std::ptr::null_mut();
     }
     match compiler::domain_here() {
-        Some(_) if super::arenas_closed() => child_alloc(l, zeroed),
         Some(a) if zeroed => a.alloc_zeroed(l),
         Some(a) => a.alloc(l),
         None => std::ptr::null_mut(),
@@ -451,10 +462,6 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
 /// Also the native global allocator's free (every free of a provided crate passes here).
 #[inline]
 pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
-    if super::arenas_closed() && child_system::find(p, true) {
-        System.dealloc(p, l);
-        return true;
-    }
     if compiler::domain_dealloc(p, l) {
         return true;
     }
@@ -472,6 +479,11 @@ unsafe fn dealloc_other(p: *mut u8, l: Layout) -> bool {
     match owner(p) {
         Owner::Domain(_heap, r) => { (*r).dealloc(p, l); true }
         Owner::Unknown => true,
+        Owner::Child => {
+            child_system::find(p, true);
+            System.dealloc(p, l);
+            true
+        }
         Owner::System => false,
     }
 }
@@ -499,30 +511,28 @@ unsafe fn resize_layout(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u
     q
 }
 pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
-    if super::arenas_closed() {
-        let tracked = child_system::find(p, false);
-        if !tracked && !compiler::domain_here().is_some_and(|a| a.region_of(p).is_some()) && matches!(owner(p), Owner::System) {
-            return None;
-        }
-        // A Layout also describes an unconfirmed block. Copy safely and leave that
-        // address alone. Only a system allocation we recorded can be released here.
-        let q = child_alloc(Layout::from_size_align_unchecked(size, l.align()), false);
-        if !q.is_null() {
-            std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
-            if tracked {
-                child_system::find(p, true);
-                System.dealloc(p, l);
-            }
-        }
-        return Some(q);
-    }
+    // a fork child's domain block moves to the system heap here too: its arena's in-place
+    // resize refuses and its allocation is the system heap's (arena.rs `alloc_slow`)
     if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
         return Some(resize_layout(r, p, l, size));
     }
     match owner(p) {
         Owner::Domain(_heap, r) => Some(resize_layout(&*r, p, l, size)),
         Owner::System => None,
-        Owner::Unknown => unreachable!(),
+        // only in a fork child: its own system block, or one the address alone cannot place (the
+        // registry was held at the fork). A Layout also describes an unconfirmed block: it is
+        // copied and left alone; only a system block the child recorded is released.
+        o @ (Owner::Child | Owner::Unknown) => {
+            let q = child_alloc(Layout::from_size_align_unchecked(size, l.align()), false);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
+                if matches!(o, Owner::Child) {
+                    child_system::find(p, true);
+                    System.dealloc(p, l);
+                }
+            }
+            Some(q)
+        }
     }
 }
 

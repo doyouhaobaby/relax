@@ -166,8 +166,14 @@ static ARENAS_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// The arenas are closed: this is the child of a plain fork (`close_for_fork_child`).
 #[inline]
 pub(crate) fn arenas_closed() -> bool { ARENAS_CLOSED.load(std::sync::atomic::Ordering::Relaxed) }
+/// The child of a plain fork: every arena closes for good (arena.rs `close_for_fork_child`), and
+/// the thread forgets its chunks of the job and slot arenas too.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-pub use compiler::close_for_fork_child;
+pub fn close_for_fork_child() {
+    compiler::close_for_fork_child();
+    burst::forget_thread_chunks();
+    slots::forget_thread_chunks();
+}
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 pub fn close_for_fork_child() {}
 
@@ -876,7 +882,6 @@ impl RelaxAlloc {
     }
     #[inline(always)]
     unsafe fn dealloc_routed(&self, p: *mut u8, l: Layout) {
-        if arenas_closed() && (compiler::owns(p) || slots::owns(p) || burst::owns(p)) { return; }
         // The compiler arena first: one address-range test decides the common free. The arenas
         // reserve disjoint ranges, so the order among them does not change who owns a block.
         if compiler::owns(p) {
@@ -904,11 +909,6 @@ impl RelaxAlloc {
     }
     #[inline(always)]
     unsafe fn realloc_routed(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        if arenas_closed() && (compiler::owns(p) || slots::owns(p) || burst::owns(p)) {
-            let q = self.alloc(Layout::from_size_align_unchecked(size, l.align()));
-            if !q.is_null() { std::ptr::copy_nonoverlapping(p, q, l.size().min(size)); }
-            return q;
-        }
         // Slot data keeps its arena even when a history grows in a compile job or kept phase.
         // On allocation failure, return null and leave the original block intact.
         if slots::owns(p) {
@@ -920,6 +920,12 @@ impl RelaxAlloc {
                 std::ptr::copy_nonoverlapping(p, n, l.size().min(size));
                 zap(p, l);
                 slots::dealloc(p, l);
+            } else if arenas_closed() {
+                // a fork child's slot arena refuses: the block moves to the system heap, and the
+                // old one stays where it is
+                let n = self.alloc(Layout::from_size_align_unchecked(size, l.align()));
+                if !n.is_null() { std::ptr::copy_nonoverlapping(p, n, l.size().min(size)); }
+                return n;
             }
             return n;
         }
@@ -1096,6 +1102,14 @@ mod routing_tests {
             });
             ready.recv().unwrap();
             close_for_fork_child();
+            // the closing thread is the child's only one: it forgot its chunks, so its own
+            // allocation misses its current chunk and comes from the system heap too
+            {
+                let _g = compiler();
+                let (mine, ml) = put(100, 8, 6);
+                assert!(!compiler::owns(mine), "the closing thread allocated from its own chunk of the closed arena");
+                RelaxAlloc.dealloc(mine, ml);
+            }
             let (done, result) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
                 let _phase = compiler();
@@ -1103,6 +1117,10 @@ mod routing_tests {
                 assert!(!compiler::owns(fresh));
                 RelaxAlloc.dealloc(fresh, fl);
                 RelaxAlloc.dealloc(old as *mut u8, old_layout);
+                // a system block outside the heaps' true bounds is the system's without the
+                // registry (held at the fork): its free neither waits nor leaks
+                assert!(compiler::in_parent_heaps(heap_block as *mut u8) || domain::system_owned(heap_block as *mut u8),
+                    "a fork child's free of a system block asked the registry it may never get");
                 RelaxAlloc.dealloc(heap_block as *mut u8, heap_layout);
                 let larger = RelaxAlloc.realloc(grow as *mut u8, grow_layout, 1024);
                 assert!(!larger.is_null() && !compiler::owns(larger) && all_eq(larger, grow_layout.size(), 3));
@@ -1131,10 +1149,14 @@ mod routing_tests {
             });
             let moved = result.recv_timeout(std::time::Duration::from_secs(10));
             compiler::reopen_after_test();
+            burst::remember_thread_chunks();
+            slots::remember_thread_chunks();
             release.send(()).unwrap();
             holder.join().unwrap();
-            moved.expect("fork-child allocation blocked on an arena lock");
-            worker.join().unwrap();
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = moved {
+                panic!("fork-child allocation blocked on an arena lock");
+            }
+            worker.join().expect("a fork child's allocation or free went wrong (its panic is above)");
             // The simulated child left these allocations alive.
             RelaxAlloc.dealloc(old as *mut u8, old_layout);
             RelaxAlloc.dealloc(grow as *mut u8, grow_layout);
