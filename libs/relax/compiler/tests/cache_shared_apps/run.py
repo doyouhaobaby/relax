@@ -6,8 +6,12 @@ crate the loader binds). Each scenario: a fresh copy of the tree and a fresh dis
 optional edit is applied, the SECOND app runs on the same cache. Checks: (1) the second app's output equals the output
 of the same app on the same (edited) tree with an empty cache; (2) the fw fns that must hit do, the fns the edit or the
 feature difference reaches are compiled again. Prints "cache_shared_apps <scenario>: ok|FAILED ..." per scenario;
-exits 1 on a failure."""
-import os, re, shutil, subprocess, sys, tempfile
+exits 1 on a failure.
+
+Four scenarios run at once, each in a slot of its own (a fixed folder: the cache keys name the workspace's path). Most
+scenarios start with the same cold run (app_a, the tree as it is): a slot runs it once and copies the folder it left
+(tree, std, cache) back in place for each such scenario, as it stood after that run."""
+import os, queue, re, shutil, subprocess, sys, tempfile, threading, traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", ".."))
@@ -150,21 +154,33 @@ def edit_file(path, old, new):
     open(path, "w").write(text.replace(old, new))
 
 
-def scenario(relax, name):
+def shares_first(sc):
+    """the scenario's first run is a slot's shared one: app_a run cold on the tree as it is"""
+    return sc["first"] == "app_a" and not sc.get("env1") and sc.get("first_cmd", "run") == "run" and not sc.get("shared_home")
+
+
+def scenario(relax, name, slot):
     sc = SCENARIOS[name]
     first, second = sc["first"], sc["second"]
     hit, compiled = sc.get("hit", []), sc.get("compiled", [])
     cmd2 = sc.get("second_cmd", "run")
-    tmp = tempfile.mkdtemp(prefix="relax-cache-shared-apps-")
+    tmp = os.path.join(slot["dir"], "w")
+    snap = os.path.join(slot["dir"], "first")
     bad = []
     try:
-        tree = os.path.join(tmp, "tree")
-        shutil.copytree(HERE, tree, ignore=shutil.ignore_patterns("run.py", "target", "__pycache__"))
-        shutil.copytree(STD, os.path.join(tmp, "std"))
-        std = os.path.join(tmp, "std")
-        cache = os.path.join(tmp, "c")
-        os.mkdir(cache, 0o700)
-        rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"), sc.get("shared_home", False))
+        tree, std, cache = os.path.join(tmp, "tree"), os.path.join(tmp, "std"), os.path.join(tmp, "c")
+        if shares_first(sc) and slot["first"]:
+            shutil.copytree(snap, tmp, symlinks=True)
+            rc, res1, out = slot["first"]
+        else:
+            os.mkdir(tmp, 0o700)
+            shutil.copytree(HERE, tree, ignore=shutil.ignore_patterns("run.py", "target", "__pycache__"))
+            shutil.copytree(STD, std)
+            os.mkdir(cache, 0o700)
+            rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"), sc.get("shared_home", False))
+            if shares_first(sc) and rc == 0 and res1 is not None:
+                shutil.copytree(tmp, snap, symlinks=True)
+                slot["first"] = (rc, res1, out)
         if rc != 0 or (res1 is None and not first.startswith("repo:") and sc.get("first_cmd", "run") == "run"):
             bad.append(f"first app: exit {rc}, no result\n{out[-600:]}")
         run_tree = tree
@@ -198,18 +214,48 @@ def scenario(relax, name):
         n_miss = sum(1 for w in tr.values() if w & {"miss", "linkfail", "cert:stale"})
         print(f"cache_shared_apps {name}: " + ("ok" if not bad else "FAILED " + "; ".join(bad)) + f" ({first} then {second}: {n_hit} slots linked, {n_miss} compiled)", flush=True)
     finally:
-        if not bad and os.path.basename(tmp).startswith("relax-cache-shared-apps-"):
+        if bad and os.path.isdir(tmp):
+            kept = os.path.join(slot["dir"], "failed-" + name)
+            os.rename(tmp, kept)
+            print(f"  logs kept in {kept}", flush=True)
+        elif os.path.isdir(tmp):
             shutil.rmtree(tmp)
-        elif bad:
-            print(f"  logs kept in {tmp}", flush=True)
     return not bad
 
 
 def main():
     relax = os.path.abspath(sys.argv[1])
     names = sys.argv[2:] or list(SCENARIOS)
-    ok = all([scenario(relax, n) for n in names])
-    sys.exit(0 if ok else 1)
+    todo = queue.Queue()
+    for n in names:
+        todo.put(n)
+    failed = []
+
+    def work():
+        slot = {"dir": tempfile.mkdtemp(prefix="relax-cache-shared-apps-"), "first": None}
+        ok = True
+        while True:
+            try:
+                n = todo.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                passed = scenario(relax, n, slot)
+            except Exception:
+                print(f"cache_shared_apps {n}: FAILED\n{traceback.format_exc()}", flush=True)
+                passed = False
+            if not passed:
+                ok = False
+                failed.append(n)
+        if ok and os.path.basename(slot["dir"]).startswith("relax-cache-shared-apps-"):
+            shutil.rmtree(slot["dir"])
+
+    slots = [threading.Thread(target=work) for _ in range(4)]
+    for t in slots:
+        t.start()
+    for t in slots:
+        t.join()
+    sys.exit(1 if failed else 0)
 
 
 main()

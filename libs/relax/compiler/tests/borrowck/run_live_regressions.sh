@@ -2,6 +2,7 @@
 # Usage: bash run_live_regressions.sh <makepad binary>
 # `makepad test` runs assertions but background borrowck errors do not fail it.
 # Check these fixtures synchronously so strict borrowck errors fail the suite.
+# rustc's verdict is its check (--emit=metadata runs the borrow check, as `cargo check`): no build, no run.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -32,7 +33,7 @@ pathlib.Path(tmp, "units.json").write_text(json.dumps(
     {"version": 1, "roots": [0], "units": [unit]}))
 PY
     if [[ "$name" == closure_external_distinct_reject || "$name" == normalization_outlives_reject ]]; then
-        if rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 ||
+        if rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta" > "$TMP/rustc.log" 2>&1 ||
            ! grep -q 'lifetime may not live long enough' "$TMP/rustc.log"; then
             cat "$TMP/rustc.log"
             exit 1
@@ -55,7 +56,7 @@ PY
             closure_annotated_free_named_reject) rustc_err='E0597'; relax_err='error[E0597]' ;;
             closure_annotated_hr_dyn_named_reject) rustc_err='E0621'; relax_err='error[E0621]' ;;
         esac
-        if rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 ||
+        if rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta" > "$TMP/rustc.log" 2>&1 ||
            ! grep -q "$rustc_err" "$TMP/rustc.log"; then
             cat "$TMP/rustc.log"
             exit 1
@@ -72,7 +73,7 @@ PY
     if [[ "$name" == ref_reuse_accept ]]; then
         # generic bodies polymorphically, as Gandalf checks them while a program runs (that
         # mode prints only the errors: exit status 0 and none printed)
-        rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 || {
+        rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta" > "$TMP/rustc.log" 2>&1 || {
             cat "$TMP/rustc.log"
             exit 1
         }
@@ -85,18 +86,17 @@ PY
         continue
     fi
     if [[ "$name" == closure_external_* || "$name" == closure_annotated_*_accept || "$name" == closure_iter_*_accept || "$name" == normalization_outlives_accept ]]; then
-        rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 || {
+        rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta" > "$TMP/rustc.log" 2>&1 || {
             cat "$TMP/rustc.log"
             exit 1
         }
-        "$TMP/rustc"
     fi
     if [[ "$name" == generic_call_* || "$name" == raw_ptr_capture_* ]]; then
         export RELAX_BORROWCK_INSTANCES=1
         if [[ "$name" == *_reject ]]; then
             code=E0596
             if [[ "$name" == raw_ptr_capture_* ]]; then code=E0382; fi
-            if rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 ||
+            if rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta" > "$TMP/rustc.log" 2>&1 ||
                ! grep -q "$code" "$TMP/rustc.log"; then
                 cat "$TMP/rustc.log"
                 exit 1
@@ -109,8 +109,7 @@ PY
             echo "$name: ok (rustc and Relax reject with $code)"
             continue
         fi
-        rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc"
-        "$TMP/rustc"
+        rustc --edition 2021 --emit=metadata "$HERE/$name.rs" -o "$TMP/rustc.rmeta"
     fi
     if ! "$BIN" check --no-serve --units "$TMP/units.json" "$name" > "$TMP/check.log" 2>&1; then
         cat "$TMP/check.log"
