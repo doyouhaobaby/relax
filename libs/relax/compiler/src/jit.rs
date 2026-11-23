@@ -2639,7 +2639,7 @@ mod fork_locks {
     pub(super) fn unregister(u: &Unit) {
         TABLES.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !Arc::ptr_eq(&t.0, &u.sites));
     }
-    pub(super) unsafe fn reset() { relax_session::reset_static(&TABLES, Mutex::new(Vec::new())); }
+    pub(super) unsafe fn reset_statics() { relax_session::reset_static(&TABLES, Mutex::new(Vec::new())); }
 
     type UnitGuards = (RwLockWriteGuard<'static, CodeTables>, MutexGuard<'static, Vec<Site>>);
     struct Guards {
@@ -36873,7 +36873,7 @@ pub(crate) unsafe fn reset_statics() {
     busy::reset_statics();
     queue::reset_statics();
     #[cfg(unix)]
-    fork_locks::reset();
+    fork_locks::reset_statics();
     settle_rebuild::reset_statics();
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     static_glue::reset_statics();
