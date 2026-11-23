@@ -1405,17 +1405,24 @@ fn walk_fp_bounded(mut fp: u64, lo: u64, out: &mut [u64]) -> usize {
 /// record of its own (a non-leaf stores x30 in its record, so [fp+8] would equal it).
 fn leaf_of_jit(f: &os::fault::Fault) -> bool {
     let (lo, hi) = STACK_BOUNDS.try_with(|c| c.get()).unwrap_or((0, 0));
-    if hi == 0 || f.sp < lo || f.sp & 7 != 0 || f.sp.saturating_add(8) > hi {
+    if hi == 0 || f.sp & 7 != 0 || f.sp.saturating_add(8) > hi {
         return false;
     }
     if cfg!(target_arch = "aarch64") {
+        // arm64 reads nothing at sp: a leaf that overflowed the stack (memset zeroing its JIT caller's array, its sp
+        // in the guard below the stack) is told by the link register too, and a frame record is read only inside
+        // the stack. (A frame record it could not have stored there: a non-leaf faulting in its prologue has done
+        // nothing yet either.)
+        if f.sp < lo && !is_stack_fault(f.addr, f.sp) {
+            return false;
+        }
         if !in_jit_code(f.lr) {
             return false;
         }
-        let own_record = f.fp & 7 == 0 && f.fp >= f.sp && f.fp.saturating_add(16) <= hi && unsafe { *((f.fp + 8) as *const u64) } == f.lr;
+        let own_record = f.fp & 7 == 0 && f.fp >= f.sp.max(lo) && f.fp.saturating_add(16) <= hi && unsafe { *((f.fp + 8) as *const u64) } == f.lr;
         !own_record
     } else {
-        in_jit_code(unsafe { *(f.sp as *const u64) })
+        f.sp >= lo && in_jit_code(unsafe { *(f.sp as *const u64) })
     }
 }
 
