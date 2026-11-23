@@ -44,6 +44,7 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::FnAddr(d, id) => Inst::FnAddr(m(*d), *id),
         Inst::Call(c, a, r) => {
             let c2 = match c {
+                Callee::Part => Callee::Part,
                 Callee::Indirect(v) => Callee::Indirect(m(*v)),
                 Callee::Fn(i) => Callee::Fn(*i),
                 Callee::Host(h) => Callee::Host(*h),

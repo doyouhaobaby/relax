@@ -885,6 +885,9 @@ pub enum Callee {
     /// call (side effects, memory, no motion); the register allocator keeps all other values out
     /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.
     Asm(Box<AsmBlock>),
+    /// Direct call to this native build's outlined part, with the Relax calling convention.
+    /// The joiner resolves it within the body. It may capture arguments, access memory and unwind.
+    Part,
 }
 
 /// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
@@ -1724,6 +1727,7 @@ impl Func {
         fn callee(c: &Callee, h: &mut relax_session::sip::Sip128, sl: &mut FirstSeen, sy: &mut FirstSeen) {
             std::mem::discriminant(c).hash(h);
             match c {
+                Callee::Part => {}
                 Callee::Fn(x) => sl.get(*x).hash(h),
                 Callee::CFn(x, g) => {
                     sl.get(*x).hash(h);
@@ -2054,6 +2058,72 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
     f.inl.iter().flat_map(|&(call, callee)| [(u32::MAX, call), (u32::MAX, callee)])
 }
 
+// An ordinary dbgloc table begins with a canonical varint (variable count), so it
+// never starts with this two-byte encoding of zero. Joined tables use the same outer
+// PC_VARS length/chunks as ordinary ones, including in mapped images.
+const PART_LOCALS: [u8; 2] = [0x80, 0];
+
+/// Select the local table for a lookup PC and return its function-relative PC.
+pub fn part_local_table(bytes: &[u8], off: u32) -> Option<(&[u8], u32)> {
+    let Some(b) = bytes.strip_prefix(&PART_LOCALS) else { return Some((bytes, off)) };
+    let p_off = u32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+    let host_len = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+    let part_len = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?) as usize;
+    let tables = b.get(12..)?;
+    if host_len.checked_add(part_len)? != tables.len() { return None; }
+    let (host, part) = tables.split_at(host_len);
+    Some(if off < p_off { (host, off) } else { (part, off - p_off) })
+}
+
+fn join_part_pc_maps(host: &mut Vec<(u32, u64)>, part: &[(u32, u64)], p_off: u32, text_len: u32) -> Result<(), String> {
+    use crate::dbgloc::{self, PC_VARS};
+    let hm = host.split_off(host.partition_point(|e| e.0 < PC_VARS));
+    let (part_rows, pm) = part.split_at(part.partition_point(|e| e.0 < PC_VARS));
+    let (hv, hi) = hm.split_at(hm.partition_point(|e| e.0 == PC_VARS));
+    let (pv, pi) = pm.split_at(pm.partition_point(|e| e.0 == PC_VARS));
+    if hi.len() % 2 != 0 || pi.len() % 2 != 0 {
+        return Err("incomplete inline context in outlined body".into());
+    }
+    // The split may have inherited a common prefix. Keep those IDs, then place P's
+    // remaining call/anchor pairs after the host's. Never alias an unrepresentable ID.
+    let shared = hi.chunks_exact(2).zip(pi.chunks_exact(2)).take_while(|(h, p)| h == p).count();
+    let ctx = |c: u64| -> Result<u64, &'static str> {
+        if c <= shared as u64 || c == POS_CTX_LOST { return Ok(c); }
+        let new = c + (hi.len() / 2 - shared) as u64;
+        if new >= POS_CTX_LOST { return Err("joined inline context exceeds the position format"); }
+        Ok(new)
+    };
+    let pos = |p| ctx(pos_ctx(p)).map(|c| pos_with_ctx(p, c));
+    host.push((p_off, pos(part_rows.first().map_or(0, |e| e.1))?));
+    for &(off, p) in part_rows {
+        host.push((p_off.checked_add(off).ok_or("part source offset overflow")?, pos(p)?));
+    }
+    if let Some(&(_, file_pos)) = hv.first().or(pv.first()) {
+        let h = dbgloc::from_pc_entries(hv.iter().copied());
+        let mut p = dbgloc::from_pc_entries(pv.iter().copied());
+        if !p.is_empty() && hi.len() / 2 > shared && pi.len() / 2 > shared {
+            let mut t = dbgloc::decode(&p).ok_or("invalid part local table")?;
+            for v in &mut t.vars { v.ctx = ctx(v.ctx.into())? as u16; }
+            p = dbgloc::encode(&t);
+        }
+        let mut bytes = Vec::from(PART_LOCALS);
+        bytes.extend_from_slice(&p_off.to_le_bytes());
+        for n in [h.len(), p.len()] {
+            bytes.extend_from_slice(&u32::try_from(n).map_err(|_| "local table exceeds PC_VARS length")?.to_le_bytes());
+        }
+        bytes.extend(h);
+        bytes.extend(p);
+        u32::try_from(bytes.len()).map_err(|_| "joined local tables exceed PC_VARS length")?;
+        // A patched source run ends within text. A byte-counting reader must never
+        // extend the last patched run to the synthetic PC_VARS offset.
+        if host.last().is_some_and(|e| pos_patched(e.1)) { host.push((text_len, 0)); }
+        host.extend(dbgloc::pc_entries(&bytes, pos_file(file_pos)));
+    }
+    host.extend_from_slice(hi);
+    for &(_, p) in &pi[2 * shared..] { host.push((u32::MAX, pos(p)?)); }
+    Ok(())
+}
+
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
         Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), notes: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, lowering: None, pending: Vec::new(), full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default(), patched_path: false, keep_frames: false, digest: None, inl_digest: Vec::new(), inl_waits: Vec::new() }
@@ -2367,7 +2437,7 @@ impl Func {
                     if *t >= nb || *u >= nb {
                         return Err(format!("{}: bad invoke target", self.name));
                     }
-                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
                         return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
                     }
                 }
@@ -2690,6 +2760,68 @@ pub fn split_unwind_info(code: &[u8]) -> SplitUnwindInfo {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+use crate::arm64 as native;
+#[cfg(not(target_arch = "aarch64"))]
+use crate::x64 as native;
+
+/// Both backends install the same layout. Only the four-byte private call field differs.
+pub(crate) fn join_native_part(mut host: native::Compiled, part: native::Compiled, call_word: fn(u32, u32) -> Result<u32, &'static str>) -> Result<native::Compiled, String> {
+    if !part.part_calls.is_empty() { return Err("outlined part calls another part".into()); }
+    let code_len = |c: &native::Compiled| {
+        let s = split_unwind_info(&c.code);
+        if s.host.is_none() || s.part.is_some() || c.code.len() % 4 != 0 || c.text_len == 0 || c.text_len as usize > s.code_len {
+            return Err("expected native function text, pool and one unwind trailer");
+        }
+        Ok(s.code_len)
+    };
+    let h_len = code_len(&host)?;
+    let p_len = code_len(&part)?;
+    let p_off = u32::try_from((h_len as u64 + 15) & !15).map_err(|_| "outlined part offset overflow")?;
+    let joined_len = u64::from(p_off) + part.code.len() as u64 + (host.code.len() - h_len) as u64 + 8;
+    if joined_len > u32::MAX as u64 { return Err("joined body exceeds code offset range".into()); }
+    let p_words = (part.code.len() - p_len) / 4;
+    if p_words > 0xff_ffff { return Err("part unwind trailer exceeds word count range".into()); }
+
+    let text = &mut host.code[..host.text_len as usize];
+    for site in host.part_calls.drain(..) {
+        let word = call_word(site, p_off)?;
+        let field = text.get_mut(site as usize..).and_then(|b| b.get_mut(..4)).ok_or("private call outside host text")?;
+        field.copy_from_slice(&word.to_le_bytes());
+    }
+    let trailer = host.code.split_off(h_len);
+    host.code.reserve(joined_len as usize - h_len);
+    host.code.resize(p_off as usize, 0);
+    host.code.extend_from_slice(&part.code[..p_len]);
+    host.code.extend(trailer);
+    host.code.extend_from_slice(&part.code[p_len..]);
+    for w in part_trailer_words(p_off, p_words) { host.code.extend_from_slice(&w.to_le_bytes()); }
+    for mut r in part.relocs {
+        r.at = p_off.checked_add(r.at).ok_or("part relocation offset overflow")?;
+        host.relocs.push(r);
+    }
+    host.text_len = p_off + part.text_len;
+    join_part_pc_maps(&mut host.pc_map, &part.pc_map, p_off, host.text_len)?;
+
+    // The assembly dump indexes instructions by block number alone. Give P's emitted
+    // blocks distinct labels there, keeping their function-local numbers for reading jumps.
+    let mut block_base = 0;
+    if !part.rir_emitted.is_empty() {
+        let block_label = |line: &str| line.strip_prefix('b')?.strip_suffix(':')?.parse::<u32>().ok();
+        block_base = host.rir_emitted.lines().filter_map(block_label).count() as u32;
+        for line in part.rir_emitted.lines() {
+            if let Some(b) = block_label(line) {
+                host.rir_emitted.push_str(&format!("b{}:  (part b{})\n", block_base + b, b));
+            } else {
+                host.rir_emitted.push_str(line);
+                host.rir_emitted.push('\n');
+            }
+        }
+    }
+    host.rir_map.extend(part.rir_map.into_iter().map(|(off, b, i)| (p_off + off, block_base + b, i)));
+    Ok(host)
+}
+
 /// Borrows each function's ordinary trailer from the image's trailer region.
 pub fn split_unwind_region(trailer: &[u8], code_len: u32) -> Option<(&[u8], Option<(u32, &[u8])>)> {
     let (_, host, part) = unwind_trailers(trailer, Some(code_len as usize))?;
@@ -2717,6 +2849,134 @@ pub fn used_slots(f: &Func) -> Vec<bool> {
         }
     }
     used
+}
+
+#[cfg(test)]
+mod join_part_tests {
+    use super::*;
+
+    // Both functions add their own constant to the argument. The host then calls P
+    // with its sum. With relocations the two constants come from distinct pool words.
+    fn body(host: bool, relocated: bool) -> native::Compiled {
+        let mut f = Func::new(if host { "host" } else { "part" }.into(), 0);
+        let (x, k, sum) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.push(x);
+        f.rets.push(Cls::I);
+        f.block();
+        let n = if host { 3 } else { 7 };
+        let constant = if relocated { Inst::Addr(k, Sym::new(n)) } else { Inst::Iconst(k, n as i64) };
+        let add = Inst::IBin(IOp::Add, IntTy { bits: 64, signed: false }, sum, x, k);
+        f.blocks[0].insts = vec![constant, add];
+        f.blocks[0].pos = vec![n as u64; 2];
+        f.blocks[0].term = Term::Ret(vec![sum]);
+        if host {
+            let result = f.vreg(Cls::I);
+            f.blocks[0].insts.push(Inst::Call(Callee::Part, vec![sum], vec![result]));
+            f.blocks[0].pos.push(4);
+            if relocated {
+                let (normal, pad) = (f.block(), f.block());
+                f.blocks[0].term = Term::Invoke(normal, pad);
+                f.blocks[normal as usize].term = Term::Ret(vec![result]);
+                f.blocks[pad as usize].term = Term::Ret(vec![x]);
+            } else {
+                f.blocks[0].term = Term::Ret(vec![result]);
+            }
+        }
+        native::compile(&relax_session::Options::default(), &f, &native::Env::standalone(false)).unwrap()
+    }
+
+    #[test]
+    fn join_part_call_returns_and_keeps_both_frames() {
+        assert!(native::join_part(body(true, false), body(true, false)).is_err(), "recursive private call");
+        for relocated in [false, true] {
+            let mut h = body(true, relocated);
+            let mut p = body(false, relocated);
+            let [site] = h.part_calls[..] else { panic!("expected one private call") };
+            let (hs, ps) = (split_unwind_info(&h.code), split_unwind_info(&p.code));
+            let p_off = ((hs.code_len + 15) & !15) as u32;
+            let p_first = p.pc_map[0].1;
+            assert_eq!(h.relocs.is_empty(), !relocated);
+            assert_eq!(p.relocs.is_empty(), !relocated);
+            let mut relocs = h.relocs.clone();
+            relocs.extend(p.relocs.iter().map(|r| RelocAt { at: r.at + p_off, ..*r }));
+            let (frame, end) = (h.frame_size, p_off + p.text_len);
+            let site = site as usize;
+            // Exercise dump and map joining without changing the process-wide dump flag.
+            h.rir_map = vec![(0, 0, 0)];
+            p.rir_map = vec![(4, 0, u32::MAX)];
+            h.rir_emitted = "fn host\nb0:\n".into();
+            p.rir_emitted = if relocated { "fn part\nb0:\n".into() } else { String::new() };
+            let mut joined = native::join_part(h, p).unwrap();
+            assert_eq!(joined.rir_map, [(0, 0, 0), (p_off + 4, u32::from(relocated), u32::MAX)]);
+            if relocated { assert!(joined.rir_emitted.contains("b1:  (part b0)")); }
+            assert!(joined.part_calls.is_empty());
+            assert_eq!((joined.frame_size, joined.text_len), (frame, end));
+            assert_eq!(joined.relocs, relocs, "ordered relocated fields");
+            assert!(joined.pc_map.contains(&(p_off, p_first)), "source at the part entry");
+            let w = i32::from_le_bytes(joined.code[site..site + 4].try_into().unwrap());
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(w as u32 >> 26, 0b100101);
+                assert_eq!(site as i64 + ((w << 6 >> 6) as i64) * 4, p_off as i64);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                assert_eq!(joined.code[site - 1], 0xe8);
+                assert_eq!(site as i64 + 4 + w as i64, p_off as i64);
+            }
+            let s = split_unwind_info(&joined.code);
+            assert_eq!(s.code_len, p_off as usize + ps.code_len);
+            let (base, pu) = s.part.unwrap();
+            assert_eq!(base, p_off);
+            for (got, orig) in [(s.host.unwrap(), hs.host.unwrap()), (pu, ps.host.unwrap())] {
+                assert_eq!((got.sp_off, got.saved, got.staged, got.pads), (orig.sp_off, orig.saved, orig.staged, orig.pads));
+            }
+            link(&mut joined.code, 0, &joined.relocs, &|r| match r {
+                Reloc::Sym(s) => s.id.into(),
+                _ => panic!("unexpected relocation {r:?}"),
+            }).unwrap();
+            let code = crate::exec::Code::new(&joined.code).unwrap();
+            let f: crate::host_fn_ptr!(fn(u64) -> u64) = unsafe { std::mem::transmute(code.ptr()) };
+            assert_eq!(unsafe { f(32) }, 42, "argument and return through the private call");
+        }
+    }
+
+    #[test]
+    fn join_part_locals_and_inline_contexts() {
+        use crate::dbgloc::{self, Home, Table, Var, VarKind};
+        let table = |disp| Table {
+            vars: vec![Var { ctx: 0, local: 3, kind: VarKind::Frame(disp), consts: vec![] },
+                       Var { ctx: 2, local: 4, kind: VarKind::Regs(1), consts: vec![] }],
+            sites: vec![(4, vec![(1, 0, Home::Fp(disp))])],
+        };
+        let shared = [(u32::MAX, 11), (u32::MAX, 12)];
+        let mut h = vec![(0, 10)];
+        h.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-16)), 1));
+        h.extend(shared);
+        h.extend([(u32::MAX, 13), (u32::MAX, 14)]);
+        let flagged = POS_GUARD | POS_PATCHED | 21;
+        let lost = pos_with_ctx(flagged, POS_CTX_LOST);
+        let mut p = vec![(4, 0), (8, pos_with_ctx(flagged, 2)), (12, lost)];
+        p.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-48)), 2));
+        p.extend(shared);
+        p.extend([(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                  (u32::MAX, pos_with_ctx(flagged, 2)), (u32::MAX, 17)]);
+        join_part_pc_maps(&mut h, &p, 32, 48).unwrap();
+        assert_eq!(&h[..5], &[(0, 10), (32, 0), (36, 0), (40, pos_with_ctx(flagged, 3)), (44, lost)]);
+        assert_eq!(&h[h.len() - 4..], &[(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                                         (u32::MAX, pos_with_ctx(flagged, 3)), (u32::MAX, 17)]);
+        let bytes = dbgloc::from_pc_entries(h.into_iter());
+        for (pc, disp, ctx) in [(3, -16, 2), (35, -48, 3)] {
+            let (b, off) = part_local_table(&bytes, pc).unwrap();
+            let t = dbgloc::decode(b).unwrap();
+            assert_eq!(t.vars[0].kind, VarKind::Frame(disp), "root local in this frame");
+            assert_eq!(t.vars[1].ctx, ctx);
+            assert_eq!(t.site(off + 1).unwrap(), &[(1, 0, Home::Fp(disp))]);
+        }
+        assert_eq!(part_local_table(&bytes, 31).unwrap().1, 31);
+        assert_eq!(part_local_table(&bytes, 32).unwrap().1, 0);
+        assert!(part_local_table(&bytes[..bytes.len() - 1], 32).is_none());
+    }
 }
 
 #[cfg(test)]

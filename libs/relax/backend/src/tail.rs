@@ -72,7 +72,7 @@ pub fn sibling_calls(options: &relax_session::Options, f: &Func, reach: &[bool],
         // the block's last call, followed by moves only
         let Some(k) = b.insts.iter().rposition(|i| !matches!(i, Inst::Mov(..))) else { continue };
         let Inst::Call(c, _, rets) = &b.insts[k] else { continue };
-        if !matches!(c, Callee::Asm(_) | Callee::Host(_) | Callee::CHost(..)) && returns_results(f, bi, k + 1, rets) {
+        if !matches!(c, Callee::Part | Callee::Asm(_) | Callee::Host(_) | Callee::CHost(..)) && returns_results(f, bi, k + 1, rets) {
             cands.push((bi, k));
         }
     }
@@ -105,6 +105,7 @@ pub fn sibling_calls(options: &relax_session::Options, f: &Func, reach: &[bool],
             }
         }
         if callee_ok(f, arch, c, args, rets) {
+            assert!(!matches!(c, Callee::Part), "a private part call must keep the host frame");
             out[bi] = Some(k);
             any = true;
         } else if trace {
@@ -328,7 +329,7 @@ pub fn tail_shaped(f: &Func, reach: &[bool]) -> Vec<usize> {
         }
         let Some(k) = b.insts.iter().rposition(|i| !matches!(i, Inst::Mov(..))) else { continue };
         let Inst::Call(c, _, rets) = &b.insts[k] else { continue };
-        if matches!(c, Callee::Asm(_) | Callee::Host(_) | Callee::CHost(..)) {
+        if matches!(c, Callee::Part | Callee::Asm(_) | Callee::Host(_) | Callee::CHost(..)) {
             continue;
         }
         let shaped = match b.term {

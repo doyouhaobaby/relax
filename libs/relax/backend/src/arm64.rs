@@ -296,17 +296,31 @@ pub struct Compiled {
     /// (code offset, source position) in ascending offset order
     pub pc_map: Vec<(u32, u64)>,
     pub frame_size: u32,
-    /// bytes of instructions (the float literal pool follows)
+    /// End of the last function's instructions (a joined body includes the host pool and alignment).
+    /// The float literal pool follows.
     pub text_len: u32,
     /// regalloc::alloc_sig of the allocation (0 unless regalloc::SIG_ON)
     pub alloc_sig: u64,
     /// the relocated fields, emitted zeroed: the embedder links the code (`rir::link`) where it
     /// installs it
     pub relocs: Vec<RelocAt>,
+    /// Byte offsets of private bl instructions to resolve when joining the outlined part.
+    pub part_calls: Vec<u32>,
     /// (code offset, block, instruction or u32::MAX = terminator) of every RIR instruction
     /// emitted -- filled only while `set_rir_map(true)` (asm dumps)
     pub rir_map: Vec<(u32, u32, u32)>,
     pub rir_emitted: String,
+}
+
+/// Resolve the host's private calls and keep both functions in one installable body.
+pub fn join_part(host: Compiled, part: Compiled) -> Result<Compiled, String> {
+    crate::rir::join_native_part(host, part, |site, p_off| {
+        if !branch_reaches(RelocKind::A64Branch26, site.into(), p_off.into()) {
+            return Err("private call is unaligned or exceeds bl range");
+        }
+        let words = (i64::from(p_off) - i64::from(site)) / 4;
+        Ok(0x9400_0000 | (words as u32 & 0x03ff_ffff))
+    })
 }
 
 /// Addresses the backend needs from the runtime.
@@ -971,6 +985,7 @@ struct Gen<'a> {
     /// empty: the function names no domain symbol)
     dom_read: Vec<bool>,
     relocs: Vec<RelocAt>,
+    part_calls: Vec<u32>,
     text_words: usize,
     pc_map: Vec<(u32, u64)>,
     cur_pos: u32,
@@ -5069,6 +5084,10 @@ impl<'a> Gen<'a> {
         self.moves(&mv);
         match c {
             Callee::Fn(id) => self.bl_reloc(Reloc::Call(*id)),
+            Callee::Part => {
+                self.part_calls.push((self.a.pos() * 4) as u32);
+                self.a.e(0x9400_0000);
+            }
             Callee::Indirect(_) => self.a.blr(IP0),
             Callee::Host(sym) => self.call_far(Reloc::Sym(*sym)),
             Callee::CHost(..) | Callee::CIndirect(..) | Callee::CFn(..) | Callee::Asm(..) => {}
@@ -5860,6 +5879,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         dom_slot: -1,
         dom_read: Vec::new(),
         relocs: Vec::new(),
+        part_calls: Vec::new(),
         text_words: 0,
         pc_map: Vec::new(),
         cur_pos: 0,
@@ -5932,7 +5952,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         crate::dbgloc::note_stats(&pc_map, &[], 0);
     }
-    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { emitted_dump(g.f) } else { String::new() }, rir_map: g.rir_map });
+    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, part_calls: g.part_calls, rir_emitted: if g.rir_map_on { emitted_dump(g.f) } else { String::new() }, rir_map: g.rir_map });
     }
 }
 

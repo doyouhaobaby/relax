@@ -106,7 +106,7 @@ fn compile_native(options: &relax_session::Options, f: &Func, env: &target::Env,
         // RELAX_NO_CODEGEN): its "code" is the interpreter's relocatable form (interp/blob.rs)
         if let Some((code, relocs)) = crate::interp::maybe_compile(options, f, env.slots, env.syms, env.sym_class, env.tls_slow, env.resume) {
             let n = code.len() as u32;
-            return Ok(target::Compiled { code, pc_map: Vec::new(), frame_size: 0, text_len: n, alloc_sig: 0, relocs, rir_map: Vec::new(), rir_emitted: String::new() });
+            return Ok(target::Compiled { code, pc_map: Vec::new(), frame_size: 0, text_len: n, alloc_sig: 0, relocs, part_calls: Vec::new(), rir_map: Vec::new(), rir_emitted: String::new() });
         }
         // research (ios-interp): RELAX_INTERP_STATS=1 also sums the machine-code backend's
         // time and output for functions compiled natively, to compare with the interpreter's lowering

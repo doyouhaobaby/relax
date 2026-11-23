@@ -61,13 +61,16 @@ pub struct Compiled {
     /// (code offset, source position) in ascending offset order
     pub pc_map: Vec<(u32, u64)>,
     pub frame_size: u32,
-    /// bytes of instructions (the float constant pool follows)
+    /// End of the last function's instructions (a joined body includes the host pool and alignment).
+    /// The float constant pool follows.
     pub text_len: u32,
     /// regalloc::alloc_sig of the allocation (0 unless regalloc::SIG_ON)
     pub alloc_sig: u64,
     /// the relocated fields, emitted zeroed: the embedder links the code (`rir::link`) where it
     /// installs it
     pub relocs: Vec<RelocAt>,
+    /// Offsets of private call rel32 fields to resolve when joining the outlined part.
+    pub part_calls: Vec<u32>,
     /// (code offset, block, instruction index; u32::MAX = the terminator) of the function as
     /// emitted -- filled only while `set_rir_map(true)` (asm dumps: tools/run/tools/asmcmp)
     pub rir_map: Vec<(u32, u32, u32)>,
@@ -76,6 +79,14 @@ pub struct Compiled {
 }
 
 static RIR_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resolve the host's private calls and keep both functions in one installable body.
+pub fn join_part(host: Compiled, part: Compiled) -> Result<Compiled, String> {
+    crate::rir::join_native_part(host, part, |site, p_off| {
+        let d = i64::from(p_off) - (i64::from(site) + 4);
+        i32::try_from(d).map(|d| d as u32).map_err(|_| "private call exceeds rel32 range")
+    })
+}
 
 /// Record `Compiled::rir_map` (code offset -> RIR block/instruction) in later compiles.
 pub fn set_rir_map(on: bool) {
@@ -1133,6 +1144,7 @@ struct Gen<'a> {
     /// empty: the function names no domain symbol)
     dom_read: Vec<bool>,
     relocs: Vec<RelocAt>,
+    part_calls: Vec<u32>,
     /// emission order successor of each block (u32::MAX for the last)
     next_block: Vec<u32>,
     /// block -> where its code goes on: blocks that emit only their jump (moves the allocator
@@ -6456,6 +6468,11 @@ impl<'a> Gen<'a> {
         }
         match c {
             Callee::Fn(id) => self.call_reloc(Reloc::Call(*id)),
+            Callee::Part => {
+                self.a.byte(0xe8);
+                self.part_calls.push(self.a.pos() as u32);
+                self.a.u32(0);
+            }
             Callee::Indirect(_) => self.a.call_r(R11),
             Callee::Host(sym) => {
                 if !self.near {
@@ -7085,6 +7102,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         dom_slot: 0,
         dom_read: Vec::new(),
         relocs: Vec::new(),
+        part_calls: Vec::new(),
         cplan: None,
         cbuf: Vec::new(),
         cret_buf: 0,
@@ -7173,7 +7191,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         crate::dbgloc::note_stats(&pc_map, &[], 0);
     }
-    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
+    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, part_calls: g.part_calls, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
 }
 
 /// `jmp target` through r11 (caller-saved, never an argument register): every argument

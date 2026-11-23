@@ -18921,7 +18921,7 @@ fn dump_base(name: &str) -> Option<String> {
 /// A back-end job's result leaves its job arena (zone_alloc::copy_out): code, pc map and relocations
 /// are copied into the heap of the thread's phase; the job's own copies die with the job.
 fn copied_out(c: x64::Compiled) -> x64::Compiled {
-    let x64::Compiled { code, pc_map, frame_size, text_len, alloc_sig, relocs, rir_map, rir_emitted } = c;
+    let x64::Compiled { code, pc_map, frame_size, text_len, alloc_sig, relocs, part_calls, rir_map, rir_emitted } = c;
     crate::zone_alloc::copy_out(|| x64::Compiled {
         code: code.clone(),
         pc_map: pc_map.clone(),
@@ -18929,6 +18929,7 @@ fn copied_out(c: x64::Compiled) -> x64::Compiled {
         text_len,
         alloc_sig,
         relocs: relocs.clone(),
+        part_calls: part_calls.clone(),
         rir_map: rir_map.clone(),
         rir_emitted: rir_emitted.clone(),
     })
