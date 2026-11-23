@@ -1571,26 +1571,33 @@ fn copy_versions_move_with_the_flags_their_code_reads() {
     // Copy versions (note_guard_reads): code that reads patch flags notes the copy versions it
     // reads under each. A flag set before the install moves them at the install (a callee patched
     // before it is caught), one set after moves them at the patch (set_patched); a slot whose code
-    // reads no flag that was set keeps its version. The disk cache never stores code naming a
-    // version that moved: a later session's starts at 0 and would reach the value again while the
-    // code's copies may be stale. Control: the same record naming a version at 0 is encoded.
+    // reads no flag that was set keeps its version. P's flag and the host exit's copy version
+    // pair only when scanned in one relocation list, whether the patch precedes or follows
+    // the scan. The disk cache never stores code naming a version that moved: a later session's
+    // starts at 0 and would reach the value again while the code's copies may be stale.
+    // Control: the same record naming a version at 0 is encoded.
     crate::borrowck::lazy::disable_gandalf();
     std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-copy-versions-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("input.rs"), "pub fn hot(out: &mut u32) { *out = 7; }\npub fn cool(out: &mut u32) { *out = 8; }\npub fn early() {}\npub fn late() {}\nfn main() {}\n").unwrap();
+    std::fs::write(dir.join("input.rs"), concat!(
+        "pub fn hot(out: &mut u32) { *out = 7; }\npub fn cool(out: &mut u32) { *out = 8; }\n",
+        "pub fn early() {}\npub fn late() {}\npub fn split_leaf() {}\npub fn split_host() {}\n",
+        "pub fn joined_leaf() {}\npub fn joined_host() {}\npub fn later_host() {}\nfn main() {}\n",
+    )).unwrap();
     std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "copy_versions", false).unwrap();
     let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
-    let defs = [def("hot"), def("cool"), def("early"), def("late")];
+    let defs = ["hot", "cool", "early", "late", "split_leaf", "split_host", "joined_leaf", "joined_host", "later_host"].map(def);
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
-    crate::owner::call(crate::owner::Class::Program, || {
-        let [hot, cool, early, late] = defs.map(|d| u.fn_id(FnKey::Inst(d, Vec::new())));
+    let (split, joined_before, joined_after, already_set) = crate::owner::call(crate::owner::Class::Program, || {
+        let [hot, cool, early, late, split_leaf, split_host, joined_leaf, joined_host, later_host] =
+            defs.map(|d| u.fn_id(FnKey::Inst(d, Vec::new())));
         let at = |u: &Unit, id: u32, off: i64| {
             let s = loop_counter_sym(u, id);
             relax_backend::rir::Sym { id: s.id, off: s.off + off }
@@ -1605,6 +1612,25 @@ fn copy_versions_move_with_the_flags_their_code_reads() {
         let reads = [at(&u, cool, COPY_VER_OFF)];
         note_guard_reads(&mut u, reads.into_iter());
         assert_eq!(ver(&u, cool), 0, "code that reads no flag keeps its version");
+
+        let flag = at(&u, split_leaf, PATCH_FLAG_OFF);
+        let version = at(&u, split_host, COPY_VER_OFF);
+        note_guard_reads(&mut u, [flag].into_iter());
+        note_guard_reads(&mut u, [version].into_iter());
+        set_patched(&u, split_leaf);
+        let split = ver(&u, split_host);
+
+        let flag = at(&u, joined_leaf, PATCH_FLAG_OFF);
+        let version = at(&u, joined_host, COPY_VER_OFF);
+        note_guard_reads(&mut u, [flag, version].into_iter());
+        let joined_before = ver(&u, joined_host);
+        set_patched(&u, joined_leaf);
+        let joined_after = ver(&u, joined_host);
+
+        let version = at(&u, later_host, COPY_VER_OFF);
+        note_guard_reads(&mut u, [flag, version].into_iter());
+        let already_set = ver(&u, later_host);
+
         let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
         cache.mode = crate::cache::Mode::On;
         u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
@@ -1623,9 +1649,14 @@ fn copy_versions_move_with_the_flags_their_code_reads() {
             assert_eq!(cache.stats.recorded > before, stored, "{}: a record naming a copy version at {} is {}", u.fns[id as usize].name, ver(&u, id), if stored { "encoded" } else { "never encoded" });
             u.cache = Some(cache);
         }
+        (split, joined_before, joined_after, already_set)
     });
     std::fs::remove_dir_all(&dir).unwrap();
     std::mem::forget(u);
+    assert_eq!(split, 0, "two relocation sets scanned apart never pair; a joined payload must carry P's flags and the exit's version in one list");
+    assert_eq!(joined_before, 0, "a joined scan with a clear flag keeps the host's version at install");
+    assert_eq!(joined_after, 1, "a patch after a joined scan moves the host's version");
+    assert_eq!(already_set, 1, "a joined scan with an already-set flag moves the new host's version at install");
 }
 
 #[test]
