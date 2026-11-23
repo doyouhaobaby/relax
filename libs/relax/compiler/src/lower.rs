@@ -7552,6 +7552,9 @@ impl<'a> Lcx<'a> {
                 let p = self.to_leaves(v, st);
                 let mut pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
                 let mut pt = inner;
+                // the steps call `DerefMut::deref_mut` only when the result is borrowed mutably
+                // (rustc convert_place_derefs_to_mutable): `&mut c as &str` calls `Deref::deref`
+                let m = match self.kind(target) { TyKind::Ref(tm, ..) => m && tm, _ => m };
                 let saved = self.want_mut;
                 self.want_mut = m;
                 for k in 0..n {
@@ -7560,7 +7563,6 @@ impl<'a> Lcx<'a> {
                     pt = b;
                 }
                 self.want_mut = saved;
-                let _ = target;
                 if self.unsized_ty(pt) {
                     match pl {
                         Place::Regs(r) => Val::L(r),

@@ -1855,6 +1855,9 @@ impl<'a> Fcx<'a> {
     /// Record their borrow before capture analysis; MIR lowering reads this same
     /// adjustment instead of independently deciding whether a cast moves a reference.
     fn record_cast_borrow(&mut self, e: ExprId, source: TyId, target: TyId) {
+        // a deref coercion (`&s as &str`) already ends in the cast's own borrow, of the target's
+        // type: reborrowing the source would replace it with a borrow of the wrong type
+        if matches!(self.b.coerce(e.0), Some(Coerce::DerefRef(_))) { return; }
         let (source, target) = (self.shallow(source), self.shallow(target));
         let TyKind::Ref(sm, inner, _) = self.tcx.tys.kind(source).clone() else { return };
         match self.tcx.tys.kind(target).clone() {
@@ -5376,7 +5379,6 @@ impl<'a> Fcx<'a> {
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
-                let mut deref_coerced = false;
                 if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
                     self.deferred_casts.push((*x, xt, target));
                 } else if matches!((&kx, &kt), (TyKind::Infer(_), TyKind::Ptr(..))) {
@@ -5437,6 +5439,11 @@ impl<'a> Fcx<'a> {
                     // `p.as_ref() as &Path`: the source referent is open (`AsRef<_>` with several
                     // impls); rustc check_casts coerces at the end of typeck, which decides it
                     self.deferred_casts.push((*x, xt, target));
+                } else if matches!((&kx, &kt), (TyKind::Ref(_, a, _), TyKind::Ref(_, b, _)) if self.has_open_infer(*a) || self.has_open_infer(*b)) {
+                    // `&w as &str` with w: Wrapper<?T>: a deref coercion now would decide `?T`
+                    // from the cast (?T = str); rustc checks every cast after typeck (check_casts),
+                    // when later uses (`let kept: Wrapper<String> = w`) have decided it
+                    self.deferred_casts.push((*x, xt, target));
                 } else if let (TyKind::Ref(m1, a, _), TyKind::Ref(m2, bt, _)) = (&kx, &kt) {
                     // a cast is first a coercion when one applies (rustc cast.rs
                     // try_coercion_cast): `&s as &str` is a deref coercion of &String
@@ -5447,11 +5454,10 @@ impl<'a> Fcx<'a> {
                             // coercion ends (`&s as &str`: Deref, Deref(String: Deref), Borrow to `&str`),
                             // and that borrow is the cast's: no reborrow of the source after it
                             self.set_deref_ref(x.0, derefs, Some((*m2, target)));
-                            deref_coerced = true;
                         }
                     }
                 }
-                if self.deferred_casts.len() == deferred_before && !deref_coerced { self.record_cast_borrow(*x, xt, target); }
+                if self.deferred_casts.len() == deferred_before { self.record_cast_borrow(*x, xt, target); }
                 target
             }
             ExprKind::Block(b, label) => {
