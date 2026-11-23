@@ -111,7 +111,8 @@ pub struct Syms {
     pub vals: u64,
     /// `rir::SymClass` per id (u8): how a backend may encode the symbol (`Env::sym_class`)
     pub classes: u64,
-    /// a byte per id: the made cell of a vtable's data symbol (`SymKind::Made`, made_cell)
+    /// a byte per id: the made cell of a vtable's data symbol (`SymKind::Made`, made_cell); the
+    /// program's code sets it, so a wasm32 program's are in its window (Unit::new)
     made: u64,
     /// kind per id (append-only: read without a lock)
     kinds: crate::conc::AppendVec<SymKind>,
@@ -196,8 +197,9 @@ pub fn vtable_name_keys(name: &str) -> impl Iterator<Item = &str> {
 }
 
 impl Syms {
-    pub fn new(vals: u64, dom0: u64) -> Syms {
-        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), made: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), vtable_count: AtomicUsize::new(0), thunk_count: AtomicUsize::new(0), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+    /// `made`: SYM_CAP zeroed bytes, the made cells (made_cell)
+    pub fn new(vals: u64, dom0: u64, made: u64) -> Syms {
+        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), made, kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), vtable_count: AtomicUsize::new(0), thunk_count: AtomicUsize::new(0), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
     }
 
 

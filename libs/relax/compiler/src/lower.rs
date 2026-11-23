@@ -4265,7 +4265,10 @@ impl<'a> Lcx<'a> {
     /// where it did before the cells.
     fn note_made(&mut self, vt: u64) {
         let (cell, b, one) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I), self.f.vreg(Cls::I));
-        let sym = self.u.syms.made_sym(self.u.data_sym(vt));
+        let vt_sym = self.u.data_sym(vt);
+        let sym = self.u.syms.made_sym(vt_sym);
+        // (a wasm32 program reaches the cell through a 32-bit offset: it must be in the window)
+        assert!(self.pb() != 4 || crate::web32::in_window(self.u.syms.made_cell(vt_sym)), "relax: a wasm32 program's made cell {:#x} is outside its window", self.u.syms.made_cell(vt_sym));
         let check = [Inst::Addr(cell, sym), Inst::Load(Mem::Int(1, false), b, cell, 0)];
         // (and the first time, a call that tells the live loop: rt_made_late, for a closure a patch
         // kept that no trait object held yet)

@@ -6123,7 +6123,12 @@ impl Unit {
             payload_end: std::sync::atomic::AtomicUsize::new(0),
             std_default_hook: std::sync::atomic::AtomicUsize::new(0),
             rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
-            syms: crate::syms::Syms::new(syms_base, rw_base),
+            // the made cells, which the program's code sets (lower.rs note_made): a wasm32 program
+            // addresses them through 32-bit offsets, so they are in its window (as its domain static
+            // blocks and block counters are); a host page above 4 GB read as its low 32 bits was
+            // another place of the window, unmapped (a segfault at the first trait object made) or
+            // the program's own memory
+            syms: crate::syms::Syms::new(syms_base, rw_base, if w32 { crate::web32::alloc(crate::syms::SYM_CAP) } else { alloc_rw(crate::syms::SYM_CAP) }),
             cache: None,
             pending_cache_records: Vec::new(),
             pending_cache_cursor: 0,
