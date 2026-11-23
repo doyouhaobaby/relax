@@ -1808,6 +1808,10 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // after the crate's environment, whose CARGO is the build's cargo (pkg_env). The runner
     // consumes `build-script` on entry, then marks tool calls.
     cmd.env("RUSTC", &exe).env("CARGO", &exe);
+    // and no compiler wrapper: a person's RUSTC_WRAPPER wraps their rustc for cargo, while a
+    // script's RUSTC here is Relax, which answers its probes itself (a caching wrapper refuses
+    // Relax as a compiler, and the script's probe failed through it)
+    cmd.env_remove("RUSTC_WRAPPER").env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env("CARGO_ENCODED_RUSTFLAGS", "");
     for f in &bs.features {
         cmd.env(format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")), "1");
