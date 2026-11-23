@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 /// Bytes a sender may have outstanding on a channel before the receiver grants more.
@@ -25,6 +25,23 @@ const GRANT_AT: usize = 64 << 10;
 pub const QUEUE_CAP: usize = 1 << 20;
 /// How long a connection's writer stays idle before it pings the peer.
 pub const KEEPALIVE: Duration = Duration::from_secs(5);
+
+/// Every connection of this process that has not ended yet ([`shut_down_all`]).
+static LIVE: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
+
+/// Shuts down every connection of this process, both ways, before it execs in place. The exec
+/// closes this process's descriptors, but a child that inherited a copy of a connection's socket
+/// holds that socket open, and its peer waited on it for good: macOS sets close-on-exec on an
+/// accepted or dialled socket only once accept or socket returns, and a spawn on another thread
+/// in between inherits it (11-23). Shut down, the copy holds a dead socket and the peer sees the
+/// end at once, as at any close; its calls fail as lost and dial again. An exec that fails leaves
+/// them shut down: their peers dial again.
+pub fn shut_down_all() {
+    let live: Vec<Arc<Shared>> = LIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    for c in live {
+        (c.shutdown)();
+    }
+}
 
 pub const CLOSE_NORMAL: u16 = 0;
 pub const CLOSE_UNSUPPORTED: u16 = 1;
@@ -238,6 +255,11 @@ impl Conn {
             ping_limit_ns: AtomicU64::new(0),
             ping_out_ns: AtomicU64::new(0),
         });
+        {
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            live.retain(|c| c.strong_count() > 0);
+            live.push(Arc::downgrade(&shared));
+        }
         let conn = Conn(shared);
         let (c1, c2) = (conn.clone(), conn.clone());
         let writer = io.writer;
