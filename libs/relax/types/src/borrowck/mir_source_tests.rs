@@ -1131,3 +1131,24 @@ fn an_inline_asm_body_is_unsupported_not_an_internal_failure() {
     assert!(unsupported.len() == 1 && unsupported[0].ends_with("spin: inline asm"), "{unsupported:?}");
     assert!(errors.len() == 1 && errors[0].ends_with("bad E0515"), "the other bodies are checked: {errors:?}");
 }
+
+/// A trait's default method returning `impl Iterator` over borrowed data is checked with its return
+/// place typed as the method's opaque (its own RPITIT projection folded to it), so its borrow of
+/// `self` flows into the declared output, as rustc checks it; an impl that overrides it with another
+/// iterator type is checked the same way.
+#[test]
+fn a_default_method_returns_an_iterator_over_borrowed_data() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Bag {
+            fn items(&self) -> &[u32];
+            fn evens(&self) -> impl Iterator<Item = &u32> { self.items().iter().filter(|x| **x % 2 == 0) }
+        }
+        pub struct Reversed(Vec<u32>);
+        impl Bag for Reversed {
+            fn items(&self) -> &[u32] { &self.0 }
+            fn evens(&self) -> impl Iterator<Item = &u32> { self.0.iter().rev() }
+        }
+        pub fn count(b: &Reversed) -> usize { b.evens().count() }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
