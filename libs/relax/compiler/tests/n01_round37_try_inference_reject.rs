@@ -1,5 +1,6 @@
-// rejects: type annotations needed
-// (rustc: E0282; makepad: E0283, the `_: Sized` it cannot satisfy)
+// rejects: E0282
+// (the `_` of `Ok::<u32, _>`, an ambiguous `Sized`: rustc reports it before the ambiguous
+// FromResidual of the `?`, a desugaring's, which report_fulfillment_errors takes last)
 // rustc_ast_lowering/src/expr.rs: ? emits FromResidual obligations. It does
 // not choose the source error type when the closure's result is unconstrained.
 fn main() {

@@ -532,6 +532,13 @@ pub struct Fcx<'a> {
     soft: bool,
     /// position of the expression checked last (patterns have no spans of their own)
     last_lo: u32,
+    /// `Trait::item` value paths (no qualified self) by the position their predicates are
+    /// registered at: (the trait, the item). An ambiguous `_: Trait` there is rustc's E0790.
+    trait_item_paths: HashMap<u32, (DefId, DefId)>,
+    /// positions of the goals a `?` registers (rustc: spans of its desugaring), whose errors
+    /// rustc reports after the others (report_fulfillment_errors: `from_expansion` last). A goal
+    /// of the operand's own at the same position counts too.
+    desugared_spans: crate::fxhash::HashSet<u32>,
     /// traits of the body's generic bounds (and its trait), with supertraits: in scope for
     /// method calls (computed on first use)
     /// trait args of the next trait method call, fixed by a generic bound
@@ -852,6 +859,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         async_body_expected: HashMap::default(),
         soft: false,
         last_lo: 0,
+        trait_item_paths: HashMap::default(),
+        desugared_spans: Default::default(),
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
         value_path_enum_lifetimes: Vec::new(),
@@ -4004,6 +4013,9 @@ impl<'a> Fcx<'a> {
                     } else {
                         last_args
                     };
+                    if pk == DefKind::Trait && path.no_qself() {
+                        self.trait_item_paths.insert(self.last_lo, (pd, d));
+                    }
                     let t = self.value_def_ty(d, explicit, key);
                     return (Res::Def(d), t);
                 }
@@ -6499,6 +6511,7 @@ impl<'a> Fcx<'a> {
         let sig = self.tcx.fn_sig(self.prog, branch).unwrap().clone();
         let (ps, flow) = self.instantiate_call_signature(branch, &full, &sig);
         self.coerce_or_unify(t, ps[0], Some(x), lo);
+        self.desugared_spans.extend([lo, self.last_lo]);
         self.register_method_obligation(branch, &full);
         self.apply_fn_bounds(branch, &full, lo);
         let flow = self.normalize_signature(flow);
@@ -6523,6 +6536,7 @@ impl<'a> Fcx<'a> {
         match block {
             Some((_, block_output)) => self.try_block_residual(ret, residual, block_output, lo),
             None => {
+                self.desugared_spans.extend([lo, self.last_lo]);
                 self.register_method_obligation(from_residual, &full);
                 self.apply_fn_bounds(from_residual, &full, lo);
             }
@@ -8162,9 +8176,54 @@ impl<'a> Fcx<'a> {
 
     fn retry_goals(&mut self, final_: bool) {
         use crate::next_solver::fulfill::NextSolverError;
-        let errors = if final_ { self.fulfillment_cx.evaluate_obligations_error_on_ambiguity(&self.infcx, self.prog) }
+        let mut errors = if final_ { self.fulfillment_cx.evaluate_obligations_error_on_ambiguity(&self.infcx, self.prog) }
             else { self.fulfillment_cx.try_evaluate_obligations(&self.infcx, self.prog) };
-        for error in errors {
+        // rustc_trait_selection error_reporting/traits/mod.rs report_fulfillment_errors: `T: Sized`,
+        // `T: MetaSized`, `T: PointeeSized`, coercion and `WF` errors come last, so the first error
+        // reported carries the most type information (an ambiguity only the first); and the errors
+        // of desugarings (`?`) are reported after all others (its `from_expansion` pass)
+        let sizedness = [crate::lang_items::LangItem::Sized, crate::lang_items::LangItem::MetaSized, crate::lang_items::LangItem::PointeeSized]
+            .map(|l| self.tcx.lang_items.get(l));
+        errors.sort_by_key(|e| {
+            let o = match e { NextSolverError::TrueError(o) | NextSolverError::Ambiguity(o) | NextSolverError::Overflow(o) => o };
+            (self.desugared_spans.contains(&o.cause.span), match &o.goal.predicate.kind {
+                PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) if sizedness.iter().any(|s| *s == Some(p.trait_ref.def_id)) =>
+                    1 + sizedness.iter().position(|s| *s == Some(p.trait_ref.def_id)).unwrap_or(0),
+                PredicateKind::Coerce(_) => 4,
+                PredicateKind::Clause(crate::next_solver::ClauseKind::WellFormed(_)) => 5,
+                _ => 0,
+            })
+        });
+        // report_fulfillment_errors' covered_by_trait_error (fulfillment_errors.rs
+        // trait_error_implies_projection_error): a failing trait goal also fails every projection
+        // goal resting on it, and such a projection at the same span is not reported again
+        let covered: Vec<bool> = {
+            use crate::next_solver::ClauseKind;
+            let tys = &self.tcx.tys;
+            let resolved = |o: &crate::next_solver::fulfill::PredicateObligation| {
+                let mut r = crate::infer::resolve::DeepVariableResolver::new(&self.infcx);
+                crate::next_solver::fold::fold_predicate(tys, &o.goal.predicate, &mut r)
+            };
+            let failed: Vec<_> = errors.iter().filter_map(|e| match e {
+                NextSolverError::TrueError(o) => match resolved(o).kind {
+                    PredicateKind::Clause(ClauseKind::Trait(p)) => Some((o.cause.span, o.goal.param_env, p.trait_ref.def_id,
+                        p.trait_ref.args.iter().filter_map(|a| match a { crate::consts::GenericArg::Type(t) => Some(*t), _ => None }).collect::<Vec<_>>())),
+                    _ => None,
+                },
+                _ => None,
+            }).collect();
+            errors.iter().map(|e| {
+                let NextSolverError::TrueError(o) = e else { return false };
+                let PredicateKind::Clause(ClauseKind::Projection(c)) = resolved(o).kind else { return false };
+                let crate::next_solver::AliasTerm::Ty(t) = c.projection_term else { return false };
+                let crate::types::TyKind::Alias(_, a) = *tys.kind(t) else { return false };
+                let crate::types::AliasTyKind::Projection { def_id } = a.kind else { return false };
+                let (trait_def, args) = (self.prog.def(def_id).parent, tys.list(a.args));
+                failed.iter().any(|(span, env, d, targs)| *span == o.cause.span && *env == o.goal.param_env && *d == trait_def && args.starts_with(targs))
+            }).collect()
+        };
+        for (i, error) in errors.into_iter().enumerate() {
+            if covered[i] { continue; }
             let (code, obligation) = match error {
                 NextSolverError::TrueError(o) => ("E0277", o),
                 NextSolverError::Ambiguity(o) => { if !self.b.errors.is_empty() { continue; } ("E0283", o) },
@@ -8175,6 +8234,24 @@ impl<'a> Fcx<'a> {
             // rustc's wording (rustc_trait_selection report_selection_error and core's
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
+                // ambiguity.rs maybe_report_ambiguity: an ambiguous `_: Sized` (or `MetaSized`) is
+                // an inference failure (E0282); one at a `Trait::item` path whose trait is the
+                // predicate's is E0790 (the item named without the type that implements it)
+                if code == "E0283" {
+                    if sizedness[..2].iter().any(|s| *s == Some(p.trait_ref.def_id)) {
+                        self.err(obligation.cause.span, "E0282: type annotations needed".to_string());
+                        continue;
+                    }
+                    if let Some(&(_, item)) = self.trait_item_paths.get(&obligation.cause.span).filter(|(t, _)| *t == p.trait_ref.def_id) {
+                        let (verb, noun) = match self.prog.def(item).kind {
+                            DefKind::AssocFn => ("call", "function"),
+                            DefKind::AssocConst => ("refer to the", "constant"),
+                            _ => ("refer to the", "type"),
+                        };
+                        self.err(obligation.cause.span, format!("E0790: cannot {verb} associated {noun} on trait without specifying the corresponding `impl` type"));
+                        continue;
+                    }
+                }
                 let (prog, tcx) = (self.prog, self.tcx);
                 let p = normalize_clause_for_diagnostics(&self.infcx, prog, &obligation.goal.param_env, p);
                 let mut msg = trait_error_message(prog, tcx, code, &p, &mut |t| self.ty_str(t));
