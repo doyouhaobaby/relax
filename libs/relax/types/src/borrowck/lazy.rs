@@ -164,9 +164,12 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, owner: &dyn Fn(DefId) -> Carr
     q.alias.insert((src, to), base);
     // every queued, seen or checked key of an owner has a verdict entry (Pending at least), so
     // the dropped keys are found from the verdicts of the dropped owners: no pass over the
-    // queue or the seen set (they hold the whole program)
+    // queue or the seen set (they hold the whole program). The map is the process's: another
+    // checker's entries (the macro world's front) carry DefIds of its own program, which may
+    // lie past this program's defs, so `owner` is asked only about owners with a key of `src`.
     let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
-    let moved: Vec<(DefId, Carry)> = verdicts.keys().copied().filter_map(|d| {
+    let moved: Vec<(DefId, Carry)> = verdicts.iter().filter_map(|(&d, instances)| {
+        if !instances.keys().any(|k| k.0 == src) { return None; }
         let how = if d == crate::program::NO_DEF { Carry::Drop } else { owner(d) };
         (how != Carry::Keep).then_some((d, how))
     }).collect();
