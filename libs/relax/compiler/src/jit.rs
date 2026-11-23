@@ -13230,11 +13230,14 @@ unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
 /// Baseline slots that keep running (a cost check under the threshold found a quarter of it: rt_hot): their
 /// O2 builds -- `hit` until the startup releases its workers after the first present
 /// (startup_main), at once after. (Hot ones get theirs first, from the O3 queue: o2_hottest_queued.)
+/// `twins`: the links of twins' stored code before then (twin_stored), whose bases are asked for
+/// at the release: (unit, twin, stored O3 code).
 struct BaseSlots {
     released: bool,
     hit: Vec<(usize, u32)>,
+    twins: Vec<(usize, u32, bool)>,
 }
-static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
+static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new(), twins: Vec::new() });
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
 /// Calculator's first frame ran ~2x native in it). Baseline code that keeps running gets
@@ -13628,16 +13631,21 @@ unsafe fn settle_rearm_all(up: *mut Unit, periodic: bool) -> (u64, u64) {
 }
 
 /// The startup released its workers (after the first present): the baseline slots sampled so far
-/// get their O2 builds. Unit lock held.
+/// get their O2 builds, and the twins linked so far ask for their bases. Unit lock held.
 unsafe fn release_base(up: *mut Unit) {
-    let hit = {
+    let (hit, twins) = {
         let mut g = BASE.lock().unwrap_or_else(|e| e.into_inner());
         g.released = true;
-        std::mem::take(&mut g.hit)
+        (std::mem::take(&mut g.hit), std::mem::take(&mut g.twins))
     };
     for (unit, id) in hit {
         if unit == up as usize {
             o2_base(up, id);
+        }
+    }
+    for (unit, t, o3) in twins {
+        if unit == up as usize {
+            twin_stored(up, t, o3);
         }
     }
 }
@@ -19464,6 +19472,11 @@ fn forget_unit_slots(unit: usize) -> usize {
     lock(&STARTUP_ROOTS).retain(|e| mine(e.0));
     lock(&STARTUP_CACHED).retain(|e| mine(e.0));
     lock(&AOT_DEFERRED).retain(|e| mine(e.0));
+    {
+        let mut b = lock(&BASE);
+        b.hit.retain(|e| mine(e.0));
+        b.twins.retain(|e| mine(e.0));
+    }
     for set in [&COMPLETING, &O2_SEEN, &O1V_SEEN, &O1V_STANDALONE] {
         if let Some(s) = lock(set).as_mut() {
             s.retain(|e| mine(e.0));
@@ -19498,7 +19511,9 @@ mod forget_unit_slots_tests {
         COMPLETING.lock().unwrap().get_or_insert_with(Default::default).extend([(gone, 3695), (kept, 9)]);
         LINKED_PROVISIONAL.lock().unwrap().get_or_insert_with(Default::default).extend([((gone, 54074), 2), ((kept, 10), 1)]);
         TWIN_USERS.lock().unwrap().extend([((gone, 5), vec![6]), ((kept, 11), vec![])]);
-        assert_eq!(forget_unit_slots(gone), 8, "each table's entry of the retired unit");
+        BASE.lock().unwrap().hit.extend([(gone, 16), (kept, 17)]);
+        BASE.lock().unwrap().twins.extend([(gone, 18, false), (kept, 19, true)]);
+        assert_eq!(forget_unit_slots(gone), 10, "each table's entry of the retired unit");
         let mine = |k: usize| k == gone || k == kept;
         assert!(PROVISIONAL.lock().unwrap().iter().filter(|e| mine(e.0)).map(|e| (e.0, e.1)).eq([(kept, 7)]), "provisional slots");
         assert!(O2_LATER.lock().unwrap().iter().filter(|e| mine(e.0)).copied().eq([(kept, 8)]), "O2 later");
@@ -19508,6 +19523,8 @@ mod forget_unit_slots_tests {
         assert!(COMPLETING.lock().unwrap().as_ref().unwrap().iter().filter(|e| mine(e.0)).copied().eq([(kept, 9)]), "completing");
         assert!(LINKED_PROVISIONAL.lock().unwrap().as_ref().unwrap().keys().filter(|k| mine(k.0)).copied().eq([(kept, 10)]), "linked provisional");
         assert!(TWIN_USERS.lock().unwrap().keys().filter(|k| mine(k.0)).copied().eq([(kept, 11)]), "twin users");
+        assert!(BASE.lock().unwrap().hit.iter().filter(|e| mine(e.0)).copied().eq([(kept, 17)]), "baseline slots held for the release");
+        assert!(BASE.lock().unwrap().twins.iter().filter(|e| mine(e.0)).copied().eq([(kept, 19, true)]), "twin links held for the release");
     }
 }
 
@@ -21570,7 +21587,12 @@ unsafe fn twin_base_build(up: *mut Unit, t: u32, hot: bool) -> bool {
 /// and no entry"), and the twins' own calls stay twin calls ("caller is a twin"), session after
 /// session. With the base's entry the next launch's links of those callers call the base, and the
 /// base's code calls bases. Stored O3 code proves the body hot (the base gets O3 too); below O3
-/// the base gets an O2 build, O3 only by its own heat. Owner thread.
+/// the base gets an O2 build, O3 only by its own heat. A link before the startup released its
+/// workers asks at the release (release_base), as a running baseline slot's O2 build waits for it:
+/// asked at the link, a warm launch's startup image queued the bases' builds before main ran, and a
+/// program that ended within its startup (a CLI tool, the warm-statics fixture) type-checked and
+/// lowered bodies at every launch that no launch recorded, since none lasted until those builds
+/// ended. Owner thread.
 unsafe fn twin_stored(up: *mut Unit, t: u32, o3: bool) {
     let u = &mut *up;
     let FnKey::Plain(b) = u.fns[t as usize].key else { return };
@@ -21582,6 +21604,13 @@ unsafe fn twin_stored(up: *mut Unit, t: u32, o3: bool) {
     u.cache = c;
     if stored {
         return;
+    }
+    {
+        let mut g = BASE.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.released {
+            crate::zone_alloc::kept_with(|| g.twins.push((up as usize, t, o3)));
+            return;
+        }
     }
     if twin_base_build(up, t, o3) {
         TWIN_BASE_STORED.fetch_add(1, Ordering::Relaxed);
@@ -36595,7 +36624,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&O2_TAKE_DROPS, [const { AtomicU64::new(0) }; 8]);
     reset(&O2_FRONT_FAILS, [[const { AtomicU64::new(0) }; 15], [const { AtomicU64::new(0) }; 15]]);
     reset(&OFFERED, std::sync::OnceLock::new());
-    reset(&BASE, relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() }));
+    reset(&BASE, relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new(), twins: Vec::new() }));
     reset(&SLOW_BASE, relax_session::sync::Mutex::new(Vec::new()));
     reset(&FORGET_SEEN, AtomicU64::new(u64::MAX));
     reset(&FINAL_SLOTS, AtomicU64::new(0));
