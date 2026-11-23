@@ -23,6 +23,27 @@ static HELD: AtomicBool = AtomicBool::new(false);
 static HEAD: AtomicPtr<Heap> = AtomicPtr::new(std::ptr::null_mut());
 struct Registry;
 impl Registry {
+    fn try_lock() -> Option<Self> {
+        HELD.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok().map(|_| Self)
+    }
+
+    fn for_create() -> Self {
+        if !super::arenas_closed() { return Self::lock(); }
+        if let Some(g) = Self::try_lock() { return g; }
+        #[cfg(unix)]
+        unsafe {
+            extern "C" {
+                fn write(fd: i32, p: *const core::ffi::c_void, len: usize) -> isize;
+                fn _exit(code: i32) -> !;
+            }
+            let msg = b"relax: forked child: the domain registry was held at the fork by a thread of the parent, which a forked child does not have; exiting\n";
+            write(2, msg.as_ptr().cast(), msg.len());
+            _exit(134)
+        }
+        #[cfg(not(unix))]
+        std::process::abort()
+    }
+
     fn lock() -> Self {
         while HELD
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -48,7 +69,7 @@ impl DomainHeap {
                 next: UnsafeCell::new(std::ptr::null_mut()),
             }),
         });
-        let _registry = Registry::lock();
+        let _registry = Registry::for_create();
         unsafe {
             *heap.inner.next.get() = HEAD.load(Ordering::Relaxed);
             // The registry owns a strong reference; a matching free clones it under the lock.
@@ -88,6 +109,9 @@ impl DomainHeap {
 }
 impl Drop for DomainHeap {
     fn drop(&mut self) {
+        // Keep the registry reference and mapping. An inherited lease may never end,
+        // and every old address must remain identifiable after this handle is gone.
+        if super::arenas_closed() { return; }
         let removed = {
             let _registry = Registry::lock();
             unsafe {
@@ -174,6 +198,7 @@ unsafe fn allocate(arena: &Arena, size: usize, align: usize, zero: bool) -> *mut
     p
 }
 unsafe fn release(arena: &Arena, p: *mut u8) {
+    if super::arenas_closed() { return; }
     let h = p.cast::<Header>().sub(1).read();
     arena.dealloc_counted(
         p.sub(h.offset),
@@ -182,28 +207,107 @@ unsafe fn release(arena: &Arena, p: *mut u8) {
     );
 }
 
-/// The heap holding `p` and the region of it that does (alive while the lease is).
-unsafe fn owner(p: *mut u8) -> Option<(Arc<Heap>, *const Arena)> {
+enum Owner {
+    Domain(Arc<Heap>, *const Arena),
+    System,
+    Unknown,
+}
+
+#[cfg(test)]
+impl Owner {
+    fn is_none(&self) -> bool { matches!(self, Self::System) }
+}
+
+#[cfg(test)]
+pub(super) fn hold_registry() -> impl Drop { Registry::lock() }
+
+/// The heap holding `p` and its region, kept alive by the lease.
+unsafe fn owner(p: *mut u8) -> Owner {
     // Conservative bounds only widen: ordinary native frees need no registry lock. Actual
     // ownership is still checked against live ranges, so recycled addresses are never stale.
-    if !in_heaps(p) || HEAD.load(Ordering::Acquire).is_null() {
-        return None;
-    }
-    let _registry = Registry::lock();
+    if !in_heaps(p) { return Owner::System; }
+    let _registry = if super::arenas_closed() {
+        let Some(g) = Registry::try_lock() else { return Owner::Unknown };
+        g
+    } else {
+        if HEAD.load(Ordering::Acquire).is_null() { return Owner::System; }
+        Registry::lock()
+    };
     let mut h = HEAD.load(Ordering::Relaxed);
     while let Some(heap) = h.as_ref() {
         if let Some(r) = heap.arena.region_of(p) {
             Arc::increment_strong_count(h);
-            return Some((Arc::from_raw(h), r));
+            return Owner::Domain(Arc::from_raw(h), r);
         }
         h = *heap.next.get();
     }
-    None
+    Owner::System
 }
 /// Whether `p` may be a domain heap's (the regions' conservative bounds).
 fn in_heaps(p: *mut u8) -> bool {
     let address = p as usize;
     address >= compiler::HEAPS_LOW.load(Ordering::Acquire) && address < compiler::HEAPS_HIGH.load(Ordering::Acquire)
+}
+
+// Counting normally recognizes a headerless Rust buffer shared with a provided crate
+// by its domain address. Preserve that distinction when the child puts it on the
+// system heap: Counting must never subtract its tag header from such a pointer.
+// C malloc/free have a separate ABI and need no record.
+mod child_system {
+    use super::*;
+
+    struct Slot {
+        address: AtomicPtr<u8>,
+        next: *mut Slot,
+    }
+    static BUCKETS: [AtomicPtr<Slot>; 256] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 256];
+    fn bucket(p: *mut u8) -> &'static AtomicPtr<Slot> {
+        let n = p as usize;
+        &BUCKETS[((n >> 4) ^ (n >> 12) ^ (n >> 20)) % BUCKETS.len()]
+    }
+    // Nodes stay mapped in the child. Only their address changes, so a nested fork
+    // can traverse the list even if the thread publishing or recycling a slot vanished.
+    pub(super) unsafe fn record(p: *mut u8) -> bool {
+        let list = bucket(p);
+        let mut head = list.load(Ordering::Acquire);
+        let mut s = head;
+        while let Some(slot) = s.as_ref() {
+            if slot.address.compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+            s = slot.next;
+        }
+        let node = System.alloc(Layout::new::<Slot>()).cast::<Slot>();
+        if node.is_null() { return false; }
+        loop {
+            node.write(Slot { address: AtomicPtr::new(p), next: head });
+            match list.compare_exchange_weak(head, node, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => head = now,
+            }
+        }
+    }
+    pub(super) unsafe fn find(p: *mut u8, remove: bool) -> bool {
+        let mut s = bucket(p).load(Ordering::Acquire);
+        while let Some(slot) = s.as_ref() {
+            if slot.address.load(Ordering::Acquire) == p {
+                // The allocation's caller owns it exclusively until free returns.
+                if remove { slot.address.store(std::ptr::null_mut(), Ordering::Release); }
+                return true;
+            }
+            s = slot.next;
+        }
+        false
+    }
+}
+
+unsafe fn child_alloc(l: Layout, zero: bool) -> *mut u8 {
+    let p = if zero { System.alloc_zeroed(l) } else { System.alloc(l) };
+    if !p.is_null() && crate::memstat::enabled() && !child_system::record(p) {
+        System.dealloc(p, l);
+        return std::ptr::null_mut();
+    }
+    p
 }
 
 /// The calling program thread is about to block in a condvar or park wait (std's wait registry):
@@ -221,6 +325,7 @@ pub fn after_wait() {
 /// chunks; memstat::trim): a program heap is trimmed like the compiler's (a large app: 100 MB in use,
 /// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
 pub fn trim_all() {
+    if super::arenas_closed() { return; }
     for h in lease().iter().flatten() {
         h.arena.regions().for_each(|r| r.trim());
     }
@@ -230,6 +335,7 @@ pub fn trim_all() {
 /// waiting threads' current chunks settled, and (Linux) huge pages for dense chunks, taken from
 /// sparse ones; at most `budget` collapses per heap. Returns the collapses done.
 pub fn densify_all(budget: usize) -> usize {
+    if super::arenas_closed() { return 0; }
     lease().iter().flatten().flat_map(|h| h.arena.regions()).map(|r| r.densify(budget)).sum()
 }
 
@@ -266,22 +372,31 @@ pub unsafe fn dealloc(p: *mut u8) -> bool {
         release(r, p);
         return true;
     }
-    if let Some((_heap, r)) = owner(p) {
-        release(&*r, p);
-        true
-    } else {
-        false
+    match owner(p) {
+        Owner::Domain(_heap, r) => { release(&*r, p); true }
+        Owner::Unknown => true,
+        Owner::System => false,
     }
 }
 pub unsafe fn realloc_owned(p: *mut u8, size: usize) -> Option<*mut u8> {
     if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
         return Some(reallocate(r, p, size));
     }
-    let (_heap, r) = owner(p)?;
-    Some(reallocate(&*r, p, size))
+    match owner(p) {
+        Owner::Domain(_heap, r) => Some(reallocate(&*r, p, size)),
+        // The bounds include system blocks. Only a proven domain C block has a Header.
+        Owner::Unknown => Some(std::ptr::null_mut()),
+        Owner::System => None,
+    }
 }
 unsafe fn reallocate(heap: &Arena, p: *mut u8, size: usize) -> *mut u8 {
     let h = p.cast::<Header>().sub(1).read();
+    if super::arenas_closed() {
+        let mut q = std::ptr::null_mut();
+        if program_memalign(&mut q, h.align, size) != 0 { return std::ptr::null_mut(); }
+        std::ptr::copy_nonoverlapping(p, q, h.size.min(size));
+        return q;
+    }
     let old = Layout::from_size_align_unchecked(h.size.max(1) + h.offset, h.align);
     if let Some(total) = size.max(1).checked_add(h.offset) {
         if h.size != 0 && size != 0 && Layout::from_size_align(total, h.align).is_ok() && heap.resize_in_place(p.sub(h.offset), old, total) {
@@ -305,10 +420,13 @@ pub unsafe extern "C" fn program_alloc(size: usize, align: usize) -> *mut u8 {
 #[cold]
 #[inline(never)]
 unsafe extern "C" fn system_alloc(size: usize, align: usize) -> *mut u8 {
-    System.alloc(Layout::from_size_align_unchecked(size, align))
+    let l = Layout::from_size_align_unchecked(size, align);
+    if super::arenas_closed() { return child_alloc(l, false); }
+    System.alloc(l)
 }
 pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
     let l = Layout::from_size_align_unchecked(size, align);
+    if super::arenas_closed() { return child_alloc(l, true); }
     match compiler::domain_here() {
         Some(a) => a.alloc_zeroed(l),
         None => System.alloc_zeroed(l),
@@ -324,6 +442,7 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
         return std::ptr::null_mut();
     }
     match compiler::domain_here() {
+        Some(_) if super::arenas_closed() => child_alloc(l, zeroed),
         Some(a) if zeroed => a.alloc_zeroed(l),
         Some(a) => a.alloc(l),
         None => std::ptr::null_mut(),
@@ -332,6 +451,10 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
 /// Also the native global allocator's free (every free of a provided crate passes here).
 #[inline]
 pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
+    if super::arenas_closed() && child_system::find(p, true) {
+        System.dealloc(p, l);
+        return true;
+    }
     if compiler::domain_dealloc(p, l) {
         return true;
     }
@@ -346,10 +469,11 @@ pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
 #[cold]
 #[inline(never)]
 unsafe fn dealloc_other(p: *mut u8, l: Layout) -> bool {
-    if let Some((_heap, r)) = owner(p) {
-        (*r).dealloc(p, l);
-        true
-    } else { false }
+    match owner(p) {
+        Owner::Domain(_heap, r) => { (*r).dealloc(p, l); true }
+        Owner::Unknown => true,
+        Owner::System => false,
+    }
 }
 pub unsafe extern "C" fn program_dealloc(p: *mut u8, size: usize, align: usize) {
     compiler::domain_free(p, Layout::from_size_align_unchecked(size, align), dealloc_shared)
@@ -360,7 +484,8 @@ pub unsafe extern "C" fn program_dealloc(p: *mut u8, size: usize, align: usize) 
 #[inline(never)]
 unsafe extern "C" fn dealloc_shared(p: *mut u8, size: usize, align: usize) {
     let l = Layout::from_size_align_unchecked(size, align);
-    if !dealloc_other(p, l) {
+    let handled = if super::arenas_closed() { dealloc_layout(p, l) } else { dealloc_other(p, l) };
+    if !handled {
         System.dealloc(p, l);
     }
 }
@@ -374,11 +499,31 @@ unsafe fn resize_layout(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u
     q
 }
 pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
+    if super::arenas_closed() {
+        let tracked = child_system::find(p, false);
+        if !tracked && !compiler::domain_here().is_some_and(|a| a.region_of(p).is_some()) && matches!(owner(p), Owner::System) {
+            return None;
+        }
+        // A Layout also describes an unconfirmed block. Copy safely and leave that
+        // address alone. Only a system allocation we recorded can be released here.
+        let q = child_alloc(Layout::from_size_align_unchecked(size, l.align()), false);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
+            if tracked {
+                child_system::find(p, true);
+                System.dealloc(p, l);
+            }
+        }
+        return Some(q);
+    }
     if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
         return Some(resize_layout(r, p, l, size));
     }
-    let (_heap, r) = owner(p)?;
-    Some(resize_layout(&*r, p, l, size))
+    match owner(p) {
+        Owner::Domain(_heap, r) => Some(resize_layout(&*r, p, l, size)),
+        Owner::System => None,
+        Owner::Unknown => unreachable!(),
+    }
 }
 
 pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, size: usize) -> *mut u8 {
@@ -400,6 +545,7 @@ extern "C" {
     fn _aligned_free(p: *mut u8);
 }
 pub unsafe extern "C" fn program_malloc(size: usize) -> *mut u8 {
+    if super::arenas_closed() { return malloc(size).cast(); }
     match compiler::domain_here() {
         Some(a) => allocate(a, size, 16, false),
         None => malloc(size).cast(),
@@ -410,8 +556,8 @@ pub unsafe extern "C" fn program_calloc(n: usize, size: usize) -> *mut u8 {
         return std::ptr::null_mut();
     };
     match compiler::domain_here() {
-        Some(a) => allocate(a, total, 16, true),
-        None => calloc(n, size).cast(),
+        Some(a) if !super::arenas_closed() => allocate(a, total, 16, true),
+        _ => calloc(n, size).cast(),
     }
 }
 pub unsafe extern "C" fn program_free(p: *mut u8) {
@@ -434,7 +580,7 @@ pub unsafe extern "C" fn program_memalign(out: *mut *mut u8, align: usize, size:
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
         return 22;
     }
-    if let Some(a) = compiler::domain_here() {
+    if let Some(a) = compiler::domain_here().filter(|_| !super::arenas_closed()) {
         let p = allocate(a, size, align, false);
         if p.is_null() {
             return 12;

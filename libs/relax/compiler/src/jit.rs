@@ -135,6 +135,8 @@ pub struct FnEntry {
     pub baseline_hint: AtomicBool,
     /// a Relax core fn called by `// relax: hot` code: compiled like it (marked_hot)
     pub hot_hint: AtomicBool,
+    /// Cache tier for installs in a fork child, where no O2 queue is consulted.
+    cached_o2: AtomicBool,
     /// O3 code is installed (built or linked): O2 builds must not replace it
     pub o3: AtomicBool,
     /// its installed code is baseline code (note_base) that has not kept running yet (base_running)
@@ -408,7 +410,7 @@ pub struct Unit {
     nc_window: std::sync::OnceLock<(u32, u32)>,
     /// which slot's code holds a pc, and how its frames unwind (a leaf lock: panics, unwinding
     /// and faults read it on their own thread, without a unit call)
-    pub code: std::sync::RwLock<CodeTables>,
+    pub code: std::sync::Arc<std::sync::RwLock<CodeTables>>,
     pub prog: Program,
     pub tcx: Tcx,
     /// provided crates (provided.rs): crate index -> its shims
@@ -474,7 +476,7 @@ pub struct Unit {
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
     /// the link sections laid out so far, by output section (sections.rs)
     pub(crate) sections: crate::fxhash::HashMap<String, crate::sections::Section>,
-    pub sites: relax_session::sync::Mutex<Vec<Site>>,
+    pub sites: std::sync::Arc<relax_session::sync::Mutex<Vec<Site>>>,
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
     site_ix: relax_session::sync::Mutex<HashMap<(u32, u32, String), u64>>,
@@ -2609,7 +2611,6 @@ extern "C" fn relax_fork() -> i32 {
     let pid = os::thread::fork();
     let err = os::proc::last_error();
     if pid == 0 {
-        crate::domain_res::fork_child();
         fork_child();
         crate::domain_res::atfork_child(&handlers);
     } else {
@@ -2622,16 +2623,76 @@ extern "C" fn relax_fork() -> i32 {
 }
 
 #[cfg(unix)]
+mod fork_locks {
+    use super::*;
+    use relax_session::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, RwLock, RwLockWriteGuard};
+
+    // Include suspended callers and auxiliary units too. A unit may retire while the
+    // fork is being prepared. Keeping its tables alive does not keep its JIT world alive.
+    type Tables = (Arc<Mutex<Vec<Site>>>, Arc<RwLock<CodeTables>>);
+    static TABLES: Mutex<Vec<Tables>> = Mutex::new(Vec::new());
+
+    pub(super) fn register(u: &Unit) {
+        TABLES.lock().unwrap_or_else(|e| e.into_inner()).push((u.sites.clone(), u.code.clone()));
+    }
+    pub(super) fn unregister(u: &Unit) {
+        TABLES.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !Arc::ptr_eq(&t.0, &u.sites));
+    }
+    pub(super) unsafe fn reset() { relax_session::reset_static(&TABLES, Mutex::new(Vec::new())); }
+
+    type UnitGuards = (RwLockWriteGuard<'static, CodeTables>, MutexGuard<'static, Vec<Site>>);
+    struct Guards {
+        // Fields drop in this order. Unit guards drop in reverse registration order.
+        globals: (MutexGuard<'static, Option<std::collections::HashSet<(usize, u32)>>>,
+            MutexGuard<'static, Vec<u32>>, MutexGuard<'static, Vec<(Arc<FrontShared>, AheadWork, u64)>>,
+            MutexGuard<'static, queue::Queue>),
+        units: Vec<UnitGuards>,
+        registry: MutexGuard<'static, Vec<Tables>>,
+    }
+    thread_local! { static HELD: std::cell::Cell<Option<Guards>> = const { std::cell::Cell::new(None) }; }
+
+    pub(super) fn prepare() {
+        let registry = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut units = Vec::with_capacity(registry.len());
+        for (sites, code) in registry.iter() {
+            // SAFETY: registry owns both allocations and stays locked until after every
+            // guard in units is dropped. Moving Guards moves neither allocation.
+            let sites = unsafe { &*Arc::as_ptr(sites) }.lock().unwrap_or_else(|e| e.into_inner());
+            let code = unsafe { &*Arc::as_ptr(code) }.write().unwrap_or_else(|e| e.into_inner());
+            units.push((code, sites));
+        }
+        let q = queue::queue().lock().unwrap_or_else(|e| e.into_inner());
+        let ahead = queue::AHEAD_INBOX.lock().unwrap_or_else(|e| e.into_inner());
+        let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        HELD.with(|h| h.set(Some(Guards { globals: (seen, active, ahead, q), units, registry })));
+        crate::vfs::fork_prepare();
+    }
+
+    pub(super) fn release() {
+        if let Some(Guards { globals, mut units, registry }) = HELD.with(std::cell::Cell::take) {
+            drop(globals);
+            while let Some(pair) = units.pop() { drop(pair); }
+            drop(registry);
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn fork_prepare() {
     pause_compile_jobs("fork", false);
     owner::fork_prepare();
     // (every code writer paused: the child's copy of the W^X code views is consistent)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_prepare();
+    fork_locks::prepare();
 }
 
 #[cfg(unix)]
 pub(crate) fn fork_parent() {
+    crate::vfs::fork_parent();
+    fork_locks::release();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_parent();
     owner::fork_parent();
@@ -2640,6 +2701,11 @@ pub(crate) fn fork_parent() {
 
 #[cfg(unix)]
 pub(crate) fn fork_child() {
+    relax_session::sync::fork_child();
+    crate::zone_alloc::close_for_fork_child();
+    crate::vfs::fork_child();
+    fork_locks::release();
+    crate::domain_res::fork_child();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_child();
     owner::fork_child();
@@ -6161,7 +6227,7 @@ impl Unit {
             tls_places: Default::default(),
             static_spans: Default::default(),
             sections: Default::default(),
-            sites: Default::default(),
+            sites: crate::zone_alloc::kept_with(Default::default),
             site_ix: Default::default(),
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
             payload_end: std::sync::atomic::AtomicUsize::new(0),
@@ -6251,7 +6317,7 @@ impl Unit {
             keep_compile_state: false,
             aux: false,
             nc_window: std::sync::OnceLock::new(),
-            code: Default::default(),
+            code: crate::zone_alloc::kept_with(Default::default),
             kept_users: HashMap::new(),
             retiers: HashMap::new(),
             frequency_profiles: HashMap::new(),
@@ -6262,6 +6328,8 @@ impl Unit {
             self_ptr: UnitPtr(std::ptr::null_mut()),
         };
         let mut u = crate::zone_alloc::kept_with(|| Box::new(unit));
+        #[cfg(unix)]
+        crate::zone_alloc::kept_with(|| fork_locks::register(&u));
         if no_codegen {
             #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
             {
@@ -8212,7 +8280,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, first_code_ns: AtomicU64::new(0), first_by_call: AtomicBool::new(false), code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, lowering: None, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, first_code_ns: AtomicU64::new(0), first_by_call: AtomicBool::new(false), code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), cached_o2: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, lowering: None, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -10887,7 +10955,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
     // still does is reported with what it compiled and how long the thread stalled, and
     // everything that slot reaches is compiled at once, ahead of its next calls (and recorded
     // for the next run's mark).
-    if !owner::is_owner() && is_realtime_thread() && !(&*up).fns[id as usize].compiled {
+    if !owner::is_owner() && queue::takes_jobs() && is_realtime_thread() && !(&*up).fns[id as usize].compiled {
         realtime_live(None);
         // the JIT code that called it (which code version missed it, and whether the reach had
         // walked it): a frame-pointer walk, taken on every miss (the thread stalls for a compile
@@ -10991,9 +11059,9 @@ fn lazy_long_event(name: &str, r: &MainCompile) {
 }
 
 unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
-    // inside a unit call already (a constant's initializer running code, a nested build): the
-    // whole build here, no split
-    if owner::is_owner() {
+    // Inside a unit call (a constant's initializer or a nested build), and on every
+    // thread of a fork child, the whole build runs here with no worker to split it to.
+    if owner::is_owner() || !queue::takes_jobs() {
         // (a cancellation must not unwind through the JIT frames above: the call gets a stub that
         // panics, and the Rust frame that ran the code -- run_init_code -- cancels the request)
         // (no park: a call made on the owner -- a constant's code -- gets the error stub)
@@ -11583,11 +11651,13 @@ fn plain_path(u: &Unit, id: u32) -> bool {
 /// (it may wait for an in-flight build, load deferred modules and split off its back end); a
 /// nested one (a constant's initializer running code) builds everything here.
 unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
+    // A suspended caller can re-enter a different unit from the one current at fork.
+    if !queue::takes_jobs() { (&mut *up).fns[id as usize].inflight = false; }
     cost_name(up, id);
     if let Some(c) = ready_code_locked(up, id) {
         return Compiled::Code(c);
     }
-    if relax_level(&*up, id) == 4 && !(&*up).fns[id as usize].inflight {
+    if queue::takes_jobs() && relax_level(&*up, id) == 4 && !(&*up).fns[id as usize].inflight {
         if let Some(c) = compile_o3_always(up, id) {
             return Compiled::Code(c);
         }
@@ -11840,7 +11910,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             // fresh code of a marked slot gets its O2 build, and so does O1 code linked for one (an
             // earlier run ended before that build); linked baseline code gets it by running
             // (base_running), and an O2 entry's slot is queued already (o2_cached)
-            let o2 = marked && (record || linked_from_cache && !base);
+            let o2 = queue::takes_jobs() && marked && (record || linked_from_cache && !base);
             if o2 && record { crate::cache::trace_lookup(u, id, "o2-marked"); }
             // makepad inspect: what this code is (O3-always's first code says so itself)
             let kind = if fresh {
@@ -11850,7 +11920,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     tier::O3
                 } else if base {
                     tier::BASELINE
-                } else if O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(&(up as usize, id))) {
+                } else if installed_o2(u, id) {
                     tier::O2
                 } else {
                     tier::O1
@@ -11875,7 +11945,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     " [O3]"
                 } else if base {
                     " [B]"
-                } else if O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(&(up as usize, id))) {
+                } else if installed_o2(u, id) {
                     " [O2]"
                 } else {
                     " [O1]"
@@ -12363,11 +12433,17 @@ pub static FRAMES: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::
 
 fn note_frame(id: u32, frame: u32, slots: u32, tier1: bool) {
     let _k = crate::zone_alloc::kept();
-    let mut g = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut g, child_slots) = if queue::takes_jobs() {
+        (FRAMES.lock().unwrap_or_else(|e| e.into_inner()), None)
+    } else {
+        let Ok(frames) = FRAMES.try_lock() else { return };
+        let Ok(slots) = FRAME_SLOTS.try_lock() else { return };
+        (frames, Some(slots))
+    };
     if g.len() <= id as usize {
         g.resize(id as usize + 1, (0, 0));
     }
-    let mut h = FRAME_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = child_slots.unwrap_or_else(|| FRAME_SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
     if h.len() <= id as usize {
         h.resize(id as usize + 1, (0, 0));
     }
@@ -13233,8 +13309,15 @@ fn o2_trace() -> bool {
     *T.get_or_init(|| std::env::var_os("RELAX_O2_TRACE").is_some())
 }
 
+fn installed_o2(u: &Unit, id: u32) -> bool {
+    if !queue::takes_jobs() { return u.fns[id as usize].cached_o2.load(Ordering::Relaxed); }
+    O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(&(u as *const Unit as usize, id)))
+}
+
 /// Slot `id`'s code came from an O2 cache entry: no O2 build for it this run.
 pub(crate) unsafe fn o2_cached(up: *mut Unit, id: u32) {
+    (&*up).fns[id as usize].cached_o2.store(true, Ordering::Relaxed);
+    if !queue::takes_jobs() { return; }
     O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id));
 }
 
@@ -13254,6 +13337,7 @@ unsafe fn o2_hot(up: *mut Unit, id: u32) {
 /// builds queued at their first calls (a game start queues a thousand of those; on a headset's
 /// starved worker a hot audio loop waited minutes behind them in baseline code).
 unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
+    if !queue::takes_jobs() { return; }
     if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     {
         let mut seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -13289,6 +13373,7 @@ static OFFERED: std::sync::OnceLock<relax_session::sync::Mutex<std::collections:
 /// as fast as they run (through a cold start the snapshot builds take the hot slots out of
 /// baseline / O1 code before the first frame).
 fn o2_offer_hottest() {
+    if !queue::takes_jobs() { return; }
     let offered = crate::zone_alloc::kept_with(|| OFFERED.get_or_init(Default::default));
     let next = { let offered = offered.lock().unwrap_or_else(|e| e.into_inner()); o2_hottest_queued(&offered) };
     if let Some((up, id)) = next {
@@ -13299,6 +13384,7 @@ fn o2_offer_hottest() {
 
 /// Queues slot `id` (marked O2 or higher) for its O2 build on the O2 worker, once.
 unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
+    if !queue::takes_jobs() { return; }
     // (a lean code window takes no O2 code: Unit::code_lean)
     if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) || (&*up).lean_now() { return; }
     {
@@ -13797,6 +13883,7 @@ unsafe fn o2_twin_base(up: *mut Unit, id: u32) -> bool {
 }
 
 unsafe fn o2_base_as(up: *mut Unit, id: u32, kind: queue::O2Kind) -> bool {
+    if !queue::takes_jobs() { return false; }
     let u = &*up;
     if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || u.cache.is_none() {
         return false;
@@ -14415,6 +14502,10 @@ pub(crate) unsafe fn begin_build(up: *mut Unit, id: u32) -> Result<(), String> {
 /// served meanwhile. A request served nested inside an earlier request's wait does not wait:
 /// the back end may be that request's own (a patch's batch), which cannot end before this one.
 unsafe fn wait_inflight(up: *mut Unit, id: u32) {
+    if !queue::takes_jobs() {
+        (&mut *up).fns[id as usize].inflight = false;
+        return;
+    }
     if !(&*up).fns[id as usize].inflight {
         return;
     }
@@ -14723,6 +14814,7 @@ pub fn take_completed_drops() -> SettleDrops {
 /// Arc snapshots; queued/active O3 jobs and a nested O1 build still pin this slot.
 /// Current closure owners can be rechecked; old file versions must survive hot reload.
 fn drop_completed_body(u: &mut Unit, id: u32) {
+    if !queue::takes_jobs() { return; }
     if u.keep_compile_state || !u.prog.session.runtime.settle_drop || RT_KEEP.with(|k| k.get()) { return; }
     let f = &u.fns[id as usize];
     if !f.compiled || f.building || f.inflight { return; }
@@ -19551,6 +19643,8 @@ impl Drop for Unit {
                 }
             }
         }
+        #[cfg(unix)]
+        fork_locks::unregister(self);
     }
 }
 
@@ -21651,6 +21745,7 @@ pub(crate) static LAZY_FRONTS: AtomicU64 = AtomicU64::new(0);
 /// SPEC-V: slot `id` runs borrowed twin code: its own build in the background (O2 worker: the
 /// cache's entry when it has one, else an O2 build). Owner thread.
 unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
+    if !queue::takes_jobs() { return; }
     // (an O2 build: marked hot, as o2_base marks the slots it queues)
     (&*up).fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
     O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id));
@@ -31185,6 +31280,7 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
 /// (in a take that bails) slot `id`'s lowering, taken by this take, goes back to the lowered-ahead
 /// table for the take's next round (its callees resolved, its constants checked already).
 fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
+    if !queue::takes_jobs() { return; }
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     // (a closure's names the parent body it was lowered from, as prefront_closure's)
     let body = match u.fns[id as usize].key {
@@ -31199,6 +31295,7 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
 /// Unit lock held. Never wait for lowering: taking an unfinished reservation cancels its
 /// publication, and this build uses the already checked body through the ordinary path.
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
+    if !queue::takes_jobs() { return None; }
     let Some(lowered) = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else {
         let copy = TakenBack::copy(u, id);
         if copy.is_some() && ahead_trace() {
@@ -31367,6 +31464,7 @@ fn look_ahead(f: &std::sync::Arc<FrontShared>, d: DefId, args: &[TyId], levels: 
 }
 
 fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Arc<Body>) {
+    if !queue::takes_jobs() { return; }
     let before = crate::memstat::live_total();
     let claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
     if !f.is_built(&key) {
@@ -31400,7 +31498,7 @@ fn ahead_on(options: &crate::options::Options) -> bool {
 
 /// The checked-ahead body of an instance, if one waits (unit lock held).
 fn take_ahead(prog: &Program, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId]) -> Result<std::sync::Arc<Body>, &'static str> {
-    if !ahead_on(&prog.session.options) {
+    if !queue::takes_jobs() || !ahead_on(&prog.session.options) {
         return Err("off");
     }
     let key = (d, args.to_vec());
@@ -31462,7 +31560,7 @@ fn ahead_check_diag(u: &Unit, id: u32, reason: &str, ns: u64) {
 /// Type-checks slot `id`'s body ahead (no unit lock held). `up` only reaches the unit's
 /// FrontShared (a field never written after the unit is set up).
 pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
-    if up.is_null() { return; }
+    if !queue::takes_jobs() || up.is_null() { return; }
     let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
@@ -36231,6 +36329,7 @@ impl Drop for RtBuild {
 /// Real-time slots `ids` get their O2 build (once; o2_hot / o2_base) unless their code is O2 or
 /// O3 already. RELAX_RT_TRACE: the tiers they run at now.
 unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
+    if !queue::takes_jobs() { return; }
     let (mut base, mut o3, mut o2, mut o1) = (0, 0, 0, 0);
     for &id in ids {
         let u = &*up;
@@ -36760,6 +36859,7 @@ fn run_tick() {
 }
 
 fn compile_checkpoint() {
+    if !queue::takes_jobs() { return; }
     let held = front_reads_held() + u32::from(owner::is_owner());
     let site = if owner::is_owner() { "jit owner unit" } else { FRONT_READ_SITE.try_with(|site| site.get()).unwrap_or("jit front read") };
     crate::pool::checkpoint(held, site);
@@ -36772,6 +36872,8 @@ pub(crate) unsafe fn reset_statics() {
     crate::gate::reset_statics();
     busy::reset_statics();
     queue::reset_statics();
+    #[cfg(unix)]
+    fork_locks::reset();
     settle_rebuild::reset_statics();
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     static_glue::reset_statics();

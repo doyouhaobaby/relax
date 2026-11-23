@@ -686,7 +686,7 @@ fn lock() -> QueueGuard {
     QueueGuard { guard, acquired: Instant::now() }
 }
 pub(super) fn start() {
-    if DRAINS.started.load(Ordering::Acquire) { return; }
+    if FORKED.load(Ordering::Relaxed) || DRAINS.started.load(Ordering::Acquire) { return; }
     let _kept = crate::zone_alloc::kept();
     let want = budget::cores() as usize;
     let init = || {
@@ -804,6 +804,8 @@ const QUIT_DROP_BATCH: usize = 1024;
 pub(super) fn fork_child() {
     FORKED.store(true, Ordering::SeqCst);
 }
+#[cfg(all(unix, test))]
+pub(super) fn leave_child_for_test() { FORKED.store(false, Ordering::SeqCst); }
 pub(super) fn push(job: Job, at: u64) {
     if FORKED.load(Ordering::Relaxed) { return; }
     let runnable = crate::zone_alloc::kept_with(|| { let mut q = lock(); q.push(job, at) || q.runnable() });
@@ -847,7 +849,7 @@ pub(super) fn ahead_found(front: &Arc<FrontShared>, work: Vec<AheadWork>) {
 /// work in every body: each queued under the queue's lock, which a worker holds for every pick,
 /// met it on one push in seven (15k sleeps of the owner through a large app's cold start, the thread the
 /// UI waits behind; 130k of the workers').
-static AHEAD_INBOX: relax_session::sync::Mutex<Vec<(Arc<FrontShared>, AheadWork, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+pub(super) static AHEAD_INBOX: relax_session::sync::Mutex<Vec<(Arc<FrontShared>, AheadWork, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);
 /// A parked worker is woken while a check ahead can start: through the startup, below their
 /// width (STARTUP_AHEAD; a running check takes the next itself when it ends). Ahead work blocked
@@ -889,6 +891,7 @@ pub(super) fn tiers() -> Vec<TierEntry> {
 }
 /// The queued O3 entries `keep` takes (it runs under the queue's lock).
 pub(super) fn tiers_where(keep: impl Fn(&TierEntry) -> bool) -> Vec<TierEntry> {
+    if FORKED.load(Ordering::Relaxed) { return Vec::new(); }
     drain_tier_inbox();
     lock().entries.iter().filter_map(|e| if let Job::O3(t) = e.job { keep(&t).then_some(t) } else { None }).collect()
 }

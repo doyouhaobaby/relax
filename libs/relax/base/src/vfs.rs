@@ -552,6 +552,55 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
 /// The whiteout list changes on disk during a live run; stat it, parse only when it changes.
 static WHITEOUTS: RwLock<Option<(std::path::PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>> = RwLock::new(None);
 
+#[cfg(unix)]
+mod fork {
+    use super::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::sync::RwLockWriteGuard as Write;
+
+    // Tuple fields drop in declaration order, the reverse of acquisition.
+    type Guards = (
+        Write<'static, BTreeSet<String>>,
+        Write<'static, Option<(PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>>,
+        Write<'static, BTreeMap<String, Option<Arc<[u8]>>>>,
+        Write<'static, Vec<String>>,
+        Write<'static, Option<PathBuf>>,
+        Write<'static, Vec<(String, PathBuf)>>,
+        Write<'static, Vec<Arc<Mount>>>,
+    );
+    thread_local! { static HELD: Cell<Option<Guards>> = const { Cell::new(None) }; }
+
+    /// Keep every mount and overlay table writable by the forking thread across a plain fork.
+    pub fn fork_prepare() {
+        let mounts = MOUNTS.write().unwrap_or_else(|e| e.into_inner());
+        let folders = FOLDER_MOUNTS.write().unwrap_or_else(|e| e.into_inner());
+        let edits = EDITS.write().unwrap_or_else(|e| e.into_inner());
+        let frozen = FROZEN.write().unwrap_or_else(|e| e.into_inner());
+        let view = STD_VIEW.write().unwrap_or_else(|e| e.into_inner());
+        let whiteouts = WHITEOUTS.write().unwrap_or_else(|e| e.into_inner());
+        let program = PROGRAM_EDITS.write().unwrap_or_else(|e| e.into_inner());
+        HELD.with(|h| h.set(Some((program, whiteouts, view, frozen, edits, folders, mounts))));
+    }
+
+    /// Release the forking thread's VFS guards in the parent.
+    pub fn fork_parent() { drop(HELD.with(Cell::take)); }
+    /// Release the surviving thread's VFS guards in the child.
+    pub fn fork_child() { drop(HELD.with(Cell::take)); }
+
+    // The compiler's integration test links this crate as an ordinary dependency.
+    #[doc(hidden)]
+    pub fn fork_locks_available(exclusive: bool) -> [bool; 7] {
+        macro_rules! probe { ($lock:ident) => {
+            if exclusive { $lock.try_write().is_ok() } else { $lock.try_read().is_ok() }
+        }; }
+        [probe!(MOUNTS), probe!(FOLDER_MOUNTS), probe!(EDITS), probe!(FROZEN),
+         probe!(STD_VIEW), probe!(WHITEOUTS), probe!(PROGRAM_EDITS)]
+    }
+}
+#[cfg(unix)]
+pub use fork::{fork_prepare, fork_parent, fork_child, fork_locks_available};
+
 /// The edits folder's whiteouts (`.makepad-run-deleted`): each deleted file's place there, as
 /// [`edit_rel`] gives it; none without an edits folder. One read of the list.
 pub fn edits_deleted() -> BTreeSet<String> {

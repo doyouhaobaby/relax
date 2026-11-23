@@ -1865,7 +1865,12 @@ fn a_preempted_check_gives_way_to_a_pause() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("input.rs");
     std::fs::write(&path, "pub fn checked(x: u32) -> u32 { x + 1 }\nfn main() { let _ = checked(1); }\n").unwrap();
-    let session = std::sync::Arc::new(crate::Session::default());
+    let mut session = crate::Session::default();
+    session.runtime.settle_drop = true;
+    // (no slot is an inline candidate: a completed slot's lowered body is the settle's to drop,
+    // so the fork child's drop_completed_body below would reach the tier queue and TIER_ACTIVE)
+    session.options.inline_src = Some(0);
+    let session = std::sync::Arc::new(session);
     let (prog, core, krate) = crate::load_with_std(&session, path.to_str().unwrap(), "preempted_pause", false).unwrap();
     let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
@@ -1898,6 +1903,69 @@ fn a_preempted_check_gives_way_to_a_pause() {
     drop(writer);
     pause.join().unwrap();
     assert!(gave_way, "a preempted check waited for the writer while a pause waited for its job");
+    #[cfg(unix)]
+    {
+        let mut u = u;
+        let up = &mut *u as *mut Unit;
+        // (said outside the owner's call: a panic in a request it serves is a silent compile error)
+        let (id, built, state, droppable) = owner::call(owner::Class::Program, || unsafe {
+            let id = u.fn_id(FnKey::Inst(def, Vec::new()));
+            let built = compile_fn(up, id).map_err(|e| format!("compile: {e:?}"))
+                .and_then(|c| u.install(id, &c.0, &c.2, c.1, 0).map(|_| ()).map_err(|e| format!("install: {e:?}")))
+                .and_then(|_| build_rir(up, id).map(|_| ()).map_err(|e| format!("build_rir: {e:?}")));
+            let f = &u.fns[id as usize];
+            (id, built, (f.compiled, f.building, f.inflight), f.rir.is_some() && !inline_source_wanted(&u, id, false))
+        });
+        built.unwrap();
+        assert_eq!(state, (true, false, false), "the slot is compiled, not building, not in flight");
+        assert!(droppable, "its lowered body is the settle's to drop: drop_completed_body reaches the tier checks when jobs are enabled");
+        let probe = |released: bool| {
+            let (sites, code) = (u.sites.clone(), u.code.clone());
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                loop {
+                    let jit = [sites.try_lock().is_ok(), if released { code.try_write().is_ok() } else { code.try_read().is_ok() },
+                        queue::queue().try_lock().is_ok(), queue::AHEAD_INBOX.try_lock().is_ok(),
+                        TIER_ACTIVE.try_lock().is_ok(), O2_SEEN.try_lock().is_ok()];
+                    let vfs = crate::vfs::fork_locks_available(released);
+                    if !released || (jit, vfs) == ([true; 6], [true; 7]) || start.elapsed().as_secs() >= 10 {
+                        break (jit, vfs);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }).join().unwrap()
+        };
+        fork_prepare();
+        let during = probe(false);
+        fork_parent();
+        assert_eq!(during, ([false; 6], [false; 7]), "prepare must hold every JIT and VFS lock");
+        assert_eq!(probe(true), ([true; 6], [true; 7]), "parent must release every JIT and VFS lock");
+
+        let (stage, progress) = std::sync::mpsc::channel();
+        let address = up as usize;
+        queue::fork_child();
+        let q = queue::queue().lock().unwrap();
+        let active = TIER_ACTIVE.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            let empty = queue::tiers().is_empty();
+            stage.send(empty).unwrap();
+            owner::call(owner::Class::Program, || unsafe { drop_completed_body(&mut *(address as *mut Unit), id) });
+            stage.send(true).unwrap();
+        });
+        let bound = std::time::Duration::from_secs(10);
+        let tiers = progress.recv_timeout(bound);
+        let dropped = tiers.is_ok() && progress.recv_timeout(bound).is_ok();
+        drop(active);
+        drop(q);
+        let joined = worker.join();
+        queue::leave_child_for_test();
+        joined.unwrap();
+        assert!(tiers.expect("fork-child tiers blocked on QUEUE"), "fork-child tiers must be empty");
+        assert!(dropped, "fork-child drop_completed_body blocked on TIER_ACTIVE");
+        assert!(u.fns[id as usize].rir.is_some(), "a fork child keeps the completed slot's lowered body");
+        drop(u);
+    }
+    #[cfg(not(unix))]
     drop(u);
     std::fs::remove_dir_all(dir).unwrap();
 }

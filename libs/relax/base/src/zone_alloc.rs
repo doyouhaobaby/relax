@@ -161,6 +161,16 @@ use disabled as compiler;
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 use disabled as slots;
 
+// All three instances of arena.rs share the child's allocation policy.
+static ARENAS_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The arenas are closed: this is the child of a plain fork (`close_for_fork_child`).
+#[inline]
+pub(crate) fn arenas_closed() -> bool { ARENAS_CLOSED.load(std::sync::atomic::Ordering::Relaxed) }
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+pub use compiler::close_for_fork_child;
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
+pub fn close_for_fork_child() {}
+
 pub use burst::{copy_out, stats as burst_stats, trim as burst_trim, ScratchGuard};
 
 // ------------------------------------------------------------------ job arena
@@ -866,6 +876,7 @@ impl RelaxAlloc {
     }
     #[inline(always)]
     unsafe fn dealloc_routed(&self, p: *mut u8, l: Layout) {
+        if arenas_closed() && (compiler::owns(p) || slots::owns(p) || burst::owns(p)) { return; }
         // The compiler arena first: one address-range test decides the common free. The arenas
         // reserve disjoint ranges, so the order among them does not change who owns a block.
         if compiler::owns(p) {
@@ -893,6 +904,11 @@ impl RelaxAlloc {
     }
     #[inline(always)]
     unsafe fn realloc_routed(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        if arenas_closed() && (compiler::owns(p) || slots::owns(p) || burst::owns(p)) {
+            let q = self.alloc(Layout::from_size_align_unchecked(size, l.align()));
+            if !q.is_null() { std::ptr::copy_nonoverlapping(p, q, l.size().min(size)); }
+            return q;
+        }
         // Slot data keeps its arena even when a history grows in a compile job or kept phase.
         // On allocation failure, return null and leave the original block intact.
         if slots::owns(p) {
@@ -998,9 +1014,25 @@ mod routing_tests {
 
     #[test]
     fn phase_routes_allocations_and_frees_follow_the_address() {
+        // Closing is process-wide. Other domain tests can be allocating concurrently.
+        const CHILD: &str = "RELAX_TEST_CLOSED_ARENAS";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "zone_alloc::routing_tests::phase_routes_allocations_and_frees_follow_the_address", "--nocapture"])
+                .env(CHILD, "1").env("RELAX_MEM_REPORT", "1").output().unwrap();
+            assert!(result.status.success() && String::from_utf8_lossy(&result.stdout).contains("test result: ok. 1 passed"),
+                "closed arena test failed: {}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
         let _s = serial();
         assert!(compiler_arena_enabled());
         unsafe {
+            // The base crate's test binary can use std's global allocator. Enter the
+            // loader's allocator once, as loader startup does, to initialize accounting.
+            let probe = Layout::new::<u64>();
+            let p = crate::memstat::Counting.alloc(probe);
+            assert!(!p.is_null() && crate::memstat::enabled());
+            crate::memstat::Counting.dealloc(p, probe);
             let (kept, kl) = put(100, 8, 1);
             assert!(!compiler::owns(kept));
             let (comp, cl) = {
@@ -1022,6 +1054,94 @@ mod routing_tests {
             // freed from the kept phase, by address
             RelaxAlloc.dealloc(comp, cl);
             RelaxAlloc.dealloc(kept, kl);
+
+            let (heap_block, heap_layout) = put(100, 8, 1);
+            let (old, old_layout, grow, grow_layout) = {
+                let _g = compiler();
+                let (old, l) = put(100, 8, 2);
+                let (grow, gl) = put(137, 16, 3);
+                (old as usize, l, grow as usize, gl)
+            };
+            assert!(compiler::owns(old as *mut u8) && compiler::owns(grow as *mut u8));
+            assert!(!compiler::owns(heap_block));
+            let heap_block = heap_block as usize;
+            let _ = domain::symbol(b"relax_alloc");
+            let domain_heap = domain::DomainHeap::new().unwrap();
+            domain::enter(&*domain_heap);
+            let dl = Layout::from_size_align(101, 16).unwrap();
+            let dp = domain::program_alloc(dl.size(), dl.align());
+            let dg = domain::program_alloc(dl.size(), dl.align());
+            assert!(!dp.is_null() && !dg.is_null());
+            let in_domain = |p: usize| domain_heap.ranges().any(|(base, n)| p.wrapping_sub(base) < n);
+            let (dp, dg) = (dp as usize, dg as usize);
+            assert!(in_domain(dp) && in_domain(dg));
+            let ranges = domain_heap.ranges().collect::<Vec<_>>();
+            std::ptr::write_bytes(dg as *mut u8, 4, dl.size());
+            #[cfg(unix)]
+            let (c_block, current) = {
+                let mut p = std::ptr::null_mut();
+                assert_eq!(domain::program_memalign(&mut p, 256, 73), 0);
+                std::ptr::write_bytes(p, 5, 73);
+                (p as usize, domain::current() as usize)
+            };
+            domain::enter(std::ptr::null());
+
+            let (held, ready) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _partial = compiler::hold_partial();
+                let _registry = domain::hold_registry();
+                held.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            ready.recv().unwrap();
+            close_for_fork_child();
+            let (done, result) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _phase = compiler();
+                let (fresh, fl) = put(100, 8, 1);
+                assert!(!compiler::owns(fresh));
+                RelaxAlloc.dealloc(fresh, fl);
+                RelaxAlloc.dealloc(old as *mut u8, old_layout);
+                RelaxAlloc.dealloc(heap_block as *mut u8, heap_layout);
+                let larger = RelaxAlloc.realloc(grow as *mut u8, grow_layout, 1024);
+                assert!(!larger.is_null() && !compiler::owns(larger) && all_eq(larger, grow_layout.size(), 3));
+                RelaxAlloc.dealloc(larger, Layout::from_size_align(1024, grow_layout.align()).unwrap());
+                RelaxAlloc.dealloc(dp as *mut u8, dl);
+                let moved = domain::program_resize(dg as *mut u8, dl.size(), dl.align(), 1024);
+                assert!(!moved.is_null() && all_eq(moved, dl.size(), 4));
+                assert!(!compiler::owns(moved) && ranges.iter().all(|&(base, n)| (moved as usize).wrapping_sub(base) >= n));
+                // A provided crate takes ownership of the program's unprefixed Rust buffer.
+                let gl = Layout::from_size_align(1024, dl.align()).unwrap();
+                let bigger = crate::memstat::Counting.realloc(moved, gl, 2048);
+                assert!(!bigger.is_null() && all_eq(bigger, dl.size(), 4));
+                crate::memstat::Counting.dealloc(bigger, Layout::from_size_align(2048, dl.align()).unwrap());
+                #[cfg(unix)]
+                {
+                    // No Layout and no registry lease: the address alone cannot prove a C header.
+                    assert!(domain::program_realloc(c_block as *mut u8, 4096).is_null());
+                    domain::restore(current as *const ());
+                    let c = domain::program_realloc(c_block as *mut u8, 4096);
+                    assert!(!c.is_null() && c as usize % 256 == 0 && all_eq(c, 73, 5));
+                    assert!(ranges.iter().all(|&(base, n)| (c as usize).wrapping_sub(base) >= n));
+                    domain::program_free(c);
+                    domain::enter(std::ptr::null());
+                }
+                done.send(()).unwrap();
+            });
+            let moved = result.recv_timeout(std::time::Duration::from_secs(10));
+            compiler::reopen_after_test();
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            moved.expect("fork-child allocation blocked on an arena lock");
+            worker.join().unwrap();
+            // The simulated child left these allocations alive.
+            RelaxAlloc.dealloc(old as *mut u8, old_layout);
+            RelaxAlloc.dealloc(grow as *mut u8, grow_layout);
+            domain::program_dealloc(dp as *mut u8, dl.size(), dl.align());
+            domain::program_dealloc(dg as *mut u8, dl.size(), dl.align());
+            #[cfg(unix)]
+            domain::program_free(c_block as *mut u8);
         }
     }
 
