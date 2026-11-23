@@ -14292,7 +14292,7 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     // a back end the owner's own step split off for the reach and no reach build took yet: run here
     // (realtime_back_for_wait). (In a publish the wait bails or is a bug, as below.)
     if owner::is_owner() {
-        owner::forbid_in_publish("a wait", u32::MAX);
+        owner::forbid_in_publish("a wait", id);
         if realtime_back_for_wait(up, id) && !(&*up).fns[id as usize].inflight {
             return;
         }
@@ -22127,6 +22127,9 @@ pub(crate) static TAKE_GIVES_WAY: AtomicU32 = AtomicU32::new(u32::MAX);
 /// (tests) the slot whose O3 take meets a patch: the patch epoch moves once its code is built
 #[cfg(test)]
 pub(crate) static TAKE_MEETS_PATCH: AtomicU32 = AtomicU32::new(u32::MAX);
+/// (tests) (the slot whose O3 take waits for a slot in flight, that slot)
+#[cfg(test)]
+pub(crate) static TAKE_MEETS_FLIGHT: relax_session::sync::Mutex<Option<(u32, u32)>> = relax_session::sync::Mutex::new(None);
 
 /// A queued slot whose entry left at its pick counts again in its count stub, from the cost it has
 /// now: code that still runs queues itself again soon. `recount`: it left to be counted again (a
@@ -24315,6 +24318,17 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if TAKE_GIVES_WAY.load(Ordering::Relaxed) == id {
             owner::forbid_in_publish("a wait", u32::MAX);
         }
+        // (a test's slot whose take meets a slot in flight, as a candidate's preparation does)
+        #[cfg(test)]
+        {
+            // (copied out: the wait bails, and an unwind through the guard would poison the lock)
+            let meets = *TAKE_MEETS_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((t, s)) = meets {
+                if t == id {
+                    wait_inflight(up, s);
+                }
+            }
+        }
         cost_name(up, id);
         // the owner's item while this take runs, and only then: every exit (a give-back, a walk's
         // WALK_ITEMS stop, a bail's unwind, the snapshot) ends it -- the boot bar showed the last
@@ -24562,6 +24576,23 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // is needed again after it: lowering ahead refused it) is left out of the snapshot; only
         // the root's own front failing drops the build. (Dropping the root for a candidate kept
         // warm-image code -- every body without its checked body -- at baseline: MICKEYGAP.)
+        // a candidate's preparation met a slot in flight (its back end runs off the unit: a patch's
+        // batch, another thread's build): its end, waited for here off the owner, and taken again.
+        // Given way instead, the slot's next take could come while the flight still ran: with
+        // nothing changed since, it waited for an unrelated edit or build (count_again_after_bail:
+        // "gave way on a wait again", a live session's nav test)
+        Err(b) if rounds < O3_TAKE_ROUNDS && b.flight.is_some() => {
+            let s = b.flight.unwrap_or(u32::MAX);
+            if tier1_trace() {
+                eprintln!("O3 take of #{} waits for #{} in flight, off the owner", id, s);
+            }
+            if let Some(w) = owner::publish(|| ((s as usize) < (&*up).fns.len() && (&*up).fns[s as usize].inflight).then(|| yielded(up, s))) {
+                // (out of the job count meanwhile, as a requester waiting for a build is)
+                let _idle = JobIdle::enter();
+                w.wait();
+            }
+            continue;
+        }
         Err(b) if rounds < O3_TAKE_ROUNDS && !b.slots.is_empty() && b.slots.iter().fold(true, |ok, &s| {
             let made = fronted.insert(s) && prefront_slot(&front, s);
             if !made && s != id {
@@ -29522,7 +29553,7 @@ fn tree_bail(id: u32, n0: usize) {
     let asks = TREE.try_with(|t| t.borrow_mut().as_mut().map(|s| s.asks.split_off(n0.min(s.asks.len())))).ok().flatten().unwrap_or_default();
     if !asks.is_empty() {
         TREE_STATS[TS_ASKED].fetch_add(1, Ordering::Relaxed);
-        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "build", slots: vec![id], builds: asks }));
+        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "build", slots: vec![id], builds: asks, flight: None }));
     }
 }
 
@@ -29932,7 +29963,7 @@ fn bail_for_fronts(mut needs: Vec<u32>) -> Vec<u32> {
         return needs;
     }
     if !needs.is_empty() {
-        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "front", slots: needs, builds: Vec::new() }));
+        std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "front", slots: needs, builds: Vec::new(), flight: None }));
     }
     Vec::new()
 }

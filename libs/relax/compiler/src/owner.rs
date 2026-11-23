@@ -718,7 +718,13 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             if *TRACE.get_or_init(|| std::env::var_os("RELAX_BAIL_TRACE").is_some()) {
                 eprintln!("relax bail: {} (slot {}) at\n{}", what, slot, std::backtrace::Backtrace::force_capture());
             }
-            std::panic::resume_unwind(Box::new(PublishBail { what, slots: if slot == u32::MAX { Vec::new() } else { vec![slot] }, builds: Vec::new() }))
+            // (a wait's slot is the one in flight: no front of it helps)
+            let (slots, flight) = match slot {
+                u32::MAX => (Vec::new(), None),
+                s if what == "a wait" => (Vec::new(), Some(s)),
+                s => (vec![s], None),
+            };
+            std::panic::resume_unwind(Box::new(PublishBail { what, slots, builds: Vec::new(), flight }))
         }
         _ => {
             // said here, before it unwinds: on the owner the panic hook is silent (a request's

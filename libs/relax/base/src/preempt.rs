@@ -126,11 +126,14 @@ pub struct OwnerBusy;
 /// `bail_for_fronts`). `what` "build": a preparation inside a build tree's take met inline
 /// candidates without the body it inlines (compiler jit.rs `tree_ask`): `slots` is its own slot,
 /// `builds` the candidates with how each is built; its thread builds them first, each in its own
-/// takes, and takes it again.
+/// takes, and takes it again. `flight`: the slot in flight a wait of the take met ("a wait"; its
+/// back end runs off the unit), whose end an O3 snapshot take waits for off the owner before it
+/// takes again (compiler jit.rs `compile_tier1`); `slots` stays empty, as no front helps.
 pub struct PublishBail {
     pub what: &'static str,
     pub slots: Vec<u32>,
     pub builds: Vec<(u32, u8)>,
+    pub flight: Option<u32>,
 }
 
 /// Whether a caught unwind payload is work to be redone rather than a failure: a preemption,

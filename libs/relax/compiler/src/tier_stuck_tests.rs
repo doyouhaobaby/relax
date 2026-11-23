@@ -764,7 +764,8 @@ fn a_closure_front_from_its_parents_old_body_is_made_again() {
 /// once per call. A take that gave way counted the slot again from the cost it had, over the
 /// threshold, so its next call queued it for the same take: a live session's O3 workers ran ~68
 /// builds a second for minutes with nothing edited (11-17). A build on the owner or an edit is a
-/// change: one more take each.
+/// change: one more take each. A slot in flight is no such cause: a take that meets one waits for
+/// its end off the owner and builds.
 #[test]
 fn a_take_that_gives_way_waits_for_a_change() {
     isolated_test!(a_take_that_gives_way_waits_for_a_change);
@@ -840,6 +841,36 @@ fn a_take_that_gives_way_waits_for_a_change() {
     assert_eq!(state(), T_QUEUED, "one take per change: twice waits for the next one");
     rearm_bailed(up);
     assert_eq!(state(), T_QUEUED, "nothing changed since: twice still waits");
+    // a take that meets a slot in flight (a candidate's preparation waiting for another thread's
+    // back end) waits for that flight's end off the owner and takes again: it builds, rather than
+    // give way and wait for an unrelated change ("gave way on a wait again")
+    TAKE_GIVES_WAY.store(u32::MAX, Ordering::Relaxed);
+    let m = crate::owner::call(crate::owner::Class::Program, || u.fn_id(FnKey::Inst(main, Vec::new())));
+    *TAKE_MEETS_FLIGHT.lock().unwrap() = Some((id, m));
+    let waits = || crate::owner::BAILS[3].load(Ordering::Relaxed);
+    let waits0 = waits();
+    struct P(*mut Unit);
+    unsafe impl Send for P {}
+    let p = P(up);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let p = p;
+        let me = crate::waits::me();
+        crate::owner::call(crate::owner::Class::Program, || unsafe { begin_flight(p.0, m, me, &[m]) });
+        tx.send(()).unwrap();
+        // the flight ends once the take gave the owner back for it (bounded: a take that never
+        // waits is the failure below, not a hang)
+        let t0 = std::time::Instant::now();
+        while waits() == waits0 && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::owner::call(crate::owner::Class::Program, || unsafe { end_flight(p.0, &[m]) });
+    });
+    rx.recv().unwrap();
+    assert!(unsafe { compile_tier1(up, id) }, "twice's take met a slot in flight: it waited for the flight's end and built");
+    holder.join().unwrap();
+    assert_eq!(waits(), waits0 + 1, "the take met the flight once (a wait bail), then took again after its end");
+    *TAKE_MEETS_FLIGHT.lock().unwrap() = None;
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
