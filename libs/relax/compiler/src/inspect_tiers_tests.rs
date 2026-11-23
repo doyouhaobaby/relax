@@ -530,17 +530,13 @@ pub fn panicking(out: &mut [u32; 2]) {
         let dir = std::env::temp_dir().join(format!("relax-joined-body-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("lib.rs"), PROGRAM).unwrap();
-        for phase in ["control", "cold", "warm", "image"] {
+        for phase in ["cold", "warm", "image"] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact", "jit::inspect_tiers_tests::joined_bodies_unwind_once_and_show_the_parts_locals", "--nocapture", "--test-threads=1"])
-                .env(PHASE, phase).env(DIR, &dir).env("RELAX_CACHE_DIR", dir.join(if phase == "control" { "control" } else { "cache" }))
-                .env("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std")).env("RELAX_PANIC_PARK", "0");
-            if phase == "control" {
-                child.env_remove("RELAX_OUTLINE_WHOLE");
-            } else {
-                child.env("RELAX_OUTLINE_WHOLE", "outlined_leaf,outlined_host").env_remove("RELAX_INSPECT")
-                    .env("RELAX_FLIGHTREC", "0").env("RELAX_PANIC_PARK", "600").env("RELAX_EXPECTED_CRASH", "the joined body test inspects and releases its park");
-            }
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_CACHE_DIR", dir.join("cache"))
+                .env("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"))
+                .env("RELAX_OUTLINE_WHOLE", "outlined_leaf,outlined_host").env_remove("RELAX_INSPECT")
+                .env("RELAX_FLIGHTREC", "0").env("RELAX_PANIC_PARK", "600").env("RELAX_EXPECTED_CRASH", "the joined body test inspects and releases its park");
             let start = std::time::Instant::now();
             let out = crate::test_child::output(&mut child);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -559,7 +555,7 @@ pub fn panicking(out: &mut [u32; 2]) {
     tcx.collect(&prog);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
-    let (ids, [normal, panicking]) = crate::owner::call(crate::owner::Class::Program, || {
+    let (ids, plain, [normal, panicking]) = crate::owner::call(crate::owner::Class::Program, || {
         let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
         cache.mode = crate::cache::Mode::On;
         if phase == "image" {
@@ -568,7 +564,8 @@ pub fn panicking(out: &mut [u32; 2]) {
         }
         u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
         let ids = [leaf, host].map(|d| u.fn_id(FnKey::Inst(d, vec![])));
-        (ids, [normal, panicking].map(|d| u.entry(u.fn_id(FnKey::Inst(d, vec![])))))
+        let plain = u.fn_id(FnKey::Inst(normal, vec![]));
+        (ids, plain, [normal, panicking].map(|d| u.entry(u.fn_id(FnKey::Inst(d, vec![])))))
     });
     if phase == "image" {
         assert!(unsafe { prelink_startup(up) } >= ids.len(), "startup image placed before the first call");
@@ -588,18 +585,20 @@ pub fn panicking(out: &mut [u32; 2]) {
         assert_eq!(tables.version_of(start).map(|(v, n, _)| (v, n)), Some((1, 1)), "{phase}: {}", name);
         let end = start + u64::from(len);
         let base = tables.function_base(start, end - 1);
-        assert_eq!(base != start, phase != "control", "{phase}: {} part in code tables", name);
-        let mut frames: Vec<_> = tables.unwind.keys().copied().chain(tables.image_unwind.iter().map(|t| t.0))
-            .filter(|a| (start..end).contains(a)).collect();
-        frames.sort_unstable();
-        if phase == "control" {
-            assert_eq!(frames, [start], "{} has only its host unwind trailer", name);
-        } else {
-            assert_eq!(frames, [start, base], "{} has both unwind trailers", name);
-            assert_eq!(tables.function_base(start, base - 1), start);
-            assert_eq!(tables.function_base(start, base), base);
-            assert_eq!(tables.entry_at(base), Some((start, len, id)));
-        }
+        assert_ne!(base, start, "{phase}: {} part in code tables", name);
+        assert_eq!(unwind_starts(&tables, start, end), [start, base], "{} has both unwind trailers", name);
+        assert_eq!(tables.function_base(start, base - 1), start);
+        assert_eq!(tables.function_base(start, base), base);
+        assert_eq!(tables.entry_at(base), Some((start, len, id)));
+    }
+    // A function the option does not name takes the path an unset option takes: unchanged
+    if phase == "cold" {
+        let start = crate::owner::call(crate::owner::Class::Program, || u.fns[plain as usize].code);
+        let tables = u.code.read().unwrap();
+        let (_, len, _) = tables.entry_at(start).expect("installed code");
+        let end = start + u64::from(len);
+        assert_eq!(tables.function_base(start, end - 1), start, "an unnamed function has no part");
+        assert_eq!(unwind_starts(&tables, start, end), [start], "an unnamed function has only its own unwind trailer");
     }
     // Snapshot those same installs for disk and image before the inspector can replace one.
     if phase == "cold" {
@@ -609,6 +608,12 @@ pub fn panicking(out: &mut [u32; 2]) {
             assert!(cache.record_manifest(&u, krate, &ids, ids.len(), &|| false), "record the two functions in the startup image");
             u.cache = Some(cache);
         });
+    }
+    fn unwind_starts(tables: &CodeTables, start: u64, end: u64) -> Vec<u64> {
+        let mut frames: Vec<_> = tables.unwind.keys().copied().chain(tables.image_unwind.iter().map(|t| t.0))
+            .filter(|a| (start..end).contains(a)).collect();
+        frames.sort_unstable();
+        frames
     }
     fn parked_leaf(u: &Unit, leaf_start: u64, regs: &[u64]) -> Result<[u32; 2], String> {
         use crate::inspect::vars;
@@ -631,33 +636,29 @@ pub fn panicking(out: &mut [u32; 2]) {
     }
     let (done, finished) = std::sync::mpsc::channel::<()>();
     let addr = up as usize;
-    let watcher = (phase != "control").then(|| {
-        crate::inspect::start("joined_body");
-        std::thread::spawn(move || {
-            use crate::inspect::events;
-            let mut seen = Vec::new();
-            loop {
-                for (id, _, _, message, _) in events::parked_now() {
-                    if seen.iter().any(|(k, _, _)| *k == id) { continue; }
-                    let values = events::parked_regs(Some(id)).ok_or("missing parked registers".to_string()).and_then(|(_, regs)| {
-                        crate::owner::call(crate::owner::Class::Program, || parked_leaf(unsafe { &*(addr as *const Unit) }, starts[0], &regs))
-                    });
-                    seen.push((id, message, values));
-                    events::quit_releases();
-                }
-                if finished.recv_timeout(std::time::Duration::from_millis(2)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) { break; }
+    crate::inspect::start("joined_body");
+    let watcher = std::thread::spawn(move || {
+        use crate::inspect::events;
+        let mut seen = Vec::new();
+        loop {
+            for (id, _, _, message, _) in events::parked_now() {
+                if seen.iter().any(|(k, _, _)| *k == id) { continue; }
+                let values = events::parked_regs(Some(id)).ok_or("missing parked registers".to_string()).and_then(|(_, regs)| {
+                    crate::owner::call(crate::owner::Class::Program, || parked_leaf(unsafe { &*(addr as *const Unit) }, starts[0], &regs))
+                });
+                seen.push((id, message, values));
+                events::quit_releases();
             }
-            seen
-        })
+            if finished.recv_timeout(std::time::Duration::from_millis(2)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) { break; }
+        }
+        seen
     });
     let ran = unsafe { call_jit(up, panicking, out.as_mut_ptr() as u64) };
     drop(done);
-    if let Some(watcher) = watcher {
-        let seen = watcher.join().unwrap();
-        assert_eq!(seen.len(), 1, "{phase}: one park: {seen:?}");
-        assert!(seen[0].1.contains("outlined_leaf panics"), "{phase}: {seen:?}");
-        assert_eq!(seen[0].2, Ok([22, 7]), "{phase}: seen and n in the leaf's part");
-    }
+    let seen = watcher.join().unwrap();
+    assert_eq!(seen.len(), 1, "{phase}: one park: {seen:?}");
+    assert!(seen[0].1.contains("outlined_leaf panics"), "{phase}: {seen:?}");
+    assert_eq!(seen[0].2, Ok([22, 7]), "{phase}: seen and n in the leaf's part");
     ran.map_err(|p| p.message).unwrap();
     assert_eq!(out, [1, 22], "{phase}: join returned the panic and unwinding added exactly 11 drops");
     if phase == "cold" {
