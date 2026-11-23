@@ -5103,6 +5103,13 @@ impl<'a> Fcx<'a> {
                                 let pos = self.ast().expr(*e).lo;
                                 self.coerce_or_unify(t, x, Some(*e), pos);
                                 result = x;
+                            } else if !unsized_x && !soft && matches!(self.tcx.tys.kind(st), TyKind::Never) && !matches!(self.tcx.tys.kind(sx), TyKind::Never | TyKind::Infer(_)) {
+                                // rustc check_block_with_expected: the tail is coerced to the block's
+                                // ExpectHasType type, a `!` tail by NeverToAny (coercion.rs Coerce::coerce), so
+                                // the block has that type; a place read of `!` (`fn f(n: &!) -> u32 { *n }`)
+                                // then reaches MIR as `NeverToAny(*n)`, not as `!` written to the u32
+                                self.never_to_any(Some(*e), x);
+                                result = x;
                             }
                         }
                     } else if !*semi {
