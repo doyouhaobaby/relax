@@ -10,29 +10,36 @@
 //! read): the emitters read an empty block's terminator at the block's start, before the region's
 //! window begins, so d came from its stale slot (an app's slicer `gaps` at O3: `cap + 1 < cap`, the
 //! overflow check of `self.cap + 1`, rebuilt from cap's slot, a false overflow panic); they now read
-//! it at the terminator's regalloc position. The allocation checker runs on every compile, and
+//! it at the terminator's regalloc position. With compares_into_readers off (RELAX_OPT=-cmpread)
+//! that block holds its compare, `c = t < 0; branch c`, which x64 fuses into the branch: it read
+//! the compare at the block's start too (no instruction before it), past the window's loads; it
+//! now reads it where the compare stands. The allocation checker runs on every compile, and
 //! results must equal Rust's.
 #![cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "aarch64", unix)))]
 use relax_backend::regalloc::{allocate_split, Loc, Remat};
 use relax_backend::{exec::Code, rir::*};
 
-fn options() -> relax_session::Options {
+/// `fused`: compares stay where they are made (the branch block's compare is fused at emission)
+fn options(fused: bool) -> relax_session::Options {
     let mut o = relax_session::Options::default();
     o.opt.push("+checkra".into());
+    if fused {
+        o.opt.push("-cmpread".into());
+    }
     o
 }
 
 #[cfg(target_arch = "x86_64")]
-fn compile(f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
+fn compile(o: &relax_session::Options, f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
     let env = relax_backend::x64::Env::standalone(true);
-    let c = relax_backend::x64::compile_freq(&options(), f, &env, freq).unwrap();
+    let c = relax_backend::x64::compile_freq(o, f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
 #[cfg(target_arch = "aarch64")]
-fn compile(f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
+fn compile(o: &relax_session::Options, f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
     let env = relax_backend::arm64::Env::standalone(true);
-    let c = relax_backend::arm64::compile_freq(&options(), f, &env, freq).unwrap();
+    let c = relax_backend::arm64::compile_freq(o, f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
@@ -61,10 +68,11 @@ fn push(f: &mut Func, b: u32, i: Inst) {
 /// spills) and read after them. With `empty`, t = d + 1 takes d's place in the test (`t & 3`),
 /// lives across the bursts too (read there as `acc = (bursts + t) ^ d`: rebuilt from d, not
 /// spilled) and the latch's way first passes an empty block that branches on it: `acc = if (t as
-/// i64) < 0 { k.rotl(9) } else { d.rotl(7) }`.
+/// i64) < 0 { k.rotl(9) } else { d.rotl(7) }`. With `fused` that block makes the compare itself,
+/// `c = t < 0`, and branches on c.
 /// Returns the function and its sampled block frequencies (the loop 1, the bursts 1/4, the rest
 /// never sampled).
-fn build(empty: bool) -> (Func, Vec<f32>) {
+fn build(empty: bool, fused: bool) -> (Func, Vec<f32>) {
     let mut f = Func::new("region_exit_stores".into(), 0);
     let (n, seed) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.params = vec![n, seed];
@@ -93,7 +101,13 @@ fn build(empty: bool) -> (Func, Vec<f32>) {
         f.blocks[b2 as usize].pos.insert(2, 0);
         f.blocks[b2 as usize].insts[4] = Inst::IBinI(IOp::And, W, bits, t, 3);
         f.blocks[b2 as usize].term = Term::Branch(z, b4, e);
-        f.blocks[e as usize].term = Term::BranchCmp(Cmp::K(Cond::Lt, true, t, 0), b5, b3);
+        if fused {
+            let c = f.vreg(Cls::I);
+            push(&mut f, e, Inst::ICmpI(Cond::Lt, true, c, t, 0));
+            f.blocks[e as usize].term = Term::Branch(c, b5, b3);
+        } else {
+            f.blocks[e as usize].term = Term::BranchCmp(Cmp::K(Cond::Lt, true, t, 0), b5, b3);
+        }
         push(&mut f, b5, Inst::IBinI(IOp::Rotl, W, acc, k, 9));
         f.blocks[b5 as usize].term = Term::Jump(b1);
         (t, e, b5)
@@ -174,9 +188,10 @@ fn reference(n: u64, seed: u64, empty: bool) -> u64 {
 
 #[test]
 fn cold_read_stores_on_the_way_out() {
-    for empty in [false, true] {
-        let (f, freq) = build(empty);
-        let (g, al, _) = allocate_split(&options(), &f, &reg_config(), true, Some(&freq));
+    for (empty, fused) in [(false, false), (true, false), (true, true)] {
+        let o = options(fused);
+        let (f, freq) = build(empty, fused);
+        let (g, al, _) = allocate_split(&o, &f, &reg_config(), true, Some(&freq));
         let h = g.as_ref().unwrap_or(&f);
         // the loop body (its `& 3` test) and the bursts' block (the allocated function may add and
         // reorder blocks)
@@ -193,14 +208,18 @@ fn cold_read_stores_on_the_way_out() {
             // t = d + 1 is rebuilt from d at its reads, among them the empty block's branch
             let t = h.blocks[body].insts.iter().find_map(|i| if let Inst::IBinI(IOp::Add, _, t, s, 1) = i { (*s == d).then_some(*t) } else { None }).unwrap();
             assert!(matches!((al.loc[t.0 as usize], al.remat[t.0 as usize]), (Loc::None, Remat::Offset(b, 1)) if b == d), "the fixture needs t rebuilt from d: {:?} {:?}", al.loc[t.0 as usize], al.remat[t.0 as usize]);
-            let e = h.blocks.iter().position(|b| b.insts.is_empty() && matches!(b.term, Term::BranchCmp(Cmp::K(Cond::Lt, true, u, 0), ..) if u == t));
-            assert!(e.is_some(), "the fixture needs the empty block that branches on t: {:?}", h.blocks.iter().map(|b| &b.term).collect::<Vec<_>>());
+            let e = h.blocks.iter().position(|b| match (&b.insts[..], &b.term) {
+                ([], Term::BranchCmp(Cmp::K(Cond::Lt, true, u, 0), ..)) => !fused && *u == t,
+                ([Inst::ICmpI(Cond::Lt, true, c, u, 0)], Term::Branch(c2, ..)) => fused && *u == t && c == c2,
+                _ => false,
+            });
+            assert!(e.is_some(), "fused {}: the fixture needs the block that branches on t alone: {:?}", fused, h.blocks.iter().map(|b| (&b.insts, &b.term)).collect::<Vec<_>>());
         }
         for fr in [None, Some(&freq[..])] {
-            let code = Code::new(&compile(&f, fr)).unwrap();
+            let code = Code::new(&compile(&o, &f, fr)).unwrap();
             let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             for (n, seed) in [(0u64, 1u64), (1, 7), (16, 0), (63, 0x1234), (64, 0x9e3779b97f4a7c15), (1001, 3)] {
-                assert_eq!(run(n, seed), reference(n, seed, empty), "empty {} freq {} n {} seed {}", empty, fr.is_some(), n, seed);
+                assert_eq!(run(n, seed), reference(n, seed, empty), "empty {} fused {} freq {} n {} seed {}", empty, fused, fr.is_some(), n, seed);
             }
         }
     }
@@ -285,13 +304,13 @@ fn reference_join(n: u64, seed: u64) -> u64 {
 fn join_stores_before_the_branch() {
     let (f, freq) = build_join();
     for fr in [None, Some(&freq[..])] {
-        let code = Code::new(&compile(&f, fr)).unwrap();
+        let code = Code::new(&compile(&options(false), &f, fr)).unwrap();
         let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
         for (n, seed) in [(0u64, 1u64), (1, 7), (16, 0), (63, 0x1234), (64, 0x9e3779b97f4a7c15), (1001, 3)] {
             assert_eq!(run(n, seed), reference_join(n, seed), "freq {} n {} seed {}", fr.is_some(), n, seed);
         }
     }
-    let (g, al, _) = allocate_split(&options(), &f, &reg_config(), true, Some(&freq));
+    let (g, al, _) = allocate_split(&options(false), &f, &reg_config(), true, Some(&freq));
     let h = g.as_ref().unwrap_or(&f);
     // the loop body (d & 3) and the region's cold block (d & 4)
     let body = h.blocks.iter().position(|b| b.insts.iter().any(|i| matches!(i, Inst::IBinI(IOp::And, _, _, _, 3)))).unwrap();

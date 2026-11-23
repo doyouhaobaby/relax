@@ -1392,6 +1392,20 @@ impl<'a> Gen<'a> {
             _ => None,
         }
     }
+    /// The region windows that begin at `at`: their values into their registers (from the slot, or
+    /// recomputed)
+    fn window_loads(&mut self, at: u32) {
+        if let Some(ls) = self.win_start.get(&at).cloned() {
+            for (v, r) in ls {
+                if let Loc::Stack(o) = self.al.loc[v as usize] {
+                    let d = self.spill_disp(o);
+                    self.load_spill(r, d);
+                } else {
+                    self.remat_into(r, VReg(v));
+                }
+            }
+        }
+    }
     /// Recomputes a value without a location (Alloc::remat) into r, flags-preserving: a fused
     /// compare may have set them for the next jcc / cmov.
     fn remat_into(&mut self, r: u8, v: VReg) {
@@ -1990,16 +2004,7 @@ impl<'a> Gen<'a> {
                         self.sel_flags = None;
                     }
                 }
-                if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
-                    for (v, r) in ls {
-                        if let Loc::Stack(o) = self.al.loc[v as usize] {
-                            let d = self.spill_disp(o);
-                            self.load_spill(r, d);
-                        } else {
-                            self.remat_into(r, VReg(v));
-                        }
-                    }
-                }
+                self.window_loads(self.cur_pos);
                 if into_branch && ii + 1 == ne {
                     break;
                 }
@@ -2067,6 +2072,16 @@ impl<'a> Gen<'a> {
                         self.sel_flags = Some((cmp, icc(cc, sg)));
                     }
                 }
+            }
+            // a block whose one instruction is the compare fused into its branch: the compare reads
+            // where it stands, its windows loaded first, as unfused (with an instruction before it,
+            // it reads after that one ran, which regalloc accounts for). Read at the block's start, a
+            // window entered live there (from block_start + 1) had not begun: a value the region
+            // holds in a register came from its slot, stale where the region skips its stores (the
+            // empty block's case below; with RELAX_OPT=-cmpread, or a compare that writes its operand)
+            if fused && ne == 0 && n == 1 {
+                self.cur_pos = self.al.inst_pos(bi, 0);
+                self.window_loads(self.cur_pos);
             }
             // a sibling call ended the block: its Ret is the callee's
             if self.tail.get(bi).is_some_and(|t| t.is_some()) {
