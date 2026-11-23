@@ -2378,10 +2378,17 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 /// fresh vreg, stored back on every edge that leaves the loop.
 ///
 /// Legality, as LLVM decides it:
-/// * the pointer is `noalias` and not captured: no pointer that is not based on it (derived from it
-///   by moves and address arithmetic, or returned by a call that was given one) reaches its pointee,
-///   and it is never stored as a value; so nothing in the loop but accesses through the parameter
-///   itself can touch the field;
+/// * the pointer is `noalias` and not captured before or in the loop (`isNotCapturedBeforeOrInLoop`):
+///   no pointer that is not based on it (derived from it by moves and address arithmetic, or returned
+///   by a call that was given one) reaches its pointee, and it is never stored as a value, in a block
+///   the loop's header can be reached from; so nothing in the loop but accesses through the parameter
+///   itself can touch the field. A block the header cannot be reached from runs after the loop's last
+///   iteration on its path, the write-backs on the loop's exits before it: a live split body's patched
+///   path (patched.rs: entered only by the fast half's exits, never back) gives the closure's pointers
+///   to its guards' slow calls, and counted, they kept every loop of the fast half in memory (an
+///   iterator fold's cursor and accumulator, 9% slower live than without the split). Such a loop is
+///   promoted for its carried fields only (below). RELAX_OPT=-promotereach: a capture anywhere in the
+///   function counts (A/B);
 /// * every access in the loop through a pointer based on the parameter is a plain load or store
 ///   through the parameter, and every one overlapping the field has its exact offset and type;
 /// * no atomic or fence in the loop but relaxed loads (a live session's patch guard reads its
@@ -2467,6 +2474,18 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool], (tri
     if atomic_or_fence {
         return false;
     }
+    // the blocks the header can be reached from: the loop, and what may run before an iteration of it
+    let every = relax_backend::stats::opt_env_off("-promotereach");
+    let mut before = vec![every; n];
+    before[h as usize] = true;
+    let mut work = if every { Vec::new() } else { vec![h] };
+    while let Some(x) = work.pop() {
+        for &q in &preds[x as usize] {
+            if !std::mem::replace(&mut before[q as usize], true) {
+                work.push(q);
+            }
+        }
+    }
     let mut did = false;
     for pi in 0..f.noalias.len() {
         let p = f.noalias[pi];
@@ -2505,25 +2524,32 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool], (tri
                 }
             }
         }
-        // captured: stored as a value, or given to a call that may keep or return it
-        let mut captured = false;
-        for b in &f.blocks {
+        // captured (stored as a value, or given to a call that may keep or return it) before or in
+        // the loop: no promotion; only after it (`late`): carried fields only, below
+        let (mut captured, mut late) = (false, false);
+        for (b, &bf) in f.blocks.iter().zip(&before) {
+            let mut c = false;
             for i in &b.insts {
                 match i {
-                    Inst::Store(_, _, _, src) | Inst::StoreX(_, _, _, _, _, src) | Inst::VStore(_, _, src) | Inst::AtomicStore(_, _, _, src) => captured |= based[src.0 as usize],
-                    Inst::AtomicRmw(_, _, _, _, _, src) => captured |= based[src.0 as usize],
-                    Inst::AtomicCas(_, _, _, _, _, e, nw) => captured |= based[e.0 as usize] || based[nw.0 as usize],
-                    Inst::Call(c, args, _) => {
-                        captured |= args.iter().enumerate().any(|(k, a)| based[a.0 as usize] && !sroa_nocapture(c, k));
-                        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
-                            captured |= based[v.0 as usize];
+                    Inst::Store(_, _, _, src) | Inst::StoreX(_, _, _, _, _, src) | Inst::VStore(_, _, src) | Inst::AtomicStore(_, _, _, src) => c |= based[src.0 as usize],
+                    Inst::AtomicRmw(_, _, _, _, _, src) => c |= based[src.0 as usize],
+                    Inst::AtomicCas(_, _, _, _, _, e, nw) => c |= based[e.0 as usize] || based[nw.0 as usize],
+                    Inst::Call(cl, args, _) => {
+                        c |= args.iter().enumerate().any(|(k, a)| based[a.0 as usize] && !sroa_nocapture(cl, k));
+                        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = cl {
+                            c |= based[v.0 as usize];
                         }
                     }
                     _ => {}
                 }
             }
             if let Term::Ret(vs) = &b.term {
-                captured |= vs.iter().any(|v| based[v.0 as usize]);
+                c |= vs.iter().any(|v| based[v.0 as usize]);
+            }
+            if bf {
+                captured |= c;
+            } else {
+                late |= c;
             }
         }
         if captured {
@@ -2587,8 +2613,11 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool], (tri
         // Load-only fields alone are LLVM LICM's invariant-load hoisting: a Vec's pointer and length
         // read through `&mut self` in a loop that writes only through the heap pointer (vorbis
         // `self.spectra[i] *= self.curves[i]` reloaded both headers every iteration).
-        // RELAX_OPT=-promoteld: carried fields only.
-        if !take.iter().any(|x| x.2 && x.3) && (relax_backend::stats::opt_env_off("-promoteld") || !take.iter().any(|x| x.2)) {
+        // RELAX_OPT=-promoteld: carried fields only. So for a parameter captured after the loop
+        // (`late`): an invariant load is on no iteration's chain, and its register held over the loop
+        // cost more where the loop was short of them (a recursive layout pass's child loop: its
+        // vector's pointer and length hoisted, the loop's other values spilled, 5% slower).
+        if !take.iter().any(|x| x.2 && x.3) && (late || relax_backend::stats::opt_env_off("-promoteld") || !take.iter().any(|x| x.2)) {
             continue;
         }
         take.retain(|x| x.2);
@@ -5968,6 +5997,50 @@ mod tests {
         ]);
         f.blocks[0].term = Term::Ret(vec![result]);
         sroa_rejects(&mut f, SroaReject::KindMix);
+    }
+
+    /// A loop's carried field through a `&mut` parameter lives in a register when the pointer is
+    /// captured only after the loop (a block the header cannot be reached from: a live split body's
+    /// patched path, its guards' slow calls given the closure's pointers), and stays in memory when the
+    /// capture may run before an iteration
+    #[test]
+    fn a_capture_after_the_loop_leaves_its_carried_field_promoted() {
+        // the loop loads [p], and with `store` stores it back + 1; a call is given p in `capture_in`
+        let carried = |capture_in: Option<usize>, store: bool| {
+            let mut f = Func::new("carried".into(), 0);
+            let (p, c, x, y) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            f.params.extend([p, c]);
+            f.noalias.push(p);
+            f.deref.push((p, 8));
+            for _ in 0..3 { f.block(); }
+            f.blocks[0].term = Term::Jump(1);
+            f.blocks[1].insts = vec![Inst::Load(Mem::Int(8, false), x, p, 0), Inst::IBinI(IOp::Add, U64, y, x, 1)];
+            if store {
+                f.blocks[1].insts.push(Inst::Store(Mem::Int(8, false), p, 0, y));
+            }
+            f.blocks[1].term = Term::Branch(c, 1, 2);
+            f.blocks[2].term = Term::Ret(vec![]);
+            if let Some(b) = capture_in {
+                f.blocks[b].insts.push(Inst::Call(Callee::Fn(7), vec![p], vec![]));
+            }
+            for b in &mut f.blocks { b.pos = vec![0; b.insts.len()]; }
+            f.verify().unwrap();
+            f
+        };
+        let mut f = carried(Some(2), true);
+        assert!(promote_loop_memory(&mut f), "a capture after the loop stopped the promotion");
+        f.verify().unwrap();
+        assert!(!f.blocks[1].insts.iter().any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))), "the field stayed in memory: {:?}", f.blocks[1].insts);
+        let back = f.blocks.iter().position(|b| b.insts.iter().any(|i| matches!(i, Inst::Store(Mem::Int(8, false), _, 0, _))) && b.term == Term::Jump(2));
+        assert!(back.is_some(), "no write-back before the block that captures it");
+        let mut f = carried(Some(0), true);
+        assert!(!promote_loop_memory(&mut f), "captured before the loop, it was promoted");
+        // an invariant field: hoisted when nothing captures p, kept in memory when p is captured
+        // after the loop (carried fields only there)
+        let mut f = carried(None, false);
+        assert!(promote_loop_memory(&mut f), "an invariant field of an uncaptured parameter was not hoisted");
+        let mut f = carried(Some(2), false);
+        assert!(!promote_loop_memory(&mut f), "captured after the loop, its invariant field was hoisted");
     }
 }
 
