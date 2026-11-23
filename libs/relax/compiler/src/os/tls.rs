@@ -11,6 +11,10 @@
 include!("../rt_abi.rs");
 pub use imp::*;
 
+/// `relax_tls_fixed`'s question for the answering runtime's own nesting depth under Relax (no cell
+/// is at this address): a runtime asks the one that runs it, so a refusal can say how deep it is.
+pub const DEPTH_QUERY: u64 = u64::MAX;
+
 #[cfg(unix)]
 mod unix {
     extern "C" {
@@ -62,9 +66,24 @@ mod imp {
         let cell = TLS_BLOCK.with(|c| c as *const std::cell::Cell<u64> as u64);
         let off = cell.wrapping_sub(fs_base()) as i64;
         if off < i32::MIN as i64 || off > i32::MAX as i64 || !static_cell(cell) {
-            panic!("thread-local block cell is not in static TLS (offset {:#x})", off);
+            // a plain error: nothing this run does moves the cell
+            eprintln!("{}", cell_refusal(super::fixed::depth(), off));
+            std::process::exit(2);
         }
         off as u64
+    }
+
+    /// What a runtime says when JIT code cannot reach its thread-local block cell at a fixed
+    /// offset from the thread pointer: `depth` is how deep under Relax it runs (1: the loader,
+    /// 2: a runtime the loader runs; 0: the runtime above did not say), `off` the cell's offset.
+    pub(super) fn cell_refusal(depth: u32, off: i64) -> String {
+        let deep = match depth {
+            1 => return format!("relax: this runtime's thread-local block cell is {off:#x} from the thread pointer, out of the reach of JIT code"),
+            2 => return "relax: this runtime runs under Relax, and the static TLS the outer runtime hands out was used up before it placed this runtime's thread-local block cell, so JIT code cannot reach the cell".to_string(),
+            0 => "more than one level deep".to_string(),
+            d => format!("{d} levels deep"),
+        };
+        format!("relax: this runtime runs {deep} under Relax (the loader is level 1, a runtime it runs level 2). On Linux x86-64 JIT code reaches its thread's block through a cell at a fixed offset from the thread pointer, and only the loader hands such cells out, to the runtime it runs; Relax nested deeper than that is not supported. Run this program under the loader directly.")
     }
 
     /// Under Relax the cell is the outer program's thread-local: in the outer runtime's static TLS
@@ -134,6 +153,9 @@ mod fixed {
     /// whether `addr` is a variable this runtime placed in static TLS (as seen from the calling
     /// thread), i.e. at the same offset from the thread pointer on every thread.
     pub extern "C" fn relax_tls_fixed(addr: u64) -> u32 {
+        if addr == super::DEPTH_QUERY {
+            return depth();
+        }
         let (Some(base), r) = (static_tls_base(), FS_BASE.load(Ordering::Acquire)) else { return 0 };
         if r == 0 {
             return 0;
@@ -141,6 +163,25 @@ mod fixed {
         let fs_base: rt_fn_ty!(fn() -> u64) = unsafe { std::mem::transmute(r as usize) };
         let off = addr.wrapping_sub(fs_base()) as i64;
         (off >= base as i64 && off < base as i64 + NEXT.load(Ordering::Acquire) as i64) as u32
+    }
+
+    /// How deep under Relax this runtime runs: 1 natively (the loader), else one more than the
+    /// runtime that runs it says (`relax_tls_fixed(DEPTH_QUERY)`); 0 when that one does not say.
+    pub fn depth() -> u32 {
+        #[cfg(relax)]
+        {
+            extern "C" {
+                fn __relax_tls_fixed(addr: u64) -> u32;
+            }
+            match unsafe { __relax_tls_fixed(super::DEPTH_QUERY) } {
+                0 => 0,
+                d => d + 1,
+            }
+        }
+        #[cfg(not(relax))]
+        {
+            1
+        }
     }
 
     pub fn static_tls_alloc(size: u32, align: u32) -> Option<i32> {
@@ -347,4 +388,25 @@ mod imp {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     fixed::reset_statics();
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod tests {
+    /// A runtime whose thread-local block cell JIT code cannot reach stops with a plain error that
+    /// says how deep under Relax it runs, and a runtime learns its depth from the one that runs it:
+    /// natively the test is the loader (1); under Relax one more than its loader says (0 while that
+    /// loader is a build from before the depth question).
+    #[test]
+    fn a_nested_runtime_knows_its_depth_and_says_it() {
+        let deep = super::imp::cell_refusal(3, 0);
+        assert!(deep.starts_with("relax: this runtime runs 3 levels deep under Relax") && deep.contains("not supported"), "the refusal names the depth: {deep}");
+        assert!(super::imp::cell_refusal(0, 0).contains("more than one level deep"), "an unknown depth is said as such");
+        assert!(super::imp::cell_refusal(2, 0).contains("used up"), "one level deep the cause is the outer runtime's full reserve");
+        let d = super::fixed::depth();
+        if cfg!(relax) {
+            assert!(d == 2 || d == 0, "a runtime under the loader is level 2, got {d}");
+        } else {
+            assert_eq!(d, 1, "a native runtime is the loader");
+        }
+    }
 }
