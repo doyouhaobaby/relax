@@ -2090,6 +2090,9 @@ impl Func {
             let d: Vec<String> = self.param_ints.iter().map(|(v, n, sg)| format!("{:?}:{}{}", v, if *sg { "i" } else { "u" }, *n as u32 * 8)).collect();
             s.push_str(&format!("; declared params: {}\n", d.join(" ")));
         }
+        if !self.noalias.is_empty() || !self.withheld_noalias.is_empty() {
+            s.push_str(&format!("; noalias {:?} withheld {:?}\n", self.noalias, self.withheld_noalias));
+        }
         if self.slots.iter().any(|x| x.size >= 1024) {
             let big: Vec<String> = self.slots.iter().enumerate().filter(|(_, x)| x.size >= 1024).map(|(i, x)| format!("{}:{}", i, x.size)).collect();
             s.push_str(&format!("; slots >= 1 KB: {}\n", big.join(" ")));

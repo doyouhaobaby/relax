@@ -7228,9 +7228,13 @@ impl Unit {
         self.tcx.type_implements_trait(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
     }
 
-    /// Whether the monomorphic type `t` is Unpin (an auto trait: every component is, and
-    /// `PhantomPinned` is not). Uncertain cases (trait objects without `+ Unpin`, opaque types,
-    /// closures over them) answer false: the safe side for noalias.
+    /// Whether the monomorphic type `t` is Unpin and UnsafeUnpin, as rustc asks for a `&mut T` or
+    /// `Box<T>` argument's `noalias` (rustc_middle ty/layout.rs pointee_info_at: `is_unpin &&
+    /// is_unsafe_unpin`): auto traits, every component is, `PhantomPinned` and `UnsafePinned` are
+    /// not. The walk sees no explicit impls: a field-less `PhantomData<T>` counts as Unpin, which
+    /// keeps `Box<T>` and `Pin<Box<T>>` Unpin (rustc's `impl Unpin for Box`) through Unique's
+    /// marker. Uncertain cases (trait objects without `+ Unpin`, opaque types, closures over them)
+    /// answer false: the safe side for noalias.
     pub fn is_unpin(&self, t: TyId) -> bool {
         self.is_unpin_inner(t, &mut TypeCycle::default())
     }
@@ -7249,7 +7253,8 @@ impl Unit {
                 // an async block / fn body is !Unpin (rustc: it may hold references into itself)
                 TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin_inner(up, cycle),
                 TyKind::Adt(d, args, _) => {
-                    if self.prog.name(d) == "PhantomPinned" {
+                    let a = self.tcx.adts.get(&d);
+                    if self.prog.name(d) == "PhantomPinned" || a.is_some_and(|a| a.is_unsafe_pinned()) {
                         false
                     } else {
                         let fields: Vec<TyId> = match self.tcx.adts.get(&d) {

@@ -127,6 +127,42 @@ struct SlicePat {
     fixed: usize,
 }
 
+/// rustc_abi PointerKind: a reference or a Box an argument scalar points with (pointee_at)
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PtrKind {
+    Shared { frozen: bool },
+    Mut { unpin: bool },
+    Box { unpin: bool, global: bool },
+}
+
+/// rustc_abi PointeeInfo of an argument's pointer scalar: its kind (None: a raw pointer, or one
+/// inside a ManuallyDrop), the pointee's size (0 when unsized), and whether the scalar may be null
+/// (a niche's: `Option<&mut T>`)
+#[derive(Clone, Copy, Debug)]
+struct ArgPointee {
+    kind: Option<PtrKind>,
+    size: u32,
+    maybe_null: bool,
+}
+
+impl ArgPointee {
+    /// rustc_ty_utils abi.rs arg_attrs_for_rust_scalar's `no_alias` (`-Z box-noalias` on, its
+    /// default)
+    fn noalias(&self) -> bool {
+        match self.kind {
+            Some(PtrKind::Shared { frozen }) => frozen,
+            Some(PtrKind::Mut { unpin }) => unpin,
+            Some(PtrKind::Box { unpin, global }) => unpin && global,
+            None => false,
+        }
+    }
+
+    /// a `noalias` pointer the callee may write through (SPEC-V: alias_prone)
+    fn unique(&self) -> bool {
+        self.noalias() && !matches!(self.kind, Some(PtrKind::Shared { .. }))
+    }
+}
+
 #[derive(Clone)]
 enum LocalSt {
     Regs(Vec<VReg>),
@@ -3037,6 +3073,193 @@ impl<'a> Lcx<'a> {
         vals
     }
 
+    /// rustc_abi BackendRepr::Scalar / ScalarPair of a sized `t`: the byte offsets of its one or
+    /// two scalars (rustc_abi layout.rs univariant, "Try to make this a Scalar/ScalarPair"; a
+    /// niche-filling enum takes its untagged variant's when the other variant is a ZST). None:
+    /// Memory, or a repr left out here (a tagged enum, a union, SIMD, a coroutine), whose
+    /// pointers no ScalarPair attribute can name either (pointee_at finds none in them).
+    fn rust_scalars(&mut self, t: TyId, depth: usize) -> Option<Vec<u32>> {
+        let l = self.layout(t);
+        if depth > self.type_depth_limit() || l.size == 0 || l.uninhabited {
+            return None;
+        }
+        let u = self.u;
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        let (fts, offs, repr_c): (Vec<TyId>, Vec<u32>, bool) = match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::FnPtr(..) => return Some(vec![0]),
+            TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => {
+                return Some(if self.unsized_ty(inner) { vec![0, u.ptr_bytes()] } else { vec![0] });
+            }
+            TyKind::Tuple(v) => (u.tcx.tys.list(v).to_vec(), l.fields.clone(), false),
+            TyKind::Closure(file, ce, _) if !u.tcx.coroutines.contains(&(file, ce)) => (u.closure_storage(t).fields, l.fields.clone(), false),
+            TyKind::Adt(d, args, _) => {
+                let a = u.tcx.adts.get(&d)?;
+                if a.is_union() || a.is_simd() {
+                    return None;
+                }
+                let args = u.tcx.tys.list(args);
+                let variant = |vi: u32| -> Vec<TyId> { (0..a.variants[vi as usize].fields.len() as u32).map(|fi| u.tcx.field_ty(&u.prog, env, d, vi, fi, args)).collect() };
+                if !a.is_enum() {
+                    (variant(0), l.fields.clone(), a.repr_c)
+                } else {
+                    let zst = |me: &mut Self, vi: u32| variant(vi).into_iter().all(|f| me.layout(f).size == 0);
+                    match l.enc {
+                        crate::layout::TagEnc::Single(v) => (variant(v), l.variant_fields.get(v as usize)?.clone(), a.repr_c),
+                        // the other variants are ZSTs: the enum is its untagged variant's repr, the
+                        // niche in it (rustc_abi layout_of_enum, niche-filling)
+                        crate::layout::TagEnc::Niche { untagged, .. } => {
+                            if !(0..a.variants.len() as u32).all(|vi| vi == untagged || zst(self, vi)) {
+                                return None;
+                            }
+                            (variant(untagged), l.variant_fields.get(untagged as usize)?.clone(), a.repr_c)
+                        }
+                        // a fieldless enum: its tag (the tagged layouts' pairs hold no pointer)
+                        crate::layout::TagEnc::Direct if l.tag.is_some_and(|(o, _)| o == 0) && (0..a.variants.len() as u32).all(|vi| zst(self, vi)) => return Some(vec![0]),
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        };
+        let non_zst: Vec<(TyId, u32)> = fts.iter().zip(offs.iter()).filter(|(f, _)| self.layout(**f).size > 0).map(|(f, o)| (*f, *o)).collect();
+        match non_zst.as_slice() {
+            // one non-ZST field filling the value: its Scalar (not unpacked under repr(C)) or pair
+            [(f, o)] => {
+                let fl = self.layout(*f);
+                if *o != 0 || fl.align != l.align || fl.size != l.size {
+                    return None;
+                }
+                let s = self.rust_scalars(*f, depth + 1)?;
+                (s.len() == 2 || !repr_c).then_some(s)
+            }
+            // two Scalar fields in rustc's scalar_pair placement
+            [(fa, oa), (fb, ob)] => {
+                let ((fa, oa), (fb, ob)) = if oa <= ob { ((*fa, *oa), (*fb, *ob)) } else { ((*fb, *ob), (*fa, *oa)) };
+                if self.rust_scalars(fa, depth + 1)?.len() != 1 || self.rust_scalars(fb, depth + 1)?.len() != 1 {
+                    return None;
+                }
+                let (la, lb) = (self.layout(fa), self.layout(fb));
+                let b_off = la.size.next_multiple_of(lb.align);
+                let align = la.align.max(lb.align);
+                (oa == 0 && ob == b_off && l.align == align && l.size == (b_off + lb.size).next_multiple_of(align)).then(|| vec![0, b_off])
+            }
+            _ => None,
+        }
+    }
+
+    /// How deep rust_scalars and pointee_at follow by-value fields: the crate's recursion limit
+    /// (rustc's layout queries stop there), a guard only (by-value types nest finitely).
+    fn type_depth_limit(&self) -> usize {
+        self.u.prog.crates[self.u.prog.def(self.b.def).krate as usize].recursion_limit
+    }
+
+    /// rustc_middle ty/layout.rs ty_and_layout_pointee_info_at: the pointer at byte `off` of a `t`
+    /// value, when it is a reference or a Box (a raw pointer: `kind` None), reached through a
+    /// struct, tuple or closure field, a single-variant enum or a two-variant enum's null niche
+    /// (`maybe_null`); a ManuallyDrop around it takes its kind (rustc is_like_maybe_dangling).
+    fn pointee_at(&mut self, t: TyId, off: u32, depth: usize) -> Option<ArgPointee> {
+        if depth > self.type_depth_limit() {
+            return None;
+        }
+        let u = self.u;
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        let ptr = u.ptr_bytes();
+        let pointer = |me: &mut Self, inner: TyId, kind: PtrKind| {
+            let size = if me.unsized_ty(inner) { 0 } else { me.layout(inner).size };
+            Some(ArgPointee { kind: Some(kind), size, maybe_null: false })
+        };
+        let (fts, offs): (Vec<TyId>, Vec<u32>) = match self.kind(t) {
+            TyKind::Ptr(..) | TyKind::FnPtr(..) if off == 0 => return Some(ArgPointee { kind: None, size: 0, maybe_null: true }),
+            // a pointer's metadata: rustc types a `dyn` tail's vtable `&'static [usize; N]` (frozen;
+            // its [drop, size, align] header here), a slice's length is no pointer
+            TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) if off == ptr => {
+                if !self.unsized_ty(inner) {
+                    return None;
+                }
+                let tail = u.lay.struct_tail_for_codegen(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, inner);
+                return matches!(self.kind(tail), TyKind::Dyn(..)).then_some(ArgPointee { kind: Some(PtrKind::Shared { frozen: true }), size: 3 * ptr, maybe_null: false });
+            }
+            TyKind::Ref(m, inner, _) if off == 0 => {
+                let kind = if m { PtrKind::Mut { unpin: self.u.is_unpin(inner) } } else { PtrKind::Shared { frozen: u.tcx.is_freeze(&u.prog, env, inner) } };
+                return pointer(self, inner, kind);
+            }
+            TyKind::Adt(d, args, _) if off == 0 && u.tcx.adts.get(&d).is_some_and(|a| a.is_box()) => {
+                let args = u.tcx.tys.list(args);
+                let inner = *args.first()?;
+                let global = args.get(1).map_or(true, |a| crate::provided::is_global_alloc(&u.tcx, *a));
+                let unpin = self.u.is_unpin(inner);
+                return pointer(self, inner, PtrKind::Box { unpin, global });
+            }
+            TyKind::Tuple(v) => (u.tcx.tys.list(v).to_vec(), self.layout(t).fields.clone()),
+            TyKind::Closure(file, ce, _) if !u.tcx.coroutines.contains(&(file, ce)) => (u.closure_storage(t).fields, self.layout(t).fields.clone()),
+            TyKind::Adt(d, args, _) => {
+                let a = u.tcx.adts.get(&d)?;
+                if a.is_union() {
+                    return None;
+                }
+                let l = self.layout(t);
+                let args = u.tcx.tys.list(args);
+                let variant = |vi: u32| -> Vec<TyId> { (0..a.variants[vi as usize].fields.len() as u32).map(|fi| u.tcx.field_ty(&u.prog, env, d, vi, fi, args)).collect() };
+                let (fts, offs, null) = if !a.is_enum() {
+                    (variant(0), l.fields.clone(), false)
+                } else {
+                    match l.enc {
+                        crate::layout::TagEnc::Single(v) => (variant(v), l.variant_fields.get(v as usize)?.clone(), false),
+                        // only the niche scalar itself, the other variant its null
+                        crate::layout::TagEnc::Niche { untagged, start: 0, .. } if a.variants.len() == 2 && l.tag.is_some_and(|(o, _)| o == off) => {
+                            (variant(untagged), l.variant_fields.get(untagged as usize)?.clone(), true)
+                        }
+                        _ => return None,
+                    }
+                };
+                let found = self.pointee_in_fields(&fts, &offs, off, depth)?;
+                let found = ArgPointee { maybe_null: found.maybe_null || null, ..found };
+                return Some(if a.is_manually_drop() { ArgPointee { kind: None, size: 0, ..found } } else { found });
+            }
+            TyKind::Array(e, _) => {
+                let stride = self.layout(e).size;
+                if stride == 0 || off / stride >= self.layout(t).size / stride {
+                    return None;
+                }
+                return self.pointee_at(e, off % stride, depth + 1).filter(|_| off % stride + ptr <= stride);
+            }
+            _ => return None,
+        };
+        self.pointee_in_fields(&fts, &offs, off, depth)
+    }
+
+    /// pointee_at's field walk: the first field holding the whole pointer at `off`.
+    fn pointee_in_fields(&mut self, fts: &[TyId], offs: &[u32], off: u32, depth: usize) -> Option<ArgPointee> {
+        let ptr = self.u.ptr_bytes();
+        for (f, o) in fts.iter().zip(offs) {
+            if *o <= off && off + ptr <= o + self.layout(*f).size {
+                if let Some(p) = self.pointee_at(*f, off - o, depth + 1) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// The argument's pointer scalars (rustc ArgAbi::new: PassMode::Direct / Pair parts) with
+    /// the leaf each is in: (leaf index, its pointee).
+    /// RELAX_OPT=-pairnoalias: a sized reference's own pointer only (A/B).
+    fn abi_pointers(&mut self, t: TyId, leaves: &[Leaf]) -> Vec<(usize, ArgPointee)> {
+        if relax_backend::stats::opt_env_off("-pairnoalias") && !matches!(self.kind(t), TyKind::Ref(_, inner, _) if !self.unsized_ty(inner)) {
+            return Vec::new();
+        }
+        let Some(offs) = self.rust_scalars(t, 0) else { return Vec::new() };
+        let ptr = self.u.ptr_bytes() as u8;
+        let mut out = Vec::new();
+        for off in offs {
+            let Some(i) = leaves.iter().position(|lf| lf.off == off && lf.cls == Cls::I && matches!(lf.mem, Mem::Int(n, _) if n == ptr)) else { continue };
+            if let Some(p) = self.pointee_at(t, off, 0) {
+                out.push((i, p));
+            }
+        }
+        out
+    }
+
     fn abi_param(&mut self, t: TyId) -> (Vec<VReg>, bool) {
         let l = self.layout(t);
         match &l.leaves {
@@ -3050,19 +3273,32 @@ impl<'a> Lcx<'a> {
                         self.f.param_ints.push((*r, n, signed));
                     }
                 }
-                // rustc marks `&mut T` noalias only for T: Unpin (a !Unpin value, e.g. a
-                // self-referential future, may be aliased through itself)
-                if let TyKind::Ref(true, inner, _) = self.kind(t) {
-                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.is_unpin(inner) {
-                        self.f.noalias.push(regs[0]);
+                // rustc_ty_utils abi.rs arg_attrs_for_rust_scalar, for each pointer scalar of a
+                // Scalar or ScalarPair argument (a reference, a slice's data pointer, a closure's
+                // `&mut` capture, a pair's parts): `noalias` for `&mut T` with T: Unpin (a !Unpin
+                // value, e.g. a self-referential future, may be aliased through itself), `&T` with
+                // T: Freeze (nothing writes the memory during the call, so its loads are
+                // loop-invariant: quicksort's pivot under partition's stores), and a global
+                // allocator's `Box<T>` with T: Unpin
+                let parts = self.abi_pointers(t, leaves);
+                for (i, p) in &parts {
+                    if p.noalias() {
+                        self.f.noalias.push(regs[*i]);
                     }
                 }
-                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
-                // -> noalias + readonly): nothing writes the memory during the call, so its loads
-                // are loop-invariant (quicksort's pivot under partition's stores)
-                if let TyKind::Ref(false, inner, _) = self.kind(t) {
-                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
-                        self.f.noalias.push(regs[0]);
+                // a reference or Box part is never null (rustc: its scalar's valid range; a niche's
+                // part may be), and a frozen `&T`'s or Unpin `&mut T`'s pointee is dereferenceable
+                // for the call (rustc pointee_size: zero for the others, which the call may free) --
+                // a reference parameter's own pointer below
+                let own = matches!(self.kind(t), TyKind::Ref(..));
+                for (i, p) in &parts {
+                    if !(own && *i == 0) {
+                        if !p.maybe_null && p.kind.is_some() {
+                            self.f.nonnull.push(regs[*i]);
+                            if p.size > 0 && matches!(p.kind, Some(PtrKind::Shared { frozen: true } | PtrKind::Mut { unpin: true })) {
+                                self.f.deref.push((regs[*i], p.size));
+                            }
+                        }
                     }
                 }
                 // a reference's (or fat reference's data) pointer is never null (rustc `nonnull`
@@ -11157,16 +11393,20 @@ impl<'a> Lcx<'a> {
     }
 
     /// SPEC-V: whether a call with these arguments could pass aliasing pointers to a `noalias`
-    /// parameter: a `&mut` of a sized `Unpin` type (the parameters lowered with `noalias`) and at least
-    /// one other argument that can hold a pointer. Two paths to the same bytes need two such values.
+    /// parameter: a pointer scalar the callee may write through with `noalias` (a `&mut` of an
+    /// `Unpin` type, a Box: abi_param's parts, a pair's or a closure's included) and at least one
+    /// other value that can hold a pointer, a scalar of the same pair counted. Two paths to the same
+    /// bytes need two such values.
     fn alias_prone(&mut self, args: &[(Val, TyId)]) -> bool {
         let mut muts = false;
         let mut holders = 0;
         for (_, t) in args {
-            if let TyKind::Ref(true, inner, _) = self.kind_ref(*t).clone() {
-                if !self.unsized_ty(inner) && self.u.is_unpin(inner) { muts = true; }
-            }
-            if self.may_hold_pointer(*t, 0) { holders += 1; }
+            let parts = match self.layout(*t).leaves.as_ref() {
+                Some(leaves) => self.abi_pointers(*t, leaves),
+                None => Vec::new(),
+            };
+            muts |= parts.iter().any(|(_, p)| p.unique());
+            holders += parts.len().max(self.may_hold_pointer(*t, 0) as usize);
         }
         muts && holders >= 2
     }

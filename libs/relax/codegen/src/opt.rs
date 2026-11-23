@@ -2395,8 +2395,11 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
+/// Every noalias parameter of a loop is tried once (`&mut self` and a closure's `&mut`
+/// capture, both carried: `try_fold`'s cursor and accumulator); RELAX_OPT=-promoteone: the first
+/// promoted parameter ends the loop's turn (A/B).
 /// Most fields promoted in one loop, and most write-back stores (exit targets and calls in the
-/// loop, times stored fields).
+/// loop, times stored fields), over all its parameters.
 const PROMOTE_MAX_FIELDS: usize = 4;
 const PROMOTE_MAX_WRITEBACKS: usize = 8;
 
@@ -2405,16 +2408,18 @@ pub fn promote_loop_memory(f: &mut Func) -> bool {
         return false;
     }
     let mut changed = false;
-    let mut done: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let one = relax_backend::stats::opt_env_off("-promoteone");
+    // per loop header: the parameters tried, and the fields and write-backs promoted so far
+    let mut done: std::collections::HashMap<u32, (Vec<VReg>, usize, usize)> = std::collections::HashMap::new();
     loop {
         let (preds, loops) = natural_loops(f);
         let mut progressed = false;
         for (h, body) in &loops {
-            if *h == 0 || done.contains(h) {
+            if *h == 0 || (one && done.contains_key(h)) {
                 continue;
             }
-            done.insert(*h);
-            if promote_in_loop(f, &preds, *h, body) {
+            let st = done.entry(*h).or_default();
+            if promote_in_loop(f, &preds, *h, body, st) {
                 changed = true;
                 progressed = true;
                 break;
@@ -2427,7 +2432,7 @@ pub fn promote_loop_memory(f: &mut Func) -> bool {
     changed
 }
 
-fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> bool {
+fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool], (tried, n_fields, n_writebacks): &mut (Vec<VReg>, usize, usize)) -> bool {
     let n = f.blocks.len();
     let nv = f.vregs.len();
     // vregs with one definition, the parameters among them
@@ -2465,6 +2470,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
     let mut did = false;
     for pi in 0..f.noalias.len() {
         let p = f.noalias[pi];
+        if tried.contains(&p) {
+            continue;
+        }
+        tried.push(p);
         // defined once, as a parameter
         if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
             continue;
@@ -2586,7 +2595,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         // the busiest few fields only (every promoted field is a register held across
         // the loop), and stored fields only when the write-backs on the loop's exits stay few
         take.sort_by(|a, b| b.4.cmp(&a.4));
-        take.truncate(PROMOTE_MAX_FIELDS);
+        take.truncate(PROMOTE_MAX_FIELDS.saturating_sub(*n_fields));
         let mut exit_targets: Vec<u32> = Vec::new();
         for bi in 0..n {
             if body[bi] {
@@ -2633,10 +2642,11 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         // cleanup might)
         let call_writebacks = if owned && !has_invoke { 0 } else { calls };
         let mut stored_n = 0;
+        let wb_before = *n_writebacks;
         take.retain(|x| {
             if x.3 {
                 stored_n += 1;
-                (exit_targets.len() + call_writebacks) * stored_n <= PROMOTE_MAX_WRITEBACKS
+                wb_before + (exit_targets.len() + call_writebacks) * stored_n <= PROMOTE_MAX_WRITEBACKS
             } else {
                 true
             }
@@ -2644,6 +2654,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         if take.is_empty() {
             continue;
         }
+        let writebacks = (exit_targets.len() + call_writebacks) * take.iter().filter(|x| x.3).count();
         // a preheader: all edges into the header from outside the loop go through one jump block
         let outside: Vec<u32> = preds[h as usize].iter().copied().filter(|q| !body[*q as usize]).collect();
         if outside.is_empty() {
@@ -2725,7 +2736,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             }
         }
         did = true;
-        // the loop's structure changed (new blocks): the caller recomputes before the next field
+        *n_fields += take.len();
+        *n_writebacks += writebacks;
+        // the loop's structure changed (new blocks): the caller recomputes before the next
+        // parameter
         break;
     }
     did
