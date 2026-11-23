@@ -7553,8 +7553,15 @@ impl<'a> Lcx<'a> {
                 let mut pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
                 let mut pt = inner;
                 // the steps call `DerefMut::deref_mut` only when the result is borrowed mutably
-                // (rustc convert_place_derefs_to_mutable): `&mut c as &str` calls `Deref::deref`
-                let m = match self.kind(target) { TyKind::Ref(tm, ..) => m && tm, _ => m };
+                // (rustc convert_place_derefs_to_mutable): `&mut c as &str` calls `Deref::deref`.
+                // The adjustment's own final borrow says which: a block tail passes its own type
+                // as `target` (`let s: &str = { &mut c };` borrowed `c` mutably). Without a
+                // borrow the target's mutability decides, as before.
+                let tm = match self.b.reborrow(key) {
+                    Some(tm) => tm,
+                    None => !matches!(self.kind(target), TyKind::Ref(false, ..)),
+                };
+                let m = m && tm;
                 let saved = self.want_mut;
                 self.want_mut = m;
                 for k in 0..n {

@@ -3,7 +3,8 @@
 //! `&mut c as &str` calls `Deref::deref` and only `as &mut str` calls `DerefMut::deref_mut`; and a cast
 //! whose referent is still open (`&w as &str` with w: Wrapper<?T>) is checked after typeck, as rustc's
 //! check_casts does, when later uses have decided it. Relax decided ?T = str from the cast, and
-//! called deref_mut for a shared result.
+//! called deref_mut for a shared result. A block's or a function's tail coerced to `&str` is the same
+//! shared borrow (`let x: &str = { &mut c };`): Relax called deref_mut there too.
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 struct Wrapper<T>(T);
@@ -12,6 +13,7 @@ fn wrap_from<T: From<&'static str>>(s: &'static str) -> Wrapper<T> { Wrapper(T::
 struct Counted { s: String, shared: Cell<u32>, unique: u32 }
 impl Deref for Counted { type Target = str; fn deref(&self) -> &str { self.shared.set(self.shared.get() + 1); &self.s } }
 impl DerefMut for Counted { fn deref_mut(&mut self) -> &mut str { self.unique += 1; &mut self.s } }
+fn view(c: &mut Counted) -> &str { c }
 
 #[test]
 fn shared_casts() {
@@ -56,4 +58,10 @@ fn counted_derefs() {
     { let x = &mut c as &mut str; x.make_ascii_uppercase(); }
     assert_eq!((c.shared.get(), c.unique), (2, 1));
     assert_eq!(c.s, "HI");
+    { let x: &str = { &mut c }; assert_eq!(x, "HI"); }
+    assert_eq!(view(&mut c), "HI");
+    assert_eq!((c.shared.get(), c.unique), (4, 1), "a tail coerced to &str borrows shared");
+    { let x: &mut str = { &mut c }; x.make_ascii_lowercase(); }
+    assert_eq!((c.shared.get(), c.unique), (4, 2), "a tail coerced to &mut str borrows unique");
+    assert_eq!(c.s, "hi");
 }
