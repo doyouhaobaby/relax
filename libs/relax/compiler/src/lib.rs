@@ -1268,6 +1268,17 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
 /// `load_with_std` with the file's crate under a cargo profile's checks: its cfg has them, as
 /// run.rs gives a test's crates the profile's (`makepad test <package>`); Relax's std keeps its own.
 pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
+    let loaded = load_resolved(sess, root, name, test, checks)?;
+    if !loaded.0.errors.is_empty() {
+        return Err(loaded.0.errors.clone());
+    }
+    Ok(loaded)
+}
+
+/// `load_with_std_checks` that keeps a program whose names did not all resolve: its resolution errors
+/// stay in `prog.errors` (the file form of `makepad test` reports them with the item checks after
+/// them, as rustc carries on from resolution to the analysis). Err: the file or std did not load.
+fn load_resolved(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
     pmhost::install();
     let mut prog = program::Program::new(sess);
     prog.std_simd = std_simd_wanted([root]);
@@ -1289,9 +1300,6 @@ pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, n
     };
     prog.prelude_crate = Some(core);
     prog.resolve_imports();
-    if !prog.errors.is_empty() {
-        return Err(prog.errors.clone());
-    }
     Ok((prog, core, krate))
 }
 
@@ -1334,7 +1342,9 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // import of the file was reported unused
     relax_types::macros::uses::record(true);
     relax_front::program::set_record_import_uses(true);
-    let (mut prog, core, krate) = match load_with_std(sess, &path, "test_crate", true) {
+    // (a resolution error does not end it here: the up-front check below reports it with the item
+    // checks rustc runs after resolution, E0046 for an impl item of the wrong kind)
+    let (mut prog, core, krate) = match load_resolved(sess, &path, "test_crate", true, crate::resolve::ProfileChecks { debug_assertions: false, overflow_checks: false }) {
         Ok(x) => x,
         Err(e) => {
             for m in e {
@@ -1361,7 +1371,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // in the up-front check below, as in the package form)
     tcx.collect_declarations(&prog);
     if !tcx.errors.is_empty() {
-        for m in &tcx.errors {
+        for m in prog.errors.iter().chain(&tcx.errors) {
             eprintln!("error: {}", m);
         }
         return 1;
@@ -1369,11 +1379,8 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let t2 = Instant::now();
     let tests = jit::find_tests(&prog, krate);
     let mut u = jit::Unit::new(prog, tcx, core);
-    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
-    if !enum_errors.is_empty() {
-        for error in enum_errors { eprintln!("error: {}", error); }
-        return 1;
-    }
+    // (a failed enum discriminant does not end it before the check: the check's item checks report
+    // it beside the rest, as rustc's analysis carries on past it, tcx.rs check_def_signature)
     let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
     // (what the tests' own code resolves and expands from now on is no lint's input)
     relax_types::macros::uses::record(false);
@@ -1381,6 +1388,13 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     if check_errors > 0 {
         eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
         return 101;
+    }
+    // (the check reported a failed discriminant with its item checks; a check it replayed from a stored
+    // clean verdict had none, and the tests need the values: a failure here still stops them)
+    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
+    if !enum_errors.is_empty() {
+        for error in enum_errors { eprintln!("error: {}", error); }
+        return 1;
     }
     jit::enable_pipelining(options);
     println!(
