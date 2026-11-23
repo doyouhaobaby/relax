@@ -456,3 +456,44 @@ fn a_frame_in_a_patched_path_is_named() {
     unsafe { UNIT = std::ptr::null_mut() };
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn joined_body_unwind_uses_each_functions_frame() {
+    use relax_backend::rir::{part_trailer_words, split_unwind_info, unwind_info_words};
+    const LEN: u32 = 48;
+    const P_OFF: u32 = 24;
+    // The image keeps these bytes mapped for the lifetime of the code tables.
+    static BODY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let body = BODY.get_or_init(|| {
+        let mut words = vec![0; LEN as usize / 4];
+        words.extend(unwind_info_words(&[3], &[], &[(P_OFF, 16)], 48));
+        let p = unwind_info_words(&[12, 0x108], &[], &[(8, 32)], 80);
+        let footer = part_trailer_words(P_OFF, p.len());
+        words.extend(p);
+        words.extend(footer);
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    });
+
+    let mut tables = CodeTables::default();
+    let split = split_unwind_info(body);
+    tables.add(0x2000, split.code_len as u32, 7, split.host, split.part, CodeKind::default(), false);
+    assert_eq!(tables.index.len(), 1, "one code range for both functions");
+
+    // Image order can differ from address order. The second install uses its mapped trailers.
+    tables.add_image_trailers(0x1000, LEN, &body[LEN as usize..], &PcMap::default());
+    tables.add(0x1000, LEN, 8, None, None, CodeKind::default(), false);
+    assert_eq!(tables.index.len(), 2, "one more code range for the mapped body");
+    for (start, slot) in [(0x2000, 7), (0x1000, 8)] {
+        let p = start + P_OFF as u64;
+        assert_eq!(tables.entry_at(p + 7), Some((start, LEN, slot)), "P belongs to its owner's slot");
+        assert_eq!(tables.version_of(start).map(|(v, n, _)| (v, n)), Some((1, 1)), "one version per install");
+        assert_eq!(tables.function_base(start, p - 1), start, "last byte of host");
+        assert_eq!(tables.function_base(start, p), p, "first byte of P");
+        assert_eq!(tables.frame_pointer_at(start + 8, 1000), Ok(1048), "host frame");
+        assert_eq!(tables.frame_pointer_at(p, 1000), Ok(1064), "call ending at P belongs to host");
+        assert_eq!(tables.frame_pointer_at(p + 8, 1000), Ok(1112), "P's staged bytes at its relative return offset");
+        assert_eq!(tables.frame_pointer_at(start + LEN as u64, 1000), Ok(1080), "last call in P");
+        assert_eq!(tables.saved_regs_at(p - 1), Some((start, vec![3])), "host register saves");
+        assert_eq!(tables.saved_regs_at(p), Some((p, vec![12, 0x108])), "P's register saves and base");
+    }
+}

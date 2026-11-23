@@ -8,6 +8,7 @@
 mod queue;
 
 include!("rt_abi.rs");
+use relax_backend::rir::{SplitUnwindInfo, UnwindInfo};
 use relax_types::next_solver::TraitRef;
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use relax_types::consts::GenericArg;
@@ -908,8 +909,10 @@ pub struct CodeTables {
     /// what each code body references, by code start, recorded at its install whatever made it
     /// (a build, the disk cache, the startup image, a forwarder): the real-time walk reads these
     refs: HashMap<u64, CodeRefs>,
-    /// unwind info (callee-saved register saves, frame size, landing stubs) by code start
-    pub unwind: HashMap<u64, relax_backend::rir::UnwindInfo>,
+    /// unwind info (callee-saved register saves, frame size, landing stubs) by function start
+    pub unwind: HashMap<u64, UnwindInfo>,
+    /// (owner start, part offset), sorted by owner. A joined body has one index entry.
+    parts: Vec<(u64, u32)>,
     /// unwind trailers of code installed from the startup image, read in place there (code
     /// start, trailer address and length; ascending): parsed when a frame of that code
     /// unwinds. `image_keep` keeps the image mapped.
@@ -924,15 +927,18 @@ pub struct CodeTables {
 }
 
 impl CodeTables {
-    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>, kind: CodeKind, twin: bool) {
+    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<UnwindInfo>, part: Option<(u32, UnwindInfo)>, kind: CodeKind, twin: bool) {
         // identity state (panics and faults walk it): the tables are the program's
         let _k = crate::zone_alloc::kept();
         if twin {
             self.twins.insert(at);
         }
         if let Some(i) = unwind {
-            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off, staged: i.staged.clone() };
-            self.unwind.insert(at, own);
+            self.unwind.insert(at, i.clone());
+        }
+        if let Some((off, i)) = part {
+            self.unwind.insert(at + off as u64, i.clone());
+            self.note_part(at, off);
         }
         let install = (self.next_install, crate::clock::ms_since_start() as u32);
         self.next_install += 1;
@@ -946,6 +952,21 @@ impl CodeTables {
             self.kinds.insert(k, kind.pack());
             self.installs.insert(k, install);
         }
+    }
+
+    fn note_part(&mut self, start: u64, off: u32) {
+        let _k = crate::zone_alloc::kept();
+        let k = self.parts.partition_point(|p| p.0 < start);
+        self.parts.insert(k, (start, off));
+    }
+
+    /// The function whose frame holds `pc` in the body at `start`.
+    fn function_base(&self, start: u64, pc: u64) -> u64 {
+        if let Ok(k) = self.parts.binary_search_by_key(&start, |p| p.0) {
+            let base = start + self.parts[k].1 as u64;
+            if pc >= base { return base; }
+        }
+        start
     }
 
     fn reserve(&mut self, n: usize) {
@@ -1055,6 +1076,16 @@ impl CodeTables {
         self.index.iter().zip(&self.kinds).filter(|(e, _)| e.2 == id).map(|(e, k)| (e.0, e.1, CodeKind::unpack(*k))).collect()
     }
 
+    fn add_image_trailers(&mut self, at: u64, len: u32, trailer: &'static [u8], pc_map: &PcMap) {
+        if let Some((host, part)) = relax_backend::rir::split_unwind_region(trailer, len) {
+            self.add_image_unwind(at, host, pc_map);
+            if let Some((off, p)) = part {
+                self.add_image_unwind(at + off as u64, p, pc_map);
+                self.note_part(at, off);
+            }
+        }
+    }
+
     fn add_image_unwind(&mut self, at: u64, trailer: &'static [u8], pc_map: &PcMap) {
         let _k = crate::zone_alloc::kept();
         let e = (at, trailer.as_ptr() as u64, trailer.len() as u32);
@@ -1093,9 +1124,11 @@ impl CodeTables {
     pub fn frame_pointer_at(&self, ret: u64, sp: u64) -> Result<u64, &'static str> {
         let pc = ret.wrapping_sub(1);
         if let Some((start, _, _)) = self.entry_at(pc) {
-            let info = match self.unwind.get(&start) {
-                Some(i) => i.fp_from_sp((ret - start) as u32, sp),
-                None => self.image_unwind_at(start).ok_or("its code has no unwind info")?.fp_from_sp((ret - start) as u32, sp),
+            let base = self.function_base(start, pc);
+            let off = (ret - base) as u32;
+            let info = match self.unwind.get(&base) {
+                Some(i) => i.fp_from_sp(off, sp),
+                None => self.image_unwind_at(base).ok_or("its code has no unwind info")?.fp_from_sp(off, sp),
             };
             return Ok(info);
         }
@@ -1103,6 +1136,15 @@ impl CodeTables {
         match self.glue.get(k.wrapping_sub(1)) {
             Some(&(at, len, frame)) if pc < at + len as u64 => Ok(sp + frame as u64),
             _ => Err("its code has no frame size (glue without a frame record)"),
+        }
+    }
+
+    fn saved_regs_at(&self, pc: u64) -> Option<(u64, Vec<u32>)> {
+        let (start, _, _) = self.entry_at(pc)?;
+        let base = self.function_base(start, pc);
+        match self.unwind.get(&base) {
+            Some(i) => Some((base, i.saved.to_vec())),
+            None => self.image_unwind_at(base).map(|i| (base, i.saved.into_vec())),
         }
     }
 
@@ -4508,7 +4550,8 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
         // the threaded interpreter's call boundary: a frame with a landing that hands the unwind
         // to the interpreter (it runs the interpreted frames' cleanups, then resumes here)
         let boundary = relax_codegen::interp::unwind_boundary(ret);
-        let entry = tables.entry_at(ret.wrapping_sub(1));
+        let pc = ret.wrapping_sub(1);
+        let entry = tables.entry_at(pc);
         if boundary.is_none() && entry.is_none() {
             // native code called the frame below (its frame pointer register is that code's own:
             // rustc keeps none on x86-64). Below the recovery point (`enter` saved the sp of its
@@ -4527,10 +4570,11 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
             break;
         }
         let Some((start, _, _)) = entry else { break };
+        let base = tables.function_base(start, pc);
         let image_info;
-        let info = match tables.unwind.get(&start) {
+        let info = match tables.unwind.get(&base) {
             Some(i) => i,
-            None => match tables.image_unwind_at(start) {
+            None => match tables.image_unwind_at(base) {
                 Some(i) => {
                     image_info = i;
                     &image_info
@@ -4538,14 +4582,14 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
                 None => break,
             },
         };
-        let off = (ret - start) as u32;
+        let off = (ret - base) as u32;
         let twin = tables.is_twin(start);
         cut &= twin;
         // a twin's landing is walked past when the walk is cut, or when the module's call has
         // spent its fuel: the cleanup's first block would stop it again, a panic in its cleanup
         if !(twin && (cut || crate::sandbox::fuel_spent())) {
             if let Some(&(_, stub)) = info.pads.iter().find(|p| p.0 == off) {
-                target = Some((fp, fp - info.sp_off as u64, start + stub as u64));
+                target = Some((fp, fp - info.sp_off as u64, base + stub as u64));
                 twin_landing = twin;
                 break;
             }
@@ -6509,10 +6553,10 @@ impl Unit {
 
     /// Records code at `at` in the address-ordered index (sandbox code spaces lie below later
     /// unit code: inserted in order).
-    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
+    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<UnwindInfo>, part: Option<(u32, UnwindInfo)>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
-        self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind, twin);
+        self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, part, kind, twin);
         crate::inspect::flightrec::jit_install(id, len, kind.tier, kind.origin);
         if crate::inspect::pstream::viewing() {
             let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
@@ -8563,15 +8607,10 @@ impl Unit {
         self.code.read().unwrap_or_else(|e| e.into_inner()).slot_at(pc)
     }
 
-    /// The callee-saved registers the prologue of the code body holding `pc` saved below its
-    /// frame pointer ([fp - 8k], k = 1..; rir::unwind_info_words) and the body's start.
+    /// The callee-saved registers of the function holding `pc` ([fp - 8k], k = 1..;
+    /// rir::unwind_info_words) and that function's start.
     pub(crate) fn saved_regs_at(&self, pc: u64) -> Option<(u64, Vec<u32>)> {
-        let t = self.code.read().unwrap_or_else(|e| e.into_inner());
-        let (start, _, _) = t.entry_at(pc)?;
-        match t.unwind.get(&start) {
-            Some(i) => Some((start, i.saved.to_vec())),
-            None => t.image_unwind_at(start).map(|i| (start, i.saved.into_vec())),
-        }
+        self.code.read().unwrap_or_else(|e| e.into_inner()).saved_regs_at(pc)
     }
 
     /// Foreign fns declared in Relax core's `intrinsics*` modules become instructions.
@@ -9787,8 +9826,8 @@ impl Unit {
         // foreign function's veneer): the slot takes the entry itself, nothing is written
         let interp = relax_codegen::interp::blob::is_blob(code);
         // the unwind trailer is kept beside the code, not in it
-        let (n, info) = if interp { (code.len(), None) } else { relax_backend::rir::split_unwind_info(code) };
-        let code = &code[..n];
+        let unwind = if interp { SplitUnwindInfo::no_trailer(code.len()) } else { relax_backend::rir::split_unwind_info(code) };
+        let code = &code[..unwind.code_len];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
         // (code is append-only: a replaced version stays mapped, twins' too; code that may be
@@ -9803,7 +9842,7 @@ impl Unit {
         }
         self.mark_interpreted(id, at);
         if redirect.is_none() {
-            self.index_code(at, code.len() as u32, id, info);
+            self.index_code(at, code.len() as u32, id, unwind.host, unwind.part);
             // every non-O3 build uses the slot's RIR; linked code's RIR may be another build's
             if code_as_now().is_none_or(|k| !matches!(k.origin, origin::CACHE | origin::IMAGE) && !matches!(k.tier, tier::O3 | tier::STUB)) {
                 if let Some(rir) = &self.fns[id as usize].rir {
@@ -10242,11 +10281,9 @@ impl Unit {
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         {
             let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
-            if !trailer.is_empty() {
-                t.add_image_unwind(at, trailer, &pc_map);
-            }
+            t.add_image_trailers(at, len, trailer, &pc_map);
             let kind = code_as_now().unwrap_or(CodeKind::new(tier::O1, origin::IMAGE));
-            t.add(at, len, id, None, kind, twin);
+            t.add(at, len, id, None, None, kind, twin);
             t.note_refs(at, refs);
         }
         let f = &mut self.fns[id as usize];
@@ -14165,7 +14202,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
     let u = &mut *up;
     let c = match built {
         Ok(Ok((func, inlined, c))) if !stale && !cut && {
-            let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).0 };
+            let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).code_len };
             u.link_check(&c.code[..n], &c.relocs)
         } => {
             // a completion build that came out provisional again changes nothing: not stored,
@@ -20710,7 +20747,7 @@ mod tier_cost_tests {
 
         let held = u.code.read().unwrap();
         // the install, as the owner's compile makes it: its write lock waits for the reader
-        let install = std::thread::spawn(move || unsafe { (*(up as *mut Unit)).index_code(at, 64, id, None) });
+        let install = std::thread::spawn(move || unsafe { (*(up as *mut Unit)).index_code(at, 64, id, None, None) });
         let queued = std::time::Instant::now();
         while u.code.try_read().is_ok() {
             assert!(queued.elapsed().as_secs() < 20, "the install's write lock never queued");
@@ -23852,7 +23889,7 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
             || !f.rir.as_ref().is_some_and(|r| std::sync::Arc::ptr_eq(r, &rir)) || crate::inspect::instrument::active(id) {
             return false;
         }
-        let nb = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).0 };
+        let nb = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).code_len };
         if !u.link_check(&c.code[..nb], &c.relocs) {
             return false;
         }
@@ -25166,7 +25203,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 && !(reach && u.fns[id as usize].compiled)
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
                 && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
-                let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
+                let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).code_len };
                 let tl = cpu_ns();
                 let ok = u.link_check(&code[..n], &relocs);
                 o3_owner(1, tl);
@@ -25388,8 +25425,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 } else {
                 // an interpreted function's O3 build is its relocatable form (interp/blob.rs)
                 let blob = relax_codegen::interp::blob::is_blob(&code);
-                let (n, info) = if blob { (code.len(), None) } else { relax_backend::rir::split_unwind_info(&code) };
-                let code = code[..n].to_vec();
+                let unwind = if blob { SplitUnwindInfo::no_trailer(code.len()) } else { relax_backend::rir::split_unwind_info(&code) };
+                let code = code[..unwind.code_len].to_vec();
                 let u = &mut *up;
                 let te = cpu_ns();
                 let o3_group = if blob { None } else { crate::invalid::group_of(u, id, 0, &inlined) };
@@ -25417,7 +25454,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // Twin spaces can precede the last host code in the address index.
                 if !blob {
                     let _as = code_as(inspect_o3_kind().unwrap_or(CodeKind::new(tier::O3, origin::FRESH)));
-                    u.index_code(at, code.len() as u32, id, info);
+                    u.index_code(at, code.len() as u32, id, unwind.host, unwind.part);
                     let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
                     c.note_inlined(at, &inlined);
                     c.note_digest(at, Some(o3_digest.clone()), crate::gate::DigestOrigin::O3);

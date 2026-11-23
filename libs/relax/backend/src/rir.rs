@@ -2537,6 +2537,14 @@ pub const UNWIND_MAGIC: u32 = 0xA5;
 /// any of its calls (`UnwindInfo::fp_from_sp`): a thread walked without its registers (blocked in
 /// a syscall). A function without staged calls keeps UNWIND_MAGIC and costs nothing more.
 pub const UNWIND_MAGIC_STAGED: u32 = 0xA6;
+/// Two ordinary trailers (host, then part), followed by the part's code offset and this magic
+/// with the part trailer's word count in the low 24 bits. Each trailer is function-relative.
+pub const UNWIND_MAGIC_PART: u32 = 0xA7;
+
+pub fn part_trailer_words(p_off: u32, p_words: usize) -> [u32; 2] {
+    assert!(p_words <= 0xff_ffff, "part trailer word count must fit the head");
+    [p_off, UNWIND_MAGIC_PART << 24 | p_words as u32]
+}
 
 pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32)], sp_off: u32) -> Vec<u32> {
     let mut w = Vec::with_capacity(2 * pads.len() + 2 * staged.len() + saved.len() / 4 + 4);
@@ -2559,7 +2567,8 @@ pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32
 }
 
 /// Parsed trailer of a function's code (see `unwind_info_words`). Boxed slices: the code tables
-/// keep one per installed body.
+/// keep one per installed function.
+#[derive(Clone)]
 pub struct UnwindInfo {
     pub saved: Box<[u32]>,
     pub pads: Box<[(u32, u32)]>,
@@ -2569,11 +2578,6 @@ pub struct UnwindInfo {
 }
 
 impl UnwindInfo {
-    /// u32 words of the trailer
-    fn words(&self) -> usize {
-        2 * self.pads.len() + 2 * self.staged.len() + (self.saved.len() + 3) / 4 + 2 + usize::from(!self.staged.is_empty())
-    }
-
     /// The frame pointer of this function's frame from its stack pointer at the call whose
     /// return address is `ret_off` bytes into the code: the body's frame below it, and the
     /// call's stack arguments when it staged them.
@@ -2583,60 +2587,113 @@ impl UnwindInfo {
     }
 }
 
-/// Reads the trailer at the end of `code` (`len` bytes at `code`, a multiple of 4).
+fn unwind_word(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+}
+
+/// The ordinary trailer at the end of a word-aligned slice. Locating it reads just the header
+/// fields, so the startup image can keep the register and call tables mapped until a walk.
+struct UnwindTrailer<'a> {
+    bytes: &'a [u8],
+    n_pads: usize,
+    n_staged: usize,
+    n_saved: usize,
+}
+
+impl<'a> UnwindTrailer<'a> {
+    fn at_end(bytes: &'a [u8], joined: bool) -> Option<Self> {
+        let end = bytes.len();
+        let head = unwind_word(bytes, end.checked_sub(4)?);
+        let n_staged = match head >> 24 {
+            UNWIND_MAGIC => 0,
+            UNWIND_MAGIC_STAGED => {
+                let n = unwind_word(bytes, end.checked_sub(12)?);
+                if joined && n == 0 { return None; }
+                n
+            }
+            _ => return None,
+        };
+        let n_saved = (head >> 19) & 0x1f;
+        let n_pads = head & 0x7_ffff;
+        let words = 2 * (n_pads as u64 + n_staged as u64) + ((n_saved + 3) / 4) as u64 + 2 + u64::from(n_staged != 0);
+        let start = end.checked_sub(usize::try_from(words * 4).ok()?)?;
+        Some(Self { bytes: &bytes[start..], n_pads: n_pads as usize, n_staged: n_staged as usize, n_saved: n_saved as usize })
+    }
+
+    fn info(&self) -> UnwindInfo {
+        let pair = |k: usize| (unwind_word(self.bytes, 8 * k), unwind_word(self.bytes, 8 * k + 4));
+        let pads = (0..self.n_pads).map(pair).collect();
+        let staged = (self.n_pads..self.n_pads + self.n_staged).map(pair).collect();
+        let sbase = 8 * (self.n_pads + self.n_staged);
+        let saved = self.bytes[sbase..sbase + self.n_saved].iter().map(|&b| {
+            if b & 0x80 != 0 { 0x100 | (b & 0x7f) as u32 } else { b as u32 }
+        }).collect();
+        let sp_off = unwind_word(self.bytes, self.bytes.len() - 8);
+        UnwindInfo { saved, pads, sp_off, staged }
+    }
+}
+
+/// Reads one ordinary trailer at the end of `code`. A joined body's head describes two
+/// functions and must go through `split_unwind_info`.
 ///
 /// # Safety
 /// `code..code + len` must be readable.
 pub unsafe fn read_unwind_info(code: u64, len: u64) -> Option<UnwindInfo> {
-    if len < 8 {
-        return None;
-    }
-    let rd = |off: u64| -> u32 { std::ptr::read_unaligned((code + off) as *const u32) };
-    let end = len & !3;
-    let head = rd(end - 4);
-    let n_staged = match head >> 24 {
-        UNWIND_MAGIC => 0,
-        UNWIND_MAGIC_STAGED if end >= 12 => rd(end - 12) as u64,
-        _ => return None,
-    };
-    let n_saved = ((head >> 19) & 0x1f) as u64;
-    let n_pads = (head & 0x7_ffff) as u64;
-    let sp_off = rd(end - 8);
-    let saved_words = (n_saved + 3) / 4;
-    let words = 2 * n_pads + 2 * n_staged + saved_words + 2 + u64::from(n_staged != 0);
-    if words * 4 > end {
-        return None;
-    }
-    let base = end - words * 4;
-    let pair = |k: u64| (rd(base + 8 * k), rd(base + 8 * k + 4));
-    let pads = (0..n_pads).map(pair).collect();
-    let staged = (n_pads..n_pads + n_staged).map(pair).collect();
-    let sbase = base + 8 * (n_pads + n_staged);
-    let saved = (0..n_saved)
-        .map(|k| {
-            let b = (rd(sbase + 4 * (k / 4)) >> (8 * (k % 4))) & 0xff;
-            if b & 0x80 != 0 {
-                0x100 | (b & 0x7f)
-            } else {
-                b
-            }
-        })
-        .collect();
-    Some(UnwindInfo { saved, pads, sp_off, staged })
+    if len < 8 { return None; }
+    let bytes = std::slice::from_raw_parts(code as *const u8, (len & !3) as usize);
+    Some(UnwindTrailer::at_end(bytes, false)?.info())
 }
 
-/// Splits a compiled function into its code and its unwind trailer: (code length without
-/// the trailer, the trailer). The runtime keeps the trailer out of the code memory.
-pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
-    let n = code.len() & !3;
-    if n < 8 {
-        return (code.len(), None);
+pub struct SplitUnwindInfo {
+    pub code_len: usize,
+    pub host: Option<UnwindInfo>,
+    pub part: Option<(u32, UnwindInfo)>,
+}
+
+impl SplitUnwindInfo {
+    pub fn no_trailer(code_len: usize) -> Self {
+        Self { code_len, host: None, part: None }
     }
-    let info = unsafe { read_unwind_info(code.as_ptr() as u64, n as u64) };
-    match info {
-        Some(i) => (n - 4 * i.words(), Some(i)),
-        None => (code.len(), None),
+}
+
+/// Walk backwards from the head. For a mapped image the code is separate and the host
+/// trailer must consume everything before the part trailer.
+fn unwind_trailers(bytes: &[u8], image_code_len: Option<usize>) -> Option<(usize, UnwindTrailer<'_>, Option<(u32, UnwindTrailer<'_>)>)> {
+    let end = bytes.len() & !3;
+    let head = unwind_word(bytes, end.checked_sub(4)?);
+    let joined = head >> 24 == UNWIND_MAGIC_PART;
+    let (host_end, part) = if joined {
+        if end != bytes.len() { return None; }
+        let p_end = end.checked_sub(8)?;
+        let p_start = p_end.checked_sub((head & 0xff_ffff) as usize * 4)?;
+        let p = UnwindTrailer::at_end(&bytes[p_start..p_end], true)?;
+        if p.bytes.len() != p_end - p_start { return None; }
+        (p_start, Some((unwind_word(bytes, p_end), p)))
+    } else {
+        (end, None)
+    };
+    let host = UnwindTrailer::at_end(&bytes[..host_end], joined)?;
+    let start = host_end - host.bytes.len();
+    if image_code_len.is_some() && start != 0 { return None; }
+    let code_len = image_code_len.unwrap_or(start);
+    if let Some((off, _)) = &part {
+        if *off == 0 || *off as usize >= code_len { return None; }
     }
+    Some((code_len, host, part))
+}
+
+/// Splits the emitted body into its code length and the unwind info of each function.
+pub fn split_unwind_info(code: &[u8]) -> SplitUnwindInfo {
+    match unwind_trailers(code, None) {
+        Some((code_len, host, part)) => SplitUnwindInfo { code_len, host: Some(host.info()), part: part.map(|(off, p)| (off, p.info())) },
+        None => SplitUnwindInfo::no_trailer(code.len()),
+    }
+}
+
+/// Borrows each function's ordinary trailer from the image's trailer region.
+pub fn split_unwind_region(trailer: &[u8], code_len: u32) -> Option<(&[u8], Option<(u32, &[u8])>)> {
+    let (_, host, part) = unwind_trailers(trailer, Some(code_len as usize))?;
+    Some((host.bytes, part.map(|(off, p)| (off, p.bytes))))
 }
 
 /// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
@@ -2716,6 +2773,14 @@ mod succs_tests {
 
 #[cfg(test)]
 mod unwind_trailer_tests {
+    use super::*;
+
+    fn append_words(bytes: &mut Vec<u8>, words: &[u32]) {
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
     /// A trailer reads back as written behind its code, with and without staged calls; a frame's
     /// pointer from sp adds the staged bytes at that call only. Without staged calls the trailer
     /// keeps the plain magic (and its size).
@@ -2726,18 +2791,80 @@ mod unwind_trailer_tests {
         let pads = [(8u32, 40u32)];
         for staged in [&[][..], &[(8u32, 16u32), (12, 32)][..]] {
             let mut bytes = code.to_vec();
-            for w in super::unwind_info_words(&saved, &pads, staged, 48) {
-                bytes.extend_from_slice(&w.to_le_bytes());
-            }
-            let (n, info) = super::split_unwind_info(&bytes);
-            let info = info.expect("a trailer");
-            assert_eq!(n, code.len());
+            append_words(&mut bytes, &unwind_info_words(&saved, &pads, staged, 48));
+            let split = split_unwind_info(&bytes);
+            let info = split.host.expect("a trailer");
+            assert_eq!(split.code_len, code.len());
+            assert!(split.part.is_none());
+            let region = &bytes[split.code_len..];
+            let (host, part) = split_unwind_region(region, split.code_len as u32).unwrap();
+            assert!(std::ptr::eq(host, region) && part.is_none());
             assert_eq!((&info.saved[..], &info.pads[..], &info.staged[..], info.sp_off), (&saved[..], &pads[..], staged, 48));
             let extra = staged.iter().find(|s| s.0 == 12).map_or(0, |s| s.1 as u64);
             assert_eq!(info.fp_from_sp(12, 0x1000), 0x1000 + 48 + extra);
             assert_eq!(info.fp_from_sp(4, 0x1000), 0x1000 + 48);
         }
         assert_eq!(super::unwind_info_words(&saved, &pads, &[], 48).last().map(|h| h >> 24), Some(super::UNWIND_MAGIC));
+    }
+
+    #[test]
+    fn joined_unwind_trailers_keep_function_relative_offsets() {
+        let (code_len, p_off) = (64, 32);
+        for h_staged in [&[][..], &[(8, 16)][..]] {
+            for p_staged in [&[][..], &[(8, 32)][..]] {
+                let mut bytes = vec![0x90; code_len];
+                append_words(&mut bytes, &unwind_info_words(&[3], &[(8, 20)], h_staged, 48));
+                let p_start = bytes.len();
+                let p_words = unwind_info_words(&[12, 0x108], &[(8, 24)], p_staged, 80);
+                append_words(&mut bytes, &p_words);
+                let p_end = bytes.len();
+                append_words(&mut bytes, &part_trailer_words(p_off, p_words.len()));
+                assert!(unsafe { read_unwind_info(bytes.as_ptr() as u64, bytes.len() as u64) }.is_none());
+
+                let split = split_unwind_info(&bytes);
+                assert_eq!(split.code_len, code_len);
+                let h = split.host.unwrap();
+                let (off, p) = split.part.unwrap();
+                assert_eq!(off, p_off);
+                assert_eq!((&*h.saved, &*h.pads, &*h.staged, h.sp_off), (&[3][..], &[(8, 20)][..], h_staged, 48));
+                assert_eq!((&*p.saved, &*p.pads, &*p.staged, p.sp_off), (&[12, 0x108][..], &[(8, 24)][..], p_staged, 80));
+
+                let (h, part) = split_unwind_region(&bytes[split.code_len..], code_len as u32).unwrap();
+                let (off, p) = part.unwrap();
+                assert_eq!(off, p_off);
+                assert!(std::ptr::eq(h, &bytes[code_len..p_start]), "mapped host trailer");
+                assert!(std::ptr::eq(p, &bytes[p_start..p_end]), "mapped part trailer");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_part_discards_both_unwind_trailers() {
+        let plain = [16, UNWIND_MAGIC << 24];
+        let staged = [4, 16, 1, 32, UNWIND_MAGIC_STAGED << 24];
+        for (host, part, count, off) in [
+            (&plain[..], &plain[..], 0, 4),               // no part trailer
+            (&plain[..], &plain[..], 0xff_ffff, 4),       // count exceeds body
+            (&plain[..], &plain[..], 3, 4),               // count includes host head
+            (&plain[..], &staged[..], 4, 4),              // count omits a staged word
+            (&plain[..], &staged[2..], 3, 4),             // truncated staged table
+            (&plain[..], &[0, 32, UNWIND_MAGIC_STAGED << 24][..], 3, 4),
+            (&plain[..1], &plain[..], 2, 4),              // missing host head
+            (&plain[..], &plain[..], 2, 0),               // no host code
+            (&plain[..], &plain[..], 2, 8),               // no part code
+            (&plain[..], &plain[..], 2, 12),              // offset lies in trailers
+        ] {
+            let mut bytes = vec![0x90; 8];
+            append_words(&mut bytes, host);
+            append_words(&mut bytes, part);
+            append_words(&mut bytes, &part_trailer_words(off, count));
+            let split = split_unwind_info(&bytes);
+            assert_eq!(split.code_len, bytes.len(), "bad trailer stripped code");
+            assert!(split.host.is_none() && split.part.is_none(), "bad trailer supplied frame info");
+            assert!(split_unwind_region(&bytes[8..], 8).is_none(), "bad mapped trailer");
+        }
+        let head = (UNWIND_MAGIC_PART << 24 | 2).to_le_bytes();
+        assert!(split_unwind_info(&head).host.is_none(), "part head without offset");
     }
 }
 

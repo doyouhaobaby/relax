@@ -259,7 +259,7 @@ const LEDGER_KEY: u128 = 0;
 // A vtable's data name carries its principal keys (syms::vtable_name_keys). 40: no notes (39
 // reverted). 41: the notes again, and the real-time set they gate (a 39 set, taken ungated, is
 // never read: the configuration key carries the version).
-const ENTRY_VERSION: u32 = 41;
+const ENTRY_VERSION: u32 = 42;
 /// The real-time set earlier runs recorded (Cache::rt_set_load), by why each slot joined. Nothing
 /// announces a missed slot's code (a handoff through a static met once as a counted miss, what an
 /// audit's hole reached): the next run walks those slots before the tickets, as roots, so the

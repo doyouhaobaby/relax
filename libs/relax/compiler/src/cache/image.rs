@@ -887,7 +887,7 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
     e.u32(blob.len() as u32);
     e.u32(code.len() as u32);
     // the code without its unwind trailer (the trailer stays in the image: Unit::unwind_at)
-    e.u32(relax_backend::rir::split_unwind_info(code).0 as u32);
+    e.u32(relax_backend::rir::split_unwind_info(code).code_len as u32);
     e.u32(rel.len() as u32);
     for (at, kind, t, ix) in rel {
         e.u32(at);
