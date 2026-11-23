@@ -1003,9 +1003,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.ret_stack.push(out);
         fcx.async_depth += 1;
         let t = fcx.check_block(bid, Some(out));
-        if !fcx.diverges {
-            fcx.coerce_or_unify(t, out, None, ast.block(bid).hi);
-        }
+        fcx.coerce_body_tail(t, out, ast.block(bid).hi);
         fcx.async_depth -= 1;
         fcx.ret_stack.pop();
         fcx.closure_depth.pop();
@@ -1017,23 +1015,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     } else if let Some(bid) = body {
         fcx.b.body = Some(bid);
         let t = fcx.check_block(bid, Some(ret));
-        if !fcx.diverges {
-            fcx.coerce_or_unify(t, ret, None, ast.block(bid).hi);
-        } else {
-            // a tail after a diverging statement still types the return (rustc coerces the
-            // tail; `panic!(); MyStruct` defines `impl MyTrait` as MyStruct)
-            let st = fcx.shallow(t);
-            if !matches!(fcx.tcx.tys.kind(st), TyKind::Never) {
-                let save = fcx.start_snapshot();
-                if !fcx.try_coerce(t, ret, None) { fcx.rollback_to(save); } else { fcx.commit_from(save); }
-            }
-            // a body that only diverges (`fn f() -> impl Sized { todo!() }`): the return type's
-            // still-open variable falls back like any variable a `!` flowed into
-            let sr = fcx.shallow(ret);
-            if matches!(fcx.tcx.tys.kind(sr), TyKind::Infer(_)) {
-                fcx.diverging.push(sr);
-            }
-        }
+        fcx.coerce_body_tail(t, ret, ast.block(bid).hi);
     }
     fcx.finish();
     fcx.into_body()
@@ -1693,6 +1675,26 @@ impl<'a> Fcx<'a> {
         let x = self.infcx.deeply_resolve_ignoring_regions(scrutinee);
         let sx = ty_to_string(false, self.prog, self.tcx, x);
         self.err(self.last_lo, format!("E0308: mismatched types: expected `{}`, found `&{}_`", sx, if m { "mut " } else { "" }));
+    }
+
+    /// The end of a body (a fn's, an async fn's, an async block's): its tail is its output. After a
+    /// diverging statement rustc still coerces the tail (`panic!(..); 7u8` defines `impl Debug` as
+    /// u8, `async { loop { x? } Ok::<(), E>(()) }` is a future of `Result<(), E>`), and an output only
+    /// a `!` reached (`todo!()`) falls back like any variable a `!` flowed into.
+    fn coerce_body_tail(&mut self, tail: TyId, out: TyId, pos: u32) {
+        if !self.diverges {
+            self.coerce_or_unify(tail, out, None, pos);
+        } else {
+            let st = self.shallow(tail);
+            if !matches!(self.tcx.tys.kind(st), TyKind::Never) {
+                let save = self.start_snapshot();
+                if !self.try_coerce(tail, out, None) { self.rollback_to(save); } else { self.commit_from(save); }
+            }
+            let so = self.shallow(out);
+            if matches!(self.tcx.tys.kind(so), TyKind::Infer(_)) {
+                self.diverging.push(so);
+            }
+        }
     }
 
     /// rustc_hir_typeck/src/demand.rs:230-270: report only after the coercion
@@ -7298,22 +7300,7 @@ impl<'a> Fcx<'a> {
         self.loops = save_loops;
         self.in_loop_condition = save_condition;
         let points = std::mem::replace(&mut self.await_count, save_awaits);
-        if !self.diverges {
-            self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
-        } else {
-            // a tail after a diverging statement still types the output (rustc coerces the
-            // tail: `async { loop { x? } Ok::<(), E>(()) }` is a future of `Result<(), E>`)
-            if !matches!(self.tcx.tys.kind(self.shallow(bt)), TyKind::Never) {
-                let save = self.start_snapshot();
-                if self.try_coerce(bt, out, None) { self.commit_from(save); } else { self.rollback_to(save); }
-            }
-            // a body that only diverges (`async { todo!() }`): the return type's still-open
-            // variable falls back like any variable a `!` flowed into
-            let so = self.shallow(out);
-            if matches!(self.tcx.tys.kind(so), TyKind::Infer(_)) {
-                self.diverging.push(so);
-            }
-        }
+        self.coerce_body_tail(bt, out, self.ast().block(b).hi);
         self.async_depth -= 1;
         self.ret_stack.pop();
         self.closure_depth.pop();
