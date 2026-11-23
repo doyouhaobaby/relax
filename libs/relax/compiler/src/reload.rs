@@ -11032,6 +11032,18 @@ pub(crate) fn own_source_file(prog: &crate::program::Program, file: u32) -> bool
     prog.file_paths.get(file as usize).is_some_and(|p| own_source(p, std_dir))
 }
 
+/// The watcher's own source rule for the location of a call's code. An unknown location can park.
+pub(crate) fn live_edit_reaches(location: &str) -> bool {
+    let mut parts = location.rsplitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(col), Some(line), Some(path)) if !path.is_empty() && line.parse::<u32>().is_ok() && col.parse::<u32>().is_ok() => {
+            let std_dir = STD.get_or_init(|| std::env::var("RELAX_STD").unwrap_or_default());
+            own_source(path, std_dir)
+        }
+        _ => true,
+    }
+}
+
 fn own_source(path: &str, std_dir: &str) -> bool {
     !(path.is_empty() || (!std_dir.is_empty() && crate::vfs::relative_path(path, std_dir).is_some()) || path.contains("/.cargo/registry/") || path.contains("/.cargo/git/") || path.contains("/rustlib/"))
 }
