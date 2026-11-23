@@ -2083,7 +2083,10 @@ mod tests {
     fn domains_have_their_own_statics() {
         isolated_test!(domains_have_their_own_statics);
         let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let sess = &std::sync::Arc::new(crate::Session::default());
+        // initializers run as code (no CTFE), each through call_jit_initializer on this thread
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let sess = &std::sync::Arc::new(session);
         let root = std::env::temp_dir().join(format!("relax-domains-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("fixture.rs");
@@ -2112,12 +2115,20 @@ mod tests {
             out
         };
         let dom0 = u.syms.dom0();
+        let start = current();
+        // the unit's domain as a booted program's (a thread that enters it takes a reservation),
+        // booted on a thread that ends: this one starts outside it
+        std::thread::spawn(move || register_boot("fixture", dom0)).join().unwrap();
+        let registered = |base: u64| unsafe { crate::domain_threads::data(crate::jit::tls_block()) }.registrations.iter().any(|r| r.0 == base);
+        assert!(!registered(dom0), "this thread starts outside the unit's domain");
         // the statics exist (and have offsets) before the second domain is made
         for d in [counter, cell, pcell] {
             let s = u.static_sym(d);
             assert!(u.syms.value(s) > 0 && u.syms.value(s) < BLOCK_SIZE as u64, "an offset, not an address");
             assert_eq!(u.syms.addr(s), dom0 + u.syms.value(s));
         }
+        // their initializers ran in dom0 on this thread, each registering it for its call only
+        assert!(!registered(dom0), "an initializer's call left this thread registered in the unit's domain");
         let (e_bump, e_through) = (entry(&mut u, bump), entry(&mut u, through));
         assert_eq!(call(dom0, e_bump), 6);
         let b = create(&u);
@@ -2148,11 +2159,15 @@ mod tests {
         assert_eq!(call(b, e_late), 42);
         assert_eq!(call(dom0, e_late), 42);
         // the thread is back in the domain it was in
-        assert_eq!(current(), dom0);
-        assert_eq!(enter(b), dom0);
+        assert_eq!(current(), start);
+        assert_eq!(enter(b), start);
         assert_eq!(enter(dom0), b);
         destroy(b);
         assert!(!blocks().contains(&b));
+        select(start);
+        let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+        t.registrations.retain(|&(r, _)| r != dom0);
+        domains().retain(|d| d.info.base != dom0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
