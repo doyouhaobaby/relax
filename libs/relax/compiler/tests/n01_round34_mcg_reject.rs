@@ -1,3 +1,4 @@
+// rejects: E0770
 #![allow(dead_code)]
 struct A<const N: usize>;
 fn arithmetic<const N: usize>() -> [u8; N + 1] { loop {} }
