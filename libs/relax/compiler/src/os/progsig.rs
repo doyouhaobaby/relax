@@ -872,6 +872,7 @@ const SIGABRT: i32 = 6;
 
 /// A SIGABRT the host's handler chained here was sent on (true, counted off): not reported now,
 /// its next delivery is.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 pub(crate) fn take_sent_on_abort() -> bool {
     ABRT_SENT_ON.try_update(Relaxed, Relaxed, |n| n.checked_sub(1)).is_ok()
 }
