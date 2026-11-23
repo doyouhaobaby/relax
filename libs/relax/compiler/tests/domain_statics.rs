@@ -16,7 +16,10 @@ static NA: Node = Node { next: &NB, v: 1 };
 static NB: Node = Node { next: &NA, v: 2 };
 static mut COUNTER: u64 = 5;
 static mut CELL: u64 = 1;
-static PCELL: *mut u64 = unsafe { &CELL as *const u64 as *mut u64 };
+// (a raw pointer is not Sync: a static holds one in a type that says it may be shared)
+struct SharedPtr(*mut u64);
+unsafe impl Sync for SharedPtr {}
+static PCELL: SharedPtr = SharedPtr(&raw mut CELL);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static PHITS: &AtomicU64 = &HITS;
 
@@ -31,9 +34,9 @@ fn images_point_at_statics() {
     unsafe {
         COUNTER += 1;
         assert_eq!(COUNTER, 6);
-        *PCELL += 10;
+        *PCELL.0 += 10;
         assert_eq!(CELL, 11);
-        assert!(std::ptr::eq(PCELL as *const u64, &CELL as *const u64));
+        assert!(std::ptr::eq(PCELL.0 as *const u64, &raw const CELL));
     }
     PHITS.fetch_add(3, Ordering::SeqCst);
     assert_eq!(HITS.load(Ordering::SeqCst), 3);
