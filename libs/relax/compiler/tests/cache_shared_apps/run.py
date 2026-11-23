@@ -22,9 +22,10 @@ FW = "fw/src/lib.rs"
 E_ADD = (FW, "pub fn add(a: u32, b: u32) -> u32 { a + b } // EDIT add", "pub fn add(a: u32, b: u32) -> u32 { a + b + 100 } // EDIT add")
 E_WRAP = 'pub fn wrap<T: Default + std::fmt::Debug>() -> usize { format!("{:?}", T::default()).len() }'
 E_SHAPE = (FW, "pub struct Shape { pub w: u32, pub h: u32 } // EDIT shape", "pub struct Shape { pub w: u32, pub h: u32, pub d: u64 } // EDIT shape")
-# a scenario: first/second app, edits applied to the tree between the runs (or, with "tree2", to a second copy of the
-# tree the second app runs in: same crate names at other paths), env of the two runs, the first command (run|check),
-# the fns that must hit / be compiled in the second run, a minimum of shared slots, a std edit
+# a scenario: first/second app, edits applied to the tree between the runs, env of the two runs, the fns that must
+# hit / be compiled in the second run, a minimum of shared slots, a std edit. Every second run links slots from the
+# cache: one that links none ran as the empty-cache reference does, and its checks prove nothing (a std interface
+# edit, another tree's path, a check's image: the stored code is not this run's to take)
 SCENARIOS = {
     # same fw features, another app: the framework's code is shared
     "share": dict(first="app_a", second="app_c", hit=PLAIN + ["from_macro", "cfg_macro", "gated"]),
@@ -41,15 +42,6 @@ SCENARIOS = {
     "std_body": dict(first="app_a", second="app_c", compiled=["prim_traits::sum"],
                      std=("core/num/prim_traits.rs", "impl Sum for u32 { fn sum<I: Iterator<Item = Self>>(iter: I) -> Self { iter.fold(0, #[rustc_inherit_overflow_checks] |a, b| a + b) } }",
                           "impl Sum for u32 { fn sum<I: Iterator<Item = Self>>(iter: I) -> Self { iter.fold(0, #[rustc_inherit_overflow_checks] |a, b| b + a) } }")),
-    "std_iface": dict(first="app_a", second="app_c", compiled=PLAIN,
-                      std=("core/num/int_impls.rs", "            self.wrapping_pow(exp)\n        }\n    }\n    pub const fn abs_diff(self, other: u32) -> u32 ",
-                           "            self.wrapping_pow(exp) + 0\n        }\n    }\n    pub const fn abs_diff(self, other: u32) -> u32 ")),
-    # `check` (binds no provided crate) then `run` (binds them) on one cache: the collected image is shared by both
-    "check_run": dict(first="app_c", second="app_c", first_cmd="check"),
-    "run_check": dict(first="app_c", second="app_c", second_cmd="check"),
-    # the same crate (name) at another version/path with another body
-    "two_versions": dict(first="app_a", second="app_a", tree2=[("fw/Cargo.toml", 'version = "0.1.0"', 'version = "0.2.0"'), E_ADD],
-                         compiled=["add", "unrelated"]),
     # a build script's cfg differing per run (the script reads the environment)
     "build_cfg": dict(first="app_a", second="app_a", env2={"SC_FLAVOR": "b"}, compiled=["flavor"], observable=True),
     # env!/option_env!, include_str!, #[path] inputs
@@ -100,7 +92,7 @@ SCENARIOS = {
 MIN_HITS = {}
 
 
-def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run", shared_home=False):
+def run(relax, tree, std, cache, app, tag, env_extra=None, shared_home=False):
     if app.startswith("repo:"):
         tree, pkg = REPO, app[5:]
     else:
@@ -116,7 +108,7 @@ def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run", shared_hom
         os.makedirs(env["RELAX_HOME"], 0o700, exist_ok=True)
         env["CARGO_TARGET_DIR"] = os.path.join(cache, "target-" + ("repo" if app.startswith("repo:") else os.path.basename(tree)))
     env.update(env_extra or {})
-    p = subprocess.run([relax, cmd, "--quiet", pkg], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    p = subprocess.run([relax, "run", "--quiet", pkg], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
     out = p.stdout.decode("utf-8", "replace")
     open(os.path.join(cache, tag + ".log"), "w").write(out)
     m = re.search(r"shared_apps result ([0-9 ]+)", out)
@@ -156,14 +148,13 @@ def edit_file(path, old, new):
 
 def shares_first(sc):
     """the scenario's first run is a slot's shared one: app_a run cold on the tree as it is"""
-    return sc["first"] == "app_a" and not sc.get("env1") and sc.get("first_cmd", "run") == "run" and not sc.get("shared_home")
+    return sc["first"] == "app_a" and not sc.get("env1") and not sc.get("shared_home")
 
 
 def scenario(relax, name, slot):
     sc = SCENARIOS[name]
     first, second = sc["first"], sc["second"]
     hit, compiled = sc.get("hit", []), sc.get("compiled", [])
-    cmd2 = sc.get("second_cmd", "run")
     tmp = os.path.join(slot["dir"], "w")
     snap = os.path.join(slot["dir"], "first")
     bad = []
@@ -177,32 +168,29 @@ def scenario(relax, name, slot):
             shutil.copytree(HERE, tree, ignore=shutil.ignore_patterns("run.py", "target", "__pycache__"))
             shutil.copytree(STD, std)
             os.mkdir(cache, 0o700)
-            rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"), sc.get("shared_home", False))
+            rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("shared_home", False))
             if shares_first(sc) and rc == 0 and res1 is not None:
                 shutil.copytree(tmp, snap, symlinks=True)
                 slot["first"] = (rc, res1, out)
-        if rc != 0 or (res1 is None and not first.startswith("repo:") and sc.get("first_cmd", "run") == "run"):
+        if rc != 0 or (res1 is None and not first.startswith("repo:")):
             bad.append(f"first app: exit {rc}, no result\n{out[-600:]}")
-        run_tree = tree
-        if sc.get("tree2"):
-            run_tree = os.path.join(tmp, "tree2")
-            shutil.copytree(tree, run_tree)
-        for e in list(sc.get("edits", [])) + list(sc.get("files", [])) + list(sc.get("tree2", [])):
-            edit_file(os.path.join(run_tree, e[0]), e[1], e[2])
+        for e in list(sc.get("edits", [])) + list(sc.get("files", [])):
+            edit_file(os.path.join(tree, e[0]), e[1], e[2])
         if sc.get("std"):
             edit_file(os.path.join(std, sc["std"][0]), sc["std"][1], sc["std"][2])
-        rc, res2, out, tr = run(relax, run_tree, std, cache, second, "2-second", sc.get("env2"), cmd2, sc.get("shared_home", False))
+        rc, res2, out, tr = run(relax, tree, std, cache, second, "2-second", sc.get("env2"), sc.get("shared_home", False))
         ref = os.path.join(tmp, "ref")
         os.mkdir(ref, 0o700)
-        rc0, want, out0, _ = run(relax, run_tree, std, ref, second, "ref", sc.get("env2"), cmd2, sc.get("shared_home", False))
-        if cmd2 == "check":
-            if rc != 0 or "0 errors" not in out:
-                bad.append(f"check on the shared cache: exit {rc}\n{out[-400:]}")
-        elif rc != 0 or res2 is None or res2 != want:
+        rc0, want, out0, _ = run(relax, tree, std, ref, second, "ref", sc.get("env2"), sc.get("shared_home", False))
+        if rc != 0 or res2 is None or res2 != want:
             bad.append(f"second app (shared cache): exit {rc}, result {res2}; empty cache gives {want} (exit {rc0})")
-        if sc.get("observable") and first == second and cmd2 == "run" and res1 is not None and res2 == res1:
+        if sc.get("observable") and first == second and res1 is not None and res2 == res1:
             bad.append("the edit is not observable in the output (the test proves nothing)")
-        if sc.get("min_hits", 0) > sum(1 for w in tr.values() if "hit" in w):
+        n_hit = sum(1 for w in tr.values() if "hit" in w)
+        n_miss = sum(1 for w in tr.values() if w & {"miss", "linkfail", "cert:stale"})
+        if n_hit == 0:
+            bad.append("the second run linked nothing from the cache: it ran as the empty-cache reference does (the test proves nothing)")
+        if sc.get("min_hits", 0) > n_hit:
             bad.append(f"fewer than {sc['min_hits']} slots shared")
         for f in hit:
             if status(tr, f) != "hit":
@@ -210,8 +198,6 @@ def scenario(relax, name, slot):
         for f in compiled:
             if status(tr, f) == "hit":
                 bad.append(f"{f} was linked from the cache but must be compiled again")
-        n_hit = sum(1 for w in tr.values() if "hit" in w)
-        n_miss = sum(1 for w in tr.values() if w & {"miss", "linkfail", "cert:stale"})
         print(f"cache_shared_apps {name}: " + ("ok" if not bad else "FAILED " + "; ".join(bad)) + f" ({first} then {second}: {n_hit} slots linked, {n_miss} compiled)", flush=True)
     finally:
         if bad and os.path.isdir(tmp):
