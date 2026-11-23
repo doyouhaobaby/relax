@@ -887,7 +887,8 @@ fn main() {
 /// A hot fn edited mid-run counts its calls again, in front of its patch's code, and returns to O3
 /// within its normal count: whether the edit found it counting, at O3, in its counted (PGO)
 /// window, with its O3 take running, or final by the verdict an earlier run stored (which the
-/// settled state's periodic look leaves final, where it counts a slot this run made final again). A patch left a slot marked queued (O3 code, a counted
+/// settled state's periodic look counts again at a raised bar, final again unless its rate rose
+/// to it, where it counts a slot this run made final again at the threshold). A patch left a slot marked queued (O3 code, a counted
 /// window, a take) with its count stub gone, and a take it dropped left its slot the same: their
 /// calls were never counted again, and a live app's edited draw ran O1 code for the rest of the
 /// run (11-17).
@@ -993,9 +994,10 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     assert!(unsafe { compile_tier1(up, id) }, "hot gets O3 code after its dropped take");
     assert_eq!(run(), 10);
     // final by the verdict an earlier run stored (a warm launch linking its code: never hot): the
-    // settled state's periodic look leaves it final; edited while final, the settle's re-arm for
-    // the patch counts it again, in front of the patch's code. A warm session re-decided its
-    // stored tiers at the periodic look's second every launch, and built a few dozen O3s then
+    // settled state's periodic look counts it again at STORED_RISE x the threshold, and its sweep
+    // makes it final again, the marks kept; edited while final, the settle's re-arm for the patch
+    // counts it again, in front of the patch's code. A warm session re-decided its stored tiers at
+    // the periodic look's second every launch, and built a few dozen O3s then
     edit("= 10;", "= 11;");
     counting("at O3, then edited before its stored verdict");
     let w5 = || unsafe { (*rec.add(5)).load(Ordering::Relaxed) };
@@ -1005,15 +1007,36 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
         assert_eq!(SlotWord::of(&u.slots, id).load(Ordering::SeqCst), (*rec.add(1)).load(Ordering::Relaxed), "{what}: hot's slot calls its code, no count stub");
     });
     let rearm = |periodic: bool| crate::owner::call(crate::owner::Class::Program, || unsafe { settle_rearm_all(up, periodic) });
-    crate::owner::call(crate::owner::Class::Program, || unsafe { stored_tier_verdict(&*up, id, crate::cache::TierVerdict::None, false) });
+    let stored = |v: crate::cache::TierVerdict| crate::owner::call(crate::owner::Class::Program, || unsafe { stored_tier_verdict(&*up, id, v, false) });
+    stored(crate::cache::TierVerdict::None);
     final_now("its stored verdict: never hot");
     assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), STORED_FINAL, "a never-hot verdict marks hot final by a stored verdict, not parked");
-    let (_, kept) = rearm(true);
-    assert!(kept >= 1, "the periodic look counts hot among the stored decisions it keeps");
-    final_now("the periodic look over a stored verdict");
+    let (_, recounted, _) = rearm(true);
+    assert!(recounted >= 1, "the periodic look counts hot among the stored decisions it recounts");
+    counting("the periodic look over a stored verdict");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED | STORED_RECOUNT), STORED_FINAL | STORED_RECOUNT, "a recount keeps the stored marks");
+    // half a threshold over it: the check of its next call (rt_hot's) leaves it counting
+    unsafe { tier_charge(rec, threshold + threshold / 2) };
+    let (now, wall) = tier_clocks();
+    assert_eq!(unsafe { tier_check(rec, threshold, now, wall) }, None, "a recount half a threshold over it counts on");
+    let cost = counting("over the threshold, under a recount's bar");
+    assert!(cost >= threshold, "the recount's cost is over the threshold: {cost} of {threshold}");
+    assert_eq!(w5() & STORED_FINAL, STORED_FINAL, "a cost under the raised bar reopens nothing");
+    assert!(crate::owner::call(crate::owner::Class::Program, || unsafe { settle_recount_end(&*up, id) }), "the sweep ends the recount");
+    final_now("a recount under its bar");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED | STORED_RECOUNT), STORED_FINAL, "final again by its stored verdict");
+    // risen to the raised bar: its check queues it (rt_hot), the decision is this run's again
+    rearm(true);
+    counting("recounted again");
+    unsafe { tier_charge(rec, STORED_RISE * threshold + threshold) };
+    let (now, wall) = tier_clocks();
+    assert!(unsafe { tier_check(rec, threshold, now, wall) }.is_some(), "a recount over its bar is for the queue (rt_hot queues it)");
+    assert_eq!(w5() & (STORED_FINAL | STORED_RECOUNT), 0, "a rise clears the stored marks");
+    stored(crate::cache::TierVerdict::None);
+    final_now("its stored verdict again");
     assert_eq!(run(), 11);
     edit("= 11;", "= 12;");
-    let (n, _) = rearm(false);
+    let (n, _, _) = rearm(false);
     assert!(n >= 1, "the settle's re-arm for a patch counts the stored decisions again");
     counting("final by a stored verdict, then edited");
     assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), 0, "counting again clears the stored marks");
@@ -1024,9 +1047,10 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     rearm(true);
     counting("final by this run's counts, then the periodic look");
     // parked by a stored verdict: final, its loops included, until a phase change re-arms it
-    crate::owner::call(crate::owner::Class::Program, || unsafe { stored_tier_verdict(&*up, id, crate::cache::TierVerdict::Parked, false) });
+    stored(crate::cache::TierVerdict::Parked);
     assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), STORED_FINAL | STORED_PARKED, "a parked verdict marks hot parked and final by a stored verdict");
-    rearm(true);
+    let (_, _, kept) = rearm(true);
+    assert!(kept >= 1, "the periodic look keeps a parked decision");
     final_now("the periodic look over a parked verdict");
     rearm(false);
     counting("parked by a stored verdict, then new code reached");

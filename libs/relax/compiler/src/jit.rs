@@ -13352,8 +13352,10 @@ fn drain_slow_base() {
 /// timer runs afterwards; the first O3 worker's idle poll only reads counters. Phase changes:
 /// SETTLE_NEW_CODE first compiles since the settle or a live patch re-arm every final slot (a new
 /// window, then a sweep), and so does SETTLE_REARM_NS of program time for the slots this run made
-/// final (a decision an earlier run stored stays: STORED_FINAL); a final slot's own loop that
-/// reaches the O3 threshold's rate re-arms that slot at once (rt_loop_hot). Nothing here is stored:
+/// final; a decision an earlier run stored (STORED_FINAL) counts again then at a raised bar
+/// (STORED_RECOUNT: only a real rise reopens it) and is final again at the sweep; a final slot's
+/// own loop that reaches the O3 threshold's rate re-arms that slot at once (rt_loop_hot). Nothing
+/// here is stored:
 /// a warm start links the O2 entries and settles again, without builds.
 /// RELAX_SETTLE_DIV=<n>: the running bar (default 256).
 const T_FINAL: u64 = 4;
@@ -13438,9 +13440,9 @@ fn settle_tier_tick() {
             drop(st);
             if FINAL_SLOTS.load(Ordering::Relaxed) != 0 {
                 let periodic = why == "periodic";
-                let (n, kept) = owner::publish(|| unsafe { settle_rearm_all(up, periodic) });
+                let (n, recounted, kept) = owner::publish(|| unsafe { settle_rearm_all(up, periodic) });
                 if settle_trace() {
-                    eprintln!("relax settle-tier: re-armed {} final slots ({}) at t={:.1} s, {} final by a stored verdict kept", n, why, wall_ns() as f64 / 1e9, kept);
+                    eprintln!("relax settle-tier: re-armed {} final slots ({}) at t={:.1} s, {} final by a stored verdict recounted, {} kept", n, why, wall_ns() as f64 / 1e9, recounted, kept);
                 }
             }
         }
@@ -13479,6 +13481,8 @@ fn settle_tier_tick() {
         eprintln!("relax settle-tier: epoch {} round {} at t={:.1} s: {} running slots, {} O2 builds queued, {} made final ({} final in all){}", epoch, round, wall_ns() as f64 / 1e9, running, queued, finalized, FINAL_SLOTS.load(Ordering::Relaxed), if st.final_at != 0 { " -- final" } else { "" });
         let r: Vec<u64> = SETTLE_ENTRY_RANKS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
         eprintln!("relax settle-tier: O2 builds so far by stored entry (no key/none/baseline/O1/O2/O3): {:?}; {}", r, o2_drop_census());
+        let c: Vec<u64> = RECOUNTS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        eprintln!("relax settle-tier: stored decisions recounted {}, reopened {}, final again {}", c[0], c[1], c[2]);
     }
 }
 
@@ -13518,6 +13522,11 @@ unsafe fn settle_sweep(up: *mut Unit) -> (u64, u64, u64) {
     for id in 0..u.fns.len() as u32 {
         let rec = tier_rec(&u.slots, id);
         if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING || u.frequency_profiles.contains_key(&id) {
+            continue;
+        }
+        // a stored decision's recount that did not rise to its bar: final again, its marks kept
+        if (*rec.add(5)).load(Ordering::Relaxed) & STORED_RECOUNT != 0 {
+            settle_recount_end(u, id);
             continue;
         }
         if !running_now(rec) {
@@ -13577,8 +13586,9 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
 /// behind them for their own builds, 11-07.) Baseline code without a parked verdict counts on: it
 /// gets its O2 build by running (base_running, the settle sweep), and that install applies the
 /// verdict. Final code counts again when the settled state re-arms for a patch or new code
-/// (settle_tier_tick; its periodic look leaves it final: STORED_FINAL), and without a parked
-/// verdict when one of its loops turns hot (rt_loop_hot). Unit lock held.
+/// (settle_tier_tick; its periodic look recounts it at a raised bar, parked leaves it final:
+/// STORED_FINAL), and without a parked verdict when one of its loops turns hot (rt_loop_hot).
+/// Unit lock held.
 unsafe fn stored_tier_verdict(u: &Unit, id: u32, v: crate::cache::TierVerdict, base: bool) {
     use crate::cache::TierVerdict;
     let marks = match v {
@@ -13611,22 +13621,62 @@ unsafe fn settle_unfinal(u: &Unit, id: u32, threshold: u64) -> bool {
     true
 }
 
-/// Every final slot counts again (owner, unit lock), but for the periodic look (`periodic`) one
-/// final by a verdict an earlier run stored (STORED_FINAL): time alone does not reopen a stored
+/// A slot final by a stored verdict counts again for the periodic look (settle_rearm_all), its
+/// marks kept and its bar raised (STORED_RECOUNT). False, and it stays final: not final, or other
+/// code is in its slot than the code it counted.
+unsafe fn settle_recount(u: &Unit, id: u32, threshold: u64, now: u64, wall: u64) -> bool {
+    let rec = tier_rec(&u.slots, id);
+    let code = (*rec.add(1)).load(Ordering::Relaxed);
+    let stub = (*rec.add(2)).load(Ordering::Relaxed);
+    if stub == 0 || SlotWord::of(&u.slots, id).load(Ordering::SeqCst) != code {
+        return false;
+    }
+    // (the raised bar before the count: a racing loop chunk never checks it at the threshold)
+    (*rec.add(5)).fetch_or(STORED_RECOUNT, Ordering::Relaxed);
+    if (*rec.add(3)).compare_exchange(T_FINAL, T_COUNTING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        (*rec.add(5)).fetch_and(!STORED_RECOUNT, Ordering::Relaxed);
+        return false;
+    }
+    tier_count_fresh(rec, threshold, now, wall);
+    FINAL_SLOTS.fetch_sub(1, Ordering::Relaxed);
+    RECOUNTS[0].fetch_add(1, Ordering::Relaxed);
+    let _ = SlotWord::of(&u.slots, id).compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst);
+    true
+}
+
+/// A stored decision's recount ends under its bar (settle_sweep): final again, its marks kept.
+unsafe fn settle_recount_end(u: &Unit, id: u32) -> bool {
+    if !settle_final(u, id) {
+        return false;
+    }
+    (*tier_rec(&u.slots, id).add(5)).fetch_and(!STORED_RECOUNT, Ordering::Relaxed);
+    RECOUNTS[2].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Every final slot counts again (owner, unit lock). For the periodic look (`periodic`) one final
+/// by a verdict an earlier run stored (STORED_FINAL) counts again at a raised bar instead
+/// (settle_recount), and one parked by it stays final: time alone does not reopen a stored
 /// decision, which made a warm session re-decide its tiers at the same second every launch and
-/// build a few dozen O3s with their cascades then (a heard run's sound fell to x0.91). The numbers
-/// re-armed and kept.
-unsafe fn settle_rearm_all(up: *mut Unit, periodic: bool) -> (u64, u64) {
+/// build a few dozen O3s with their cascades then (a heard run's sound fell to x0.91); a rise in
+/// its rate does. The numbers re-armed, recounted and kept.
+unsafe fn settle_rearm_all(up: *mut Unit, periodic: bool) -> (u64, u64, u64) {
     let u = &mut *up;
-    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return (0, 0) };
-    let (mut n, mut kept) = (0, 0);
+    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return (0, 0, 0) };
+    let (mut n, mut recounted, mut kept) = (0, 0, 0);
+    let (now, wall) = tier_clocks();
     for id in 0..u.fns.len() as u32 {
         let rec = tier_rec(&u.slots, id);
         if (*rec.add(3)).load(Ordering::Acquire) != T_FINAL {
             continue;
         }
-        if periodic && (*rec.add(5)).load(Ordering::Relaxed) & STORED_FINAL != 0 {
-            kept += 1;
+        let w5 = (*rec.add(5)).load(Ordering::Relaxed);
+        if periodic && w5 & STORED_FINAL != 0 {
+            if w5 & STORED_PARKED == 0 && settle_recount(u, id, threshold, now, wall) {
+                recounted += 1;
+            } else {
+                kept += 1;
+            }
             continue;
         }
         if !settle_unfinal(u, id, threshold) {
@@ -13640,7 +13690,7 @@ unsafe fn settle_rearm_all(up: *mut Unit, periodic: bool) -> (u64, u64) {
             u.rearm_counter(id, word);
         }
     }
-    (n, kept)
+    (n, recounted, kept)
 }
 
 /// The startup released its workers (after the first present): the baseline slots sampled so far
@@ -19894,7 +19944,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             }
             return;
         }
-        if tier_cost_now(rec, threshold, now).0 < threshold {
+        if tier_cost_now(rec, threshold, now).0 < tier_bar(rec, threshold) {
             return;
         }
         (*rec.add(7)).store(now, Ordering::Relaxed);
@@ -20264,11 +20314,24 @@ unsafe fn tier_check(rec: *const AtomicU64, threshold: u64, now: u64, wall: u64)
         return None;
     }
     let (cost, spent) = tier_cost_now(rec, threshold, now);
-    if cost >= threshold {
+    if cost >= tier_bar(rec, threshold) {
+        // a stored decision's recount that rose to its bar: the decision is this run's again
+        if (*rec.add(5)).load(Ordering::Relaxed) & STORED_RECOUNT != 0
+            && (*rec.add(5)).fetch_and(!(STORED_RECOUNT | STORED_FINAL), Ordering::Relaxed) & STORED_RECOUNT != 0
+        {
+            RECOUNTS[1].fetch_add(1, Ordering::Relaxed);
+        }
         return Some(((spent as u128 * 1_000_000_000 / (wall - last) as u128).min(u64::MAX as u128)) as u64);
     }
     tier_record_check(rec, threshold, cost, now, wall);
     None
+}
+
+/// The cost a counting slot is queued at: the threshold, STORED_RISE x it for a stored decision's
+/// recount (STORED_RECOUNT). Under the bar a check records the cost; over the threshold the budget
+/// refills threshold / REFILL_DIV (tier_refill), so such a recount checks often.
+unsafe fn tier_bar(rec: *const AtomicU64, threshold: u64) -> u64 {
+    if (*rec.add(5)).load(Ordering::Relaxed) & STORED_RECOUNT != 0 { threshold.saturating_mul(STORED_RISE) } else { threshold }
 }
 
 /// Charges `cost` to a counting slot's budget (rt_loop_hot): its next call checks it.
@@ -21978,10 +22041,22 @@ unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
 /// re-arm for a patch or new code does (settle_rearm_all)
 const STORED_PARKED: u64 = 1 << 60;
 /// Tier record word 5: final by the verdict an earlier run stored for the slot's code, parked or
-/// never hot (stored_tier_verdict): the settled state's periodic look leaves it final
-/// (settle_rearm_all); a patch, new code reached and, unless parked, its own loop turning hot
-/// count it again
+/// never hot (stored_tier_verdict): the settled state's periodic look recounts it at a raised bar
+/// (STORED_RECOUNT), or leaves it final when parked (settle_rearm_all); a patch, new code reached
+/// and, unless parked, its own loop turning hot count it again
 const STORED_FINAL: u64 = 1 << 56;
+/// Tier record word 5: a slot final by a stored verdict counts again for the settled state's
+/// periodic look (settle_recount): it is queued at STORED_RISE x the threshold (tier_bar), and the
+/// look's sweep makes it final again, its marks kept (settle_recount_end)
+const STORED_RECOUNT: u64 = 1 << 55;
+/// How far over the threshold a stored decision's recount must come to reopen it: the run that
+/// stored it counted other code (baseline or O1, whose size weighs its calls) at other rates, and
+/// slots near the bar crossed it on a warm launch's faster code. Its sweep comes at least a window
+/// (SETTLE_WINDOW_NS, two half-lives) after the count starts, where a steady rate shows three
+/// quarters of its cost: a recount reopens a slot running at 2 to 2.7 x the threshold's rate.
+const STORED_RISE: u64 = 2;
+/// Stored decisions the periodic look recounted, reopened (queued for O3) and made final again
+static RECOUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Tier record word 5: the counted code bytes (below the flag bits)
 const CODE_BYTES: u64 = (1 << 48) - 1;
 /// Tier record word 5: the slot's O3 entry, queued by its calls, left at its pick to count again
@@ -36673,6 +36748,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&FORGET_SEEN, AtomicU64::new(u64::MAX));
     reset(&FINAL_SLOTS, AtomicU64::new(0));
     reset(&SETTLE_ENTRY_RANKS, [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    reset(&RECOUNTS, [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&SETTLE_TIER, relax_session::sync::Mutex::new(SettleTier { seen: [u64::MAX; 2], at_final: [0; 2], quiet_since: 0, window_at: 0, final_at: 0, rounds: 0, epoch: 0 }));
     reset(&O1V_SEEN, relax_session::sync::Mutex::new(None));
     reset(&O1V_STANDALONE, relax_session::sync::Mutex::new(None));
