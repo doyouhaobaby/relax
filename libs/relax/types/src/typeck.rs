@@ -5367,6 +5367,7 @@ impl<'a> Fcx<'a> {
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
+                let mut deref_coerced = false;
                 if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
                     self.deferred_casts.push((*x, xt, target));
                 } else if matches!((&kx, &kt), (TyKind::Infer(_), TyKind::Ptr(..))) {
@@ -5433,11 +5434,15 @@ impl<'a> Fcx<'a> {
                     let (sa, sb) = (self.shallow(*a), self.shallow(*bt));
                     if (*m1 || !*m2) && sa != sb && !matches!(self.tcx.tys.kind(sb), TyKind::Infer(_) | TyKind::Dyn(..)) {
                         if let Some(derefs) = self.deref_coercion(sa, sb) {
-                            self.set_deref_ref(x.0, derefs, None);
+                            // the derefs are borrowed again as the target, as coerce_to_ref's deref
+                            // coercion ends (`&s as &str`: Deref, Deref(String: Deref), Borrow to `&str`),
+                            // and that borrow is the cast's: no reborrow of the source after it
+                            self.set_deref_ref(x.0, derefs, Some((*m2, target)));
+                            deref_coerced = true;
                         }
                     }
                 }
-                if self.deferred_casts.len() == deferred_before { self.record_cast_borrow(*x, xt, target); }
+                if self.deferred_casts.len() == deferred_before && !deref_coerced { self.record_cast_borrow(*x, xt, target); }
                 target
             }
             ExprKind::Block(b, label) => {
