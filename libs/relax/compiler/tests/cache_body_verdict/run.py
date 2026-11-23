@@ -83,7 +83,10 @@ with tempfile.TemporaryDirectory(prefix='relax-body-verdict-') as tmp:
         text = (root / (tag + '.log')).read_text()
         assert p.returncode == 0, text
         assert f'body-verdict {value + 1}' in text, text
-        rows = (root / f'{tag}.{p.pid}').read_text().splitlines()
+        # (the file is named by the pid of the process that compiles: on macOS `makepad run` runs the
+        # program in a child of its own)
+        rows = [r for c in sorted(root.glob(f'{tag}.*')) if c.suffix[1:].isdigit() for r in c.read_text().splitlines()]
+        assert rows, (tag, sorted(root.iterdir()))
         checked[tag] = [r.split('\t')[5] for r in rows if r.startswith('type\t')]
         print(tag, {name: sum(n.endswith('body_verdict::' + name) for n in checked[tag])
                     for name in ['value', 'dependent']})

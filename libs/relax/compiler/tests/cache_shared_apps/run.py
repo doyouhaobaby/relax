@@ -25,18 +25,21 @@ SCENARIOS = {
     # same fw features, another app: the framework's code is shared
     "share": dict(first="app_a", second="app_c", hit=PLAIN + ["from_macro", "cfg_macro", "gated"]),
     # the first app holds a crate the loader binds (the provided-crate fixture, run from the repository's own workspace),
-    # the second does not: the std code both compile is shared
-    "provided": dict(first="repo:relax-provided-fixture", second="app_b", min_hits=100),
+    # the second does not: the std code both compile is shared. Two workspaces share only a sealed crate's code (std,
+    # outside both), in the shared code folder (`<relax home>/code`), which RELAX_CACHE_DIR turns off: shared_home
+    "provided": dict(first="repo:relax-provided-fixture", second="app_b", min_hits=100, shared_home=True),
     # fw built with feature `fast` by one app, without by the other: what reads the feature is never shared
     "features": dict(first="app_a", second="app_b", compiled=["cfg_macro", "gated"]),
     "body": dict(first="app_a", second="app_a", edits=[E_ADD], hit=[x for x in PLAIN if x != "add"] + ["from_macro"], compiled=["add"], observable=True),
     "macro": dict(first="app_a", second="app_a", edits=[(FW, "mk_fn!(from_macro = 40); // EDIT macro", "mk_fn!(from_macro = 41); // EDIT macro")],
                   hit=PLAIN, compiled=["from_macro"], observable=True),
     "layout": dict(first="app_a", second="app_c", edits=[E_SHAPE], compiled=["area", "describe"]),
-    "std_body": dict(first="app_a", second="app_c", compiled=["sum_from"],
-                     std=("core/iter/mod.rs", "    iter.fold(zero, |a, b| a + b)\n", "    iter.fold(zero, |a, b| b + a)\n")),
+    "std_body": dict(first="app_a", second="app_c", compiled=["prim_traits::sum"],
+                     std=("core/num/prim_traits.rs", "impl Sum for u32 { fn sum<I: Iterator<Item = Self>>(iter: I) -> Self { iter.fold(0, #[rustc_inherit_overflow_checks] |a, b| a + b) } }",
+                          "impl Sum for u32 { fn sum<I: Iterator<Item = Self>>(iter: I) -> Self { iter.fold(0, #[rustc_inherit_overflow_checks] |a, b| b + a) } }")),
     "std_iface": dict(first="app_a", second="app_c", compiled=PLAIN,
-                      std=("core/num/int_impls.rs", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) }", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) + 0 }")),
+                      std=("core/num/int_impls.rs", "            self.wrapping_pow(exp)\n        }\n    }\n    pub const fn abs_diff(self, other: u32) -> u32 ",
+                           "            self.wrapping_pow(exp) + 0\n        }\n    }\n    pub const fn abs_diff(self, other: u32) -> u32 ")),
     # `check` (binds no provided crate) then `run` (binds them) on one cache: the collected image is shared by both
     "check_run": dict(first="app_c", second="app_c", first_cmd="check"),
     "run_check": dict(first="app_c", second="app_c", second_cmd="check"),
@@ -93,7 +96,7 @@ SCENARIOS = {
 MIN_HITS = {}
 
 
-def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run"):
+def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run", shared_home=False):
     if app.startswith("repo:"):
         tree, pkg = REPO, app[5:]
     else:
@@ -101,6 +104,13 @@ def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run"):
     env = dict(os.environ, RELAX_CACHE_DIR=os.path.join(cache, "cache"), RELAX_STD=std, RUSTC_BOOTSTRAP="1",
                RELAX_CACHE_TRACE=os.path.join(cache, tag + ".trace"))
     env.pop("RELAX_CACHE", None)
+    if shared_home:
+        # no RELAX_CACHE_DIR: a private relax home (its shared code folder) under `cache`, and each workspace's
+        # run dir in a target folder of its own there (`<target dir>/relax`)
+        del env["RELAX_CACHE_DIR"]
+        env["RELAX_HOME"] = os.path.join(cache, "home")
+        os.makedirs(env["RELAX_HOME"], 0o700, exist_ok=True)
+        env["CARGO_TARGET_DIR"] = os.path.join(cache, "target-" + ("repo" if app.startswith("repo:") else os.path.basename(tree)))
     env.update(env_extra or {})
     p = subprocess.run([relax, cmd, "--quiet", pkg], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
     out = p.stdout.decode("utf-8", "replace")
@@ -124,7 +134,8 @@ def status(trace, name):
     for slot, whats in trace.items():
         if slot.startswith(("sc_fw::", "sc_mid::", "sc_app_")) and re.search(r"::(" + re.escape(name) + r")(,|$)", slot):
             seen |= whats
-        elif name in ("sum_from",) and re.search(r"::sum_from(,|$)", slot):
+        elif name == "prim_traits::sum" and slot.startswith("core::num::prim_traits::") and re.search(r"::sum(,|$)", slot):
+            # (std_body's std fn: u32's Sum, `core::num::prim_traits::<impl>::sum,<its iterator type>`)
             seen |= whats
     if seen & {"miss", "linkfail", "cert:stale", "cert:undecodable"}:
         return "compiled"
@@ -153,7 +164,7 @@ def scenario(relax, name):
         std = os.path.join(tmp, "std")
         cache = os.path.join(tmp, "c")
         os.mkdir(cache, 0o700)
-        rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"))
+        rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"), sc.get("shared_home", False))
         if rc != 0 or (res1 is None and not first.startswith("repo:") and sc.get("first_cmd", "run") == "run"):
             bad.append(f"first app: exit {rc}, no result\n{out[-600:]}")
         run_tree = tree
@@ -164,10 +175,10 @@ def scenario(relax, name):
             edit_file(os.path.join(run_tree, e[0]), e[1], e[2])
         if sc.get("std"):
             edit_file(os.path.join(std, sc["std"][0]), sc["std"][1], sc["std"][2])
-        rc, res2, out, tr = run(relax, run_tree, std, cache, second, "2-second", sc.get("env2"), cmd2)
+        rc, res2, out, tr = run(relax, run_tree, std, cache, second, "2-second", sc.get("env2"), cmd2, sc.get("shared_home", False))
         ref = os.path.join(tmp, "ref")
         os.mkdir(ref, 0o700)
-        rc0, want, out0, _ = run(relax, run_tree, std, ref, second, "ref", sc.get("env2"), cmd2)
+        rc0, want, out0, _ = run(relax, run_tree, std, ref, second, "ref", sc.get("env2"), cmd2, sc.get("shared_home", False))
         if cmd2 == "check":
             if rc != 0 or "0 errors" not in out:
                 bad.append(f"check on the shared cache: exit {rc}\n{out[-400:]}")

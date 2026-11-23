@@ -1,3 +1,4 @@
+// rustc accepts: an impl's return type refines the trait's `impl Copy + 'a` with `&'b u32`, where 'b: 'a
 #![allow(dead_code, refining_impl_trait)]
 trait Tr {
     fn get<'a, 'b: 'a>(x: &'a u32, y: &'b u32) -> impl Copy + 'a;

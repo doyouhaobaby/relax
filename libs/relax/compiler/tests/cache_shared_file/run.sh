@@ -28,4 +28,6 @@ print("cache_shared_file: " + ("ok" if not bad else "FAILED " + "; ".join(bad)) 
 # the temp dir this script made (mktemp -d), nothing else
 if os.path.dirname(c) and os.path.isdir(c) and not os.path.islink(c) and os.path.basename(c).startswith("tmp."):
     shutil.rmtree(c)
+# (the verdict is the exit status too: a check reads that)
+sys.exit(1 if bad else 0)
 PY
