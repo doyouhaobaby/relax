@@ -252,15 +252,27 @@ pub fn mount_folder(root: &str, folder: &std::path::Path) {
     ANY.store(true, Ordering::Release);
 }
 
+#[inline(always)]
+#[track_caller]
+fn mount_read<T>(table: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    let guard = table.read().unwrap();
+    #[cfg(test)]
+    tests::pause_after_first_mount_read();
+    guard
+}
+
 /// The folder mount whose root is the innermost mount containing `p` (normalized): (root, disk
 /// folder, `p` relative to the root). A store mount inside it wins for its own folder.
 fn folder_mount(p: &str) -> Option<(String, std::path::PathBuf, String)> {
     if !ANY_FOLDER.load(Ordering::Acquire) {
         return None;
     }
-    let folders = FOLDER_MOUNTS.read().unwrap();
+    // MOUNTS before FOLDER_MOUNTS, the order find nests its reads in: opposite orders deadlock
+    // once a writer queues on each (a_folder_mount_is_its_folder_under_another_name).
+    let mounts = mount_read(&MOUNTS);
+    let folders = mount_read(&FOLDER_MOUNTS);
     let (root, dir, rel) = folders.iter().find_map(|(r, d)| relative(p, r).map(|rel| (r, d, rel)))?;
-    if MOUNTS.read().unwrap().iter().any(|m| m.root.len() > root.len() && relative(p, &m.root).is_some()) {
+    if mounts.iter().any(|m| m.root.len() > root.len() && relative(p, &m.root).is_some()) {
         return None;
     }
     Some((root.clone(), dir.clone(), rel.to_string()))
@@ -475,10 +487,10 @@ fn relative<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 /// A path whose innermost mount is a folder mount has none ([`folder_path`]).
 fn find(path: &str) -> Option<(Arc<Mount>, String)> {
     let p = normalize_path(path);
-    let m = MOUNTS.read().unwrap();
+    let m = mount_read(&MOUNTS);
     for mount in m.iter() {
         if let Some(rest) = relative(&p, &mount.root) {
-            if ANY_FOLDER.load(Ordering::Acquire) && FOLDER_MOUNTS.read().unwrap().iter().any(|(r, _)| r.len() > mount.root.len() && relative(&p, r).is_some()) {
+            if ANY_FOLDER.load(Ordering::Acquire) && mount_read(&FOLDER_MOUNTS).iter().any(|(r, _)| r.len() > mount.root.len() && relative(&p, r).is_some()) {
                 return None;
             }
             return Some((mount.clone(), rest.to_string()));
@@ -1910,10 +1922,31 @@ mod test_store;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, sync::mpsc, thread, time::{Duration, Instant}};
 
     /// The mounts' outermost root and the edits folder are process state: the tests that set
     /// them run one at a time.
     static EDITS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        static FIRST_MOUNT_READ: Cell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn pause_after_first_mount_read() {
+        if let Some((held, release)) = FIRST_MOUNT_READ.with(Cell::take) {
+            held.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
+
+    fn paused_mount_lookup(held: mpsc::Sender<()>, lookup: impl FnOnce() + Send + 'static) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (release, wait) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            FIRST_MOUNT_READ.with(|p| p.set(Some((held, wait))));
+            lookup();
+        });
+        (release, reader)
+    }
 
     /// A held landing's files read as they were before it: changed, removed (still there) and
     /// added (not there yet) alike, through every read; the live watch reads them as they are; a
@@ -2150,6 +2183,17 @@ mod tests {
     /// dependency's `src/lib.rs` from the checkout's).
     #[test]
     fn a_folder_mount_is_its_folder_under_another_name() {
+        // If the readers deadlock, leave their threads in this test's process so the
+        // remaining VFS tests can still use both mount tables.
+        const CHILD: &str = "RELAX_VFS_MOUNT_ORDER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "vfs::tests::a_folder_mount_is_its_folder_under_another_name", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed"),
+                "folder mount test failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        }
         let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("relax-vfs-folder-{}", std::process::id()));
         let checkout = base.join("checkout");
@@ -2207,9 +2251,62 @@ mod tests {
         mount_text(&format!("{other}\t{}\tdir\n", checkout.display())).unwrap();
         assert_eq!(read_to_string(format!("{other}/Cargo.toml")).unwrap(), "[package]", "the table's text mounts it again");
 
+        let writer_root = format!("{other}/extra");
+        {
+            const DEADLOCK: &str = "deadlock: folder_mount and find took MOUNTS and FOLDER_MOUNTS in opposite orders";
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let remaining = || deadline.saturating_duration_since(Instant::now());
+            let wait_tick = || {
+                let left = remaining();
+                assert!(!left.is_zero(), "{DEADLOCK}");
+                thread::sleep(Duration::from_millis(2).min(left));
+            };
+            let (ready, reached) = mpsc::channel();
+            let wait_ready = || reached.recv_timeout(remaining()).expect(DEADLOCK);
+
+            let (release_a, a) = paused_mount_lookup(ready.clone(), move || {
+                assert_eq!(folder_mount(&lib).unwrap().2, "src/lib.rs");
+            });
+            wait_ready();
+            let nested_file = format!("{inner_root}/src/lib.rs");
+            let (release_b, b) = paused_mount_lookup(ready.clone(), move || {
+                assert_eq!(find(&nested_file).unwrap().1, "src/lib.rs");
+            });
+            wait_ready();
+            // Both readers should hold MOUNTS. Keep the folder writer queued even in
+            // that case. With the old order A itself holds FOLDER_MOUNTS for read.
+            let mounts_first = FOLDER_MOUNTS.try_write().is_ok();
+            let folders = FOLDER_MOUNTS.read().unwrap();
+            let (store_root, store, commit) = (dep_root.clone(), dep.store.clone(), dep.commit);
+            let mounting = ready.clone();
+            let c = thread::spawn(move || {
+                mounting.send(()).unwrap();
+                mount(&store_root, store, &commit).unwrap();
+            });
+            let folder_root = writer_root.clone();
+            let d = thread::spawn(move || {
+                ready.send(()).unwrap();
+                mount_folder(&folder_root, &checkout);
+            });
+            wait_ready();
+            wait_ready();
+            thread::sleep(Duration::from_millis(50).min(remaining()));
+            // Each table still has a reader, so a refused read here observes a queued
+            // writer. A descheduled writer cannot let the old order slip through.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            while MOUNTS.try_read().is_ok() || FOLDER_MOUNTS.try_read().is_ok() { wait_tick(); }
+            drop(folders);
+            release_a.send(()).unwrap();
+            release_b.send(()).unwrap();
+
+            let workers = [a, b, c, d];
+            while !workers.iter().all(thread::JoinHandle::is_finished) { wait_tick(); }
+            for worker in workers { worker.join().unwrap(); }
+            assert!(mounts_first, "both readers must take MOUNTS first even if the backend admits a reader past a queued writer");
+        }
         MOUNTS.write().unwrap().retain(|m| m.root != dep_root && m.root != inner_root);
         let mut folders = FOLDER_MOUNTS.write().unwrap();
-        folders.retain(|(r, _)| *r != root && *r != other);
+        folders.retain(|(r, _)| *r != root && *r != other && *r != writer_root);
         if folders.is_empty() {
             ANY_FOLDER.store(false, Ordering::Release);
         }
