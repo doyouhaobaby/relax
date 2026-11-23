@@ -9818,13 +9818,13 @@ impl Unit {
         // `makepad run --check-first`: a body's first code is installed only once its checker
         // accepts it (a live patch, gen > 0, passed reload's gate instead). Off by default:
         // Gandalf checks lazily in the background and the JIT never waits for it.
-        if gen == 0 && CHECK_FIRST.load(Ordering::Relaxed) && !self.fns[id as usize].compiled {
+        if gen == 0 && !self.fns[id as usize].compiled {
             if let Some(e) = self.refused_by_check(id) {
                 return Ok(unsafe { install_error(self, id, &e) });
             }
             // D3: code lowered before the verdict lacks its run-time disjoint-index checks: it runs
             // as unverified code and is built again with them
-            if !self.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && self.disjoint_checks(id).is_some() {
+            if CHECK_FIRST.load(Ordering::Relaxed) && !self.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && self.disjoint_checks(id).is_some() {
                 self.fns[id as usize].unverified.store(true, Ordering::Relaxed);
                 note_unverified(self, id);
                 self.fns[id as usize].rir = None;
@@ -9841,10 +9841,18 @@ impl Unit {
     /// checker rejects, whatever the background checker reached. Some(error) refuses it: the
     /// errors are printed here and the slot gets the error stub (the call ends the run).
     fn refused_by_check(&mut self, id: u32) -> Option<String> {
-        let events = self.check_first_events(id);
-        let first = events.first()?;
-        for ev in &events { eprintln!("{}", ev.error.render()); }
-        Some(format!("{} (the borrow checker rejects this body, so Relax does not execute it)", first.error.one_line()))
+        let error = if CHECK_FIRST.load(Ordering::Relaxed) {
+            let events = self.check_first_events(id);
+            let first = events.first()?;
+            for ev in &events { eprintln!("{}", ev.error.render()); }
+            first.error.one_line()
+        } else {
+            // The background check never blocks an install, but a known escaping stack borrow
+            // cannot safely be used to construct or call a closure.
+            let Verdict::Failed(events) = self.verdict_state(id) else { return None };
+            events.iter().find(|event| event.error.code == "E0373")?.error.one_line()
+        };
+        Some(format!("{error} (the borrow checker rejects this body, so Relax does not execute it)"))
     }
 
     /// `--check-first`: slot `id`'s owner checked now (or its verdict from this run / the disk cache); the
@@ -11880,7 +11888,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     let fresh = record;
     // check-before-run (Unit::install), before the code is recorded: a refused body's code
     // never reaches the disk cache or the startup image (a warm start would run it unchecked)
-    if CHECK_FIRST.load(Ordering::Relaxed) && (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
+    if (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
         if let Some(e) = (&mut *up).refused_by_check(id) {
             return install_error(up, id, &e);
         }
