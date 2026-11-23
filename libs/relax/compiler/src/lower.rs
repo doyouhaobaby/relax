@@ -11413,10 +11413,21 @@ impl<'a> Lcx<'a> {
 
     fn may_hold_pointer(&mut self, t: TyId, depth: u32) -> bool {
         match self.kind_ref(t).clone() {
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str => false,
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str | TyKind::FnDef(..) => false,
             TyKind::Tuple(v) => {
                 let items: Vec<TyId> = self.u.tcx.tys.list(v).to_vec();
                 items.into_iter().any(|x| self.may_hold_pointer(x, depth + 1))
+            }
+            // a closure holds what it captures: a capture-less one (`|x| *x ^ 5` handed to
+            // sort_by_key) holds nothing, so a `&mut [T]` beside it is no aliasing pair. (Counted
+            // as a pointer, a slice's sort from unverified code went to its twin.) A coroutine's
+            // state is not walked here
+            TyKind::Closure(file, ce, _) if depth < 4 && !self.u.tcx.coroutines.contains(&(file, ce)) => {
+                if self.layout(t).size == 0 {
+                    return false;
+                }
+                let fields = self.u.closure_storage(t).fields.clone();
+                fields.into_iter().any(|f| self.may_hold_pointer(f, depth + 1))
             }
             TyKind::Array(e, _) => depth < 4 && self.may_hold_pointer(e, depth + 1),
             TyKind::Adt(d, args, _) if depth < 4 => {

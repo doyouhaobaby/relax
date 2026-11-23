@@ -2246,7 +2246,7 @@ unsafe fn manifest_install_allowed(up: *mut Unit) -> bool {
 /// link is the preemption grain; a batch gives the owner back as soon as main queues a request,
 /// after a link once another thread's request waits (owner::request_waiting) and SEED_BATCH_NS
 /// after it began, as the record batches do (record_cache_batch). Given back to main only, a warm
-/// Fab's batches linked 17-28 k slots in 0.7-1.0 s each: an app pool thread's lazy call waited
+/// launch of a large app linked 17-28 k slots a batch in 0.7-1.0 s each: an app pool thread's lazy call waited
 /// for all of it, and every background publish (the O3 takes, the startup's) with it.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     // Verify mode compiles what it checks, and an edited program's identities are not the

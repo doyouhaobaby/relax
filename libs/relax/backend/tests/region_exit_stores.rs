@@ -8,7 +8,7 @@
 //! a select reading the value in the region reads the register (no slot read). So does an empty
 //! region block's branch on `t = d + 1`, which no register holds (it is rebuilt from d where it is
 //! read): the emitters read an empty block's terminator at the block's start, before the region's
-//! window begins, so d came from its stale slot (Fab's arachne `gaps` at O3: `cap + 1 < cap`, the
+//! window begins, so d came from its stale slot (an app's slicer `gaps` at O3: `cap + 1 < cap`, the
 //! overflow check of `self.cap + 1`, rebuilt from cap's slot, a false overflow panic); they now read
 //! it at the terminator's regalloc position. The allocation checker runs on every compile, and
 //! results must equal Rust's.
