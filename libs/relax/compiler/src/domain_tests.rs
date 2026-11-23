@@ -48,9 +48,13 @@ fn fixture() -> (Box<Unit>, u64, std::path::PathBuf) {
 }
 
 fn fixture_of(source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::PathBuf) {
+    fixture_in("fixture.rs", source, entry_name)
+}
+
+fn fixture_in(file_name: &str, source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("relax-domain-teardown-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("fixture.rs");
+    let path = root.join(file_name);
     std::fs::write(&path, source).unwrap();
     // the std sources of this checkout (as lazy_reload_tests.rs does: a test binary is not next to them)
     std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
@@ -223,6 +227,74 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     domains().retain(|d| d.info.id != domain && d.info.id != replacement);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_live_domain_only_receives_its_units_statics() {
+    isolated_test!(a_live_domain_only_receives_its_units_statics);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(r#"
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FIRST: AtomicU64 = AtomicU64::new(0);
+        static SECOND: AtomicU64 = AtomicU64::new(0);
+        fn app_entry(p: *mut u64) {
+            let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+            FIRST.store(17, Ordering::SeqCst);
+            SECOND.store(31, Ordering::SeqCst);
+            flags[3].store(&FIRST as *const AtomicU64 as u64, Ordering::SeqCst);
+            flags[0].store(1, Ordering::SeqCst);
+            while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+            let intact = FIRST.load(Ordering::SeqCst) == 17 && SECOND.load(Ordering::SeqCst) == 31;
+            flags[2].store(if intact { 1 } else { 2 }, Ordering::SeqCst);
+        }
+    "#, "app_entry");
+    let flags = [const { AtomicU64::new(0) }; 4];
+    let (domain, base, main) = launch(&mut u, entry, None, &flags);
+    let mut auxiliary = None;
+    // Even a failed image check must release and join the app before its flags or unit go away.
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait(|| flags[0].load(Ordering::SeqCst) != 0 || main.is_finished());
+        assert_eq!(flags[0].load(Ordering::SeqCst), 1, "app exited before publishing its static");
+        assert!((base..base + BLOCK_SIZE as u64).contains(&flags[3].load(Ordering::SeqCst)), "app static outside its live block");
+
+        const MARKER: u64 = 0x2222_2222_2222_2222;
+        let (unit, other_entry, _) = fixture_in("other.rs", r#"
+            static MARKER: [u64; 2] = [0x2222_2222_2222_2222; 2];
+            fn marker_address(p: *mut u64) { unsafe { *p = &MARKER as *const [u64; 2] as u64; } }
+        "#, "marker_address");
+        let other = auxiliary.insert(unit).as_mut();
+        other.aux = true;
+        other.tier1 = None;
+        let dom0 = other.syms.dom0();
+        let mut addr = 0u64;
+        unsafe { crate::jit::call_jit(other, other_entry, &mut addr as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        assert!((dom0..=dom0 + BLOCK_SIZE as u64 - 8).contains(&addr), "auxiliary static outside its compile domain");
+        assert_eq!(unsafe { (addr as *const u64).read_unaligned() }, MARKER, "auxiliary static's initial image");
+
+        // Pin the mapping for these reads even if the app faults during its wait.
+        let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(blocks.iter().any(|&(b, _)| b == base), "app block reclaimed during the auxiliary call");
+        let at = base + (addr - dom0);
+        assert_ne!(unsafe { (at as *const u64).read_unaligned() }, MARKER, "auxiliary static copied to its offset in the app");
+        let prefix = unsafe { std::slice::from_raw_parts(base as *const u8, 32 * 1024) };
+        assert!(!prefix.windows(8).any(|word| word == MARKER.to_ne_bytes()), "auxiliary static found in the app's first 32 KiB");
+        drop(blocks);
+
+        flags[1].store(1, Ordering::SeqCst);
+        wait(|| flags[2].load(Ordering::SeqCst) != 0 || main.is_finished());
+        assert_eq!(flags[2].load(Ordering::SeqCst), 1, "the app's statics changed while it waited");
+    }));
+    if checked.is_err() { flags[1].store(1, Ordering::SeqCst); }
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert!(!blocks().contains(&base));
+    domains().retain(|d| d.info.id != domain);
+    if let Some(mut other) = auxiliary {
+        unsafe { crate::jit::retire_unit(&mut *other) };
+    }
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+    if let Err(p) = checked { std::panic::resume_unwind(p); }
 }
 
 // The CPU budget's source and an app whose task pool lives in a static (tests/static_pool/pool.rs).

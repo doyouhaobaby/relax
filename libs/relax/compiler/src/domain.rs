@@ -18,7 +18,7 @@
 //!   data) are rebased, words that point into shared read-only data stay. The attribution of
 //!   words and the image bytes are the sandbox's (`sandbox::provenance_words`, `initial_bytes`):
 //!   the same "one data image, pointers relocated per copy" machinery, a second client.
-//! - A static laid out after a domain exists is copied into every live block (`materialize`).
+//! - A late static is copied into the live blocks that use its unit's layout (`materialize`).
 //! - Threads: a thread JIT code starts inherits its parent's base (std's thread start calls
 //!   `relax_domain_base` / `relax_domain_enter`); `call_jit` runs in the unit's domain 0; a
 //!   thread that native code starts gets the runtime unit's compile domain from `rt_tls_block`,
@@ -163,8 +163,9 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     new
 }
 
-/// Blocks of the domains other than the compile domain, by base.
-static BLOCKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Each block made by `create` and its creating unit's compile-domain base. Only that unit's
+/// symbols describe the statics at offsets in the block.
+static BLOCKS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Bytes of a domain block (the unit's writable region; a block is address space until touched).
 pub const BLOCK_SIZE: usize = crate::jit::UNIT_RW_SIZE as usize;
@@ -555,7 +556,7 @@ pub fn create(u: &Unit) -> u64 {
     }
     {
         let _kept = crate::zone_alloc::kept();
-        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((base, u.syms.dom0()));
     }
     base
 }
@@ -566,22 +567,24 @@ pub fn destroy(base: u64) {
         let _ = sc.base.compare_exchange(base, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
     }
     forget_tls_keys(base);
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| *b != base);
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(b, _)| b != base);
     if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
-/// A static was just laid out (jit.rs `static_addr`, after its initial image was captured): copy
-/// it into the live blocks. No other domain: nothing to do.
+/// Copies a newly captured image into this unit's live blocks. Another unit can have an
+/// unrelated static at the same offset, including while a live edit runs its proc macros.
 pub(crate) fn materialize(u: &Unit, sym: Sym) {
     let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    for &base in blocks.iter() {
-        materialize_in(u, base, sym.id, &mut HashSet::new());
+    for &(base, owner) in blocks.iter() {
+        if owner == u.syms.dom0() {
+            materialize_in(u, base, sym.id, &mut HashSet::new());
+        }
     }
 }
 
 /// The live blocks other than domain 0 (tests, inspect).
 pub fn blocks() -> Vec<u64> {
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(base, _)| base).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
