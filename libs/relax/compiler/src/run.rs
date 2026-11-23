@@ -2512,7 +2512,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         verbose!("relax collected: verified restored graph against rebuilt graph");
     }
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
-    if !enum_errors.is_empty() {
+    // The test check reports a failed discriminant with its other item errors, as rustc carries on past it.
+    if test_subjects.is_empty() && !enum_errors.is_empty() {
         for error in enum_errors {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&error, "typeck")); }
             eprintln!("error: {}", error);
@@ -2579,6 +2580,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (`{tool} test` fails as `cargo test` does on code rustc rejects; if `cargo test` builds it, this is a Relax bug)",
                 names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "), n, if n == 1 { "" } else { "s" }, tool = crate::tool_name());
             return 101;
+        }
+        // A stored clean verdict skips the item checks, but the tests still need the discriminant values.
+        if !enum_errors.is_empty() {
+            for error in enum_errors {
+                if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&error, "typeck")); }
+                eprintln!("error: {}", error);
+            }
+            return 1;
         }
         if !self_exec {
             let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();

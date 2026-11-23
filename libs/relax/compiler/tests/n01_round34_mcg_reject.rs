@@ -1,4 +1,9 @@
 // rejects: E0770
+// rejects: E0747
+// rejects: E0308
+// (rustc: E0747 "unresolved item provided when a constant was expected" at `id::<N>()`, the N of a
+// const operation resolving to an error; E0308 at the default "bad" of a u8 const parameter, whose
+// anonymous constant is type-checked as a body owner. A failed discriminant (`E`) stops neither.)
 #![allow(dead_code)]
 struct A<const N: usize>;
 fn arithmetic<const N: usize>() -> [u8; N + 1] { loop {} }
