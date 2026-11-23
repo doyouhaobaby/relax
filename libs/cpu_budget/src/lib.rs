@@ -145,8 +145,8 @@ struct State {
     last_window: u64,
 }
 /// The span the person's demand on the cores is averaged over (`Budget::roll`). A live run's packs
-/// start and end at its round rate (about 1.7 thousand rounds a second in Fab's drum machine), so an
-/// instant reads 0 or 3 tokens by chance; a tenth of a second holds a few hundred rounds. The
+/// start and end at its round rate (about 1.7 thousand rounds a second in a live audio simulation),
+/// so an instant reads 0 or 3 tokens by chance; a tenth of a second holds a few hundred rounds. The
 /// reading is the larger of the last two spans: work that starts counts within one span, work that
 /// ended leaves after two. A wrong reading only places a build on the other kind of core.
 const DEMAND_SPAN_NS: u64 = 100_000_000;
@@ -883,8 +883,8 @@ pub fn limit() -> u32 { global().limit as u32 }
 /// that share for its steady work, at most [`cores`]; else [`cores`] ([`granted_cores`] says which
 /// variable sizes what). A pool's threads stay for the whole run, while a compile burst (the JIT's,
 /// at a launch) is short and is what an interactive launch waits on: devhub gives a live test
-/// session's pools its call's charge and leaves the budget, and so the JIT, the box. A live Fab
-/// test's app pool and CSG pool each took the box's 16 cores beside the JIT's workers while the
+/// session's pools its call's charge and leaves the budget, and so the JIT, the box. A live app
+/// test's app pool and geometry pool each took the box's 16 cores beside the JIT's workers while the
 /// budget counted it a small ask, and its box stood at load 57 (11-18). Read on each call: a
 /// pool reads it once, at its start.
 pub fn pool_cores() -> u32 {
