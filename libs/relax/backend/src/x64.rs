@@ -1975,8 +1975,7 @@ impl<'a> Gen<'a> {
             self.last_spill = None;
             self.last_alu = None;
             self.r11_base = None;
-            // window lookups of this block never see the previous block's last position (an empty
-            // block's terminator reads at its start: no window there, the slot is read)
+            // window lookups of this block never see the previous block's last position
             self.cur_pos = self.al.block_start[bi];
             self.sel_flags = None;
             for (ii, inst) in b.insts.iter().enumerate().take(ne) {
@@ -2090,6 +2089,13 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+            }
+            // an empty block's terminator reads where regalloc puts terminator uses (block_end - 1),
+            // where a region's window entered live starts: read at the block's start, a value the
+            // region holds in a register came from its slot, stale where the region skips its
+            // stores (Fab's arachne `gaps` at O3: `cap + 1 < cap` rebuilt from cap's slot)
+            if b.insts.is_empty() {
+                self.cur_pos = self.al.block_end[bi] - 1;
             }
             self.term(options, &b.term, bi, bcmp);
         }

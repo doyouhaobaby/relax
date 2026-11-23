@@ -1510,8 +1510,7 @@ impl<'a> Gen<'a> {
             // nor flags: the previous block's terminator (a fused cmp + b.cond) or another
             // predecessor set them, not the compare a select chain was started for
             self.sel_chain = None;
-            // window lookups of this block never see the previous block's last position (an empty
-            // block's terminator reads at its start: no window there, the slot is read)
+            // window lookups of this block never see the previous block's last position
             self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
@@ -1683,6 +1682,13 @@ impl<'a> Gen<'a> {
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
             if self.rir_map_on {
                 self.rir_map.push(((self.a.pos() * 4) as u32, bi as u32, u32::MAX));
+            }
+            // an empty block's terminator reads where regalloc puts terminator uses (block_end - 1),
+            // where a region's window entered live starts: read at the block's start, a value the
+            // region holds in a register came from its slot, stale where the region skips its
+            // stores
+            if b.insts.is_empty() {
+                self.cur_pos = self.al.block_end[bi] - 1;
             }
             self.term(&b.term, bi, bcmp);
         }
