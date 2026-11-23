@@ -497,3 +497,171 @@ fn joined_body_unwind_uses_each_functions_frame() {
         assert_eq!(tables.saved_regs_at(p), Some((p, vec![12, 0x108])), "P's register saves and base");
     }
 }
+
+#[test]
+fn joined_bodies_unwind_once_and_show_the_parts_locals() {
+    const PHASE: &str = "RELAX_JOINED_BODY_PHASE";
+    const DIR: &str = "RELAX_JOINED_BODY_DIR";
+    const PROGRAM: &str = r#"
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+static DROPS: AtomicU32 = AtomicU32::new(0);
+struct D<F: Fn()>(u32, F);
+impl<F: Fn()> Drop for D<F> { fn drop(&mut self) { (self.1)(); DROPS.fetch_add(self.0, SeqCst); } }
+#[inline(never)]
+pub fn outlined_leaf(n: u32) -> u32 {
+    let seen = n * 3 + 1;
+    // Both locals are still needed when the panic unwinds this frame.
+    let _d = D(10, || { std::hint::black_box((&n, &seen)); });
+    if n > 2 { panic!("outlined_leaf panics") }
+    seen
+}
+#[inline(never)]
+pub fn outlined_host(n: u32) -> u32 { let _d = D(1, || {}); outlined_leaf(n) + 1 }
+pub fn normal(out: &mut [u32; 2]) {
+    out[0] = outlined_host(1);
+    out[1] = DROPS.load(SeqCst);
+}
+pub fn panicking(out: &mut [u32; 2]) {
+    out[0] = std::thread::spawn(|| outlined_host(7)).join().is_err() as u32;
+    out[1] = DROPS.load(SeqCst);
+}
+"#;
+    let Ok(phase) = std::env::var(PHASE) else {
+        let dir = std::env::temp_dir().join(format!("relax-joined-body-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), PROGRAM).unwrap();
+        for phase in ["control", "cold", "warm", "image"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "jit::inspect_tiers_tests::joined_bodies_unwind_once_and_show_the_parts_locals", "--nocapture", "--test-threads=1"])
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_CACHE_DIR", dir.join(if phase == "control" { "control" } else { "cache" }))
+                .env("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std")).env("RELAX_PANIC_PARK", "0");
+            if phase == "control" {
+                child.env_remove("RELAX_OUTLINE_WHOLE");
+            } else {
+                child.env("RELAX_OUTLINE_WHOLE", "outlined_leaf,outlined_host").env_remove("RELAX_INSPECT")
+                    .env("RELAX_FLIGHTREC", "0").env("RELAX_PANIC_PARK", "600").env("RELAX_EXPECTED_CRASH", "the joined body test inspects and releases its park");
+            }
+            let start = std::time::Instant::now();
+            let out = crate::test_child::output(&mut child);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            eprintln!("joined bodies {phase}: {:.2?}", start.elapsed());
+            assert!(out.status.success() && stdout.contains("1 passed"), "{phase} ({}): {stdout}\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::borrowck::lazy::disable_gandalf();
+    let path = std::path::PathBuf::from(std::env::var_os(DIR).unwrap()).join("lib.rs");
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "joined_body", false).unwrap();
+    let def = |name| (0..prog.defs.len() as u32).map(DefId).find(|&d| prog.def(d).krate == krate && prog.name(d) == name).unwrap();
+    let [leaf, host, normal, panicking] = ["outlined_leaf", "outlined_host", "normal", "panicking"].map(def);
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (ids, [normal, panicking]) = crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        if phase == "image" {
+            cache.load_manifest(krate);
+            assert!(cache.has_startup_image(), "the cold run wrote a startup image");
+        }
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        let ids = [leaf, host].map(|d| u.fn_id(FnKey::Inst(d, vec![])));
+        (ids, [normal, panicking].map(|d| u.entry(u.fn_id(FnKey::Inst(d, vec![])))))
+    });
+    if phase == "image" {
+        assert!(unsafe { prelink_startup(up) } >= ids.len(), "startup image placed before the first call");
+    }
+    let mut out = [0u32; 2];
+    unsafe { call_jit(up, normal, out.as_mut_ptr() as u64) }.map_err(|p| p.message).unwrap();
+    assert_eq!(out, [5, 11], "{phase}: return and normal drops");
+    // Releasing a watched panic can instrument its leaf for the next restart. Inspect the
+    // installs that will run, and identify that same leaf by its body start at the park.
+    let starts = crate::owner::call(crate::owner::Class::Program, || ids.map(|id| u.fns[id as usize].code));
+    let origin = match phase.as_str() { "warm" => "warm-cache", "image" => "warm-image", _ => "fresh" };
+    for ((id, start), name) in ids.into_iter().zip(starts).zip(["outlined_leaf", "outlined_host"]) {
+        assert_eq!(codever::kind_at(&u, start).origin_name(), origin, "{phase}: {}", name);
+        let tables = u.code.read().unwrap();
+        let (_, len, slot) = tables.entry_at(start).expect("installed code");
+        assert_eq!(slot, id);
+        assert_eq!(tables.version_of(start).map(|(v, n, _)| (v, n)), Some((1, 1)), "{phase}: {}", name);
+        let end = start + u64::from(len);
+        let base = tables.function_base(start, end - 1);
+        assert_eq!(base != start, phase != "control", "{phase}: {} part in code tables", name);
+        let mut frames: Vec<_> = tables.unwind.keys().copied().chain(tables.image_unwind.iter().map(|t| t.0))
+            .filter(|a| (start..end).contains(a)).collect();
+        frames.sort_unstable();
+        if phase == "control" {
+            assert_eq!(frames, [start], "{} has only its host unwind trailer", name);
+        } else {
+            assert_eq!(frames, [start, base], "{} has both unwind trailers", name);
+            assert_eq!(tables.function_base(start, base - 1), start);
+            assert_eq!(tables.function_base(start, base), base);
+            assert_eq!(tables.entry_at(base), Some((start, len, id)));
+        }
+    }
+    // Snapshot those same installs for disk and image before the inspector can replace one.
+    if phase == "cold" {
+        crate::owner::call(crate::owner::Class::Program, || {
+            u.flush_cache_records();
+            let mut cache = u.cache.take().unwrap();
+            assert!(cache.record_manifest(&u, krate, &ids, ids.len(), &|| false), "record the two functions in the startup image");
+            u.cache = Some(cache);
+        });
+    }
+    fn parked_leaf(u: &Unit, leaf_start: u64, regs: &[u64]) -> Result<[u32; 2], String> {
+        use crate::inspect::vars;
+        let stop = vars::Stop::from_block(u, regs).ok_or("short parked register block")?;
+        let frame = {
+            let tables = u.code.read().unwrap();
+            stop.frames.iter().position(|&(pc, _)| tables.entry_at(pc).is_some_and(|(start, _, _)| start == leaf_start && tables.function_base(start, pc) != start))
+        }.ok_or("parked stack has no frame in outlined_leaf's part")?;
+        let levels = vars::levels(u, &stop, Some(frame));
+        let level = levels.iter().flat_map(|(_, levels)| levels).find(|l| l.inlined_into.is_none() && l.name.ends_with("outlined_leaf"))
+            .ok_or("no root level for outlined_leaf's part")?;
+        let read = |name| {
+            let local = level.locals.iter().find(|l| l.name == name).ok_or_else(|| format!("missing {name}"))?;
+            match &local.got {
+                vars::Got::Bytes(b, _) => b.as_slice().try_into().map(u32::from_le_bytes).map_err(|_| format!("{name}: expected u32")),
+                vars::Got::No(why) => Err(format!("{name}: {why}")),
+            }
+        };
+        Ok([read("seen")?, read("n")?])
+    }
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let addr = up as usize;
+    let watcher = (phase != "control").then(|| {
+        crate::inspect::start("joined_body");
+        std::thread::spawn(move || {
+            use crate::inspect::events;
+            let mut seen = Vec::new();
+            loop {
+                for (id, _, _, message, _) in events::parked_now() {
+                    if seen.iter().any(|(k, _, _)| *k == id) { continue; }
+                    let values = events::parked_regs(Some(id)).ok_or("missing parked registers".to_string()).and_then(|(_, regs)| {
+                        crate::owner::call(crate::owner::Class::Program, || parked_leaf(unsafe { &*(addr as *const Unit) }, starts[0], &regs))
+                    });
+                    seen.push((id, message, values));
+                    events::quit_releases();
+                }
+                if finished.recv_timeout(std::time::Duration::from_millis(2)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) { break; }
+            }
+            seen
+        })
+    });
+    let ran = unsafe { call_jit(up, panicking, out.as_mut_ptr() as u64) };
+    drop(done);
+    if let Some(watcher) = watcher {
+        let seen = watcher.join().unwrap();
+        assert_eq!(seen.len(), 1, "{phase}: one park: {seen:?}");
+        assert!(seen[0].1.contains("outlined_leaf panics"), "{phase}: {seen:?}");
+        assert_eq!(seen[0].2, Ok([22, 7]), "{phase}: seen and n in the leaf's part");
+    }
+    ran.map_err(|p| p.message).unwrap();
+    assert_eq!(out, [1, 22], "{phase}: join returned the panic and unwinding added exactly 11 drops");
+    if phase == "cold" {
+        crate::owner::call(crate::owner::Class::Program, || u.cache.as_mut().unwrap().flush().unwrap());
+    }
+    std::mem::forget(u);
+}
