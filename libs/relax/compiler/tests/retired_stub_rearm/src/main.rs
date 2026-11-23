@@ -7,7 +7,7 @@
 
 const LUKE_MS: u64 = 7000;
 /// the hot phase's end when no O3 code comes (a failure): run.sh stops it as soon as it does
-const HOT_MS: u64 = 30_000;
+const HOT_MS: u64 = 10_000;
 
 #[inline(never)]
 fn work(x: u64) -> u64 {

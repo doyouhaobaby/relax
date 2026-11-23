@@ -23621,9 +23621,27 @@ fn pgo_poll_at(now: u64) {
     }
     for (id, rate, counters, weights) in ready {
         // its counted code runs on until the O3 build: the work its counts show goes into the
-        // record, the queue's heat (profiled_heat), from a window's worth at the window's rate
+        // record, the queue's heat, a window's worth at the window's rate now and the rest as it
+        // comes (profiled_heat). Left to profiled_heat's next look, the window's worth came after
+        // the pick when an idle worker took the entry at once: the pick read the record as the
+        // slot's calls had left it, under the bar while its counted code ran hot, parked the slot
+        // as cold code, and each next window queued it for the same pick again (a hot loop's
+        // callee that had been lukewarm never reached O3)
         let total = counters.iter().zip(weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
-        let work = total.saturating_sub(rate.saturating_mul(PGO_MS) / 1000);
+        let window = rate.saturating_mul(PGO_MS) / 1000;
+        let mut work = total.saturating_sub(window);
+        if let Some((u, _)) = heat_unit() {
+            if (id as usize) < u.fns.len() {
+                unsafe {
+                    let rec = tier_rec(&u.slots, id);
+                    // (as profiled_heat: only a queued slot's record is the queue's heat)
+                    if (*rec.add(3)).load(Ordering::Acquire) == T_QUEUED {
+                        tier_charge(rec, (total - work) / WORK_PER_UNIT);
+                        work = total;
+                    }
+                }
+            }
+        }
         crate::zone_alloc::kept_with(|| PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).push(ProfiledHeat { id, counters, weights, work }));
         tier_push(id, Q_PROFILED, rate);
     }
