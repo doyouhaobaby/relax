@@ -1342,7 +1342,9 @@ pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -
             tls_dtor(os::tls::get(tls_key()));
             set_tls_block(self.0 as *mut u8);
             os::tls::static_tls_swap(&mut self.1);
-            crate::domain::enter(unsafe { *(self.0 as *const u64) });
+            // back in the worker's domain, and its heap: only selected, as it was (entering
+            // would register the worker there for the rest of its life)
+            crate::domain::select(unsafe { *(self.0 as *const u64) });
         }
     }
     set_tls_block(std::ptr::null_mut());

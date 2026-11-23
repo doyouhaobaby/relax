@@ -2024,6 +2024,33 @@ mod tests {
     use crate::jit::FnKey;
     use crate::program::DefId;
 
+    /// A host worker's call into a domain (Callback::call, jit::domain_callback) runs on a block
+    /// and a registration of its own; after it the worker is back in the domain it was in, with
+    /// no registration there it did not have and none left in the domain it called.
+    #[test]
+    fn a_host_callback_leaves_the_worker_as_it_found_it() {
+        isolated_test!(a_host_callback_leaves_the_worker_as_it_found_it);
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (0x7100_0000u64, 0x7200_0000u64);
+        // two running domains, booted on threads that end; b is an app domain (id 0 calls direct)
+        for (name, base) in [("a", a), ("b", b)] {
+            std::thread::spawn(move || register_boot(name, base)).join().unwrap();
+        }
+        domains().iter_mut().find(|d| d.info.base == b).unwrap().info.id = 7;
+        std::thread::spawn(move || {
+            let registered = |base: u64| unsafe { crate::domain_threads::data(crate::jit::tls_block()) }.registrations.iter().any(|r| r.0 == base);
+            select(b);
+            let into_b = callback().expect("b is a running domain");
+            // the worker is in a, which it only selected (a native worker's domain)
+            select(a);
+            assert_eq!(into_b.call(current), Some(b), "the call runs in b");
+            assert_eq!(current(), a, "the worker is back in a");
+            assert!(!registered(a), "the call's return registered the worker in a");
+            assert!(!registered(b) && threads_besides(b, 0).is_empty(), "the call's registration in b ended with it");
+        }).join().unwrap();
+        domains().retain(|d| d.info.base != a && d.info.base != b);
+    }
+
     #[test]
     fn initializer_scopes_only_retire_their_own_registration() {
         isolated_test!(initializer_scopes_only_retire_their_own_registration);
