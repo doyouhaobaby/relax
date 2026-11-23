@@ -64,4 +64,9 @@ fn counted_derefs() {
     { let x: &mut str = { &mut c }; x.make_ascii_lowercase(); }
     assert_eq!((c.shared.get(), c.unique), (4, 2), "a tail coerced to &mut str borrows unique");
     assert_eq!(c.s, "hi");
+    // the arms of an if and of a match share the one coercion to &str
+    let flag = c.unique > 0;
+    { let x: &str = if flag { &mut c } else { &mut c }; assert_eq!(x, "hi"); }
+    { let x: &str = match flag { true => &mut c, false => &mut c }; assert_eq!(x, "hi"); }
+    assert_eq!((c.shared.get(), c.unique), (6, 2), "an if's and a match's arms coerced to &str borrow shared");
 }
