@@ -20,8 +20,11 @@ static mut CELL: u64 = 1;
 struct SharedPtr(*mut u64);
 unsafe impl Sync for SharedPtr {}
 static PCELL: SharedPtr = SharedPtr(&raw mut CELL);
+// (each test its own counter: the test harness runs the two at once)
 static HITS: AtomicU64 = AtomicU64::new(0);
 static PHITS: &AtomicU64 = &HITS;
+static IMAGE_HITS: AtomicU64 = AtomicU64::new(0);
+static PIMAGE_HITS: &AtomicU64 = &IMAGE_HITS;
 
 #[test]
 fn images_point_at_statics() {
@@ -38,8 +41,9 @@ fn images_point_at_statics() {
         assert_eq!(CELL, 11);
         assert!(std::ptr::eq(PCELL.0 as *const u64, &raw const CELL));
     }
-    PHITS.fetch_add(3, Ordering::SeqCst);
-    assert_eq!(HITS.load(Ordering::SeqCst), 3);
+    PIMAGE_HITS.fetch_add(3, Ordering::SeqCst);
+    assert!(std::ptr::eq(PIMAGE_HITS, &IMAGE_HITS));
+    assert_eq!(IMAGE_HITS.load(Ordering::SeqCst), 3);
 }
 
 #[test]
