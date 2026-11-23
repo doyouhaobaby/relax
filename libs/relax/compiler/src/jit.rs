@@ -2230,6 +2230,10 @@ pub(crate) fn install_ahead_line() -> String {
         if first == u64::MAX { "none".to_string() } else { first.to_string() }, n(&INSTALL_AHEAD_INDEX), n(&INSTALL_AHEAD_OWNER_NS), n(&INSTALL_AHEAD_CPU_NS))
 }
 
+/// How long one batch of the manifest's tail holds the owner at most (spec_seed_manifest), as a
+/// record batch's (RECORD_BATCH_NS); its next batch goes on where it stopped.
+const SEED_BATCH_NS: u64 = 2_000_000;
+
 fn manifest_install_stopped() -> bool {
     SPEC_STOP.load(Ordering::SeqCst) || crate::run_threads::ending() || crate::reload::program_edits() != 0
 }
@@ -2239,7 +2243,11 @@ unsafe fn manifest_install_allowed(up: *mut Unit) -> bool {
 }
 
 /// Installs the manifest's tail after the startup image window, in manifest order. Each guarded
-/// link is the preemption grain; a batch gives the owner back as soon as main queues a request.
+/// link is the preemption grain; a batch gives the owner back as soon as main queues a request,
+/// after a link once another thread's request waits (owner::request_waiting) and SEED_BATCH_NS
+/// after it began, as the record batches do (record_cache_batch). Given back to main only, a warm
+/// Fab's batches linked 17-28 k slots in 0.7-1.0 s each: an app pool thread's lazy call waited
+/// for all of it, and every background publish (the O3 takes, the startup's) with it.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     // Verify mode compiles what it checks, and an edited program's identities are not the
     // manifest's: neither installs ahead
@@ -2269,10 +2277,15 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
                 let _install = InstallingManifest::enter();
                 if !manifest_install_allowed(up) { return false; }
                 INSTALL_AHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
+                let (t0, first) = (wall_ns(), at);
                 while at < list.len() {
                     if manifest_install_stopped() { return false; }
                     if owner::main_waiting() {
                         INSTALL_AHEAD_MAIN_YIELDS.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    // (always after one link: a stream of requests does not stop the walk)
+                    if at > first && (owner::request_waiting() || wall_ns() - t0 >= SEED_BATCH_NS) {
                         return true;
                     }
                     // Advance before the guarded link: a bail leaves this slot lazy and the
