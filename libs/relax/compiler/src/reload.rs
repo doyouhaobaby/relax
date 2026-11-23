@@ -11048,6 +11048,24 @@ fn own_source(path: &str, std_dir: &str) -> bool {
     !(path.is_empty() || (!std_dir.is_empty() && crate::vfs::relative_path(path, std_dir).is_some()) || path.contains("/.cargo/registry/") || path.contains("/.cargo/git/") || path.contains("/rustlib/"))
 }
 
+#[cfg(test)]
+mod live_edit_tests {
+    /// Whether a compile error's call parks for a live edit is the watcher's own rule (own_source)
+    /// on the place's path, its line and column split off from the right (a Windows path keeps its
+    /// drive colon); a place that is not path:line:col parks.
+    #[test]
+    fn a_compile_error_parks_only_where_a_live_edit_reaches() {
+        use super::live_edit_reaches as reaches;
+        assert!(reaches("/w/app/src/main.rs:3:5"), "the program's own source parks");
+        assert!(reaches(r"C:\w\app\src\main.rs:3:5"), "a Windows path keeps its drive colon");
+        assert!(!reaches("/w/.cargo/registry/src/index-0/dep-0.1.0/src/lib.rs:10:1"), "a registry dependency stops");
+        assert!(!reaches("/w/.cargo/git/checkouts/dep-0/abc/src/lib.rs:1:1"), "a git dependency stops");
+        assert!(reaches("source position unknown") && reaches(""), "an unknown place parks");
+        assert!(reaches("/w/.cargo/registry/src/lib.rs:x:1"), "a place without its numbers is unknown, and parks");
+        assert!(!super::own_source("/s/std/core/src/lib.rs", "/s/std"), "std stops");
+    }
+}
+
 pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     // a file of a mounted store changes only by an edit (its file in the edits folder: a device's
     // devhub push); the store under a run never changes, and is not read to stat it. A folder
