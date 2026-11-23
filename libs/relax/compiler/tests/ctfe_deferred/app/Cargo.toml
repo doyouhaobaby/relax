@@ -3,4 +3,7 @@ name = "ctfe-deferred"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+ctfe-deferred-dep = { path = "../dep" }
+
 [workspace]
