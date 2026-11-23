@@ -43,7 +43,8 @@ else
   echo "web_layout $W: FAILED (exit $rc, $n rows; full log $T/relax.err)"
   exit 1
 fi
-# Execute the same rustc-derived assertions in the exported module as well.
+# Execute the same rustc-derived assertions in the exported module as well (with node on the machine, as web_diff).
+command -v node > /dev/null || exit 0
 RELAX_WASM_EXPORT=$T/relax.wasm RELAX_SPEC=0 RELAX_O1=always RELAX_O3=0 RELAX_CHECK_TARGET=$TRIPLE RELAX_STD=$H/../../std RELAX_CACHE_DIR=$T/tgt-export "$B" run --quiet --no-live --units "$T/u/units.json" web_layout --release > "$T/export.out" 2> "$T/export.err" || { tail -40 "$T/export.err"; exit 1; }
 node - "$T/relax.wasm" <<'JS' || exit 1
 const fs = require('fs');
