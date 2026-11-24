@@ -1989,6 +1989,8 @@ static PREV_ALLOC_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 /// Ends the process by signal `sig` with its default action (exit status 128 + sig, as a
 /// rustc build's fault would), from normal context: a contained fault the policy found fatal.
+/// Windows: a fault's `sig` is its exception code, and the process ends with that code, as a
+/// rustc build's unhandled exception does (`unhandled` above); an abort ends with its own.
 pub fn die_by(sig: i32) -> ! {
     #[cfg(unix)]
     unsafe {
@@ -1998,6 +2000,12 @@ pub fn die_by(sig: i32) -> ! {
         }
         signal(sig, 0);
         raise(sig);
+    }
+    // (an exception code has its severity bits high; the watchdog's -1 and a signal number are none)
+    #[cfg(windows)]
+    if sig < 0 && sig != SIG_WATCHDOG {
+        use crate::os::win32::{GetCurrentProcess, TerminateProcess};
+        unsafe { TerminateProcess(GetCurrentProcess(), sig as u32) };
     }
     let _ = sig;
     std::process::abort()
