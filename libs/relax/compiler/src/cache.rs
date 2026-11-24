@@ -2436,6 +2436,10 @@ impl Cache {
             if let Some(v) = self.crate_defs.get_mut(pc as usize) { *v = defs; }
         }
         for c in &touched { self.def_maps.remove(c); }
+        // (the lists cover the crates loaded since they were made: every crate has its list)
+        if !self.crate_defs.is_empty() && self.crate_defs.len() < u.prog.crates.len() {
+            self.crate_defs.resize(u.prog.crates.len(), Vec::new());
+        }
         if !self.crate_defs.is_empty() && !touched.is_empty() {
             for &c in &touched { if let Some(v) = self.crate_defs.get_mut(c as usize) { v.clear(); } }
             for i in 0..n {
@@ -2456,7 +2460,9 @@ impl Cache {
     /// Crate `c`'s map from definition key to definition, built when it has none, asking `stop`
     /// every DEF_MAP_STEP definitions (a large crate's map took 10-35 ms in one step inside the
     /// startup image build): a stop keeps what is keyed (`def_map_partial`) for the next call, of
-    /// this crate. Ok(true): `c` has its map; Ok(false): `stop` said yes; Err: `c` has no list.
+    /// this crate. Each call keys a step before it asks, so a stop that always says yes still
+    /// sees the map built. Ok(true): `c` has its map; Ok(false): `stop` said yes; Err: `c` has no
+    /// list.
     pub(super) fn map_crate_defs(&mut self, u: &Unit, c: u32, stop: &dyn Fn() -> bool) -> Result<bool, ()> {
         if !self.defs_mapped(u) { self.defs_appended(u); }
         if self.def_maps.contains_key(&c) { return Ok(true); }
@@ -2483,8 +2489,9 @@ impl Cache {
                 (defs, 0, m, HashSet::new())
             }
         };
+        let start = i;
         while i < defs.len() {
-            if i % DEF_MAP_STEP == DEF_MAP_STEP - 1 && stop() {
+            if i > start && (i - start) % DEF_MAP_STEP == 0 && stop() {
                 self.def_map_partial = Some((c, defs, i, m, dup));
                 return Ok(false);
             }
@@ -11298,6 +11305,15 @@ mod data_tests {
         // every lookup as a cache that builds every map from the whole program finds it
         pack::ensure_private_dir(&root.join("full")).unwrap();
         let mut full = open_test_cache(&u, &root.join("full"));
+        // each call keys a step before it can give way: under a stop that always says yes the
+        // other crate's map is still built, a step a call (and decodes as one built whole)
+        let mut at = 0;
+        while full.map_crate_defs(&u, other, &|| true) == Ok(false) {
+            let now = full.def_map_partial.as_ref().map_or(0, |p| p.2);
+            assert!(now > at, "a call resumed at a step's end keys before it gives way ({now} after {at})");
+            at = now;
+        }
+        assert!(full.def_maps.contains_key(&other), "the map in steps is built under a stop that always says yes");
         for (what, b) in [("f", &e.0), ("o3", &other_e.0), ("h", &h_e.0), ("f's copy", &twin_e.0), ("g", &module_e.0)] {
             assert_eq!(c.dec_def(&u, &mut D { b, p: 0 }), full.dec_def(&u, &mut D { b, p: 0 }), "{what}: as a full rebuild decodes it");
         }

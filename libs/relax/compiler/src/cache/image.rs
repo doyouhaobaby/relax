@@ -272,9 +272,10 @@ impl Cache {
             // one step of the loop below
             if self.mapped_definitions.is_none() {
                 crate::run::yield_section("image def maps");
+                // (a byte and a hash lookup per symbol: no yield check; the maps it finds missing
+                // are built in checked steps below)
                 let mut crates: Vec<u32> = Vec::new();
-                for (j, b) in tab.syms.list.iter().enumerate().skip(resume.at) {
-                    if j % 1024 == 1023 && stop() { return Err(()); }
+                for b in tab.syms.list.iter().skip(resume.at) {
                     if b.first() != Some(&3) || b.len() < 17 { continue; }
                     let ci = u128::from_le_bytes(b[1..17].try_into().unwrap());
                     if let Some(&c) = self.crate_by_ident.get(&ci) {
