@@ -707,12 +707,18 @@ pub struct Ctx {
     /// ended
     seh: Vec<SehProc>,
     seh_open: Option<SehProc>,
+    #[cfg(not(target_arch = "aarch64"))]
     seh_prologue_done: bool,
 }
 
 impl Ctx {
     fn new(arch: Arch, format: Format, att: bool, inline: bool) -> Ctx {
-        Ctx { arch, format, att, sections: vec![Section { name: ".text".to_string(), bytes: Vec::new(), exec: true, bss: false, align: 4 }], cur: 0, fixups: Vec::new(), labels: HashMap::new(), local_count: HashMap::new(), sets: HashMap::new(), globals: Vec::new(), defs_order: Vec::new(), inline, seh: Vec::new(), seh_open: None, seh_prologue_done: false }
+        Ctx { arch, format, att, sections: vec![Section { name: ".text".to_string(), bytes: Vec::new(), exec: true, bss: false, align: 4 }], cur: 0, fixups: Vec::new(), labels: HashMap::new(), local_count: HashMap::new(), sets: HashMap::new(), globals: Vec::new(), defs_order: Vec::new(), inline,
+            seh: Vec::new(),
+            seh_open: None,
+            #[cfg(not(target_arch = "aarch64"))]
+            seh_prologue_done: false,
+        }
     }
 
     /// Offset in the current section.
