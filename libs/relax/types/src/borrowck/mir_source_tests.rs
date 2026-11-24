@@ -885,13 +885,20 @@ fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initiali
 }
 
 #[test]
-fn a_reference_to_a_local_returned_as_an_opaque_type_names_the_universal_region() {
-    // The argument's region is named (`'1`), so the borrow is explained by the opaque type's constraint:
-    // E0597 "opaque type requires that `y` is borrowed for `'1`" (regions/do-not-suggest-adding-bound-to-opaque-type).
+fn a_local_returned_as_an_opaque_type_is_e0515_unless_the_opaque_type_requires_static() {
+    // rustc 1.100: a borrow of a local returned as `impl Sized + '_` is blamed on the return (E0515). An
+    // opaque type that captures no lifetime requires `'static`, and that requirement is blamed on the
+    // opaque type: E0597 (regions/do-not-suggest-adding-bound-to-opaque-type.rs).
     let (errors, unchecked) = borrowck_source_in("
-        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
+        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }
+        pub trait T {}
+        pub struct S<'a>(&'a ());
+        impl<'a> T for S<'a> {}
+        pub fn foo() -> impl T { let x = (); S(&x) }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.len() == 1 && errors[0].starts_with("E0597") && errors[0].contains("opaque type requires that `y` is borrowed for `'1`"), "{errors:?}");
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors.iter().any(|e| e.starts_with("E0515 cannot return reference to local variable `y`")), "the returned borrow: {errors:?}");
+    assert!(errors.iter().any(|e| e.starts_with("E0597") && e.contains("opaque type requires that `x` is borrowed for `'static`")), "the opaque type's requirement: {errors:?}");
 }
 
 #[test]
