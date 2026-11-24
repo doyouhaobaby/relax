@@ -23,7 +23,16 @@ windows = { "lib" = "16 of 468 fail there: cache and check reuse (4); platform g
 
 # a Windows box runs its unit tests after the landings that reach it (devhub's windows-tests
 # bucket), all but those still red there, by their exact names, until the relaxwin lane lands
-# their fixes: its Windows code (SEH, its memory, sockets, handles) is tested nowhere else
+# their fixes: its Windows code (SEH, its memory, sockets, handles) is tested nowhere else. And
+# these corpus files under the JIT there (`makepad test <file>`), what Relax's std and runtime do
+# with the OS: no other run tests them on Windows
+[package.metadata.makepad.windows-tests]
+"corpus:tests/thread_name_cut.rs" = "a thread's name as Windows keeps it (its thread description)"
+"corpus:tests/thread_local_keys.rs" = "thread-local keys and their destructors as Windows threads end"
+"corpus:tests/deep_clone_stack.rs" = "a deep recursion on an 8 MB thread: Windows' stack reserve and its probes"
+"corpus:tests/fp_env.rs" = "the floating-point control register across Windows' calling convention"
+"corpus:tests/os_str_path_cow_cmp.rs" = "OsStr and Path forms compared as Windows paths"
+
 [package.metadata.makepad.windows-tests.lib]
 why = "its Windows code: SEH, its memory, sockets and handles"
 known = "the relaxwin lane"
