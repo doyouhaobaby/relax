@@ -6530,7 +6530,7 @@ enum StdWait {
 
 /// The program's parse of `path`, waiting for it while the program's std load runs.
 fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
-    match shared_std_wait_on(path, &LOAD_STEPS, STD_WAIT_STALL) {
+    match shared_std_wait_on(path, || LOAD_STEPS.load(std::sync::atomic::Ordering::Relaxed), STD_WAIT_STALL) {
         StdWait::Shared(sp) => Some(sp),
         StdWait::Alone => None,
         StdWait::Stalled => {
@@ -6541,10 +6541,11 @@ fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
     }
 }
 
-/// `shared_std_wait` with its steps and the interval with none that is a stall.
-fn shared_std_wait_on(path: &str, steps: &std::sync::atomic::AtomicU64, stall: std::time::Duration) -> StdWait {
+/// `shared_std_wait` with its loads' step count (`steps`, read as it starts and at the end of each
+/// interval) and the interval with no step that is a stall.
+fn shared_std_wait_on(path: &str, mut steps: impl FnMut() -> u64, stall: std::time::Duration) -> StdWait {
     let mut g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
-    let mut seen = steps.load(std::sync::atomic::Ordering::Relaxed);
+    let mut seen = steps();
     loop {
         let Some(m) = g.as_ref() else { return StdWait::Alone };
         if let Some(sp) = m.get(path) {
@@ -6558,7 +6559,7 @@ fn shared_std_wait_on(path: &str, steps: &std::sync::atomic::AtomicU64, stall: s
         if to.timed_out() {
             // a program that registered a graph but loads no std (never expected), or a cycle:
             // no step for the interval, and the file is not here
-            let now = steps.load(std::sync::atomic::Ordering::Relaxed);
+            let now = steps();
             if now == seen && g.as_ref().map_or(true, |m| !m.contains_key(path)) {
                 return StdWait::Stalled;
             }
@@ -7146,35 +7147,42 @@ pub fn take_missing() -> Vec<(u32, String)> {
 #[cfg(test)]
 mod std_wait_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// The world's wait for a std parse the program's load has not shared yet: while the loads
-    /// take steps, however slowly, it goes on through several of its intervals and ends when the
-    /// load ends its sharing (the world parses alone, nothing said); loads that take no step for
-    /// the interval are a stall, and the wait ends there (the cycle guard, which says so).
+    /// take steps, however slowly (here one per interval, the slowest that moves), it goes on
+    /// through several of its intervals and ends when the load ends its sharing (the world parses
+    /// alone, nothing said); loads that take no step for the interval are a stall, and the wait
+    /// ends there (the cycle guard, which says so). The load's steps come with the wait's looks,
+    /// not from a thread's clock: a thread that stepped every 1 ms went 100 ms without the CPU
+    /// on a full box, and its wait called it a stall (11-24).
     #[test]
     fn a_slow_load_that_moves_is_waited_for_and_a_still_one_is_a_stall() {
         let path = "/relax-std-wait-test/core/lib.rs";
         let stall = Duration::from_millis(100);
-        let steps = AtomicU64::new(0);
         share_std_begin();
+        let (looked, look) = std::sync::mpsc::channel::<()>();
+        let mut looks = 0u64;
         let t = Instant::now();
         let moving = std::thread::scope(|s| {
-            s.spawn(|| {
-                while t.elapsed() < 4 * stall {
-                    steps.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(1));
+            // the load ends its sharing once the wait has read its steps as it began and at the
+            // end of 4 intervals
+            s.spawn(move || {
+                for _ in 0..5 {
+                    if look.recv().is_err() { break; }
                 }
                 share_std_end();
             });
-            shared_std_wait_on(path, &steps, stall)
+            // each look at an interval's end sees a step taken since the last
+            let r = shared_std_wait_on(path, || { looks += 1; let _ = looked.send(()); looks }, stall);
+            drop(looked);
+            r
         });
         assert!(matches!(moving, StdWait::Alone), "a load that moves is waited for, then the world parses alone");
-        assert!(t.elapsed() >= 4 * stall, "through several intervals: {:?}", t.elapsed());
+        assert!(looks >= 5 && t.elapsed() >= 4 * stall, "through several intervals: {looks} looks in {:?}", t.elapsed());
         share_std_begin();
         let t = Instant::now();
-        let still = shared_std_wait_on(path, &AtomicU64::new(0), stall);
+        let still = shared_std_wait_on(path, || 0, stall);
         share_std_end();
         drop_shared_std();
         assert!(matches!(still, StdWait::Stalled), "no step for the interval is a stall");
