@@ -30671,19 +30671,30 @@ pub(crate) mod front_holders {
     static SINCE: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
     pub(crate) static UNLISTED: AtomicU64 = AtomicU64::new(0);
 
-    /// Claims a row for this thread's read at `site` (None: every row is taken).
+    /// Claims a row for this thread's read at `site`, before it takes the read (None: every row
+    /// is taken). The read shows in `snapshot` once `holding` says it is held.
     pub(crate) fn claim(site: &'static str) -> Option<usize> {
         let me = crate::os::thread::current().max(1);
         for k in 0..ROWS {
             if TID[k].load(Relaxed) == 0 && TID[k].compare_exchange(0, me, Acquire, Relaxed).is_ok() {
                 SITE[k].store(site.as_ptr() as usize, Relaxed);
                 SITE_LEN[k].store(site.len(), Relaxed);
-                SINCE[k].store(crate::clock::wall_ns().max(1), Release);
                 return Some(k);
             }
         }
         UNLISTED.fetch_add(1, Relaxed);
         None
+    }
+
+    /// Row `k`'s read is held from now.
+    pub(crate) fn holding(k: usize) {
+        SINCE[k].store(crate::clock::wall_ns().max(1), Release);
+    }
+
+    /// Every thread with a row: about to take a front read, holding one, or just given it back.
+    /// The pause lets them run on (inspect::instrument::pause_lets_front_readers_go).
+    pub(crate) fn threads() -> Vec<u64> {
+        (0..ROWS).map(|k| TID[k].load(Acquire)).filter(|&t| t != 0).collect()
     }
 
     pub(crate) fn release(k: usize) {
@@ -30718,10 +30729,28 @@ pub(crate) mod front_holders {
 }
 
 thread_local! {
-    /// this thread's front reads held now
+    /// this thread's front reads held now (counted from before each is taken until after it was
+    /// given back: front_read)
     static FRONT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FRONT_READ_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
+
+#[cfg(test)]
+thread_local! {
+    /// (tests) called on this thread between the two steps of taking a front read (1: counted
+    /// and listed, the lock not taken yet) and of giving it back (2: the lock given back, still
+    /// counted and listed): inspect::instrument's pause_tests stops the thread there
+    pub(crate) static FRONT_READ_BETWEEN: std::cell::Cell<Option<fn(u32)>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn front_read_between(step: u32) {
+    if let Some(f) = FRONT_READ_BETWEEN.try_with(|h| h.get()).ok().flatten() {
+        f(step);
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn front_read_between(_step: u32) {}
 
 /// The front reads this thread holds now.
 pub(crate) fn front_reads_held() -> u32 {
@@ -30730,12 +30759,17 @@ pub(crate) fn front_reads_held() -> u32 {
 
 pub struct FrontRead {
     prior_site: &'static str,
-    _g: std::sync::RwLockReadGuard<'static, ()>,
+    /// given back first in `drop`, before this thread stops counting as a reader (front_read)
+    g: std::mem::ManuallyDrop<std::sync::RwLockReadGuard<'static, ()>>,
     traced: Option<(&'static str, std::time::Instant)>,
     row: Option<usize>,
 }
 impl Drop for FrontRead {
     fn drop(&mut self) {
+        // SAFETY: dropped once, here; `g` is not used after
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.g) };
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        front_read_between(2);
         let _ = FRONT_READ_SITE.try_with(|site| site.set(self.prior_site));
         let _ = FRONT_READS.try_with(|c| c.set(c.get().saturating_sub(1)));
         if let Some(k) = self.row {
@@ -30782,6 +30816,18 @@ unsafe fn owner_front<'u>(up: *const Unit) -> (&'u Program, &'u Tcx) {
 }
 
 pub fn front_read(site: &'static str) -> FrontRead {
+    // This thread counts as a reader (its count, FRONT_READS; its row, front_holders) from before
+    // it takes the read until after it gave it back (Drop): a pause for a report lets a reader run
+    // on, and holds it once it has left the front end (inspect::instrument::
+    // pause_lets_front_readers_go). Counted only while the lock was held, a thread the pause
+    // stopped between taking the lock and counting itself, or between uncounting itself and
+    // giving the lock back, was held with the read, and every front writer stayed out until the
+    // resume. (A thread that waits for its read behind a writer counts too: it holds nothing, and
+    // runs on.)
+    let _ = FRONT_READS.try_with(|c| c.set(c.get() + 1));
+    let row = front_holders::claim(site);
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    front_read_between(1);
     let g = match FRONT_RW.try_read() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -30794,8 +30840,10 @@ pub fn front_read(site: &'static str) -> FrontRead {
             FRONT_RW.read().unwrap_or_else(|e| e.into_inner())
         }
     };
-    let _ = FRONT_READS.try_with(|c| c.set(c.get() + 1));
-    FrontRead { prior_site: FRONT_READ_SITE.try_with(|old| old.replace(site)).unwrap_or(""), _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())), row: front_holders::claim(site) }
+    if let Some(k) = row {
+        front_holders::holding(k);
+    }
+    FrontRead { prior_site: FRONT_READ_SITE.try_with(|old| old.replace(site)).unwrap_or(""), g: std::mem::ManuallyDrop::new(g), traced: front_trace().then(|| (site, std::time::Instant::now())), row }
 }
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
 /// context (shared, Sync), slot keys, and the checked bodies waiting for their builds.

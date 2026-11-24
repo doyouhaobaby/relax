@@ -1470,10 +1470,10 @@ mod pause_imp {
     }
     /// The threads the pause let go inside the compiler's front end (pause), until it holds them.
     static DECLINED: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
-    /// The pthread handles of the threads with a front read now (jit::front_holders: a thread
-    /// stopped between taking its read and listing it, a few instructions, is not seen).
+    /// The pthread handles of the threads with a front read now (jit::front_holders: listed from
+    /// before a thread takes its read until after it gave it back).
     fn front_readers() -> Vec<u64> {
-        crate::jit::front_holders::snapshot().iter().map(|r| r.0).collect()
+        crate::jit::front_holders::threads()
     }
     /// The pause's windows (the zones locked, the threads suspended): the picked threads of `list`
     /// (all moved out) suspended into `held`, the others into `rest`. No allocation or free in
@@ -1912,52 +1912,97 @@ mod pause_tests {
     /// runs on while it reads, is held once it has left, and a front writer gets in while the
     /// program stays paused. (Held while it read, the main thread kept the front end for as long
     /// as a stale access stayed parked: the module fixtures' `inspect eval` failed after 30 s,
-    /// "the compiler's front end stayed busy (read by makepad at typeck_ahead)", 11-12.) The first
-    /// pause of its process: a hang ends at the deadline (the next test's).
+    /// "the compiler's front end stayed busy (read by makepad at typeck_ahead)", 11-12.) The
+    /// reader stands still between the two steps of taking its read and of giving it back
+    /// (jit::FRONT_READ_BETWEEN), where it still counted as no reader while the lock was its own:
+    /// held there, it kept every front writer out (a test run under the JIT, once, 11-24). The
+    /// first pause of its process: a hang ends at the deadline (the next test's).
     #[test]
     fn a_pause_holds_no_thread_inside_the_compilers_front_end() {
         if !crate::test_child::run_alone_within(module_path!(), "a_pause_holds_no_thread_inside_the_compilers_front_end", 120) {
             return;
         }
-        static STEP: AtomicU32 = AtomicU32::new(0);
+        use crate::jit::FRONT_RW;
+        // where the reader stands: 1 between taking its read's two steps, 2 holding the read, 3
+        // between giving it back's two steps, 4 out of the front end
+        static AT: AtomicU32 = AtomicU32::new(0);
+        // how far it may go: past position p once GO is p or more
+        static GO: AtomicU32 = AtomicU32::new(0);
+        fn stand(at: u32) {
+            AT.store(at, SeqCst);
+            while GO.load(SeqCst) < at {
+                std::hint::spin_loop();
+            }
+        }
+        fn between(step: u32) {
+            stand(if step == 1 { 1 } else { 3 });
+        }
+        fn reached(at: u32) {
+            while AT.load(SeqCst) != at {
+                std::thread::yield_now();
+            }
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::Builder::new().name("pause-reader".into()).spawn(move || {
+            crate::jit::FRONT_READ_BETWEEN.with(|h| h.set(Some(between)));
             tx.send(crate::inspect::threads::self_os_id()).unwrap();
             let read = crate::jit::front_read("pause test");
-            STEP.store(1, SeqCst);
-            while STEP.load(SeqCst) < 2 { std::hint::spin_loop(); }
+            stand(2);
             drop(read);
-            while STEP.load(SeqCst) < 3 { std::hint::spin_loop(); }
+            stand(4);
         }).unwrap();
         let os_id = rx.recv().unwrap();
-        while STEP.load(SeqCst) < 1 { std::thread::yield_now(); }
+        reached(1);
         // The pause is asked for, and its effect read, from a thread of the runtime's inspector
         // (as `inspect pause` and a stale access's report are): the pause holds every program
         // thread, this test's own among them (on Linux, held asleep, it waited out the hold's 10
-        // minutes).
+        // minutes). A reader held where it should run on cannot go on: the steps end there.
         let inspector = std::thread::Builder::new().name("run-inspect-t".into()).spawn(move || {
+            let mut seen: Vec<(&'static str, bool)> = Vec::new();
             super::pause_program();
-            // (several of the pause's sweeps, 5 ms apart)
-            std::thread::sleep(std::time::Duration::from_millis(40));
-            let reading_held = super::held_now(os_id);
-            let writer_while_read = crate::jit::FRONT_RW.try_write().is_ok();
-            STEP.store(2, SeqCst);
-            let t0 = std::time::Instant::now();
-            while !super::held_now(os_id) && t0.elapsed().as_secs() < 5 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            'steps: {
+                let held = super::held_now(os_id);
+                seen.push(("a thread about to take its front read is not held by the pause", !held));
+                seen.push(("a front writer gets in before the reader has taken its lock", FRONT_RW.try_write().is_ok()));
+                if held {
+                    break 'steps;
+                }
+                GO.store(1, SeqCst);
+                reached(2);
+                let held = super::held_now(os_id);
+                seen.push(("a thread holding a front read is not held by the pause", !held));
+                seen.push(("(the reader still read: no writer got in)", FRONT_RW.try_write().is_err()));
+                if held {
+                    break 'steps;
+                }
+                GO.store(2, SeqCst);
+                reached(3);
+                let held = super::held_now(os_id);
+                seen.push(("a thread giving its front read back is not held by the pause before it has left", !held));
+                seen.push(("a front writer gets in once the reader has given its lock back", FRONT_RW.try_write().is_ok()));
+                if held {
+                    break 'steps;
+                }
+                GO.store(3, SeqCst);
+                reached(4);
+                // (the pause's sweep, every 5 ms, holds it)
+                let t0 = std::time::Instant::now();
+                while !super::held_now(os_id) && t0.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                seen.push(("the thread is held once it has left the front end", super::held_now(os_id)));
+                seen.push(("a front writer gets in while the program stays paused", FRONT_RW.try_write().is_ok()));
             }
-            let held_after = super::held_now(os_id);
-            let writer_while_paused = crate::jit::FRONT_RW.try_write().is_ok();
             super::resume_program();
-            STEP.store(3, SeqCst);
-            (reading_held, writer_while_read, held_after, writer_while_paused)
+            GO.store(4, SeqCst);
+            seen
         }).unwrap();
-        let (reading_held, writer_while_read, held_after, writer_while_paused) = inspector.join().unwrap();
+        let seen = inspector.join().unwrap();
         reader.join().unwrap();
-        assert!(!reading_held, "a thread holding a front read is not held by the pause");
-        assert!(!writer_while_read, "(the reader still read: no writer got in)");
-        assert!(held_after, "the thread is held once it has left the front end");
-        assert!(writer_while_paused, "a front writer gets in while the program stays paused");
+        for (what, ok) in &seen {
+            assert!(ok, "{what}");
+        }
+        assert_eq!(seen.len(), 8, "every step of the reader was seen: {seen:?}");
     }
 
     /// A patch's pause is the first a fresh process takes, a program thread running: it holds the
