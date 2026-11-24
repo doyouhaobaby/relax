@@ -30,32 +30,6 @@ fn finish(worker: (Sender<()>, thread::JoinHandle<()>)) {
     worker.0.send(()).unwrap();
     worker.1.join().unwrap();
 }
-/// A job on its own thread that runs without a checkpoint until told: `true` checkpoints (it sends
-/// its permit again once it runs), `false` releases its permit and ends.
-fn stretch(b: &Arc<Budget>, class: u8, client: u8, id: u32, entered: &Sender<(u32, u32)>) -> (Sender<bool>, thread::JoinHandle<()>) {
-    let b = b.clone();
-    let entered = entered.clone();
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let mut permit = b.admit(class, client, "stretch");
-        entered.send((id, permit)).unwrap();
-        while rx.recv().unwrap() {
-            permit = b.checkpoint(permit, 0, "");
-            entered.send((id, permit)).unwrap();
-        }
-        b.release(permit);
-    });
-    (tx, handle)
-}
-/// The tokens that run, and the borrowed ones by class.
-fn counts(b: &Budget) -> (usize, [usize; 3]) {
-    let s = b.lock();
-    (s.running, s.borrowed)
-}
-fn end(stretch: (Sender<bool>, thread::JoinHandle<()>)) {
-    stretch.0.send(false).unwrap();
-    stretch.1.join().unwrap();
-}
 
 #[test]
 fn permits_and_admissions_belong_to_the_budget_that_issued_them() {
@@ -276,33 +250,31 @@ fn a_raised_build_counts_against_a_persons_work() {
 }
 
 /// Background's part leaves Visible two of the limit's 3 tokens, and Visible's limit leaves
-/// Interactive the kept core. Background beyond its part borrows the idle ones, and the person's work
-/// passes them: it runs over the cores until the borrowed rows' next checkpoint. (Polled admissions:
-/// a broken rule fails an assertion, it does not hold the test.)
+/// Interactive the kept core. (Polled admissions: a broken rule fails an assertion, it does not hold
+/// the test.)
 #[test]
 fn background_reserves_two_visible_slots_and_visible_reserves_one() {
     let b = budget(4);
     let handle = BudgetHandle(Which::Own(b.clone()));
     let held = b.admit(BACKGROUND, APP, "held");
-    let borrowed: Vec<_> = (0..2).map(|_| b.admit(BACKGROUND, HAL, "borrowed")).collect();
-    assert_eq!(counts(&b), (3, [0, 0, 2]), "Background's part is one: the two idle tokens are borrowed");
     let mut background = handle.admission();
-    assert_eq!(background.poll(BACKGROUND, HAL, "waits"), None, "Background stops at the limit");
-    let v1 = handle.admission().poll(VISIBLE, HAL, "visible one").expect("Visible passes the borrowed tokens");
-    let v2 = handle.admission().poll(VISIBLE, HAL, "visible two").expect("Visible passes the borrowed tokens");
-    assert!(borrowed.iter().all(|p| b.should_yield(*p)), "the borrowed rows give way at their next checkpoint");
+    assert_eq!(background.poll(BACKGROUND, HAL, "waits"), None, "Background stops at its part of one");
+    let v1 = handle.admission().poll(VISIBLE, HAL, "visible one").expect("Visible has the two Background leaves");
+    let v2 = handle.admission().poll(VISIBLE, HAL, "visible two").expect("Visible has the two Background leaves");
     let mut visible = handle.admission();
-    assert_eq!(visible.poll(VISIBLE, HAL, "visible three"), None, "Visible stops at its limit: 3 tokens it counts");
+    assert_eq!(visible.poll(VISIBLE, HAL, "visible three"), None, "Visible stops at its limit of 3");
     let interactive = handle.admission().poll(INTERACTIVE, APP, "interactive reserve").expect("Interactive has the kept core");
-    assert_eq!(counts(&b), (6, [0, 0, 2]), "over the cores until the borrowed rows' next checkpoint");
+    assert_eq!(b.lock().running, 4);
     b.release(interactive);
     assert_eq!(visible.poll(VISIBLE, HAL, "visible three"), None, "the kept core is not Visible's");
     b.release(v2);
     let v3 = visible.poll(VISIBLE, HAL, "visible three").expect("a token within Visible's limit");
-    for p in [v1, v3].into_iter().chain(borrowed) { b.release(p); }
-    let bg = background.poll(BACKGROUND, HAL, "waits").expect("Background borrows the idle token");
-    for p in [bg, held] { b.release(p); }
-    assert_eq!(counts(&b), (0, [0; 3]));
+    for p in [v1, v3] { b.release(p); }
+    assert_eq!(background.poll(BACKGROUND, HAL, "waits"), None, "idle tokens are not Background's beyond its part");
+    b.release(held);
+    let bg = background.poll(BACKGROUND, HAL, "waits").expect("its part has room");
+    b.release(bg);
+    assert_eq!(b.lock().running, 0);
 }
 
 #[test]
@@ -687,11 +659,11 @@ fn a_second_jit_job_waits_for_a_token() {
     b.set_jit_first(false);
     finish(second);
     let third = worker(&b, BACKGROUND, APP, 4, &tx);
-    assert_eq!(rx.recv().unwrap(), 4);
-    assert_eq!(counts(&b), (3, [0, 0, 1]), "flag down: one part again, the builds count against it, and the app's job borrows an idle token");
+    until(&b, |s| s.waiters.len() == 1);
+    assert!(rx.try_recv().is_err(), "flag down: one part again, and the builds count against it");
     finish(build);
     b.release(builds[3]);
-    assert_eq!(counts(&b), (1, [0; 3]), "its part has room again: an ordinary row");
+    assert_eq!(rx.recv().unwrap(), 4);
     finish(third);
     assert_eq!(b.state.lock().unwrap().running, 0);
 
@@ -799,115 +771,4 @@ fn a_granted_run_sizes_the_budget_from_its_grant() {
     assert_eq!(granted_cores(16, None), 16);
     assert_eq!(granted_cores(16, Some("0")), 16);
     assert_eq!(granted_cores(16, Some("four")), 16);
-}
-
-/// Idle tokens go to Background work beyond its part, on borrowed rows, up to the limit. The person's
-/// work passes them: a Visible job that arrives while every borrowed row is in a long stretch is
-/// admitted at once, and the first borrowed row to reach its checkpoint gives its token back; the
-/// rows within their part keep theirs. A borrowed row becomes an ordinary one once its part has room.
-#[test]
-fn idle_tokens_go_to_background_work_and_come_back_when_the_persons_work_arrives() {
-    let b = budget(8);
-    let own: Vec<_> = (0..5).map(|_| b.admit(BACKGROUND, APP, "own part")).collect();
-    let (tx, rx) = mpsc::channel();
-    let first = stretch(&b, BACKGROUND, APP, 1, &tx);
-    let (_, p1) = rx.recv().unwrap();
-    let second = stretch(&b, BACKGROUND, HAL, 2, &tx);
-    let (_, p2) = rx.recv().unwrap();
-    assert_eq!(counts(&b), (7, [0, 0, 2]), "two beyond Background's part of 5, up to the limit of 7");
-    assert_eq!(b.tokens().holders.iter().filter(|h| h.borrowed).count(), 2, "the inspector shows the borrowed rows");
-    let third = stretch(&b, BACKGROUND, APP, 3, &tx);
-    until(&b, |s| s.waiters.len() == 1);
-    assert!(own.iter().chain([&p1, &p2]).all(|p| !b.should_yield(*p)), "nobody else wants a token: nobody gives way");
-
-    // Both borrowed rows are in a long stretch: the person's work does not wait for their checkpoints.
-    let visible = b.admit(VISIBLE, APP, "the person's work");
-    assert_eq!(b.lock().running, 8, "over the limit until a borrowed row's next checkpoint");
-    assert!(b.should_yield(p1) && b.should_yield(p2), "the borrowed rows give way at their next checkpoint");
-    assert!(own.iter().all(|p| !b.should_yield(*p)), "the rows within their part keep their tokens");
-    assert!(!b.should_yield(visible));
-    first.0.send(true).unwrap();
-    until(&b, |s| s.waiters.len() == 2 && s.given_back == 1);
-    assert_eq!(b.lock().running, 7);
-    assert!(!b.should_yield(p2), "one token back is enough: the other borrowed row keeps its");
-    b.release(visible);
-    assert_eq!(rx.recv().unwrap().0, 1, "the borrowed row comes back first, on its own ticket");
-
-    b.release(own[0]);
-    assert_eq!(rx.recv().unwrap().0, 3);
-    let s = b.lock();
-    assert_eq!((s.running, s.borrowed, s.borrows), (7, [0, 0, 2], 4),
-        "a borrowed row took the place in the part, the waiter the borrowed token it left");
-    drop(s);
-    for stretch in [first, second, third] { end(stretch); }
-    for p in &own[1..] { b.release(*p); }
-    assert_eq!(counts(&b), (0, [0; 3]));
-}
-
-/// The JIT's builds pass borrowed tokens as the person's work does: their part is what it was. The
-/// JIT never borrows (its builds on SMT siblings cost far more CPU): a build beyond its part waits
-/// beside an idle token an app job then takes.
-#[test]
-fn the_jits_part_passes_borrowed_tokens_and_the_jit_never_borrows() {
-    let b = budget(8);
-    b.set_jit_first(true);
-    let first = b.admit(BACKGROUND, JIT, "tier-up");
-    let own: Vec<_> = (0..5).map(|_| b.admit(BACKGROUND, APP, "own part")).collect();
-    let borrowed = b.admit(BACKGROUND, APP, "borrowed");
-    assert_eq!(counts(&b), (7, [0, 0, 1]), "the app's part is its 5 beside the build's token: the last idle one is borrowed");
-    let build = b.admit(BACKGROUND, JIT, "a build within the JIT's part");
-    assert!(b.should_yield(borrowed), "the borrowed row gives way to it");
-    assert!(own.iter().chain([&first, &build]).all(|p| !b.should_yield(*p)));
-    for p in own.into_iter().chain([borrowed, first, build]) { b.release(p); }
-
-    b.set_jit_first(false);
-    let builds: Vec<_> = (0..5).map(|_| b.admit(BACKGROUND, JIT, "build")).collect();
-    let (tx, rx) = mpsc::channel();
-    let beyond = worker(&b, BACKGROUND, JIT, 1, &tx);
-    until(&b, |s| s.waiters.len() == 1);
-    let app = worker(&b, BACKGROUND, APP, 2, &tx);
-    assert_eq!(rx.recv().unwrap(), 2, "the app's job borrows the idle token");
-    assert_eq!(b.lock().waiters.len(), 1, "the build beyond the JIT's part still waits");
-    finish(app);
-    b.release(builds[0]);
-    assert_eq!(rx.recv().unwrap(), 1);
-    finish(beyond);
-    for p in &builds[1..] { b.release(*p); }
-}
-
-/// A thread blocked on work it cannot do lends the kept core: one more token runs, on a borrowed row,
-/// and gives way at its next checkpoint once the core is taken back. Lends need no permit and nest;
-/// one core keeps none to lend.
-#[test]
-fn a_lent_kept_core_admits_one_more_until_it_is_taken_back() {
-    let one = BudgetHandle::of_cores(1);
-    one.lend_kept_core();
-    assert_eq!(one.limit_now(), 1, "one core keeps none");
-    one.take_back_kept_core();
-
-    let b = budget(2);
-    let own = b.admit(BACKGROUND, APP, "own part");
-    let (tx, rx) = mpsc::channel();
-    let visible = stretch(&b, VISIBLE, APP, 1, &tx);
-    until(&b, |s| s.waiters.len() == 1);
-    assert_eq!(b.limit_width.load(Relaxed), 1);
-    let lender = { let b = b.clone(); thread::spawn(move || { b.lend_kept_core(); b.lend_kept_core(); }) };
-    lender.join().unwrap();
-    let (_, v) = rx.recv().unwrap();
-    assert_eq!(b.limit_width.load(Relaxed), 2, "the cores, while the core is lent");
-    assert_eq!(b.tokens().limits[1], 2);
-    assert!(b.tokens().holders.iter().any(|h| h.class == VISIBLE && h.borrowed), "it came in on the kept core");
-    assert!(b.report().contains("the kept core lent"), "{}", b.report());
-    b.take_back_kept_core();
-    assert!(!b.should_yield(v), "the end of an inner lend keeps the core lent");
-    b.take_back_kept_core();
-    assert_eq!(b.limit_width.load(Relaxed), 1);
-    assert!(b.should_yield(v), "the row that came in on the kept core gives it back at its next checkpoint");
-    assert!(!b.should_yield(own), "the row within its part keeps its token");
-    visible.0.send(true).unwrap();
-    until(&b, |s| s.waiters.len() == 1 && s.running == 1);
-    assert!(b.should_yield(own), "the Visible job waits again, and Background gives way to it as ever");
-    b.release(own);
-    assert_eq!(rx.recv().unwrap().0, 1);
-    end(visible);
 }
