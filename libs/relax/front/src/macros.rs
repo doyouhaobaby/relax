@@ -3316,6 +3316,11 @@ pub enum Bind {
     Seq(Vec<Bind>),
 }
 
+enum ArmMatch {
+    Matched(HashMap<String, Bind>),
+    Failed { index: usize, vis_taken: u32 },
+}
+
 fn vars_of(nodes: &[MNode], out: &mut Vec<String>) {
     for n in nodes {
         match n {
@@ -3402,6 +3407,10 @@ struct MPos {
 }
 
 impl MPos {
+    fn vis_taken_at(&self, i: usize) -> u32 {
+        if self.vis_taken.0 == i { self.vis_taken.1 } else { 0 }
+    }
+
     /// rustc `MatcherPos::push_match`: outside a repetition the next metavariable's entry; inside
     /// `depth` repetitions an element of the innermost sequence being built.
     fn push_match(&mut self, var: usize, depth: usize, m: Bind) {
@@ -3671,6 +3680,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// rustc_parse `token_descr`, using the fragment kind when transcription preserved it.
+    fn token_descr(&self, t: Tok) -> String {
+        let fragment = if t.kind == T::Interp { Some(Frag::Expr) } else { self.forwarded_kind(t.lo) };
+        if let Some(frag) = fragment {
+            return format!("`{}` metavariable", frag_name(frag));
+        }
+        let text = self.tok_text(t);
+        // Transcription spells `$crate` with the defining crate's identity.
+        if t.kind == T::Ident && (t.lo as usize) >= self.src.len() && text.starts_with(b"__relax_crate_") {
+            return "reserved identifier `$crate`".into();
+        }
+        let prefix = if t.kind == T::DocComment {
+            "doc comment "
+        } else if t.kind == T::Ident || is_kw(t.kind) {
+            let edition = self.edition_at(t.lo);
+            match crate::lexer::keyword(text, edition) {
+                Some(T::KwBox | T::KwTry | T::KwYield) => "reserved keyword ",
+                Some(_) => "keyword ",
+                None if is_reserved_word(text, edition) => "reserved keyword ",
+                None if text == b"_" => "reserved identifier ",
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        format!("{prefix}`{}`", String::from_utf8_lossy(text))
+    }
+
     /// rustc_parse nonterminal.rs `nonterminal_may_begin_with`: can a fragment of kind `f`
     /// begin with the token at `i`? A matcher position waits for the fragment parser only
     /// where it can.
@@ -3763,9 +3800,9 @@ impl<'a> Parser<'a> {
     /// arm's matcher locations. Every matcher position is advanced over a token at once (a
     /// repetition's end splits a position: one leaves the repetition, one repeats it), with
     /// no backtracking; the fragment parser runs only when exactly one position waits for a
-    /// fragment and no position wants a token. Ok(Some): the bindings; Ok(None): no match
-    /// (the next arm is tried); Err: a fragment that did not parse, or an ambiguity.
-    fn parse_tt(&mut self, locs: &[MLoc], name: &str, edition: u16, lo: usize, hi: usize) -> Result<Option<HashMap<String, Bind>>, String> {
+    /// fragment and no position wants a token. An ordinary failure records the input position
+    /// for the next arm to beat. A fragment parse error or ambiguity ends the call.
+    fn parse_tt(&mut self, locs: &[MLoc], name: &str, edition: u16, lo: usize, hi: usize) -> Result<ArmMatch, String> {
         let mut cur = vec![MPos { idx: 0, matches: std::rc::Rc::new(Vec::new()), vis_taken: (usize::MAX, 0) }];
         let mut next: Vec<MPos> = Vec::new();
         let mut bb: Vec<MPos> = Vec::new();
@@ -3774,6 +3811,8 @@ impl<'a> Parser<'a> {
             next.clear();
             bb.clear();
             let eof = i >= hi;
+            // All current matcher positions share the input cursor, including empty vis groups.
+            let failure = ArmMatch::Failed { index: i, vis_taken: cur[0].vis_taken_at(i) };
             let mut eof_mps: Vec<MPos> = Vec::new();
             // parse_tt_inner
             while let Some(mut mp) = cur.pop() {
@@ -3836,7 +3875,7 @@ impl<'a> Parser<'a> {
             // that waits for a forwarded empty `vis` first takes it)
             if eof && bb.is_empty() {
                 return match eof_mps.len() {
-                    0 => Ok(None),
+                    0 => Ok(failure),
                     1 => {
                         let mp = eof_mps.pop().unwrap();
                         let matches = std::rc::Rc::try_unwrap(mp.matches).unwrap_or_else(|m| (*m).clone());
@@ -3846,13 +3885,13 @@ impl<'a> Parser<'a> {
                                 binds.insert(name.to_string(), matches[var].clone());
                             }
                         }
-                        Ok(Some(binds))
+                        Ok(ArmMatch::Matched(binds))
                     }
                     _ => Err("ambiguity: multiple successful parses".to_string()),
                 };
             }
             match (next.len(), bb.len()) {
-                (0, 0) => return Ok(None),
+                (0, 0) => return Ok(failure),
                 (_, 0) => {
                     std::mem::swap(&mut cur, &mut next);
                     i += 1;
@@ -3865,7 +3904,7 @@ impl<'a> Parser<'a> {
                     let frag = if declared == Frag::Expr2021 { Frag::Expr } else { declared };
                     let (e, taken, bare) = if frag == Frag::Vis && self.empty_vis_left(&mp, i) > 0 {
                         // the forwarded empty fragment itself, not the tokens after it
-                        mp.vis_taken = (i, if mp.vis_taken.0 == i { mp.vis_taken.1 + 1 } else { 1 });
+                        mp.vis_taken = (i, mp.vis_taken_at(i) + 1);
                         (i, None, false)
                     } else {
                         self.match_frag(frag, i, hi).map_err(|m| format!("{m} (while parsing argument for this `{}` macro fragment)", frag_name(declared)))?
@@ -3901,7 +3940,7 @@ impl<'a> Parser<'a> {
     }
 
     fn empty_vis_left(&self, mp: &MPos, i: usize) -> u32 {
-        self.empty_vis_before(i).saturating_sub(if mp.vis_taken.0 == i { mp.vis_taken.1 } else { 0 })
+        self.empty_vis_before(i).saturating_sub(mp.vis_taken_at(i))
     }
 
     fn lookup_bind<'b>(binds: &'b HashMap<String, Bind>, name: &str, idx: &[usize]) -> Option<&'b Bind> {
@@ -4116,6 +4155,7 @@ impl<'a> Parser<'a> {
         // the definition's edition decides which tokens can begin an `expr` (rustc: the
         // metavariable's span edition)
         let edition = if def.edition == 0 { self.edition } else { def.edition };
+        let mut best_failure = None;
         for (arm, (matcher, body)) in def.arms.iter().enumerate() {
             // rustc_expand mbe/macro_rules.rs: try_match_macro starts each arm with
             // a fresh parser. A failed arm must not leave grammar-split tokens behind.
@@ -4126,7 +4166,15 @@ impl<'a> Parser<'a> {
             // Failure: the next arm; an error (a fragment that did not parse, an ambiguity)
             // ends the call, as rustc's ErrorReported / Error do
             let binds = match self.parse_tt(&locs, &def.name, edition, lo, hi) {
-                Ok(b) => b,
+                Ok(ArmMatch::Matched(binds)) => Some(binds),
+                Ok(ArmMatch::Failed { index, vis_taken }) => {
+                    let position = (index, vis_taken);
+                    if best_failure.is_none_or(|(best, _)| position > best) {
+                        // The token can be the remainder of an operator split by this arm.
+                        best_failure = Some((position, self.toks.at(index)));
+                    }
+                    None
+                }
                 Err(m) => {
                     self.restore_match_tokens(undo);
                     return Err(m);
@@ -4150,7 +4198,12 @@ impl<'a> Parser<'a> {
             }
             self.restore_match_tokens(undo);
         }
-        Err(format!("no rule of `{}!` matches these arguments -- check the macro's patterns", def.name))
+        let descr = match best_failure {
+            Some(((_, taken), t)) if self.empty_vis.get(&{ t.lo }).is_some_and(|&n| n > taken) => "`vis` metavariable".into(),
+            Some(((i, _), t)) if i < hi => self.token_descr(t),
+            _ => return Err("unexpected end of macro invocation".into()),
+        };
+        Err(format!("no rules expected {descr}"))
     }
 }
 

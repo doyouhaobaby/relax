@@ -22,7 +22,7 @@ pub fn collect_definitions(prog: &mut Program, owner: DefId) -> Result<(), Strin
     let file = prog.def(owner).file;
     let pf = prog.files[file as usize].clone();
     let scope = prog.def(owner).scope;
-    let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope, legacy: false, legacy_attrs: None, legacy_names: &NO_NAMES, call_names: Some(Vec::new()), const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, legacy_calls: Default::default(), legacy_children: Vec::new() };
+    let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope, legacy: false, legacy_attrs: None, legacy_names: &NO_NAMES, call_names: Some(Vec::new()), const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, creates_defs_at: 0, legacy_calls: Default::default(), legacy_children: Vec::new() };
     visitor.visit_item(owner)?;
     // an owner with a constant or generic-default rib is walked by the legacy pass (its
     // late.rs const-rib checks report there): no entry
@@ -158,7 +158,7 @@ pub fn lower_legacy_const_owners(prog: &mut Program, owners: &[DefId]) -> usize 
         }
         let pf = prog.files[file as usize].clone();
         let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope,
-            legacy: true, legacy_attrs: Some(&attrs), legacy_names: &names, call_names: None, const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false,
+            legacy: true, legacy_attrs: Some(&attrs), legacy_names: &names, call_names: None, const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, creates_defs_at: 0,
             legacy_calls: Default::default(), legacy_children: Vec::new() };
         if let Err(error) = visitor.visit_item(owner) { visitor.prog.errors.push(error); }
         let calls = visitor.legacy_calls;
@@ -330,13 +330,18 @@ struct DefCollector<'a> {
     bindings: Vec<ValueRib>,
     checking_defs: bool,
     creates_defs: bool,
+    /// where the checked argument first creates a definition (rustc's error span)
+    creates_defs_at: u32,
     legacy_calls: crate::fxhash::HashMap<ExprId, LegacyConstArgs>,
     legacy_children: Vec<(ExprId, DefId)>,
 }
 
 impl DefCollector<'_> {
     fn create_def(&mut self, node: NodeId, name: Option<crate::program::Sym>, kind: DefKind) -> DefId {
-        if self.checking_defs { self.creates_defs = true; return self.parent_def; }
+        if self.checking_defs {
+            if let (false, NodeId::AnonConst(e) | NodeId::InlineConst(e) | NodeId::Closure(e)) = (self.creates_defs, node) { self.creates_defs_at = self.ast.expr(e).lo; }
+            self.creates_defs = true; return self.parent_def;
+        }
         let key = (self.file, node);
         if let Some(&def) = self.prog.node_id_to_def_id.get(&key) { return def; }
         let next = self.prog.def_disambiguators.entry((self.parent_def, kind, name)).or_default();
@@ -705,7 +710,10 @@ impl DefCollector<'_> {
                 Stmt::Expr(_, e) => self.visit_expr(e),
                 Stmt::Attrs(r) => self.visit_expr(self.ast.row(r).expr),
                 Stmt::Item(i) => {
-                    if self.checking_defs { self.creates_defs = true; continue; }
+                    if self.checking_defs {
+                        if !self.creates_defs { self.creates_defs_at = self.ast.item(i).lo; }
+                        self.creates_defs = true; continue;
+                    }
                     if !self.legacy {
                         if let Some(&d) = self.prog.item_defs.get(&(self.file, i.0)) {
                             self.prog.defs[d.0 as usize].parent = self.parent_def;
@@ -889,12 +897,13 @@ impl DefCollector<'_> {
                 self.legacy_children.push((arg, child));
                 // WillCreateDefIdsVisitor (expr.rs:90-109) uses the same AST walk;
                 // the checking mode records definition-producing nodes without installing them.
-                self.checking_defs = true; self.creates_defs = false;
+                self.checking_defs = true; self.creates_defs = false; self.creates_defs_at = self.ast.expr(arg).lo;
                 self.visit_expr(arg);
                 self.checking_defs = false;
+                // (once per call, at the node that creates the definition: InvalidLegacyConstGenericArg)
                 if self.creates_defs && !split.invalid {
-                    let error = self.prog.record_error(self.file, self.ast.expr(arg).lo, "legacy_const_generics",
-                        "invalid legacy const generic argument; use a const generic argument in the path instead".into());
+                    let error = self.prog.record_uncoded_error(self.file, self.creates_defs_at, "resolve",
+                        "invalid argument to a legacy const generic: cannot have const blocks, closures, async blocks or items".into());
                     if !self.prog.errors.contains(&error) { self.prog.errors.push(error); }
                     split.invalid = true;
                 }

@@ -25,6 +25,6 @@ OUT=$(cd "$H" && "$1" run --quiet pfi-app --features bad 2>&1)
 rc=$?
 echo "$OUT" | tail -4
 ok=0
-[ $rc != 0 ] && echo "$OUT" | grep -q "macro crate pfi.bad" && echo "$OUT" | grep -q "no rule of .only_a!. matches" && ok=1
+[ $rc != 0 ] && echo "$OUT" | grep -q "macro crate pfi.bad" && echo "$OUT" | grep -q "no rules expected .b." && ok=1
 case_is "the failing crate's own macro" $ok
 if [ $FAILS = 0 ]; then echo "pm_failed_crate_isolated: ok"; else echo "pm_failed_crate_isolated: FAILED ($FAILS)"; exit 1; fi

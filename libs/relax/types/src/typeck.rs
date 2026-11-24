@@ -552,7 +552,9 @@ pub struct Fcx<'a> {
     value_path_parent_regions: Vec<crate::types::RegionId>,
     /// `[x; N]` expressions whose `Copy` check waits for the end of the body (rustc
     /// deferred_repeat_expr_checks): (element, element type, the array type)
-    deferred_repeats: Vec<(ExprId, TyId, TyId)>,
+    /// per repeat expression: its operand, the operand's type, the array type and (unless `_`) its
+    /// count expression with the count as lowered, before normalization
+    deferred_repeats: Vec<(ExprId, TyId, TyId, Option<(ExprId, crate::consts::Const)>)>,
     /// goals drained as waiting for this body's coroutines (`TypeckResults::coroutine_stalled_predicates`)
     stalled_coroutine_goals: Vec<crate::next_solver::fulfill::PredicateObligation>,
     /// the probe picked a by-value method of `&U` for receiver U: autoref it
@@ -5964,19 +5966,19 @@ impl<'a> Fcx<'a> {
                     let arr = self.tcx.tys.mk_array(t, self.infcx.next_const_var());
                     // expr.rs:1775: the array type is well formed
                     self.register_wf(arr, lo);
-                    self.deferred_repeats.push((*x, t, arr));
+                    self.deferred_repeats.push((*x, t, arr, None));
                     return arr;
                 }
                 let usize_ = self.tcx.tys.usize_;
                 self.check_expr(*n, Some(usize_));
                 // hir_ty_lowering/mod.rs:2390: retain the repeat body's identity;
                 // fulfillment evaluates it through the same query as array types.
-                let len = self.tcx.lower_const_arg(self.prog, self.file, &self.env, *n, usize_);
-                let len = self.tcx.tys.intern(TyKind::Const(len));
+                let lowered = self.tcx.lower_const_arg(self.prog, self.file, &self.env, *n, usize_);
+                let len = self.tcx.tys.intern(TyKind::Const(lowered));
                 let len = self.normalize_body_type(len);
                 let arr = self.tcx.tys.mk_array(t, self.tcx.tys.expect_const(len));
                 self.register_wf(arr, lo);
-                self.deferred_repeats.push((*x, t, arr));
+                self.deferred_repeats.push((*x, t, arr, Some((*n, lowered))));
                 arr
             }
             ExprKind::Field(x, name) => self.check_field(e, *x, *name, lo),
@@ -7127,7 +7129,8 @@ impl<'a> Fcx<'a> {
         // the callee and published the const/value argument split.
         let args = if let Some(split) = &legacy {
             if split.invalid {
-                self.err(lo, "invalid legacy const generic argument".into());
+                // (collection reported it: the call is an error expression, as rustc lowers it)
+                self.infcx.set_tainted_by_errors();
                 return self.tcx.tys.error;
             }
             if let TyKind::FnDef(d, gargs, _) = self.tcx.tys.kind(fs).clone() {
@@ -7516,7 +7519,7 @@ impl<'a> Fcx<'a> {
     /// make another repeat's count known); `Copy` is required unless the count is 0 or 1.
     fn check_repeat_exprs(&mut self) {
         let mut todo = Vec::new();
-        for (x, et, arr) in std::mem::take(&mut self.deferred_repeats) {
+        for (x, et, arr, written) in std::mem::take(&mut self.deferred_repeats) {
             let mut y = x;
             while let ExprKind::Paren(i) = self.ast().expr(y).kind.clone() {
                 y = i;
@@ -7539,7 +7542,17 @@ impl<'a> Fcx<'a> {
             let count = self.deeply_resolve_ignoring_regions_with_obligations(count);
             let count = self.tcx.tys.expect_const(count);
             if matches!(self.tcx.tys.const_kind(count), crate::consts::ConstKind::Infer(_)) {
-                if self.b.errors.is_empty() { self.err(self.ast().expr(x).lo, "E0282: type annotations needed".into()); }
+                if self.b.errors.is_empty() {
+                    match written {
+                        // a count whose constant mentions a generic parameter does not evaluate:
+                        // rustc's error for the array type's ConstEvaluatable obligation
+                        // (NotConstEvaluatable::MentionsParam; `const_evaluatable_unchecked`)
+                        Some((n, lowered)) if matches!(self.tcx.tys.const_kind(lowered), crate::consts::ConstKind::Alias(..))
+                            && self.tcx.has_param(self.tcx.tys.intern(TyKind::Const(lowered))) =>
+                            self.err(self.ast().expr(n).lo, "error: constant expression depends on a generic parameter".into()),
+                        _ => self.err(self.ast().expr(x).lo, "E0282: type annotations needed".into()),
+                    }
+                }
                 continue;
             }
             if matches!(self.tcx.tys.const_kind(count), crate::consts::ConstKind::Error) || self.tcx.tys.has_error(self.tcx.tys.intern(TyKind::Const(count))) { continue; }
@@ -8226,7 +8239,14 @@ impl<'a> Fcx<'a> {
             if covered[i] { continue; }
             let (code, obligation) = match error {
                 NextSolverError::TrueError(o) => ("E0277", o),
-                NextSolverError::Ambiguity(o) => { if !self.b.errors.is_empty() { continue; } ("E0283", o) },
+                NextSolverError::Ambiguity(o) => {
+                    if !self.b.errors.is_empty() { continue; }
+                    // ambiguity.rs maybe_report_ambiguity: an ambiguity other than a trait goal's is
+                    // fallout of an error already reported (one of collection's, or a deduplicated one)
+                    // when the inference context is tainted
+                    if self.infcx.tainted_by_errors() && !matches!(o.goal.predicate.kind, PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(_))) { continue; }
+                    ("E0283", o)
+                }
                 NextSolverError::Overflow(o) => ("E0275", o),
             };
             let predicate = &obligation.goal.predicate;

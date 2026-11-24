@@ -1012,6 +1012,45 @@ mod round45_tests {
     }
 
     #[test]
+    fn an_invalid_legacy_const_generic_argument_is_its_one_error() {
+        // rustc 1.100: one error per call, at the node that creates a definition, worded as
+        // rustc_ast_lowering's InvalidLegacyConstGenericArg; the call lowers to an error expression,
+        // so the callee's generic arguments give no "type annotations needed" of their own. (rustc
+        // rewrites calls of another crate's fn only: the callee is a dependency's.)
+        isolated_test!(an_invalid_legacy_const_generic_argument_is_its_one_error);
+        let dir = std::env::temp_dir().join(format!("relax-check-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dep_root = dir.join("dep.rs").to_string_lossy().into_owned();
+        let root = dir.join("lib.rs").to_string_lossy().into_owned();
+        std::fs::write(&dep_root, "#![no_std]\n#![feature(rustc_attrs)]\n#[rustc_legacy_const_generics(1)]\n\
+            pub fn shift<const N: i32>(a: i32) -> i32 { a }\n").unwrap();
+        std::fs::write(&root, "#![no_std]\npub fn calls(a: i32) {\n    let _ = dep::shift(a, (|| 2)());\n\
+            \x20   let _ = dep::shift(a, const { 2 });\n}\n").unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = crate::program::Program::new(&session);
+        let dep = prog.load_crate("dep", &dep_root, 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let dep_name = prog.syms.intern("dep");
+        let krate = prog.load_crate("legacy", &root, 2021, crate::cfg::CfgSet::host(&session, &[]), vec![(dep_name, dep)]).unwrap();
+        prog.resolve_imports();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        // (the root's own errors, as run.rs gives the watch its load's)
+        let mut pre = crate::check::own_errors(&prog, krate, &prog.errors, "resolve");
+        pre.extend(crate::check::own_errors(&prog, krate, &tcx.errors, "typeck"));
+        let mut warm = Session::new(Unit::new(prog, tcx, 0), krate, pre);
+        warm.check();
+        let found: Vec<(u32, u32, String)> = warm.diagnostics().iter().map(|d| (d.line, d.col, d.message.clone())).collect();
+        let message = "invalid argument to a legacy const generic: cannot have const blocks, closures, async blocks or items";
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|(_, _, m)| m.ends_with(message)), "{found:?}");
+        assert_eq!(found.iter().map(|f| (f.0, f.1)).collect::<Vec<_>>(), [(3, 28), (4, 27)], "at the closure and the const block: {found:?}");
+        drop(warm);
+        std::fs::remove_file(root).unwrap();
+        std::fs::remove_file(dep_root).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn checking_body_edits_publish_owner_legacy_results() {
         isolated_test!(checking_body_edits_publish_owner_legacy_results);
         let dir = std::env::temp_dir().join(format!("relax-check-r45-{}", std::process::id()));

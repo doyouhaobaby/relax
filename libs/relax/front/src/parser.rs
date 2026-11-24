@@ -450,7 +450,7 @@ impl<'a> Parser<'a> {
     }
 
     fn ident_tok(&mut self) -> PResult<Ident> {
-        if self.at_stmt_frag() { return self.err("expected identifier, found statement metavariable"); }
+        if self.at_stmt_frag() { return self.stmt_frag_err("identifier"); }
         match self.kind() {
             T::Ident | T::RawIdent => {
                 let t = self.tok();
@@ -2777,6 +2777,11 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
+            // an expansion's items end at a `stmt` fragment, which is no item (rustc
+            // parse_ast_fragment: parse_item gives None, then ensure_complete_parse)
+            if end == T::Eof && self.exp_depth > 0 && attrs.is_empty() && self.at_stmt_frag() {
+                return Err(PErr { pos: self.lo(), msg: "macro expansion ignores `stmt` metavariable and any tokens following".into() });
+            }
             let mut attrs = attrs;
             self.normalize_builtin_test_attrs(&mut attrs);
             let dattrs = if attrs.is_empty() || self.macros.is_none() { Vec::new() } else { attrs.clone() };
@@ -3050,7 +3055,7 @@ impl<'a> Parser<'a> {
     /// An item, also one inside a fn body: its own text is not the body's (an impl or a const in
     /// a hole body is seen by other crates), so it is no hole until a fn of its own says so.
     fn item(&mut self, attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
-        if self.at_stmt_frag() { return self.err("expected item, found statement metavariable"); }
+        if self.at_stmt_frag() { return self.stmt_frag_err("item"); }
         let outer = std::mem::replace(&mut self.hole_body, false);
         let r = self.item_here(attrs);
         self.hole_body = outer;
@@ -4456,6 +4461,12 @@ impl<'a> Parser<'a> {
         !self.stmt_frags.is_empty() && self.stmt_frags.contains(&self.lo())
     }
 
+    /// rustc's error for a `stmt` fragment where `what` is expected (token_descr names the
+    /// fragment: "expected item, found `stmt` metavariable").
+    fn stmt_frag_err<X>(&self, what: &str) -> PResult<X> {
+        Err(PErr { pos: self.lo(), msg: format!("expected {what}, found `stmt` metavariable") })
+    }
+
     pub(super) fn ty_fragment_end(&self, lo: u32) -> Option<u32> {
         if self.ty_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
     }
@@ -4480,7 +4491,7 @@ impl<'a> Parser<'a> {
     }
 
     fn ty_inner(&mut self, plus: bool) -> PResult<TyId> {
-        if self.at_stmt_frag() { return self.err("expected type, found statement metavariable"); }
+        if self.at_stmt_frag() { return self.stmt_frag_err("type"); }
         // rustc_parse parser/ty.rs: parse_ty_common; parser/mod.rs: eat_metavar_seq.
         // Reparse a captured type inside invisible delimiters (`as $t << n`).
         if let Some(hi) = self.ty_fragment_end(self.tok().lo) {
@@ -4772,7 +4783,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pat_no_or(&mut self) -> PResult<PatId> {
-        if self.at_stmt_frag() { return self.err("expected pattern, found statement metavariable"); }
+        if self.at_stmt_frag() { return self.stmt_frag_err("pattern"); }
         if self.exp_depth > 0 && (!self.meta_frags.is_empty() || self.kind() == T::OpenParen) {
             self.expr_fragment_pat()?;
         }
@@ -5717,7 +5728,7 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
-        if self.at_stmt_frag() { return self.err("expected expression, found statement metavariable"); }
+        if self.at_stmt_frag() { return self.stmt_frag_err("expression"); }
         let lo = self.lo();
         // rustc_parse parser/expr.rs: parse_expr_bottom returns a Path expression
         // for MetaVarKind::Path; calls follow, but `{ .. }` and `::` do not extend it.

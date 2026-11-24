@@ -95,7 +95,19 @@ impl Tcx {
         ocx.eq(&env, trait_fn, impl_fn)?;
         for (_, ty, _) in &collected { ocx.register_obligation(Goal { param_env: env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(*ty)))) }); }
         ocx.evaluate_obligations_error_on_ambiguity()?;
-        if !infcx.resolve_regions(prog, env, &wf_tys).is_empty() { return Err(NoSolution); }
+        // :704-706 (resolve_regions_and_report_errors): a region error is reported here, by its origin
+        // (an item bound the hidden type does not meet is E0477), and the hidden types are errors (the
+        // ErrorGuaranteed of type_of), so the method's comparison reports nothing more
+        let errors = infcx.resolve_regions(prog, env, &wf_tys);
+        if !errors.is_empty() {
+            if !infcx.tainted_by_errors() {
+                let at = prog.files[prog.def(method).file as usize].ast.item(prog.def(method).item).lo;
+                for (span, message) in crate::wfcheck::obligations::region_error_messages(prog, self, &infcx, method, errors) {
+                    self.dcx.report(super::fulfill::ObligationCause { body_id: method, span: if span == 0 { at } else { span } }, message);
+                }
+            }
+            return Ok(prog.associated_types_for_impl_traits.get(&trait_method).into_iter().flatten().map(|&def| (def, self.tys.error)).collect());
+        }
         let mut result = Vec::new();
         // compare_impl_item.rs:717-719: only the RPITIT's own (captured) lifetimes are mapped;
         // the trait method's full generics (parent + own) are skipped.
