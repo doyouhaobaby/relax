@@ -900,7 +900,14 @@ impl<'a> Gates<'a> {
         self.binders.clear();
         if self.pf.edition >= 2018 { self.body_binders(owner); }
         match item.kind {
-            ItemKind::Fn(_, body, _) if let Some(b) = body.get() => self.block(b),
+            ItemKind::Fn(_, body, _) => {
+                // a deferred body (a lazy load: `makepad test`, `makepad run`) as typeck takes it, from
+                // the file's part: the check parsed every body of its crates before the gates. Only a
+                // file of this crate is asked, so nothing outside the checked crates is parsed here.
+                let ours = self.prog.file_crate.get(def.file as usize) == Some(&self.krate);
+                let b = body.get().or_else(|| if ours { self.prog.fn_body(def.file, def.item).ok().flatten() } else { None });
+                if let Some(b) = b { self.block(b) }
+            }
             ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { self.expr(e) },
             _ => {}
         }
