@@ -2488,6 +2488,10 @@ impl Cache {
         if self.crate_defs.is_empty() {
             // (definitions appended meanwhile are scanned too: the scan runs to the program's end)
             let (mut by, mut i) = self.crate_defs_scan.take().unwrap_or_else(|| (vec![Vec::new(); u.prog.crates.len()], 0));
+            // (a saved scan is this program's: definitions are only appended, and a settle
+            // rebuild, which replaces the program, opens a new cache that inherits no definition
+            // state, inherit_run_state)
+            debug_assert!(i <= u.prog.defs.len(), "a saved definition scan past the program's end: {} of {}", i, u.prog.defs.len());
             let start = i;
             while i < u.prog.defs.len() {
                 if i > start && (i - start) % DEF_SCAN_STEP == 0 && stop() {
