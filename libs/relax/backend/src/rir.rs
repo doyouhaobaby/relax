@@ -2584,14 +2584,16 @@ fn fma_nan(a: u64, b: u64, c: u64, m: u32, e: u32, is_nan: bool) -> Option<u64> 
     }
 }
 
+/// `v` as a value of `it`: its low `it.bits` bits, extended by the type's sign. Any width below 64,
+/// not only the integer types': the select-tree compare fold narrows through low masks
+/// (`n % 2 == 0` reads `n & 1`, one bit wide), and a constant kept unmasked there compared both
+/// arms of `if c { 130 } else { 131 }` as odd. 64 bits and wider are the value itself.
 pub fn extend_const(v: i64, it: IntTy) -> i64 {
-    match (it.bits, it.signed) {
-        (8, true) => v as i8 as i64,
-        (8, false) => v as u8 as i64,
-        (16, true) => v as i16 as i64,
-        (16, false) => v as u16 as i64,
-        (32, true) => v as i32 as i64,
-        (32, false) => v as u32 as i64,
+    match it.bits {
+        1..=63 => {
+            let sh = 64 - it.bits as u32;
+            if it.signed { (v << sh) >> sh } else { ((v as u64) << sh >> sh) as i64 }
+        }
         _ => v,
     }
 }

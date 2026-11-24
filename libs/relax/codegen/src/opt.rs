@@ -6184,6 +6184,39 @@ mod instcombine_tests {
         }
     }
 
+    /// `((a < 5 ? k1 : k2) & m) cc k`: the select-tree compare fold narrows through a low mask of
+    /// any width (`n % 2 == 0` is `n & 1`, one bit) and folds to what the unfolded code computes:
+    /// the masked arms zero-extended also under a signed compare (`(7 & 7) <s 4` is false), and a
+    /// mask with a gap (5, 0x50) not read as the low bits up to its top one.
+    #[test]
+    fn low_mask_compare_of_a_constant_select() {
+        let conds = [(Cond::Eq, false), (Cond::Ne, false), (Cond::Gt, false), (Cond::Lt, true), (Cond::Gt, true), (Cond::Le, true), (Cond::Ge, true)];
+        for (k1, k2) in [(130, 131), (0x1c2, 0x101), (7, 2), (0x5f, 0x20)] {
+            for m in [1, 3, 5, 7, 0x3f, 0x50, 0xff, 0x7ff] {
+                for (cc, signed) in conds {
+                    for k in [-1, 0, 1, 2, 3, 4] {
+                        let mut f = fixture(1, 7, 1);
+                        let [a, c, x1, x2, sel, low, d] = std::array::from_fn::<_, 7, _>(|i| VReg(i as u32));
+                        f.blocks[0].insts = vec![
+                            Inst::ICmpI(Cond::Lt, false, c, a, 5),
+                            Inst::Iconst(x1, k1),
+                            Inst::Iconst(x2, k2),
+                            Inst::Sel(sel, c, x1, x2),
+                            Inst::IBinI(IOp::And, U64, low, sel, m),
+                            Inst::ICmpI(cc, signed, d, low, k),
+                        ];
+                        f.blocks[0].term = Term::Ret(vec![d]);
+                        positions(&mut f);
+                        simplify_ic(&mut f, true);
+                        for (arg, kv) in [(0, k1), (9, k2)] {
+                            assert_eq!(eval(&f, &[arg]), cmp_i(cc, signed, kv & m, k) as i64, "({k1:#x} or {k2:#x}) & {m:#x} {cc:?} signed {signed} {k}, the {kv:#x} arm: {:?}", f.blocks[0].insts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn phi_fixture(narrow: bool, cc: Cond, signed: bool, k: i64) -> Func {
         let mut f = fixture(2, 5, 4);
         f.blocks[0].term = Term::Branch(VReg(0), 1, 2);
