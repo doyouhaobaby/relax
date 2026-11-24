@@ -873,6 +873,17 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
             }
             if kind == CheckKind::Items { defs.retain(|(k, _)| items.contains_key(k)); }
         }
+        // the crates' `use` declarations: no def's check sees them, and rustc's resolve refuses
+        // one through something private (E0603), as a check does (check_crate_impl import_privacy)
+        let refused: Vec<(u32, String)> = {
+            let r = beside.map(|_| jit::front_read("app check imports"));
+            let prog = r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0);
+            let mut own = vec![false; prog.crates.len()];
+            for &k in items.keys() { own[k as usize] = true; }
+            prog.import_privacy_errors(&own).into_iter().map(|(k, _, e)| (k, e)).collect()
+        };
+        for (k, _) in &refused { items.remove(k); }
+        item_errors.extend(refused);
         if crate::run_threads::run_ending() { return run_ended(); }
     }
     // Impl soundness once per crate, in parallel before its bodies. Dependencies are checked
@@ -1926,8 +1937,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     errors.extend(staged(Stage::new(Phase::Early, 2), relax_types::lint_levels::check(&u.prog, &own))); st.mark("lint_levels");
     relax_types::lint_dead::reset();
     let privacy = u.prog.import_privacy_errors(&own);
-    erroneous_imports.extend(privacy.iter().filter_map(|(i, _)| *i));
-    errors.extend(staged(Stage::new(Phase::Resolve, 6), privacy.into_iter().map(|(_, e)| e))); st.mark("import_privacy");
+    erroneous_imports.extend(privacy.iter().filter_map(|(_, i, _)| *i));
+    errors.extend(staged(Stage::new(Phase::Resolve, 6), privacy.into_iter().map(|(_, _, e)| e))); st.mark("import_privacy");
     errors.extend(staged(Stage::new(Phase::Attrs, 0), u.prog.attribute_errors(&own))); st.mark("attribute_errors");
     errors.extend(staged(Stage::new(Phase::Early, 0), u.prog.ast_validation_errors(&own))); st.mark("ast_validation");
     let d_items = t_items0.elapsed();
