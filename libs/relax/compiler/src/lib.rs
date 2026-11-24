@@ -222,8 +222,8 @@ mod test_child {
     }
 
     /// `run_alone` for a test whose regression is a hang: a child that has not ended `secs` after
-    /// it started is ended, and the test fails saying so.
-    #[cfg(any(target_vendor = "apple", all(target_os = "linux", target_arch = "x86_64")))]
+    /// it started is ended, and the test fails saying so (Windows: run to its end, no deadline).
+    #[cfg(any(target_vendor = "apple", all(any(target_os = "linux", windows), target_arch = "x86_64")))]
     pub fn run_alone_within(module: &str, name: &str, secs: u64) -> bool {
         run_alone_as(module, name, None, Some(secs))
     }

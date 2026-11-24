@@ -327,9 +327,12 @@ pub fn read_mem(addr: u64, len: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Pause: Mach suspend / resume of one thread (macOS; suspends nest); its run state.
+/// Pause: suspend / resume of one thread (macOS: Mach; Windows x64: SuspendThread; suspends
+/// nest); its run state (macOS).
 #[cfg(target_vendor = "apple")]
 pub use imp::{resume, running, suspend};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use imp::{resume, suspend};
 
 /// Walks frame records from `fp` (fp rule: [fp] = caller's fp, [fp+8] = return address), appending
 /// to `raw` until the chain ends, leaves the stack upwards order or `raw` is full.
@@ -1348,9 +1351,58 @@ mod imp {
     use makepad_windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use makepad_windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, GetThreadTimes, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME};
 
-    /// (no pause on Windows: nothing holds a thread whose registers this could give)
-    pub fn regs_now(_t: &Thread) -> Option<(u64, u64, Vec<(usize, u64)>)> {
-        None
+    /// A held thread's pc, frame pointer and callee-saved registers (rbx, r12..r15 at their
+    /// jit.rs `reg_slot` indices), read while one more suspension stops it (suspends nest).
+    pub fn regs_now(t: &Thread) -> Option<(u64, u64, Vec<(usize, u64)>)> {
+        let h = open(t, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT)?;
+        let mut ctx = Aligned(CONTEXT::default());
+        ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+        let got = unsafe {
+            let got = SuspendThread(h) != u32::MAX && GetThreadContext(h, &mut ctx.0).is_ok();
+            ResumeThread(h);
+            let _ = CloseHandle(h);
+            got
+        };
+        let c = &ctx.0;
+        got.then(|| (c.Rip, c.Rbp, vec![(2, c.Rbx), (3, c.R12), (4, c.R13), (5, c.R14), (6, c.R15)]))
+    }
+
+    /// The thread's handle with `access`; None once it ended.
+    fn open(t: &Thread, access: makepad_windows_sys::Win32::System::Threading::THREAD_ACCESS_RIGHTS) -> Option<HANDLE> {
+        unsafe { OpenThread(access, false, t.os_id as u32) }.ok()
+    }
+
+    /// Thread `t` suspended (the pause's hold; suspends nest, as Mach's do), and stopped once this
+    /// returns true: a suspension takes effect asynchronously, and GetThreadContext returns once it
+    /// has. Never this thread. System calls only, no allocation (the pause calls it with the
+    /// process heap locked).
+    pub fn suspend(t: &Thread) -> bool {
+        if t.os_id == self_os_id() {
+            return false;
+        }
+        let Some(h) = open(t, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT) else { return false };
+        let mut ctx = Aligned(CONTEXT::default());
+        ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+        unsafe {
+            let mut ok = SuspendThread(h) != u32::MAX;
+            // (a suspension that cannot be seen to stop it is taken back: not held)
+            if ok && GetThreadContext(h, &mut ctx.0).is_err() {
+                ResumeThread(h);
+                ok = false;
+            }
+            let _ = CloseHandle(h);
+            ok
+        }
+    }
+
+    /// One suspension of `t` taken back.
+    pub fn resume(t: &Thread) {
+        if let Some(h) = open(t, THREAD_SUSPEND_RESUME) {
+            unsafe {
+                ResumeThread(h);
+                let _ = CloseHandle(h);
+            }
+        }
     }
 
     pub fn self_os_id() -> u64 {

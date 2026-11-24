@@ -17,6 +17,9 @@ extern "system" {
     pub fn DiscardVirtualMemory(addr: *mut u8, size: usize) -> u32;
     pub fn K32QueryWorkingSetEx(process: HANDLE, info: *mut WorkingSetExInformation, bytes: u32) -> i32;
     pub fn FlushInstructionCache(process: HANDLE, addr: *const u8, size: usize) -> i32;
+    pub fn GetProcessHeap() -> HANDLE;
+    pub fn HeapLock(heap: HANDLE) -> i32;
+    pub fn HeapUnlock(heap: HANDLE) -> i32;
     // errors
     pub fn GetLastError() -> u32;
     pub fn SetLastError(e: u32);

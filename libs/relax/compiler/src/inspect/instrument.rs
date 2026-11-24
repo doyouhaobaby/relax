@@ -1174,9 +1174,9 @@ static PATCH_PAUSE: AtomicBool = AtomicBool::new(false);
 /// Such a thread runs on and is held once it has left the front end (the pause's sweep). A
 /// patch's pause holds every thread, as it reads their stacks before its install. Async-signal-
 /// safe (the Linux hold handler asks): two atomic loads. Where a pause holds threads: the Apple
-/// pause, the Linux and Android aarch64 hold handler (inspect/threads.rs); elsewhere a pause
-/// holds no thread.
-#[cfg(any(target_vendor = "apple", target_os = "linux", all(target_os = "android", target_arch = "aarch64")))]
+/// and Windows x64 pause, the Linux and Android aarch64 hold handler (inspect/threads.rs);
+/// elsewhere a pause holds no thread.
+#[cfg(any(target_vendor = "apple", all(windows, target_arch = "x86_64"), target_os = "linux", all(target_os = "android", target_arch = "aarch64")))]
 pub(crate) fn pause_lets_front_readers_go() -> bool {
     PAUSED.load(Relaxed) && !PATCH_PAUSE.load(Relaxed)
 }
@@ -1384,7 +1384,9 @@ pub(crate) fn held_now(os_id: u64) -> bool {
     pause_imp::holds(os_id)
 }
 
-#[cfg(target_vendor = "apple")]
+/// The pause by suspension (macOS: Mach; Windows x64: SuspendThread), in a window in which the
+/// allocator's locks are this thread's (`lock_allocator`).
+#[cfg(any(target_vendor = "apple", all(windows, target_arch = "x86_64")))]
 mod pause_imp {
     static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
     /// The threads held for good (`keep`): suspended until the run's end lets them go (`release_kept`).
@@ -1396,6 +1398,7 @@ mod pause_imp {
         relax_session::reset_static(&KEPT, relax_session::sync::Mutex::new(Vec::new()));
         relax_session::reset_static(&DECLINED, relax_session::sync::Mutex::new(Vec::new()));
     }
+    #[cfg(target_vendor = "apple")]
     extern "C" {
         static mach_task_self_: u32;
         fn malloc_get_all_zones(task: u32, reader: *const u8, out: *mut *const usize, count: *mut u32) -> i32;
@@ -1404,7 +1407,8 @@ mod pause_imp {
     /// Every malloc zone's lock taken (zone->introspect->force_lock, as fork() does) while the
     /// threads are suspended: no thread stops holding an allocator lock, so inspect's commands
     /// (which allocate) keep working while the program is paused. Nothing may allocate between
-    /// `lock_zones` and `unlock_zones` (this thread would wait for itself).
+    /// `lock_allocator` and `unlock_allocator` (this thread would wait for itself).
+    #[cfg(target_vendor = "apple")]
     unsafe fn zones() -> &'static [usize] {
         let mut addrs: *const usize = std::ptr::null();
         let mut n = 0u32;
@@ -1415,6 +1419,7 @@ mod pause_imp {
     }
     /// malloc_zone_t: introspect is its 13th word; malloc_introspection_t: force_lock, force_unlock
     /// are its 6th and 7th
+    #[cfg(target_vendor = "apple")]
     unsafe fn zone_fn(zone: usize, k: usize) -> Option<unsafe extern "C" fn(usize)> {
         let intro = *((zone as *const usize).add(12));
         if intro == 0 {
@@ -1475,7 +1480,7 @@ mod pause_imp {
     /// there: `held` and `rest` have room, the threads move out of `list` by drain (its buffer is
     /// freed after the unlock, as a thread's name is when it drops).
     unsafe fn hold_picked(list: &mut Vec<crate::inspect::threads::Thread>, picked: &[bool], held: &mut Vec<crate::inspect::threads::Thread>, rest: &mut Vec<crate::inspect::threads::Thread>) {
-        lock_zones();
+        lock_allocator();
         for (k, t) in list.drain(..).enumerate() {
             if picked[k] && crate::inspect::threads::suspend(&t) {
                 held.push(t);
@@ -1483,55 +1488,89 @@ mod pause_imp {
                 rest.push(t);
             }
         }
-        unlock_zones();
+        unlock_allocator();
     }
     /// `declined`'s threads suspended, whether each was into `stopped` (it has room).
     unsafe fn hold_declined(declined: &[crate::inspect::threads::Thread], stopped: &mut Vec<bool>) {
-        lock_zones();
+        lock_allocator();
         for t in declined {
             stopped.push(crate::inspect::threads::suspend(t));
         }
-        unlock_zones();
+        unlock_allocator();
     }
     /// Thread `t` suspended, as the pause suspends one (`keep`, of a thread it did not hold).
     unsafe fn hold_one(t: &crate::inspect::threads::Thread) -> bool {
-        lock_zones();
+        lock_allocator();
         let ok = crate::inspect::threads::suspend(t);
-        unlock_zones();
+        unlock_allocator();
         ok
     }
     /// Under a JIT (this runtime run by another Relax, as its own tests are under `--live`) the
-    /// windows' code is built before a zone is locked: a lazy compile in there asks that JIT's
-    /// compiler, whose allocations wait for the zone locks this thread holds, and the process
-    /// hangs (macOS hangs of the reload tests under the JIT, 11-17). The JIT builds them with all
+    /// windows' code is built before an allocator lock is taken: a lazy compile in there asks that
+    /// JIT's compiler, whose allocations wait for the locks this thread holds (on Windows, those of
+    /// its other threads), and the process hangs (macOS hangs of the reload tests under the JIT,
+    /// 11-17). The JIT builds them with all
     /// they reach through `__relax_precompile`, as Relax std's fork_exec asks before its fork
     /// (which locks the zones too). Each pause asks: an edit of this code sends it back to its lazy
     /// stubs, and an ask with nothing left to build is one walk. Native: no such symbol.
     fn build_windows() {
-        extern "C" {
-            fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
-        }
-        const RTLD_DEFAULT: *mut u8 = -2isize as *mut u8;
-        let at = unsafe { dlsym(RTLD_DEFAULT, b"__relax_precompile\0".as_ptr()) } as usize;
+        let at = precompile_symbol();
         if at != 0 {
             let precompile = unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*const usize, usize, bool) -> u64>(at) };
             let roots = [hold_picked as *const () as usize, hold_declined as *const () as usize, hold_one as *const () as usize];
             unsafe { precompile(roots.as_ptr(), roots.len(), false) };
         }
     }
-    unsafe fn lock_zones() {
+    /// The JIT's `__relax_precompile` (its loader's symbol, found through dlsym); 0 natively.
+    #[cfg(target_vendor = "apple")]
+    fn precompile_symbol() -> usize {
+        extern "C" {
+            fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
+        }
+        const RTLD_DEFAULT: *mut u8 = -2isize as *mut u8;
+        unsafe { dlsym(RTLD_DEFAULT, b"__relax_precompile\0".as_ptr()) as usize }
+    }
+    /// The JIT's `__relax_precompile` (its loader answers GetProcAddress for it, whatever the
+    /// module); 0 natively.
+    #[cfg(windows)]
+    fn precompile_symbol() -> usize {
+        use relax_session::win32::{GetModuleHandleExW, GetProcAddress};
+        // (GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: the executable's handle, nothing taken)
+        let mut exe = 0;
+        unsafe {
+            GetModuleHandleExW(2, std::ptr::null(), &mut exe);
+            GetProcAddress(exe, b"__relax_precompile\0".as_ptr()) as usize
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe fn lock_allocator() {
         for &z in zones() {
             if let Some(f) = zone_fn(z, 5) {
                 f(z);
             }
         }
     }
-    unsafe fn unlock_zones() {
+    #[cfg(target_vendor = "apple")]
+    unsafe fn unlock_allocator() {
         for &z in zones().iter().rev() {
             if let Some(f) = zone_fn(z, 6) {
                 f(z);
             }
         }
+    }
+    /// The process heap's lock taken (HeapLock) while the threads are suspended: the heap the
+    /// system allocator, the C runtime and the system's own calls allocate from, so no thread
+    /// stops holding it and inspect's commands keep working while the program is paused. (Only
+    /// that heap: a private heap made without serialization has no lock to take, HeapLock on it
+    /// is undefined, and inspect allocates from none.) A thread waiting for the lock stops there:
+    /// `threads::suspend` returns once its thread has stopped, so none takes it after the unlock.
+    #[cfg(windows)]
+    unsafe fn lock_allocator() {
+        relax_session::win32::HeapLock(relax_session::win32::GetProcessHeap());
+    }
+    #[cfg(windows)]
+    unsafe fn unlock_allocator() {
+        relax_session::win32::HeapUnlock(relax_session::win32::GetProcessHeap());
     }
     /// One sweep of the threads the pause let go: each is stopped, and held when it has left the
     /// front end (let go again when not). False: none is left to hold, or the pause ended.
@@ -1572,7 +1611,7 @@ mod pause_imp {
         DECLINED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         n
     }
-    /// Out of the pause's set: no resume reaches it (its Mach suspension stays until the run's end,
+    /// Out of the pause's set: no resume reaches it (its suspension stays until the run's end,
     /// `release_kept`); suspended now when the pause did not hold it.
     pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1684,7 +1723,7 @@ mod pause_imp {
     }
 }
 
-#[cfg(any(windows, target_os = "android"))]
+#[cfg(any(all(windows, not(target_arch = "x86_64")), target_os = "android"))]
 mod pause_imp {
     pub fn pause(_want: &'static (dyn Fn(&crate::inspect::threads::Thread) -> bool + Sync)) -> usize {
         0
@@ -1865,7 +1904,7 @@ mod name_tests {
     }
 }
 
-#[cfg(all(test, any(target_vendor = "apple", all(target_os = "linux", target_arch = "x86_64"))))]
+#[cfg(all(test, any(target_vendor = "apple", all(any(target_os = "linux", windows), target_arch = "x86_64"))))]
 mod pause_tests {
     use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
