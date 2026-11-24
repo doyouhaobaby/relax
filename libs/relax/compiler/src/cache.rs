@@ -990,6 +990,12 @@ pub struct Cache {
     def_maps: HashMap<u32, HashMap<u128, DefId>>,
     /// every definition by crate (built once, on the first decode)
     crate_defs: Vec<Vec<DefId>>,
+    /// a crate's definition map being built in steps (`map_crate_defs`): the crate, its
+    /// definitions, how many are keyed, the map so far, and the keys found twice
+    def_map_partial: Option<(u32, Vec<DefId>, usize, HashMap<u128, DefId>, HashSet<u128>)>,
+    /// (test) the crates whose maps an append of definitions made go (`defs_appended`)
+    #[cfg(test)]
+    def_maps_appended: Vec<u32>,
     crate_defs_n: usize,
     /// definitions from `crate_defs_n` to here are run-time modules' (`defs_mapped`); 0: none seen
     module_defs_n: usize,
@@ -1115,6 +1121,9 @@ pub struct Cache {
     image_resume: Option<image::ImageResume>,
     #[cfg(test)]
     image_reads: std::sync::atomic::AtomicUsize,
+    /// (test) image builds that gave way and then started over (cache/image.rs refresh_resume)
+    #[cfg(test)]
+    image_starts_over: usize,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -1483,6 +1492,9 @@ impl Cache {
             foreign_canon: None,
             def_maps: HashMap::new(),
             crate_defs: Vec::new(),
+            def_map_partial: None,
+            #[cfg(test)]
+            def_maps_appended: Vec::new(),
             crate_defs_n: 0,
             module_defs_n: 0,
             def_keys: HashMap::new(),
@@ -1527,6 +1539,8 @@ impl Cache {
             image_resume: None,
             #[cfg(test)]
             image_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            image_starts_over: 0,
             rec_tier: HashMap::new(),
             manifest_root: None,
             linked_key: HashMap::new(),
@@ -2392,14 +2406,7 @@ impl Cache {
         let ci = dd.u128()?;
         let k = dd.u128()?;
         let c = *self.crate_by_ident.get(&ci)?;
-        // definitions added since the maps were built (a live edit): build them again
-        if !self.defs_mapped(u) {
-            self.crate_defs_n = u.prog.defs.len();
-            self.module_defs_n = 0;
-            self.crate_defs.clear();
-            self.def_maps.clear();
-            self.mapped_definitions = None;
-        }
+        if !self.defs_mapped(u) { self.defs_appended(u); }
         if let Some(mapped) = &self.mapped_definitions {
             // (a partial restore's tables hold for its kept crates' definitions before its suffix;
             // the rest -- the other crates, a kept crate's on-demand tail -- go by the maps)
@@ -2409,38 +2416,94 @@ impl Cache {
                 None => {}
             }
         }
-        if !self.def_maps.contains_key(&c) {
-            let t0 = relax_session::clock::cpu_ns();
-            if self.crate_defs.is_empty() {
-                let mut by = vec![Vec::new(); u.prog.crates.len()];
-                for i in 0..u.prog.defs.len() {
-                    let d = DefId(i as u32);
-                    if let Some(v) = by.get_mut(u.prog.def(d).krate as usize) {
-                        v.push(d);
-                    }
-                }
-                self.crate_defs = by;
-            }
-            let defs = std::mem::take(self.crate_defs.get_mut(c as usize)?);
-            let mut m = HashMap::with_capacity(defs.len());
-            let mut dup = HashSet::new();
-            for &d in &defs {
-                let kk = self.def_key(u, d);
-                if m.insert(kk, d).is_some() {
-                    dup.insert(kk);
-                }
-            }
-            // two definitions with one key: neither decodes (a miss, never the wrong one)
-            for kk in dup {
-                m.remove(&kk);
-                self.stats.def_collisions += 1;
-            }
-            if self.verbose && trace_on() {
-                eprintln!("relax cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (relax_session::clock::cpu_ns() - t0) as f64 / 1e6);
-            }
-            self.def_maps.insert(c, m);
-        }
+        if !self.map_crate_defs(u, c, &|| false).ok()? { return None; }
         self.def_maps.get(&c)?.get(&k).copied()
+    }
+
+    /// Definitions were added to crates the cache names since the maps were built (a live edit;
+    /// definitions are only ever appended): the maps of those crates go, with their lists of
+    /// definitions taken anew; every other crate's map, or its list, holds as it was. The
+    /// restored tables go as before (they describe the definitions before the append, and the
+    /// collected record reuses them up to `crate_defs_n`).
+    fn defs_appended(&mut self, u: &Unit) {
+        let n = u.prog.defs.len();
+        let mut touched: Vec<u32> = (self.crate_defs_n.min(n)..n).map(|i| u.prog.def(DefId(i as u32)).krate).filter(|&k| (k as usize) < self.crate_ident.len()).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        // a map built in steps: its definitions back to its crate's list (taken anew below if
+        // its crate is one of these)
+        if let Some((pc, defs, ..)) = self.def_map_partial.take() {
+            if let Some(v) = self.crate_defs.get_mut(pc as usize) { *v = defs; }
+        }
+        for c in &touched { self.def_maps.remove(c); }
+        if !self.crate_defs.is_empty() && !touched.is_empty() {
+            for &c in &touched { if let Some(v) = self.crate_defs.get_mut(c as usize) { v.clear(); } }
+            for i in 0..n {
+                let d = DefId(i as u32);
+                let k = u.prog.def(d).krate;
+                if touched.binary_search(&k).is_ok() {
+                    if let Some(v) = self.crate_defs.get_mut(k as usize) { v.push(d); }
+                }
+            }
+        }
+        self.crate_defs_n = n;
+        self.module_defs_n = 0;
+        self.mapped_definitions = None;
+        #[cfg(test)]
+        { self.def_maps_appended.extend(touched); }
+    }
+
+    /// Crate `c`'s map from definition key to definition, built when it has none, asking `stop`
+    /// every DEF_MAP_STEP definitions (a large crate's map took 10-35 ms in one step inside the
+    /// startup image build): a stop keeps what is keyed (`def_map_partial`) for the next call, of
+    /// this crate. Ok(true): `c` has its map; Ok(false): `stop` said yes; Err: `c` has no list.
+    pub(super) fn map_crate_defs(&mut self, u: &Unit, c: u32, stop: &dyn Fn() -> bool) -> Result<bool, ()> {
+        if !self.defs_mapped(u) { self.defs_appended(u); }
+        if self.def_maps.contains_key(&c) { return Ok(true); }
+        let t0 = relax_session::clock::cpu_ns();
+        if self.crate_defs.is_empty() {
+            let mut by = vec![Vec::new(); u.prog.crates.len()];
+            for i in 0..u.prog.defs.len() {
+                let d = DefId(i as u32);
+                if let Some(v) = by.get_mut(u.prog.def(d).krate as usize) {
+                    v.push(d);
+                }
+            }
+            self.crate_defs = by;
+        }
+        let (defs, mut i, mut m, mut dup) = match self.def_map_partial.take() {
+            Some((pc, defs, i, m, dup)) if pc == c => (defs, i, m, dup),
+            other => {
+                // another crate's map in steps: its definitions back to its list (it starts again)
+                if let Some((pc, defs, ..)) = other {
+                    if let Some(v) = self.crate_defs.get_mut(pc as usize) { *v = defs; }
+                }
+                let defs = std::mem::take(self.crate_defs.get_mut(c as usize).ok_or(())?);
+                let m = HashMap::with_capacity(defs.len());
+                (defs, 0, m, HashSet::new())
+            }
+        };
+        while i < defs.len() {
+            if i % DEF_MAP_STEP == DEF_MAP_STEP - 1 && stop() {
+                self.def_map_partial = Some((c, defs, i, m, dup));
+                return Ok(false);
+            }
+            let kk = self.def_key(u, defs[i]);
+            if m.insert(kk, defs[i]).is_some() {
+                dup.insert(kk);
+            }
+            i += 1;
+        }
+        // two definitions with one key: neither decodes (a miss, never the wrong one)
+        for kk in dup {
+            m.remove(&kk);
+            self.stats.def_collisions += 1;
+        }
+        if self.verbose && trace_on() {
+            eprintln!("relax cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (relax_session::clock::cpu_ns() - t0) as f64 / 1e6);
+        }
+        self.def_maps.insert(c, m);
+        Ok(true)
     }
 
     /// A monomorphic type by structure. Inference variables, params, etc. cannot be stored.
@@ -6871,6 +6934,10 @@ pub(crate) fn def_kind_code(k: &DefKind) -> u32 {
 /// name, stable name), kept in memory and written at exit (no I/O on the compile path).
 static TRACE: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
+/// Definitions a crate's map keys between two asks of `stop` (map_crate_defs); few in tests, so a
+/// small crate's map is built in steps too.
+const DEF_MAP_STEP: usize = if cfg!(test) { 4 } else { 1024 };
+
 pub(crate) fn trace_on() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var_os("RELAX_CACHE_TRACE").is_some())
@@ -10356,6 +10423,38 @@ mod data_tests {
             assert_eq!(cache.pending_manifest_payload(root), Some(payload), "manifest bytes after check {g}");
             assert_eq!(first + second, reads, "image reads across check {g}");
         }
+        // A slot replaced between the tries (an O2 build of the last slot, placed last): a build
+        // that has not placed it goes on and chooses its entry again; one that placed it would
+        // hold older code for 1 of its 40 slots (over 1%) and starts over. Either way the manifest
+        // is the one a build in one go makes of the same final state.
+        let last = *ids.last().unwrap();
+        let o2 = [0x90, 0xc3];
+        let mut replaced_ref = fresh("reference-replaced");
+        replaced_ref.record_o2(&u, last, &o2, &[], &[]);
+        assert!(record(&mut replaced_ref, &|| false).0, "the replaced reference builds");
+        let replaced_payload = replaced_ref.pending_manifest_payload(root).expect("the replaced reference manifest").to_vec();
+        assert_ne!(&replaced_payload[..], payload, "the O2 code is in the image");
+        let (mut resumed, mut restarted) = (0, 0);
+        for g in 1..=calls.get() {
+            let mut cache = fresh(&format!("replaced-{g}"));
+            let checked = Cell::new(0usize);
+            let (done, _) = record(&mut cache, &|| {
+                checked.set(checked.get() + 1);
+                checked.get() == g
+            });
+            assert!(!done, "check {g} must interrupt the first try (replaced)");
+            let placed = cache.image_resume_placed(last);
+            cache.record_o2(&u, last, &o2, &[], &[]);
+            assert!(record(&mut cache, &|| false).0, "the retry after check {g} and a replacement must finish");
+            assert_eq!(cache.pending_manifest_payload(root), Some(&replaced_payload[..]), "manifest bytes after check {g} and a replacement");
+            match placed {
+                Some(true) => { assert_eq!(cache.image_starts_over, 1, "check {g}: the replaced slot was placed: the build starts over"); restarted += 1; }
+                Some(false) => { assert_eq!(cache.image_starts_over, 0, "check {g}: the replaced slot was not placed: the build goes on"); resumed += 1; }
+                None => {}
+            }
+        }
+        assert!(resumed > 0 && restarted > 0, "both cases ran: {resumed} went on, {restarted} started over");
+        drop(replaced_ref);
         drop(repeat);
         drop(reference);
         std::fs::remove_dir_all(dir).unwrap();
@@ -11139,20 +11238,33 @@ mod data_tests {
         pack::ensure_private_dir(&root).unwrap();
         let source = root.join("fixture.rs");
         let module_path = root.join("module.rs");
+        let other_path = root.join("other.rs");
         std::fs::write(&source, "pub fn f() {}\nfn main() {}\n").unwrap();
         std::fs::write(&module_path, "pub fn g() {}\n").unwrap();
+        // (more definitions than a map's step in tests: its map is built in several steps)
+        std::fs::write(&other_path, (0..10).map(|i| format!("pub fn o{i}() {{}}\n")).collect::<String>()).unwrap();
         let mut prog = crate::program::Program::new(sess);
-        prog.load_crate("fixture", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let fixture = prog.load_crate("fixture", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let other = prog.load_crate("other", other_path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
         let f = DefId(prog.defs.iter().position(|d| prog.syms.str(d.name) == "f").unwrap() as u32);
+        let o3 = DefId(prog.defs.iter().position(|d| prog.syms.str(d.name) == "o3").unwrap() as u32);
         let mut tcx = crate::tcx::Tcx::new();
         tcx.collect(&prog);
         let mut u = Unit::new(prog, tcx, 0);
         let mut c = open_test_cache(&u, &root);
         let mut e = E::default();
         c.enc_def(&u, f, &mut e, &mut Vec::new());
+        let mut other_e = E::default();
+        c.enc_def(&u, o3, &mut other_e, &mut Vec::new());
+        // a map built in steps keeps its progress over a stop, and gives way to another crate's
+        assert_eq!(c.map_crate_defs(&u, other, &|| true), Ok(false), "a stop at the first ask leaves the other crate's map in steps");
+        assert!(c.def_map_partial.as_ref().is_some_and(|p| p.0 == other && p.2 > 0), "the steps so far are kept");
         assert_eq!(c.dec_def(&u, &mut D { b: &e.0, p: 0 }), Some(f), "the program definition must decode before a module loads");
         let maps = (c.crate_defs_n, c.def_maps.len());
         assert_eq!(maps, (u.prog.defs.len(), 1), "the first decode must build the program crate's definition map");
+        assert!(c.def_map_partial.is_none(), "another crate's decode puts the map in steps back");
+        assert_eq!(c.dec_def(&u, &mut D { b: &other_e.0, p: 0 }), Some(o3), "the other crate's map is built whole after a stop");
+        let maps = (c.crate_defs_n, c.def_maps.len());
 
         u.prog.load_crate("module", module_path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
         let g = DefId(u.prog.defs.iter().position(|d| u.prog.syms.str(d.name) == "g").unwrap() as u32);
@@ -11163,12 +11275,33 @@ mod data_tests {
         c.enc_def(&u, g, &mut module_e, &mut Vec::new());
         assert_eq!(c.dec_def(&u, &mut D { b: &module_e.0, p: 0 }), None, "a run-time module's definition must not decode from a cache key");
 
-        // A live edit adds a definition to a crate the cache can name.
-        let added = *u.prog.def(f);
-        u.prog.defs.push(added);
-        let _ = c.dec_def(&u, &mut D { b: &e.0, p: 0 });
+        // A live edit adds definitions to a crate the cache can name: one under a new name, and a
+        // copy of f. (The first map took every crate's definitions as added: only what this
+        // append drops counts.)
+        c.def_maps_appended.clear();
+        let mut renamed = *u.prog.def(f);
+        renamed.name = u.prog.syms.intern("h");
+        u.prog.defs.push(renamed);
+        let h = DefId(u.prog.defs.len() as u32 - 1);
+        let twin = *u.prog.def(f);
+        u.prog.defs.push(twin);
+        let twin = DefId(u.prog.defs.len() as u32 - 1);
+        let mut h_e = E::default();
+        c.enc_def(&u, h, &mut h_e, &mut Vec::new());
+        let mut twin_e = E::default();
+        c.enc_def(&u, twin, &mut twin_e, &mut Vec::new());
+        assert_eq!(c.dec_def(&u, &mut D { b: &h_e.0, p: 0 }), Some(h), "the added definition decodes");
         assert_eq!(c.crate_defs_n, u.prog.defs.len(), "adding a program definition must rebuild the definition maps");
         assert_eq!(c.module_defs_n, 0, "rebuilding the definition maps must reset the module definition count");
+        assert_eq!(c.def_maps_appended, vec![fixture], "only the crate the definitions were added to loses its map");
+        assert!(c.def_maps.contains_key(&other), "the other crate's map is kept, not built again");
+        // every lookup as a cache that builds every map from the whole program finds it
+        pack::ensure_private_dir(&root.join("full")).unwrap();
+        let mut full = open_test_cache(&u, &root.join("full"));
+        for (what, b) in [("f", &e.0), ("o3", &other_e.0), ("h", &h_e.0), ("f's copy", &twin_e.0), ("g", &module_e.0)] {
+            assert_eq!(c.dec_def(&u, &mut D { b, p: 0 }), full.dec_def(&u, &mut D { b, p: 0 }), "{what}: as a full rebuild decodes it");
+        }
+        drop(full);
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }

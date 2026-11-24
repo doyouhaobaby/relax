@@ -34,25 +34,56 @@ pub(super) struct ImageResume {
     ids: Vec<u32>,
     edited: usize,
     replaced_at: usize,
+    /// The replacement log position its last try saw, and the slots replaced after it placed them
+    /// (their image code is older than their entry: `refresh_resume`)
+    replaced_seen: usize,
+    stale: Vec<u64>,
     by_bytes_filled: bool,
     /// Chosen before add_called, for its count of transitively added slots.
     initial_chosen: usize,
 }
 
-impl ImageResume {
-    /// Why the build of `ids` cannot continue this one (None: it can).
-    fn mismatch(&self, cache: &Cache, ids: &[u32], edited: usize) -> Option<String> {
-        if self.ids != ids { return Some(format!("its slots changed ({} then, {} now)", self.ids.len(), ids.len())); }
-        if self.edited != edited { return Some(format!("crates were edited live since ({} then, {} now)", self.edited, edited)); }
-        if self.replaced_at == cache.replaced.len() { return None; }
-        let mut bits = Vec::new();
-        for &(id, _, _) in &self.work.chosen { set_bit(&mut bits, id); }
-        let replaced = cache.replaced_in(&bits, self.replaced_at);
-        (replaced * 100 > self.work.chosen.len()).then(|| format!("{} of its {} chosen slots were replaced since it began", replaced, self.work.chosen.len()))
-    }
-}
-
 impl Cache {
+    /// Build `r` (one that gave way) made current for this try of the build of `ids` (`pend`: this
+    /// try's pending code entries by key). Of the slots replaced since its last try, one it placed
+    /// holds older code now (stale), and one it chose but has not placed takes its entry again, as
+    /// a fresh build would choose it (its code is read when it is placed: the latest). Ok(Some(n)):
+    /// it goes on, n slots chosen again; Ok(None): `stop` said yes (what it did holds; the next try
+    /// does the rest). Err(why): it starts over -- its slots changed, a live edit, or more than 1%
+    /// of its chosen slots hold code replaced after it placed them.
+    fn refresh_resume(&mut self, u: &Unit, r: &mut ImageResume, ids: &[u32], edited: usize, pend: &HashMap<u128, usize>, stop: &dyn Fn() -> bool) -> Result<Option<usize>, String> {
+        if r.ids != ids { return Err(format!("its slots changed ({} then, {} now)", r.ids.len(), ids.len())); }
+        if r.edited != edited { return Err(format!("crates were edited live since ({} then, {} now)", r.edited, edited)); }
+        let new = r.replaced_seen.min(self.replaced.len())..self.replaced.len();
+        if new.is_empty() { return Ok(Some(0)); }
+        let mut again = Vec::new();
+        for &id in &self.replaced[new] {
+            if has_bit(&r.placed, id) { set_bit(&mut r.stale, id); } else { set_bit(&mut again, id); }
+        }
+        let stale = r.stale.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        if stale * 100 > r.work.chosen.len() {
+            return Err(format!("{} of its {} chosen slots were replaced after it placed them", stale, r.work.chosen.len()));
+        }
+        let mut n = 0;
+        for j in 0..r.work.chosen.len() {
+            let id = r.work.chosen[j].0;
+            if !has_bit(&again, id) { continue; }
+            n += 1;
+            if n % 64 == 0 && stop() { return Ok(None); }
+            // (no entry now: key 0 names none, so the slot is left out where it is read, as a
+            // fresh build would leave it out)
+            r.work.chosen[j].1 = self.slot_key(u, id).and_then(|key0| self.image_entry(id, key0, pend)).unwrap_or(0);
+        }
+        r.replaced_seen = self.replaced.len();
+        Ok(Some(n))
+    }
+
+    /// (test) Whether the build that gave way placed slot `id` (None: no build gave way).
+    #[cfg(test)]
+    pub(super) fn image_resume_placed(&self, id: u32) -> Option<bool> {
+        self.image_resume.as_ref().map(|r| has_bit(&r.placed, id))
+    }
+
     pub(super) fn discard_image_resume(&mut self) {
         if let Some(resume) = self.image_resume.take() {
             crate::run::drop_later(Box::new(resume));
@@ -73,22 +104,39 @@ impl Cache {
     /// when code is replaced later: image_replaced), with the replacement log position it began at.
     pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<(Option<BuiltImage>, usize), ()> {
         let edited = crate::reload::edited_crates().len();
-        if let Some(r) = self.image_resume.as_ref() {
-            match r.mismatch(self, ids, edited) {
-                Some(why) => {
-                    if self.verbose { eprintln!("relax cache: startup image build that gave way starts over: {why}"); }
-                    self.discard_image_resume();
-                }
-                None => if self.verbose {
-                    eprintln!("relax cache: startup image build resumed in phase {} at {} ({:.1} ms of earlier tries)", r.phase, r.at, r.ph[4]);
-                },
-            }
-        }
-        let mut resume = self.image_resume.take().unwrap_or_else(|| ImageResume {
-            ids: ids.to_vec(), edited, replaced_at: self.replaced.len(), ..Default::default()
-        });
         let mut pending = ImagePending::default();
         let start = std::time::Instant::now();
+        // A spill between attempts can move all of the pending entries into stores.
+        crate::run::yield_section("image chosen");
+        if self.index_pending(KIND_CODE, &mut pending.code, stop).is_err() {
+            crate::run::drop_later(Box::new(pending));
+            return Err(());
+        }
+        let fresh = ImageResume { ids: ids.to_vec(), edited, replaced_at: self.replaced.len(), replaced_seen: self.replaced.len(), ..Default::default() };
+        let mut resume = match self.image_resume.take() {
+            None => fresh,
+            Some(mut r) => match self.refresh_resume(u, &mut r, ids, edited, &pending.code, stop) {
+                Ok(Some(again)) => {
+                    if self.verbose {
+                        eprintln!("relax cache: startup image build resumed in phase {} at {} ({:.1} ms of earlier tries; {} replaced slots it had not placed chosen again)", r.phase, r.at, r.ph[4], again);
+                    }
+                    r
+                }
+                Ok(None) => {
+                    r.ph[4] += start.elapsed().as_secs_f64() * 1e3;
+                    self.image_resume = Some(r);
+                    crate::run::drop_later(Box::new(pending));
+                    return Err(());
+                }
+                Err(why) => {
+                    if self.verbose { eprintln!("relax cache: startup image build that gave way starts over: {why}"); }
+                    #[cfg(test)]
+                    { self.image_starts_over += 1; }
+                    crate::run::drop_later(Box::new(r));
+                    fresh
+                }
+            },
+        };
         match self.build_image_in(u, &mut resume, &mut pending, stop, start) {
             Ok(img) => {
                 let at = resume.replaced_at;
@@ -108,10 +156,8 @@ impl Cache {
     fn build_image_in(&mut self, u: &Unit, resume: &mut ImageResume, pending: &mut ImagePending, stop: &dyn Fn() -> bool, start: std::time::Instant) -> Result<Option<BuiltImage>, ()> {
         let elapsed_before = resume.ph[4];
         let elapsed = || elapsed_before + start.elapsed().as_secs_f64() * 1e3;
-        // A spill between attempts can move all of the pending entries into stores.
+        // (`pending.code` is this try's: build_image)
         let ImagePending { code: pend, data: pend_data, constants: pend_const } = pending;
-        crate::run::yield_section("image chosen");
-        self.index_pending(KIND_CODE, pend, stop)?;
         if resume.phase == 0 {
             let chosen = &mut resume.work.chosen;
             chosen.reserve(resume.ids.len() - resume.at);
@@ -221,6 +267,28 @@ impl Cache {
         self.index_pending(KIND_DATA, pend_data, stop)?;
         self.index_pending(KIND_CONST, pend_const, stop)?;
         if resume.phase == 5 {
+            // the definition maps the static symbols' decodes need (static_value_obj), built first
+            // in steps: a large crate's map, built at its first decode, held the owner 10-35 ms in
+            // one step of the loop below
+            if self.mapped_definitions.is_none() {
+                crate::run::yield_section("image def maps");
+                let mut crates: Vec<u32> = Vec::new();
+                for (j, b) in tab.syms.list.iter().enumerate().skip(resume.at) {
+                    if j % 1024 == 1023 && stop() { return Err(()); }
+                    if b.first() != Some(&3) || b.len() < 17 { continue; }
+                    let ci = u128::from_le_bytes(b[1..17].try_into().unwrap());
+                    if let Some(&c) = self.crate_by_ident.get(&ci) {
+                        if !self.def_maps.contains_key(&c) && !crates.contains(&c) { crates.push(c); }
+                    }
+                }
+                let t = std::time::Instant::now();
+                for &c in &crates {
+                    if self.map_crate_defs(u, c, stop) == Ok(false) { return Err(()); }
+                }
+                if self.verbose && !crates.is_empty() {
+                    eprintln!("relax cache: startup image: definition maps of {} crates built ahead of their static symbols in {:.1} ms", crates.len(), t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
             crate::run::yield_section("image data symbols");
             let mut i = resume.at;
             // Each indexed object has either been processed or is still on the queue.
@@ -1348,6 +1416,11 @@ struct ImgSlot {
 const REL_SIZE: usize = 10;
 /// No slot for an image key (not made: no installed slot names it; or its key did not decode).
 const NO_SLOT: u32 = u32::MAX;
+
+/// Whether slot `id`'s bit is set in `bits`.
+fn has_bit(bits: &[u64], id: u32) -> bool {
+    bits.get((id / 64) as usize).is_some_and(|w| w & (1u64 << (id % 64)) != 0)
+}
 
 /// Sets slot `id`'s bit in `bits` (grown to hold it).
 fn set_bit(bits: &mut Vec<u64>, id: u32) {
