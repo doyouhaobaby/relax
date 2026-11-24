@@ -723,6 +723,7 @@ unsafe impl Sync for CacheCell {}
 impl CacheCell {
     pub fn new(cache: Cache) -> Self { Self(std::cell::UnsafeCell::new(cache)) }
     pub(crate) fn get(&self) -> *mut Cache { self.0.get() }
+    pub(crate) fn into_inner(self) -> Cache { self.0.into_inner() }
 }
 impl std::ops::Deref for CacheCell {
     type Target = Cache;

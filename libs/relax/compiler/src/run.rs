@@ -2352,7 +2352,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         // the collected image is the program as its load left it, before the bodies make their
         // types (a run's boot snapshot): the record at the end encodes this snapshot
-        let boot_cache = if selftest { None } else { check_boot_cache(&mut u, options) };
+        let mut boot_cache = if selftest { None } else { check_boot_cache(&mut u, options) };
         let (code, check_foreign) = match reuse.as_mut() {
             Some(r) => crate::check::check_crate_reusing(&mut u, root, &checked, pre, r),
             None => crate::check::check_crate(&mut u, root, &checked, pre, selftest),
@@ -2372,7 +2372,22 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if !selftest {
             let t = Instant::now();
             let std_crates = crate::check::std_crates(&u.prog);
+            // std's clean verdicts are looked up and stored in the unit's cache, as a run's app
+            // check keeps its own (check.rs prepare_check). A check's unit has none: it is lent the
+            // cache this check writes its front images with (opened here when it records no
+            // collected image), whose verdicts are written right after (record_check_front may
+            // write nothing); else every check that repeats no passing one checks all of std again.
+            let lent = u.cache.is_none() && match boot_cache.take().map(Ok).or_else(|| crate::cache::mode_from_env(options).map(|m| crate::cache::Cache::open_collected(&*u, m, None))) {
+                Some(Ok(c)) => { u.cache = Some(Box::new(crate::cache::CacheCell::new(c))); true }
+                Some(Err(e)) => { verbose!("relax check: std's verdicts not looked up: {e}"); false }
+                None => false,
+            };
             let errors = crate::check::run_check_crates(&mut *u, &std_crates, false);
+            if let Some(c) = if lent { u.cache.take() } else { None } {
+                let mut c = (*c).into_inner();
+                if let Err(e) = c.flush() { verbose!("relax check: std's verdicts not written: {e}"); }
+                boot_cache = Some(c);
+            }
             for e in &errors {
                 if crate::diag::enabled() { crate::diag::emit(&crate::diag::from_legacy(e, "typeck")); } else { eprintln!("{e}"); }
             }
