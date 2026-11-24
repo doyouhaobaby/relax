@@ -50,7 +50,9 @@ pub enum MNode {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TNode {
     Tok(MTok),
-    Var(String),
+    /// `$name`, and the position of its `$` where the macro is defined (u32::MAX when unknown):
+    /// where rustc reports a parse or match error on the fragment substituted for it
+    Var(String, u32),
     Rep(Vec<TNode>, Option<MTok>, u8),
     Group(MTok, MTok, Vec<TNode>),
     Crate,
@@ -2723,7 +2725,7 @@ fn expansion_hash(d: &MacroDef) -> u128 {
         for x in v {
             match x {
                 TNode::Tok(p) => { h.u8(0); tok(h, p) }
-                TNode::Var(n) => { h.u8(1); h.str(n) }
+                TNode::Var(n, _) => { h.u8(1); h.str(n) }
                 TNode::Rep(v, s, o) => { h.u8(2); h.u8(*o); opt(h, s); t(h, v) }
                 TNode::Group(o, c, v) => { h.u8(3); tok(h, o); tok(h, c); t(h, v) }
                 TNode::Crate => h.u8(4),
@@ -2764,7 +2766,7 @@ fn same_expansion(a: &MacroDef, b: &MacroDef) -> bool {
         a.len() == b.len()
             && a.iter().zip(b).all(|(x, y)| match (x, y) {
                 (TNode::Tok(p), TNode::Tok(q)) => tok(p, q),
-                (TNode::Var(n1), TNode::Var(n2)) => n1 == n2,
+                (TNode::Var(n1, _), TNode::Var(n2, _)) => n1 == n2,
                 (TNode::Rep(v1, s1, o1), TNode::Rep(v2, s2, o2)) => o1 == o2 && opt(s1, s2) && t(v1, v2),
                 (TNode::Group(o1, c1, v1), TNode::Group(o2, c2, v2)) => tok(o1, o2) && tok(c1, c2) && t(v1, v2),
                 (TNode::Crate, TNode::Crate) => true,
@@ -3116,7 +3118,7 @@ fn parse_transcriber(toks: &[MTok]) -> Result<Vec<TNode>, String> {
                 continue;
             }
             if matches!(n.kind, T::Ident | T::RawIdent) || n.text.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                out.push(TNode::Var(n.text.clone()));
+                out.push(TNode::Var(n.text.clone(), t.pos));
                 i += 2;
                 continue;
             }
@@ -3353,7 +3355,7 @@ fn vars_of(nodes: &[MNode], out: &mut Vec<String>) {
 fn tvars_of(nodes: &[TNode], out: &mut Vec<String>) {
     for n in nodes {
         match n {
-            TNode::Var(v) => out.push(v.clone()),
+            TNode::Var(v, _) => out.push(v.clone()),
             TNode::Rep(x, _, _) | TNode::Group(_, _, x) => tvars_of(x, out),
             _ => {}
         }
@@ -3985,7 +3987,7 @@ impl<'a> Parser<'a> {
                     self.transcribe(inner, binds, idx, krate_path, out)?;
                     out.push(c.kind, &c.text, None, c.pos);
                 }
-                TNode::Var(v) => match Self::lookup_bind(binds, v, idx) {
+                TNode::Var(v, var_pos) => match Self::lookup_bind(binds, v, idx) {
                     Some(Bind::One(lo, hi, f, taken, bare)) => {
                         // a macro-call expression stays unparenthesised only where it ends the
                         // statement-like position (`$e;` / last): `m!{..} * 2` would otherwise parse as
@@ -3993,12 +3995,13 @@ impl<'a> Parser<'a> {
                         let ends = nodes.get(ni + 1).map_or(true, |n| matches!(n, TNode::Tok(t) if t.text == ";"));
                         let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
                         let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
-                        if wrap {
+                        let wrap_at = wrap.then(|| {
                             let at = out.s.len() as u32 + 1;
                             uses::synth_note(at);
                             out.groups.push((at, at | WRAP_PAREN | META_ONLY));
                             out.push(T::OpenParen, "(", None, u32::MAX);
-                        }
+                            at
+                        });
                         let group_start = if lo < hi {
                             let t = self.toks.at(*lo);
                             out.start(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo))
@@ -4069,6 +4072,13 @@ impl<'a> Parser<'a> {
                         }
                         if wrap {
                             out.push(T::CloseParen, ")", None, u32::MAX);
+                        }
+                        // rustc_expand mbe/transcribe.rs transcribe_pnr: a fragment other than a
+                        // `tt` goes on as one token or invisible group spanned at its `$x`, where a
+                        // parse or match error on it is reported
+                        let (start, end) = (wrap_at.unwrap_or(group_start as u32), out.s.len() as u32);
+                        if *f != Frag::Tt && *var_pos != u32::MAX && end > start {
+                            out.metas.push((start, *var_pos, end - start));
                         }
                     }
                     Some(Bind::Seq(_)) => return Err(format!("`${}` is still repeating here -- use it inside `$( .. )*`", v)),
@@ -4167,8 +4177,11 @@ impl<'a> Parser<'a> {
     /// Expands a call of macro `def` with arguments in tokens [lo, hi): the expansion text
     /// (tokens joined by spaces) and, per token substituted from a fragment, (offset in the
     /// text, the fragment token's position) -- or an error naming the macro.
-    pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<crate::parse_work::Rules, String> {
+    pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<crate::parse_work::Rules, RulesError> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules", &def.name);
+        // where the input ends: just after its last token (rustc macro_parser.rs parse_tt: the
+        // Eof failure is spanned at the end of the token before it; an empty input, at the call)
+        let end = (lo < hi).then(|| self.toks.at(hi - 1).hi);
         let (lo, hi) = self.desugar_doc_comments(lo, hi);
         uses::used(def, uses::RESOLVED);
         // the definition's edition decides which tokens can begin an `expr` (rustc: the
@@ -4196,7 +4209,7 @@ impl<'a> Parser<'a> {
                 }
                 Err(m) => {
                     self.restore_match_tokens(undo);
-                    return Err(m);
+                    return Err(RulesError { at: None, msg: m });
                 }
             };
             if let Some(binds) = binds {
@@ -4211,19 +4224,30 @@ impl<'a> Parser<'a> {
                 let mut out = Transcript { edition: self.edition, ..Default::default() };
                 let result = self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out);
                 self.restore_match_tokens(undo);
-                result?;
+                result.map_err(|msg| RulesError { at: None, msg })?;
                 out.s.push(' ');
-                return Ok((out.s, out.toks, out.origins, out.bodies, out.groups));
+                return Ok((out.s, out.toks, out.origins, out.bodies, out.groups, out.metas));
             }
             self.restore_match_tokens(undo);
         }
-        let descr = match best_failure {
-            Some(((_, taken), t)) if self.empty_vis.get(&{ t.lo }).is_some_and(|&n| n > taken) => "`vis` metavariable".into(),
-            Some(((i, _), t)) if i < hi => self.token_descr(t),
-            _ => return Err("unexpected end of macro invocation".into()),
+        // rustc_expand mbe/diagnostics.rs failed_to_match_macro: at the best failure's token,
+        // or where the input ended
+        let (descr, at) = match best_failure {
+            Some(((_, taken), t)) if self.empty_vis.get(&{ t.lo }).is_some_and(|&n| n > taken) => ("`vis` metavariable".into(), t.lo),
+            Some(((i, _), t)) if i < hi => (self.token_descr(t), t.lo),
+            _ => return Err(RulesError { at: end, msg: "unexpected end of macro invocation".into() }),
         };
-        Err(format!("no rules expected {descr}"))
+        Err(RulesError { at: Some(at), msg: format!("no rules expected {descr}") })
     }
+}
+
+/// A `macro_rules!` call that did not expand: the message, and where rustc reports it when that
+/// is not the call itself (the input token no arm could match, or just after the last token of
+/// an input that ended too soon; None: the call).
+#[derive(Debug)]
+pub struct RulesError {
+    pub at: Option<u32>,
+    pub msg: String,
 }
 
 /// A transcription being written: the text (each token preceded by a space, unless it is a
@@ -4241,6 +4265,9 @@ pub struct Transcript {
     toks: Vec<Tok>,
     origins: Vec<(u32, u32, u32)>,
     bodies: Vec<(u32, u32, u32)>,
+    /// per substituted fragment other than a `tt`: (offset of its text, its `$x` in the
+    /// definition, length of its text)
+    metas: Vec<(u32, u32, u32)>,
     groups: Vec<(u32, u32)>,
     /// forwarded empty `vis` fragments waiting for the token they stand before (EMPTY_VIS)
     empty_vis: u32,
@@ -4556,7 +4583,7 @@ mod spacing_tests {
         let call = (end..toks.len()).rev().find(|&i| text(i) == name).unwrap();
         let session = std::sync::Arc::new(crate::Session::default());
         let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), edition);
-        p.expand_rules(&def, call + 3, close(call + 2)).map(|(s, etoks, ..)| (s, etoks))
+        p.expand_rules(&def, call + 3, close(call + 2)).map(|(s, etoks, ..)| (s, etoks)).map_err(|e| e.msg)
     }
 
     /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there:

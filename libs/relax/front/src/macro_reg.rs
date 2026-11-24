@@ -1214,7 +1214,7 @@ fn scan_tokens_for_entries(
                         if crate::cfg::active(p_src, &call_attrs, cfg) {
                             if let Some(def) = local_defs.iter().rev().find(|d| d.name == mname) {
                                 let mut p = crate::parser::Parser::new(sess, src, toks.to_vec(), edition);
-                                if let Ok((exp_text, exp_toks, _, _, _)) = p.expand_rules(def, open + 1, close) {
+                                if let Ok((exp_text, exp_toks, ..)) = p.expand_rules(def, open + 1, close) {
                                     scan_tokens_for_entries(sess, reg, unit, exp_text.as_bytes(), &exp_toks, edition, cfg, "", false, local_defs, stack, depth + 1);
                                 }
                             }
