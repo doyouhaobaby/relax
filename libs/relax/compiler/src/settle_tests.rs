@@ -1575,10 +1575,14 @@ fn live_o3_split_keeps_the_saved_host_current() {
             let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::live_o3_split_keeps_the_saved_host_current", "--nocapture"])
                 .env(CHILD, opt).env("RELAX_OPT", opt).env("RELAX_CACHE", "off").env("RELAX_O3_STATS", "1")
+                .env("RELAX_DUMP_RIR", "split_live::caller")
                 .env("RELAX_GANDALF", "0").env_remove("RELAX_OUTLINE_WHOLE"));
             let stderr = String::from_utf8_lossy(&result.stderr);
             let stdout = String::from_utf8_lossy(&result.stdout);
             assert!(result.status.success() && stdout.contains("1 passed"), "RELAX_OPT={opt}\n{stdout}\n{stderr}");
+            if opt == "+outline" {
+                assert!(stderr.contains("Call(Part(Some(0)),"), "O3 must pass exit zero as an immediate\n{stderr}");
+            }
             for line in stderr.lines().filter(|l| l.starts_with("relax o3-stats: outline ")) { eprintln!("{line}"); }
         }
         return;
@@ -1588,8 +1592,9 @@ fn live_o3_split_keeps_the_saved_host_current() {
     let dir = std::env::temp_dir().join(format!("relax-outline-live-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("input.rs");
+    // Only the range starts at zero. O3 used to keep that initializer live for exit zero.
     let source = "#[inline] pub fn leaf(x: u32) -> u32 { (x << 1) ^ (x >> 3) ^ 7 }\n\
-        pub fn caller(out: &mut u32) { let mut i = 0; let mut s = 0u32; while i < 100 { s = s.wrapping_add(leaf(i)); i += 1; } *out = s; }\nfn main() {}";
+        pub fn caller(out: &mut u32) { let n = *out; let mut s = 1u32; for i in 0..n { s = s.wrapping_add(leaf(i)); } *out = s; }\nfn main() {}";
     std::fs::write(&path, source).unwrap();
     let mut session = crate::Session::default();
     session.options.live = true;
@@ -1636,16 +1641,16 @@ fn live_o3_split_keeps_the_saved_host_current() {
         }
     }
     let run_saved = || {
-        let mut result = 0u32;
+        let mut result = 100u32;
         unsafe { call_jit(up, saved, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
         result
     };
-    assert_eq!(run_saved(), 9984);
+    assert_eq!(run_saved(), 1 + 9984);
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
         file, path: path.to_string_lossy().into_owned(), src: source.replace("(x << 1) ^ (x >> 3) ^ 7", "((x << 1) ^ (x >> 3) ^ 7) + 1").into_bytes(),
     }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
-    assert_eq!(run_saved(), 10084, "the original host reaches the patched leaf");
+    assert_eq!(run_saved(), 1 + 10084, "the original host reaches the patched leaf");
     unsafe { UNIT = std::ptr::null_mut() };
     std::fs::remove_dir_all(dir).unwrap();
 }

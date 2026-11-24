@@ -6473,7 +6473,11 @@ impl<'a> Gen<'a> {
         }
         match c {
             Callee::Fn(id) => self.call_reloc(Reloc::Call(*id)),
-            Callee::Part => {
+            Callee::Part(id) => {
+                if let Some(id) = id {
+                    assert!(ni < INT_ARGS.len());
+                    self.a.mov_ri(INT_ARGS[ni], i64::from(*id));
+                }
                 self.a.byte(0xe8);
                 self.part_calls.push(self.a.pos() as u32);
                 self.a.u32(0);

@@ -257,9 +257,8 @@ fn record_exit(f: &mut Func, p: &mut Func, e: &ExitLayout, slot: u32, bases: &[V
         }
     }
     unpack.extend(e.remakes.iter().cloned());
-    let id = f.vreg(Cls::I);
     let results: Vec<_> = p.rets.iter().map(|&c| f.vreg(c)).collect();
-    pack.extend([Inst::Iconst(id, e.id.into()), Inst::Call(Callee::Part, vec![record, id], results.clone())]);
+    pack.push(Inst::Call(Callee::Part(Some(e.id)), vec![record], results.clone()));
     let block = |insts: Vec<Inst>, term| Block { pos: vec![pos; insts.len()], insts, term, term_pos: pos, count: f.blocks[e.block as usize].count };
     (block(pack, Term::Ret(results)), block(unpack, Term::Jump(target)))
 }
@@ -409,7 +408,7 @@ pub fn extract_patched_part(f: &mut Func, layout: SplitLayout, body: OutlineBody
     }
     for (bi, b) in f.blocks.iter().enumerate() {
         let inside = region.contains(&bi);
-        if b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Part, ..))) { return Err("nested part"); }
+        if b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Part(_), ..))) { return Err("nested part"); }
         if inside && b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Asm(_), ..))) { return Err("frame-sensitive assembly"); }
         if bi >= region.end && old_exit[bi - region.end] { continue; }
         if b.term.succs().any(|t| t as usize >= f.blocks.len() || region.contains(&(t as usize)) != inside) { return Err("edge across patched region"); }
@@ -616,31 +615,23 @@ pub fn verify_outline(f: &Func, out: &OutlinedPart) -> Result<(), &'static str> 
 
     let reach = relax_backend::regalloc::reachable(f);
     let addresses = slot_offsets(f);
-    let mut constants = vec![None; f.vregs.len()];
-    let mut defs = vec![0u8; f.vregs.len()];
     let mut pad = vec![false; f.blocks.len()];
-    for v in &f.params { defs[v.0 as usize] = 1; }
     for (_, b) in f.blocks.iter().enumerate().filter(|(b, _)| reach[*b]) {
         if let Term::Invoke(_, cleanup) = b.term { pad[cleanup as usize] = true; }
-        for i in &b.insts {
-            for_defs(i, |v| defs[v.0 as usize] = defs[v.0 as usize].saturating_add(1));
-            if let Inst::Iconst(d, k) = *i { constants[d.0 as usize] = u32::try_from(k).ok(); }
-        }
     }
     let mut record = None;
     let mut sites = vec![None; f.blocks.len()];
     for (bi, b) in f.blocks.iter().enumerate().filter(|(b, _)| reach[*b]) {
         for (ii, i) in b.insts.iter().enumerate() {
-            let Inst::Call(Callee::Part, args, results) = i else { continue };
-            let [a, id] = args[..] else { return Err("invalid part arguments") };
+            let Inst::Call(Callee::Part(id), args, results) = i else { continue };
+            let Some(id) = id else { return Err("part call without an exit ID") };
+            let [a] = args[..] else { return Err("invalid part arguments") };
             let ai = a.0 as usize;
-            let di = id.0 as usize;
             let Some((s, 0)) = addresses[ai] else { return Err("invalid record address"); };
-            if f.vregs[ai] != Cls::I || f.vregs[di] != Cls::I
+            if f.vregs[ai] != Cls::I
                 || !f.slots.get(s as usize).is_some_and(|s| s.align >= 16 && s.size >= out.record_size)
                 || record.replace(s).is_some_and(|old| old != s) { return Err("invalid record address"); }
-            let k = constants[di].filter(|_| defs[di] == 1).ok_or("nonconstant exit ID")?;
-            let index = out.exits.binary_search_by_key(&k, |e| e.id).map_err(|_| "unknown exit ID")?;
+            let index = out.exits.binary_search_by_key(id, |e| e.id).map_err(|_| "unknown exit ID")?;
             if sites[bi].replace(index).is_some() || pad[bi] || matches!(b.term, Term::Invoke(..)) ||
                 !results.iter().map(|v| f.vregs[v.0 as usize]).eq(f.rets.iter().copied()) ||
                 !relax_backend::tail::returns_results(f, bi, ii + 1, results) { return Err("part call must return exactly and have no pad"); }
@@ -671,7 +662,7 @@ pub fn verify_outline(f: &Func, out: &OutlinedPart) -> Result<(), &'static str> 
                 Inst::VStore(a, off, v) if carries(a) && f.vregs[v.0 as usize] == Cls::V128 => (a, off, 16),
                 Inst::Copy(d, a, n) if carries(d) && !carries(a) => (d, 0, n),
                 Inst::Mov(d, a) | Inst::IBinI(IOp::Add, IntTy { bits: 64, .. }, d, a, _) if carries(a) && carries(d) => continue,
-                Inst::Call(Callee::Part, ref args, _) if carries(args[0]) && !carries(args[1]) => continue,
+                Inst::Call(Callee::Part(Some(_)), ref args, _) if carries(args[0]) => continue,
                 Inst::SlotAddr(d, s) if s == record => {
                     if !carries(d) { return Err("ambiguous record address"); }
                     continue;
@@ -2815,7 +2806,7 @@ mod tests {
         let out = extract_patched_part(&mut f, layout, OutlineBody::Native).unwrap();
         verify_outline(&f, &out).unwrap();
         let mut sites: Vec<_> = f.blocks.iter().enumerate().filter_map(|(b, blk)| {
-            let Inst::Call(Callee::Part, _, _) = blk.insts.last()? else { return None };
+            let Inst::Call(Callee::Part(Some(_)), _, _) = blk.insts.last()? else { return None };
             assert!(matches!(blk.term, Term::Ret(_)));
             Some(b)
         }).collect();
@@ -2871,7 +2862,7 @@ mod tests {
         out.part.blocks[site as usize].term = Term::Jump(normal);
         assert_eq!(verify_outline(&f, &out), Err("missing part unwind edge"));
         out.part.blocks[site as usize].term = Term::Invoke(normal, pad);
-        let exit = f.blocks.iter().position(|b| matches!(b.insts.last(), Some(Inst::Call(Callee::Part, ..)))).unwrap();
+        let exit = f.blocks.iter().position(|b| matches!(b.insts.last(), Some(Inst::Call(Callee::Part(Some(_)), ..)))).unwrap();
         let normal = f.block();
         f.blocks[normal as usize].term = f.blocks[exit].term.clone();
         f.blocks[exit].term = Term::Invoke(normal, normal);

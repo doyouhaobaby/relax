@@ -5084,7 +5084,11 @@ impl<'a> Gen<'a> {
         self.moves(&mv);
         match c {
             Callee::Fn(id) => self.bl_reloc(Reloc::Call(*id)),
-            Callee::Part => {
+            Callee::Part(id) => {
+                if let Some(id) = id {
+                    assert!(ni < INT_ARGS);
+                    self.a.mov_imm(ni as u8, i64::from(*id));
+                }
                 self.part_calls.push((self.a.pos() * 4) as u32);
                 self.a.e(0x9400_0000);
             }

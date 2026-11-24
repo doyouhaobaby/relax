@@ -887,7 +887,10 @@ pub enum Callee {
     Asm(Box<AsmBlock>),
     /// Direct call to this native build's outlined part, with the Relax calling convention.
     /// The joiner resolves it within the body. It may capture arguments, access memory and unwind.
-    Part,
+    /// `Some(id)` calls an outlined exit with the record as its only RIR argument. The backend
+    /// passes `id` in the next integer argument register, as the part's second parameter.
+    /// `None` is the whole-body stub: it forwards the host's arguments and passes no exit ID.
+    Part(Option<u32>),
 }
 
 /// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
@@ -1727,7 +1730,7 @@ impl Func {
         fn callee(c: &Callee, h: &mut relax_session::sip::Sip128, sl: &mut FirstSeen, sy: &mut FirstSeen) {
             std::mem::discriminant(c).hash(h);
             match c {
-                Callee::Part => {}
+                Callee::Part(id) => id.hash(h),
                 Callee::Fn(x) => sl.get(*x).hash(h),
                 Callee::CFn(x, g) => {
                     sl.get(*x).hash(h);
@@ -2437,7 +2440,7 @@ impl Func {
                     if *t >= nb || *u >= nb {
                         return Err(format!("{}: bad invoke target", self.name));
                     }
-                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part(_) | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
                         return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
                     }
                 }
@@ -2871,7 +2874,7 @@ mod join_part_tests {
         f.blocks[0].term = Term::Ret(vec![sum]);
         if host {
             let result = f.vreg(Cls::I);
-            f.blocks[0].insts.push(Inst::Call(Callee::Part, vec![sum], vec![result]));
+            f.blocks[0].insts.push(Inst::Call(Callee::Part(None), vec![sum], vec![result]));
             f.blocks[0].pos.push(4);
             if relocated {
                 let (normal, pad) = (f.block(), f.block());

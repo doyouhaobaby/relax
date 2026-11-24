@@ -957,7 +957,7 @@ impl<'a> Lcx<'a> {
             // every Relax callee may unwind here: whether one was compiled (and found nounwind)
             // before this body is lowered depends on build order; the optimiser demotes the
             // invokes of the build's inline candidates found nounwind (opt::demote_invokes)
-            Callee::Part | Callee::Fn(_) => true,
+            Callee::Part(_) | Callee::Fn(_) => true,
             Callee::Indirect(_) => true,
             Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
             Callee::Host(a) => *a == self.u.rs.panic_site || *a == self.u.rs.panic_bounds || *a == self.u.rs.panic_impl,

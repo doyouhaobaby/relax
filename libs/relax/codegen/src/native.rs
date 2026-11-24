@@ -115,7 +115,7 @@ fn compile_whole(options: &relax_session::Options, f: &Func, env: &target::Env, 
     let results: Vec<_> = f.rets.iter().map(|&c| h.vreg(c)).collect();
     let pos = f.blocks[0].pos.first().copied().unwrap_or(f.blocks[0].term_pos);
     h.block();
-    h.blocks[0].insts.push(Inst::Call(Callee::Part, h.params.clone(), results.clone()));
+    h.blocks[0].insts.push(Inst::Call(Callee::Part(None), h.params.clone(), results.clone()));
     h.blocks[0].pos.push(pos);
     h.blocks[0].term = Term::Ret(results);
     h.blocks[0].term_pos = pos;
