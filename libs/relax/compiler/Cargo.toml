@@ -30,17 +30,7 @@ known = "the relaxwin lane"
 skip = [
     "cache::data_tests::two_checkouts_share_only_the_code_of_their_sealed_crates",
     "check_reuse_tests::a_copy_in_another_worktree_reuses_its_verdicts_with_its_own_paths",
-    "check_reuse_tests::a_dependency_error_fails_the_check",
-    "inspect::natbin::tests::dwarf4_and_5",
-    "inspect::natbin::tests::full_debuginfo_inline_tree",
-    "inspect::natbin::tests::line_tables_only",
     "jit::trap_fill_tests::a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on",
-    "native_macros::tests::native_requires_the_complete_source_and_dependency_identity",
-    "reload::include_part_tests::an_include_through_a_chain_of_macros_is_the_calling_items",
-    "reload::removed_module_tests::a_removed_module_file_its_parent_still_declares_is_refused",
-    "syms::provenance_tests::address_maps_are_lazy_and_extend_for_new_defs",
-    "value_tests::a_virtual_folder_opens_for_reading_as_a_disk_folder_does",
-    "value_tests::io_slices_borrow_their_buffers_as_an_iovec",
 ]
 
 [lib]
