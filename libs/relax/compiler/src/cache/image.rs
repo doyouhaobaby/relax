@@ -941,6 +941,7 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
         d.u128()?;
     }
     let code = d.bytes()?;
+    let code_len = cached_code_len(code, tier)?;
     let nr = d.u32()? as usize;
     let mut rel: Vec<(u32, u8, u8, u32)> = Vec::with_capacity(nr);
     // per callee key the list wrote, in order: whether it is retargeted, and its key's id
@@ -1006,7 +1007,7 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
     e.u32(blob.len() as u32);
     e.u32(code.len() as u32);
     // the code without its unwind trailer (the trailer stays in the image: Unit::unwind_at)
-    e.u32(relax_backend::rir::split_unwind_info(code).code_len as u32);
+    e.u32(code_len as u32);
     e.u32(rel.len() as u32);
     for (at, kind, t, ix) in rel {
         e.u32(at);
@@ -2009,7 +2010,14 @@ impl Linker {
             }
             let s = &im.slots[si];
             let n = s.code_n;
-            layout.push((si, id, 0, n, &im.blob[s.code.0 + n..s.code.0 + s.code.1]));
+            let trailer = &im.blob[s.code.0 + n..s.code.0 + s.code.1];
+            // The image stores the text length separately. Both frames must fit
+            // its trailer region before this native O3 entry can be published.
+            if s.tier == TIER_O3 && relax_backend::rir::split_unwind_region(trailer, n as u32).is_none() {
+                im.failed += 1;
+                continue;
+            }
+            layout.push((si, id, 0, n, trailer));
         }
         // the hot code together (GAPX6: x64 front-end stalls): the O3 slots first, in image order
         // (the order they first ran in), then the rest. The slots stay in image order in `out`
@@ -2360,10 +2368,42 @@ pub(crate) unsafe fn prelink_unit(up: *mut Unit, install: &mut dyn FnMut(&mut Un
     Linker::new(cache).prelink(&mut *up, install)
 }
 
-/// (tests) The digests the loaded startup image holds for slot `id`'s code (gate.rs), its
-/// contexts' keys mapped to this run's slots by their encoding.
 #[cfg(test)]
 impl super::Cache {
+    pub(crate) fn corrupt_recorded_part(&mut self, u: &Unit, id: u32) {
+        let key = self.slot_key(u, id).expect("the split host has a cache key");
+        let (pack, _) = self.index_at(key).expect("the split host was recorded on disk");
+        let store = &self.stores[pack as usize];
+        let (kind, entry) = store.get_checked(key).expect("intact entry before corruption");
+        let mut d = D { b: entry, p: 0 };
+        d.u32().unwrap();
+        d.str().unwrap();
+        skip_build_inputs(&mut d).unwrap();
+        let code = d.bytes().unwrap();
+        assert!(relax_backend::rir::split_unwind_info(code).part.is_some(), "the recorded O3 body has a part");
+
+        let image = self.image.as_ref().expect("the split host has a mapped image");
+        let im = parse_image(image.bytes(), image._store.clone(), |_, _| true).unwrap();
+        let slot = im.slots.iter().find(|s| s.entry == key).expect("the image contains the split host");
+        let manifest_key = self.manifest_key(self.manifest_root.unwrap()).unwrap();
+        let (manifest_kind, manifest) = image._store.get_checked(manifest_key).unwrap();
+        let at = im.blob.as_ptr() as usize - manifest.as_ptr() as usize + slot.code.0;
+        let end = at + slot.code.1;
+        assert_eq!(&manifest[at..end], code, "the image holds the same recorded host and part");
+
+        // P may not start at the host entry. Keep both store checksums valid so
+        // prelink and the subsequent disk lookup each exercise trailer validation.
+        for (path, key, kind, bytes, end) in [
+            (&store.path, key, kind, entry, d.p),
+            (&image._store.path, manifest_key, manifest_kind, manifest, end),
+        ] {
+            let mut payload = bytes.to_vec();
+            payload[end - 8..end - 4].fill(0);
+            crate::store::append(path, vec![NewEntry { key, kind, payload }], false).unwrap();
+        }
+    }
+
+    /// The digests of the image slot, with its context keys mapped to this run's slots.
     pub(super) fn image_digest(&mut self, u: &Unit, id: u32) -> Option<std::sync::Arc<crate::gate::CodeDigest>> {
         let (img, store) = self.image.as_ref().map(|i| (i.bytes(), i._store.clone()))?;
         let im = {

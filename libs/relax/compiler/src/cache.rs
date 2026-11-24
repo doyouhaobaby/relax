@@ -7336,6 +7336,15 @@ fn file_ident(path: &str, source: u128, owner: u128, numbering: u128) -> u128 {
     h.finish128()
 }
 
+// Native O3 always emits unwind info. A malformed part must miss instead of
+// taking split_unwind_info's fallback for callers that accept trailerless code.
+fn cached_code_len(code: &[u8], tier: u8) -> Option<usize> {
+    if relax_codegen::interp::blob::is_blob(code) { return Some(code.len()); }
+    let split = relax_backend::rir::split_unwind_info(code);
+    if tier == TIER_O3 && (code.len() % 4 != 0 || split.host.is_none()) { return None; }
+    Some(split.code_len)
+}
+
 fn skip_build_inputs(d: &mut D) -> Option<(usize, usize)> {
     // the tier byte, the inlined slots and the pending ones
     d.u8()?;
@@ -12588,7 +12597,9 @@ impl Linker {
             }
         }
         skip_nounwind_and_cert(&mut d)?;
-        let code = d.bytes()?.to_vec();
+        let code = d.bytes()?;
+        if is_o3 { cached_code_len(code, tier)?; }
+        let code = code.to_vec();
         let n = d.u32()? as usize;
         let mut relocs = Vec::with_capacity(n);
         let mut rw = Vec::new();
