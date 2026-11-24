@@ -49,8 +49,11 @@ impl Job {
         match self { Self::Ahead(..) => 0, Self::O2(..) => 1, Self::O3(..) => 2, Self::Spec(..) | Self::Reach(..) => 3, Self::Tick => 4, Self::Check(..) => 5 }
     }
 }
-/// `slot`: the job's slot when it was queued (a wait for that slot promotes it).
-struct Entry { serial: u64, job: Job, at: u64, urgent: bool, class: u8, promoted: bool, key: i64, slot: Option<(usize, u32)> }
+/// `slot`: the job's slot when it was queued (a wait for that slot promotes it). `since` (wall ns):
+/// when it took its class, its queue time or its latest raise (`since_of`): its wait is reported at
+/// its class from then, so a build that sat in the background and was then waited for reports the
+/// waiter's wait, not its whole queue time, at the waiter's class.
+struct Entry { serial: u64, job: Job, at: u64, since: u64, urgent: bool, class: u8, promoted: bool, key: i64, slot: Option<(usize, u32)> }
 /// A slot's queued entries (their serials): one almost always, held without an allocation.
 #[derive(Default)]
 struct Serials { first: Option<u64>, more: Vec<u64> }
@@ -115,6 +118,8 @@ pub(super) struct Queue {
     by_slot: HashMap<(usize, u32), Serials>,
     refresh_cursor: usize,
     ahead_class: u8,
+    /// when `ahead_class` last rose (wall ns): the unpromoted checks ahead took it then
+    ahead_since: u64,
     ahead_len: usize,
     tick_at: Instant,
     tick_queued: bool,
@@ -133,7 +138,7 @@ pub(super) struct Queue {
 struct Hold { reason: usize, after: bool, since: u64, queued: u64 }
 impl Queue {
     fn new() -> Self {
-        Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_len: 0,
+        Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_since: 0, ahead_len: 0,
             tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false, hold: None }
     }
     /// Queues `job`; returns whether it can start now.
@@ -153,7 +158,7 @@ impl Queue {
         self.serial += 1;
         let urgent = at == O2_FRONT_AT && matches!(job, Job::O2(..));
         let at = if urgent { wall_ns() } else { at };
-        let mut entry = Entry { serial: self.serial, job, at, urgent, class, promoted, key: 0, slot };
+        let mut entry = Entry { serial: self.serial, job, at, since: at, urgent, class, promoted, key: 0, slot };
         entry.key = key(&entry, &now);
         self.plan[entry.job.tier()][class as usize].insert(order(entry.key, entry.serial));
         self.indices.insert(entry.serial, self.entries.len());
@@ -183,6 +188,7 @@ impl Queue {
                 budget::queued(class, budget::JIT, count);
                 left -= count as usize;
             }
+            if class < self.ahead_class { self.ahead_since = wall_ns(); }
             self.ahead_class = class;
         }
     }
@@ -190,6 +196,11 @@ impl Queue {
         if tier == 0 && stored == budget::BACKGROUND { self.ahead_class } else { stored }
     }
     fn class_of(&self, e: &Entry) -> u8 { self.bucket_class(e.job.tier(), e.class) }
+    /// When `e` took the class it is reported at (`class_of`): an unpromoted check ahead took the
+    /// ahead class with the others, at its raise.
+    fn since_of(&self, e: &Entry) -> u64 {
+        if e.job.tier() == 0 && !e.promoted && self.ahead_class != budget::BACKGROUND { e.since.max(self.ahead_since) } else { e.since }
+    }
     // One heat sample per selection, O(log n). Age is a common epoch offset: it never
     // requires touching existing entries. New hotter work still gets sampled as we rotate.
     fn refresh(&mut self, now: &HeatNow) {
@@ -211,6 +222,7 @@ impl Queue {
         if class != entry.class {
             budget::queued(entry.class, budget::JIT, -1);
             budget::queued(class, budget::JIT, 1);
+            entry.since = if class < entry.class { now.wall } else if class == budget::BACKGROUND { entry.at } else { entry.since };
             entry.class = class;
         }
         entry.key = key;
@@ -387,6 +399,7 @@ impl Queue {
         budget::queued(self.class_of(&e), budget::JIT, -1);
         self.plan[e.job.tier()][e.class as usize].remove(&order(e.key, e.serial));
         if e.job.tier() == 0 && !e.promoted { self.ahead_len -= 1; }
+        e.since = self.since_of(&e);
         e.class = self.class_of(&e);
         self.indices.remove(&e.serial);
         if let Some(moved) = self.entries.get(i) { self.indices.insert(moved.serial, i); }
@@ -956,13 +969,17 @@ impl Queue {
         self.sync_ahead();
         let Some(wanted) = self.wanted((unit, id)) else { return false };
         let serials = self.by_slot.remove(&(unit, id)).unwrap_or_default();
+        let now = wall_ns();
         for serial in serials.iter() {
-            let e = &mut self.entries[self.indices[&serial]];
+            let i = self.indices[&serial];
+            let old_since = self.since_of(&self.entries[i]);
+            let e = &mut self.entries[i];
             self.plan[e.job.tier()][e.class as usize].remove(&order(e.key, e.serial));
             let old = if e.job.tier() == 0 && !e.promoted { self.ahead_len -= 1; self.ahead_class } else { e.class };
             budget::queued(old, budget::JIT, -1);
             e.promoted = true;
             e.class = wanted.min(old);
+            e.since = if e.class < old { now } else { old_since };
             self.plan[e.job.tier()][e.class as usize].insert(order(e.key, e.serial));
             budget::queued(e.class, budget::JIT, 1);
         }
@@ -1001,7 +1018,11 @@ impl Queue {
             self.plan[tier][e.class as usize].remove(&order(e.key, e.serial));
             budget::queued(e.class, budget::JIT, -1);
             e.promoted = false;
+            let old = e.class;
             e.class = if tier == 0 { self.ahead_len += 1; budget::BACKGROUND } else { job_class(&e.job, &now) };
+            // (back in the background it has waited there since it was queued; a check ahead
+            // takes the ahead class's raise again: since_of)
+            e.since = if e.class < old { now.wall } else if e.class == budget::BACKGROUND { e.at } else { e.since };
             budget::queued(if tier == 0 { self.ahead_class } else { e.class }, budget::JIT, 1);
             self.plan[tier][e.class as usize].insert(order(e.key, e.serial));
         }
@@ -1175,7 +1196,7 @@ fn worker_loop(index: usize) {
                     }
                     if more { wake(); }
                     let (serial, tier) = (entry.serial, entry.job.tier());
-                    crate::zone_alloc::kept_with(|| budget::waited(entry.class, budget::JIT, wall_ns().saturating_sub(entry.at), entry.job.label()));
+                    crate::zone_alloc::kept_with(|| budget::waited(entry.class, budget::JIT, wall_ns().saturating_sub(entry.since), entry.job.label()));
                     let active = if let Job::O3(tier) = &entry.job {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(tier.0);
                         Some(TierActive(tier.0))
@@ -1328,8 +1349,11 @@ mod tests {
         q.push(Job::Spec(1, 10), 1);
         q.push(Job::Spec(1, 11), 2);
         q.waiters.insert((1, 11), [0, 2]);
+        let raised_from = wall_ns();
         q.promote(1, 11);
         assert_eq!(q.entries[1].class, budget::VISIBLE, "a job takes its waiters' class, not more");
+        assert!(q.entries[1].since >= raised_from, "a raised job's wait at its waiters' class starts at the raise");
+        assert_eq!(q.entries[0].since, 1, "a job nobody waits for waits from its queue time");
         q.waiters.get_mut(&(1, 11)).unwrap()[0] += 1;
         q.promote(1, 11);
         assert_eq!(q.entries[1].class, budget::INTERACTIVE, "the highest waiter's class");
@@ -1338,6 +1362,7 @@ mod tests {
         assert_eq!(q.entries[1].class, budget::INTERACTIVE, "another waiter retains promotion");
         q.end_wait(1, 11, 1);
         assert_eq!(q.entries[1].class, budget::BACKGROUND, "last waiter restores the queued class");
+        assert_eq!(q.entries[1].since, 2, "back in the background a job has waited since it was queued");
         q.waiters.insert((1, 11), [1, 0]);
         q.promote(1, 11);
         let now = HeatNow { hu: None, wall: 100, tier: 0 };
