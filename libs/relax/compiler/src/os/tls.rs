@@ -306,8 +306,10 @@ mod imp {
     /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; the run host's
     /// minSdk is 29, cargo-makepad android HOST_MIN_SDK). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
     /// stays for its thread-exit destructor; JIT code reads the slot (codegen arm64 tls_addr).
+    #[cfg(not(relax))]
     const TLS_SLOT_APP: u64 = 2;
 
+    #[cfg(not(relax))]
     fn slot() -> *mut u64 {
         let tp: u64;
         unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack, preserves_flags)); }
@@ -317,22 +319,37 @@ mod imp {
     pub fn set(key: u64, block: *mut u8) {
         unsafe {
             super::unix::pthread_setspecific(key as usize, block);
+            // (under Relax the slot is the outer runtime's: its JIT code, this runtime's own
+            // included, finds its block there; this runtime keeps to its key, `jit_offset`)
+            #[cfg(not(relax))]
             slot().write_volatile(block as u64);
         }
     }
 
-    /// The slot index JIT code reads (`Env::tls_key`), checked through the emitted reader.
+    /// The slot index JIT code reads (`Env::tls_key`), checked through the emitted reader. A
+    /// runtime under Relax stops with a plain error instead: the code it compiled would read the
+    /// outer runtime's slot. The form that serves it (a word of the outer block, read with two
+    /// loads, as on Linux x86-64) is not built yet.
     pub fn jit_offset(key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
-        let reader = emit(&relax_backend::arm64::tsd_reader());
-        let read: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(reader as usize) };
-        let old = get(key);
-        set(key, 0x5a5a_0000 as *mut u8);
-        let seen = read(TLS_SLOT_APP);
-        set(key, old);
-        if seen != 0x5a5a_0000 {
-            panic!("thread-local fast path: bionic TLS_SLOT_APP reads {:#x}", seen);
+        #[cfg(relax)]
+        {
+            let _ = (key, emit);
+            eprintln!("relax: this runtime runs under Relax on Android. JIT code on Android arm64 finds its thread's block through bionic's TLS_SLOT_APP, and in this process that slot is the outer runtime's, read by its own code; Relax running Relax on Android arm64 is not supported yet. Run this program under the outer runtime directly.");
+            std::process::exit(2);
         }
-        TLS_SLOT_APP
+        #[cfg(not(relax))]
+        {
+            let reader = emit(&relax_backend::arm64::tsd_reader());
+            let read: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(reader as usize) };
+            let old = get(key);
+            set(key, 0x5a5a_0000 as *mut u8);
+            let seen = read(TLS_SLOT_APP);
+            set(key, old);
+            if seen != 0x5a5a_0000 {
+                panic!("thread-local fast path: bionic TLS_SLOT_APP reads {:#x}", seen);
+            }
+            TLS_SLOT_APP
+        }
     }
 }
 
