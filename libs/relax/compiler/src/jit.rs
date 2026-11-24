@@ -1114,6 +1114,17 @@ impl CodeTables {
         self.entry_at(pc).map(|e| e.2)
     }
 
+    /// The bounds [lo, hi) of the function or glue holding `pc` (a joined body's part on its own).
+    pub(crate) fn code_bounds(&self, pc: u64) -> Option<(u64, u64)> {
+        if let Some((start, len, _)) = self.entry_at(pc) {
+            let (lo, end) = (self.function_base(start, pc), start + len as u64);
+            let part = self.parts.binary_search_by_key(&start, |p| p.0).ok().map(|k| start + self.parts[k].1 as u64);
+            return Some((lo, if lo == start { part.unwrap_or(end) } else { end }));
+        }
+        let k = self.glue.partition_point(|g| g.0 <= pc);
+        self.glue.get(k.wrapping_sub(1)).filter(|g| pc < g.0 + g.1 as u64).map(|g| (g.0, g.0 + g.1 as u64))
+    }
+
     /// The start of the glue code (`Unit::emit_glue`: the runtime's entries and trampolines)
     /// holding `pc`.
     pub(crate) fn glue_at(&self, pc: u64) -> Option<u64> {
@@ -28357,6 +28368,35 @@ extern "C" fn relax_host_jit_code(pc: u64) -> u32 {
     in_jit_code(pc) as u32
 }
 
+/// For a compiler this one runs: the bounds [lo, hi) of this runtime's JIT function or glue holding
+/// `pc`, into `out[0..2]` (1), or 0 (none, or the code tables stay locked). That compiler's walk of
+/// a thread blocked in a syscall, which gives sp and pc only, finds this code's frame record by the
+/// call into these bounds (inspect/cfi.rs rbp_of_its_call). Never waits on the tables' lock: the
+/// thread walked may be the one writing them.
+extern "C" fn relax_host_code_bounds(pc: u64, out: *mut u64) -> u32 {
+    let u = cur_unit();
+    if u.is_null() {
+        return 0;
+    }
+    for _ in 0..1000 {
+        let bounds = match unsafe { &*u }.code.try_read() {
+            Ok(t) => t.code_bounds(pc),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().code_bounds(pc),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::yield_now();
+                continue;
+            }
+        };
+        let Some((lo, hi)) = bounds else { return 0 };
+        unsafe {
+            *out = lo;
+            *out.add(1) = hi;
+        }
+        return 1;
+    }
+    0
+}
+
 /// For a compiler this one runs: the return address of this runtime's program stack switch
 /// (relax_base::stack), which that compiler's walks step by the switch record.
 extern "C" fn relax_host_switch_return_pc() -> u64 {
@@ -28550,6 +28590,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_tls_cell" => Some(relax_tls_cell as *const () as usize),
         b"__relax_host_jit_code" => Some(relax_host_jit_code as *const () as usize),
         b"__relax_host_switch_return_pc" => Some(relax_host_switch_return_pc as *const () as usize),
+        b"__relax_host_code_bounds" => Some(relax_host_code_bounds as *const () as usize),
         // a loader run as the program: the run's parent this runner took (restart_parent.rs)
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         b"__relax_host_restart_parent" => Some(crate::restart_parent::relax_host_restart_parent as *const () as usize),

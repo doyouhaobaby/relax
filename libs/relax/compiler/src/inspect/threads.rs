@@ -1143,6 +1143,7 @@ mod x64_walk {
         extern "C" {
             fn __relax_host_jit_code(pc: u64) -> u32;
             fn __relax_host_switch_return_pc() -> u64;
+            fn __relax_host_code_bounds(pc: u64, out: *mut u64) -> u32;
         }
 
         /// Whether `pc` is JIT code of the runtime that runs this compiler.
@@ -1155,6 +1156,22 @@ mod x64_walk {
             {
                 let _ = pc;
                 false
+            }
+        }
+
+        /// The bounds [lo, hi) of that runtime's JIT function or glue holding `pc` (None: none, or
+        /// no such runtime).
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        pub fn code_bounds(pc: u64) -> Option<(u64, u64)> {
+            #[cfg(relax)]
+            {
+                let mut out = [0u64; 2];
+                (unsafe { __relax_host_code_bounds(pc, out.as_mut_ptr()) } != 0).then_some((out[0], out[1]))
+            }
+            #[cfg(not(relax))]
+            {
+                let _ = pc;
+                None
             }
         }
 
@@ -1177,8 +1194,8 @@ mod x64_walk {
 
     /// Why a walk ends at a frame of the runtime that runs this compiler when the frame pointer is
     /// not known (a thread blocked in a syscall, walked from its sp and pc): that runtime's frame
-    /// sizes are its own, and no frame is taken from stack contents.
-    pub const HOST_NO_FP: &str = "it is JIT code of the runtime that runs this compiler, and its frame pointer is not known (a thread blocked in a syscall is walked from its sp and pc only)";
+    /// sizes are its own, and its frame record counts only where a call into its code proves it.
+    pub const HOST_NO_FP: &str = "it is JIT code of the runtime that runs this compiler, and its frame pointer is not known (a thread blocked in a syscall is walked from its sp and pc only, and no call into this code left its return address above that sp)";
 
     /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
     /// frame record (JIT code keeps one in rbp; where rbp is not known, at its unwind info's
@@ -1234,14 +1251,25 @@ mod x64_walk {
                     if top {
                         return Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
                     }
-                    if !own {
-                        return Some(HOST_NO_FP);
-                    }
-                    match crate::jit::frame_pointer_at(r.rip, sp0) {
-                        Ok(fp) => r.rbp = fp,
-                        Err(why) => {
-                            return Some(why);
+                    if own {
+                        match crate::jit::frame_pointer_at(r.rip, sp0) {
+                            Ok(fp) => r.rbp = fp,
+                            Err(why) => {
+                                return Some(why);
+                            }
                         }
+                    } else {
+                        // the runtime that runs this compiler: its frame record is the slot above
+                        // sp holding a return address whose call calls this code (stack contents
+                        // alone prove nothing: earlier calls leave records there)
+                        #[cfg(target_os = "linux")]
+                        match host::code_bounds(look).map(|(lo, hi)| cfi::rbp_of_its_call(lo, hi, sp0, 8, read)) {
+                            Some(Ok(Some(fp))) => r.rbp = fp,
+                            Some(Err(why)) => return Some(why),
+                            _ => return Some(HOST_NO_FP),
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        return Some(HOST_NO_FP);
                     }
                 }
                 if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
@@ -1642,15 +1670,19 @@ mod tests {
         assert!(!raw.frames().contains(&planted), "a caller guessed from stack contents: {names:?}");
         if cfg!(relax) {
             // under the JIT, `park_in_poll` is JIT code of the runtime that runs this test, which
-            // the walk asks about: it steps libc's frames by their CFI, reaches `park_in_poll`, and
-            // ends there, saying why: the garbage rbp, when poll's unwind tables restore it (a poll
-            // that saves rbp), or no frame pointer at all (one that leaves it alone: a thread
-            // blocked in a syscall gives none)
+            // the walk asks about: it steps libc's frames by their CFI and reaches `park_in_poll`.
+            // A poll that saves rbp restores the garbage one, and the walk ends there, saying so;
+            // one that leaves rbp alone leaves no frame pointer (a thread blocked in a syscall
+            // gives none), and the walk finds park_in_poll's frame record by the call into it
+            // (that runtime's code bounds) and goes on to its caller
             let pcs = raw.frames();
-            assert!(raw.stop == Some(FP_NOT_IN_STACK) || raw.stop == Some(HOST_NO_FP), "{names:?} {:?}", raw.stop);
-            assert!(pcs.len() >= 2 && names[pcs.len() - 2].contains("poll"), "poll's frame comes before the last: {names:?}");
-            let last = pcs[pcs.len() - 1];
-            assert!(host::jit_code(last - 1) && last > park_in_poll as fn(i32, u64, &AtomicU64) as usize as u64, "the last frame is park_in_poll's, the runtime's JIT code: {names:?}");
+            let poll_at = names.iter().position(|n| n.contains("poll")).expect("poll's frame");
+            let park = pcs.get(poll_at + 1).copied().unwrap_or(0);
+            assert!(host::jit_code(park.wrapping_sub(1)) && park > park_in_poll as fn(i32, u64, &AtomicU64) as usize as u64, "the frame after poll's is park_in_poll's, the runtime's JIT code: {names:?}");
+            assert_ne!(raw.stop, Some(HOST_NO_FP), "park_in_poll's frame pointer comes from the call into it: {names:?}");
+            if pcs.len() == poll_at + 2 {
+                assert_eq!(raw.stop, Some(FP_NOT_IN_STACK), "a walk that ends at park_in_poll ends at its garbage rbp: {names:?}");
+            }
         } else {
             let reached = names.iter().any(|n| n.contains("park_in_poll"));
             assert!(reached || raw.stop == Some(BLOCKED_NO_FP), "the walk neither reached park_in_poll nor said why it stopped: {names:?} {:?}", raw.stop);
