@@ -981,15 +981,20 @@ pub(crate) struct CheckBatch {
 static CHECK_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// CPU time (ns) of the app check's jobs for the first frame's line (`first_frame_gate`).
 static APP_CHECK_CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The check jobs beside the program: running now; most at once while something waited; slices
-/// started while something waited whose thread the OS raised to the waiter's class, and refused.
-static CHECK_SLICES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// The check jobs beside the program: running now, most at once while something waited, slices
+/// the OS raised to the waiter's class, raises refused, and total queue time (ns) of slices
+/// started while something waited.
+static CHECK_SLICES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 /// A job's slice: past it, the job gives its worker back to the queue after the item it is on.
 const CHECK_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Something waits for the check beside the program: its jobs run first in the Interactive class.
 pub(crate) fn check_waited() -> bool {
     CHECK_WAITED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn slice_queued(ns: u64) {
+    CHECK_SLICES[4].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The app's first window frame or the run's exit waits for the check beside the program.
@@ -1262,7 +1267,9 @@ pub fn wait_app_check() {
     waited();
     let t0 = std::time::Instant::now();
     let mut g = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    if *g == 1 {
+    let waited_ns = if *g == 1 {
+        let _ui = crate::preempt::UiWaits::new();
+        let _held = crate::jit::MainHeld::new();
         FIRST_FRAME_WAITS.store(true, Relaxed);
         let _gate = GateWait;
         while *g == 1 {
@@ -1271,9 +1278,11 @@ pub fn wait_app_check() {
             g = BESIDE.1.wait_while(g, |state| *state == 1 && APP_CHECK_THREAD.load(Relaxed) == holder)
                 .unwrap_or_else(|e| e.into_inner());
         }
-    }
+        Some(t0.elapsed().as_nanos() as u64)
+    } else { None };
     let failed = *g == 3;
     drop(g);
+    if let Some(ns) = waited_ns { crate::inspect::flightrec::gate_wait(ns); }
     if failed { crate::run_end::leave(); }
     if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("relax: the first frame waited {:.0} ms for the app check", t0.elapsed().as_secs_f64() * 1e3);
@@ -1300,9 +1309,9 @@ pub fn first_frame_gate() {
         _ => {
             let wait_cpu = ms(APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0));
             format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu); the first frame waited {:.0} ms for it, \
-                its checks {:.0} ms cpu meanwhile (at most {} jobs at once, CPU limit {}; {} slices raised to the frame's class at the OS, {} refused)",
+                its checks {:.0} ms cpu meanwhile (at most {} jobs at once, CPU limit {}; {} slices raised to the frame's class at the OS, {} refused; its slices waited {:.0} ms for a worker)",
                 n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)), waited_ms, wait_cpu,
-                CHECK_SLICES[1].load(Relaxed), makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed))
+                CHECK_SLICES[1].load(Relaxed), makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed), ms(CHECK_SLICES[4].load(Relaxed)))
         }
     };
     eprintln!("{line}");
@@ -2985,7 +2994,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&FIRST_FRAME_WAITS, std::sync::atomic::AtomicBool::new(false));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 8]);
     reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
-    reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
+    reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
     reset(&GATE_SAID, std::sync::atomic::AtomicBool::new(false));
     reset(&APP_CHECK_ASKED, std::sync::atomic::AtomicBool::new(false));
 }
@@ -3016,7 +3025,7 @@ mod def_work_tests {
         let start = Instant::now();
         let registered = loop {
             if crate::waits::of(id).is_some_and(|w| w.kind == crate::waits::Kind::Check && w.holder == holder && w.label == "first frame")
-                && first_frame_waits() && crate::owner::queued_note().contains("\"gate\":1") {
+                && first_frame_waits() && crate::preempt::ui_waits() && crate::owner::queued_note().contains("\"gate\":1") {
                 break true;
             }
             if start.elapsed() >= Duration::from_millis(500) { break false; }
@@ -3032,6 +3041,7 @@ mod def_work_tests {
         assert!(registered, "the parked frame must name the check thread and report the JIT gate");
         assert!(cleared.unwrap(), "the wait row must clear before the waiter thread exits");
         assert!(!first_frame_waits(), "the gate must clear when the check finishes");
+        assert!(!crate::preempt::ui_waits(), "background work must resume when the gate clears");
     }
 
     fn ice(said: &str) -> String {

@@ -1196,7 +1196,11 @@ fn worker_loop(index: usize) {
                     }
                     if more { wake(); }
                     let (serial, tier) = (entry.serial, entry.job.tier());
-                    crate::zone_alloc::kept_with(|| budget::waited(entry.class, budget::JIT, wall_ns().saturating_sub(entry.since), entry.job.label()));
+                    let queued_ns = wall_ns().saturating_sub(entry.since);
+                    if matches!(entry.job, Job::Check(..)) && crate::check::check_waited() {
+                        crate::check::slice_queued(queued_ns);
+                    }
+                    crate::zone_alloc::kept_with(|| budget::waited(entry.class, budget::JIT, queued_ns, entry.job.label()));
                     let active = if let Job::O3(tier) = &entry.job {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(tier.0);
                         Some(TierActive(tier.0))

@@ -699,7 +699,7 @@ pub fn print_summary(options: &crate::options::Options) {
     }
     let preempted = PREEMPTED.load(Ordering::Relaxed);
     if preempted > 0 {
-        s.push_str(&format!(", {} preempted by live patches (queued again)", preempted));
+        s.push_str(&format!(", {} preempted by live patches or a waiting UI (queued again)", preempted));
     }
     if stale > 0 {
         s.push_str(&format!(", {} dropped (queued before the program was collected again, or by a retired unit)", stale));
@@ -808,6 +808,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
     src.lower_priority();
     let mut started = false;
+    let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
     loop {
         if stopping() { return; }
         // The startup's checks wait for the runner; a live edit's do not: the person waits for its
@@ -815,11 +816,15 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
         // in that time waited for the release, 11-04).
         if !started {
             started = src.started();
-            let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
             if !started && !edit_first() {
                 pace(20, RANK_EDIT);
                 continue;
             }
+        }
+        // Leave the worker's CPU to the waiting frame's app check unless a live edit needs a verdict.
+        if crate::preempt::ui_waits() && !edit_first() {
+            pace(20, RANK_EDIT);
+            continue;
         }
         // (the source the worker started with must not keep a replaced front state alive)
         if !src.alive() {

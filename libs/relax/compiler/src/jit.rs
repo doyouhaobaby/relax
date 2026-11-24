@@ -32546,7 +32546,8 @@ pub fn start_background_coherence(u: &Unit) {
     let _ = crate::run_threads::spawn("run-coherence", move || { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-        while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
+        while (STARTUP_PHASE.load(Ordering::Acquire) != 0 || !(past_startup() || FIRST_TEST_PASS.load(Ordering::Acquire)))
+            && !SPEC_STOP.load(Ordering::SeqCst) {
             if !crate::run_threads::sleep(std::time::Duration::from_millis(20)) { return; }
         }
         let mut orphan_done = false;
