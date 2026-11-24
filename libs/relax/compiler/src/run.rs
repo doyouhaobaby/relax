@@ -5195,8 +5195,9 @@ pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::c
 }
 
 /// (verbose) a background owner request's longest stretch between two of its yield checks (the
-/// longest the main thread could wait behind it), and the check that ended it
-struct YieldProbe(std::sync::Mutex<(Option<Instant>, f64, &'static str, u32, &'static str)>);
+/// longest the main thread could wait behind it), the sections of the checks that began and ended
+/// it, how many checks there were, and the section of the last check
+struct YieldProbe(std::sync::Mutex<(Option<Instant>, f64, &'static str, u32, &'static str, &'static str)>);
 /// (YieldProbe) the section of a background owner request running now: a gap between two
 /// checks is reported by the section it began in
 pub(crate) static YIELD_SECTION: relax_session::sync::Mutex<&'static str> = relax_session::sync::Mutex::new("");
@@ -5225,7 +5226,7 @@ pub(crate) fn yield_section(s: &'static str) {
     }
 }
 impl YieldProbe {
-    fn new() -> Self { Self(std::sync::Mutex::new((None, 0.0, "", 0, ""))) }
+    fn new() -> Self { Self(std::sync::Mutex::new((None, 0.0, "", 0, "", ""))) }
     fn start(&self) { self.0.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(Instant::now()); }
     fn tick(&self, at: &'static str) {
         let now = Instant::now();
@@ -5233,7 +5234,7 @@ impl YieldProbe {
         let section = *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(l) = g.0 {
             let ms = (now - l).as_secs_f64() * 1e3;
-            if ms > g.1 { g.1 = ms; g.2 = if g.4.is_empty() { at } else { g.4 }; }
+            if ms > g.1 { g.1 = ms; g.2 = if g.4.is_empty() { at } else { g.4 }; g.5 = if section.is_empty() { at } else { section }; }
         }
         g.4 = section;
         g.0 = Some(now);
@@ -5241,7 +5242,7 @@ impl YieldProbe {
     }
     fn report(&self, what: &str) {
         let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if g.1 >= 5.0 { verbose!("relax cache: {} held the owner up to {:.1} ms without a yield check (ending at {}; {} checks)", what, g.1, g.2, g.3); }
+        if g.1 >= 5.0 { verbose!("relax cache: {} held the owner up to {:.1} ms without a yield check (from a check in {} to the next, in {}; {} checks)", what, g.1, g.2, g.5, g.3); }
     }
 }
 

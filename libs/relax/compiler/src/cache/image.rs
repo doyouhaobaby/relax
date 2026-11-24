@@ -40,12 +40,15 @@ pub(super) struct ImageResume {
 }
 
 impl ImageResume {
-    fn matches(&self, cache: &Cache, ids: &[u32], edited: usize) -> bool {
-        if self.ids != ids || self.edited != edited { return false; }
-        if self.replaced_at == cache.replaced.len() { return true; }
+    /// Why the build of `ids` cannot continue this one (None: it can).
+    fn mismatch(&self, cache: &Cache, ids: &[u32], edited: usize) -> Option<String> {
+        if self.ids != ids { return Some(format!("its slots changed ({} then, {} now)", self.ids.len(), ids.len())); }
+        if self.edited != edited { return Some(format!("crates were edited live since ({} then, {} now)", self.edited, edited)); }
+        if self.replaced_at == cache.replaced.len() { return None; }
         let mut bits = Vec::new();
         for &(id, _, _) in &self.work.chosen { set_bit(&mut bits, id); }
-        cache.replaced_in(&bits, self.replaced_at) * 100 <= self.work.chosen.len()
+        let replaced = cache.replaced_in(&bits, self.replaced_at);
+        (replaced * 100 > self.work.chosen.len()).then(|| format!("{} of its {} chosen slots were replaced since it began", replaced, self.work.chosen.len()))
     }
 }
 
@@ -70,8 +73,16 @@ impl Cache {
     /// when code is replaced later: image_replaced), with the replacement log position it began at.
     pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<(Option<BuiltImage>, usize), ()> {
         let edited = crate::reload::edited_crates().len();
-        if self.image_resume.as_ref().is_some_and(|r| !r.matches(self, ids, edited)) {
-            self.discard_image_resume();
+        if let Some(r) = self.image_resume.as_ref() {
+            match r.mismatch(self, ids, edited) {
+                Some(why) => {
+                    if self.verbose { eprintln!("relax cache: startup image build that gave way starts over: {why}"); }
+                    self.discard_image_resume();
+                }
+                None => if self.verbose {
+                    eprintln!("relax cache: startup image build resumed in phase {} at {} ({:.1} ms of earlier tries)", r.phase, r.at, r.ph[4]);
+                },
+            }
         }
         let mut resume = self.image_resume.take().unwrap_or_else(|| ImageResume {
             ids: ids.to_vec(), edited, replaced_at: self.replaced.len(), ..Default::default()
