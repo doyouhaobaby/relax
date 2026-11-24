@@ -306,6 +306,36 @@ fn visible_leaves_waiting_jit_background_its_floor() {
     b.release(above);
     assert_eq!(rx.recv().unwrap(), 4);
     finish(fourth);
+
+    // A granted run (MAKEPAD_CPU_GRANT), as relax-compiler's
+    // a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it has it: the work outside
+    // the table counts against the builds above the floor only. With it counted below, the build
+    // gave its token up for that work, or its token went to neither the waiting build nor the last
+    // job, and that test held until its run was ended (11-24). (Polled admissions: a broken rule
+    // fails an assertion, it does not hold the test.)
+    let b = Arc::new(Budget::new(12, 12).with_grant(true));
+    assert_eq!((b.limit, b.jit_floor), (11, 2));
+    let handle = BudgetHandle(Which::Own(b.clone()));
+    let other = b.admit(BACKGROUND, JIT, "another compile job");
+    let build = b.admit(BACKGROUND, JIT, "the build");
+    let jobs: Vec<_> = (0..b.limit - b.jit_floor).map(|_| b.admit(VISIBLE, APP, "a pool job")).collect();
+    let mut tier_up = handle.admission();
+    assert_eq!(tier_up.poll(BACKGROUND, JIT, "a tier-up"), None, "the floor is met");
+    let mut last = handle.admission();
+    assert_eq!(last.poll(VISIBLE, APP, "a pool job"), None, "the jobs and the builds hold every token");
+    {
+        let mut s = b.lock();
+        b.observe_outside(&mut s, 2000);
+        assert_eq!(s.outside, 2);
+    }
+    assert!(!b.should_yield(build), "a build within the floor keeps its token through its checkpoints, whatever runs outside the table");
+    b.release(build);
+    let floor_build = tier_up.poll(BACKGROUND, JIT, "a tier-up").expect("the token the build gave back is the floor's: the waiting build has it, whatever runs outside the table");
+    assert_eq!(last.poll(VISIBLE, APP, "a pool job"), None, "the floor's token is not the person's");
+    b.release(floor_build);
+    let job = last.poll(VISIBLE, APP, "a pool job").expect("the last job runs once the builds are done");
+    for p in jobs.into_iter().chain([job, other]) { b.release(p); }
+    assert_eq!(b.lock().running, 0);
 }
 
 #[test]

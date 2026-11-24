@@ -24,7 +24,8 @@
 //! cores its other work leaves, that of its threads that hold no token included (a test's own
 //! threads), as the process's CPU time measures it (`Budget::observe_outside`). The person's work
 //! still never waits for them. A tests shard told 6 cores ran 6 test threads beside up to 6 tier-up
-//! builds, 12 cores on its box (11-23).
+//! builds, 12 cores on its box (11-23). The JIT's floor holds there too: the builds within it count
+//! only the table, as Visible work does.
 //! On a machine with two kinds of core (Apple silicon) the budget also places Background work on
 //! them, by what it is to the program (`set_thread_work`): a build of hot code takes a performance
 //! core only where the person's work leaves one (`fast_room`: the cores less the Interactive and
@@ -318,14 +319,22 @@ impl Budget {
         }
     }
     /// What `class`'s room is measured against: the tokens that run, and for the JIT's Background
-    /// builds in a granted run the cores in use outside the table too.
+    /// builds in a granted run the cores in use outside the table too, except below the JIT's floor:
+    /// the tokens Visible work leaves the builds there (`jit_short`) are theirs, whatever runs
+    /// outside the table. Counted there, a token Visible work left the builds went to neither, and
+    /// with nothing that changed the table again (so no new reading either) a test's last Visible
+    /// job waited for it until its run was ended, twice (11-24, relax-compiler jit.rs
+    /// `a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it`).
     fn load(&self, s: &State, class: u8, client: u8) -> usize {
-        s.running + if class == BACKGROUND && client == JIT { s.outside } else { 0 }
+        s.running + if class == BACKGROUND && client == JIT && self.jit_short(s) == 0 { s.outside } else { 0 }
     }
     /// The JIT's Background builds give their tokens up at their next checkpoint: the process runs
-    /// over its cores, counting a granted run's work outside the table.
+    /// over its cores, counting a granted run's work outside the table while the builds are above
+    /// their floor (one within it that gave its token up for that work would take it back at once:
+    /// `load`).
     fn builds_over(&self, s: &State) -> bool {
-        s.running + s.outside > self.cores
+        let within_floor = self.floor_holds(s) && s.jit_background <= self.jit_floor;
+        s.running + if within_floor { 0 } else { s.outside } > self.cores
     }
     /// The performance cores the person's work leaves now: 0 on a machine with one kind of core.
     fn fast_room(&self) -> usize {
@@ -343,9 +352,13 @@ impl Budget {
             self.refresh(&mut s);
         }
     }
-    /// How far the JIT's Background jobs are below their floor: it holds only against Visible work.
+    /// The JIT's floor holds only against Visible work: some runs or waits.
+    fn floor_holds(&self, s: &State) -> bool {
+        s.visible > 0 || s.waiting & (1 << VISIBLE) != 0
+    }
+    /// How far the JIT's Background jobs are below their floor (`floor_holds`).
     fn jit_short(&self, s: &State) -> usize {
-        if s.visible == 0 && s.waiting & (1 << VISIBLE) == 0 { return 0; }
+        if !self.floor_holds(s) { return 0; }
         self.jit_floor.saturating_sub(s.jit_background)
     }
     fn class_limit(&self, s: &State, class: u8, client: u8) -> usize {
