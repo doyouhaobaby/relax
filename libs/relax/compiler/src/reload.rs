@@ -8,8 +8,8 @@
 //!    apply, as do supported layout, macro and visibility edits. Types are laid out as rustc lays
 //!    them: a field renamed applies, a type no running value of is left takes its new layout,
 //!    and an enum's added variant takes a free tag where one passes the check. Unsupported edits
-//!    offer a restart with a reason; the app keeps running until `session relaunch` is requested.
-//!    The landing check also offers a restart when old code remains on a thread's stack.
+//!    offer a restart with a reason. With `RELAX_AUTO_RESTART=1`, the watcher requests the
+//!    restart itself. The landing check also detects old code remaining on a thread's stack.
 //! 3. Freeze: closures of the functions about to be rebuilt that were never compiled are
 //!    compiled now, from the version their stored values were made by.
 //! 4. Commit the versions (each a new file index: old code, closure and coroutine types and
@@ -9595,13 +9595,13 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
     back
 }
 
-/// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
+/// An edit the patcher cannot absorb needs a restart.
 /// The first reason is the offer's headline, so a layout blocked by a frame names that holder first.
 /// The wait is the edit's files' (`paths`, those its lines name: `held_files`): a later patch that
 /// finds them back at the text that runs ends it (`reverted_waits`).
 fn restart_for_edit(what: &str, lines: &[String], paths: &[String]) {
     SOURCES_WAIT.store(true, Ordering::Release);
-    offer_restart_in(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()), held_files(lines, paths));
+    offer_source_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()), held_files(lines, paths));
 }
 
 /// The files of an edit (`paths`) that its restart lines (`lines`) hold back: those a line names
@@ -10109,7 +10109,25 @@ pub(crate) fn offer_restart(why: &str) {
     offer_restart_in(why, Vec::new());
 }
 
-/// offer_restart for an edit of `files` (restart_for_edit): their revert ends the wait.
+/// A source restart uses the same safe-point and state handover as a manual relaunch.
+fn offer_source_restart(why: &str, files: Vec<String>) {
+    if std::env::var_os("RELAX_AUTO_RESTART").is_some_and(|value| value == "1")
+        && !crate::harness::live::enabled()
+        && !pinned()
+    {
+        note_restart_pending_in(why, files.clone());
+        if crate::run_end::restarting() || host::restart_asked() {
+            return;
+        }
+        match relaunch_pending("RELAX_AUTO_RESTART", false) {
+            Ok(_) => return,
+            Err(error) => eprintln!("relax live: automatic restart failed: {error}"),
+        }
+    }
+    offer_restart_in(why, files);
+}
+
+/// offer_restart for an edit of `files`: their revert ends the wait.
 fn offer_restart_in(why: &str, files: Vec<String>) {
     note_restart_pending_in(why, files);
     eprintln!("relax live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `{tool} inspect <app> session relaunch`); the app keeps running meanwhile", tool = crate::tool_name());
@@ -12121,7 +12139,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     crate::harness::live::restart(crate::harness::live::Edit {
                         paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None, patch: None, reverted: Vec::new(),
                     }, &why);
-                } else { offer_restart(&why); }
+                } else { offer_source_restart(&why, Vec::new()); }
                 for &k in &changed { files[k].2 = settled_stamps[k]; stalled.remove(&k); }
                 continue;
             }
@@ -12830,6 +12848,26 @@ mod watch_wait_tests {
         let log = std::fs::read_to_string(home.join("live.jsonl")).unwrap_or_default();
         assert!(log.contains("\"event\":\"restart_offered\""), "the offer is in the live log (the WM's toast): {log}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_source_edit_restarts_only_when_opted_in() {
+        isolated_test!(a_source_edit_restarts_only_when_opted_in);
+        // The app can hand over its state. Observe its request without ending the test process.
+        RESTART_SUPPORTED.store(true, Ordering::SeqCst);
+        let lines = ["the running layout changed".to_string()];
+        let paths = ["src/lib.rs".to_string()];
+
+        for value in [None, Some("0"), Some("1")] {
+            match value {
+                Some(value) => std::env::set_var("RELAX_AUTO_RESTART", value),
+                None => std::env::remove_var("RELAX_AUTO_RESTART"),
+            }
+            restart_for_edit("lib.rs", &lines, &paths);
+            assert_eq!(restart_pending(), ["lib.rs: the running layout changed"]);
+            assert_eq!(RESTART_REQUESTED.load(Ordering::SeqCst), value == Some("1"));
+            assert!(!RESTART_ANYWAY.load(Ordering::SeqCst), "the app can postpone the restart");
+        }
     }
 
     /// Every `session relaunch` says who asked, a repeat too: the run window's click or key, or
