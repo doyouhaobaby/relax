@@ -482,6 +482,7 @@ pub fn set_pure_crates(crates: &'static [&'static str]) {
 }
 
 fn pure_crate(name: &str) -> bool {
+    relax_base::host::init();
     PURE_CRATES.get().is_some_and(|c| c.contains(&name))
 }
 pub fn reusable_bang(i: usize) -> bool {

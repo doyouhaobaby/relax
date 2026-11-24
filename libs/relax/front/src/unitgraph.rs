@@ -645,6 +645,7 @@ pub fn register_script_answer(a: &'static ScriptAnswer) {
 
 /// The host's answer to `pkg`'s script `bs`, when the script's files read as the answer's sources.
 fn script_answer(pkg: &str, bs: &BuildScript) -> Option<&'static ScriptAnswer> {
+    relax_base::host::init();
     let a = SCRIPT_ANSWERS.lock().unwrap().iter().copied().find(|a| a.package == pkg)?;
     let folder = std::path::Path::new(&bs.src_path).parent()?;
     a.sources.iter().all(|(path, text)| crate::vfs::read_to_string(folder.join(path)).is_ok_and(|t| t == *text)).then_some(a)

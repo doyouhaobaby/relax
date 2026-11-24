@@ -10854,7 +10854,7 @@ mod git;
 pub use inputs::Inputs;
 #[path = "reload_host.rs"]
 pub mod host;
-pub use host::set_loader_package;
+pub use host::{set_loader_package, snapshot_loader};
 
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     crate::hot_failure::enable();

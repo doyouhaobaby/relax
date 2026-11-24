@@ -45,8 +45,8 @@ mod macros;
 pub mod remote;
 
 /// What a runner binary adds to the bare runner. The `makepad` binary (tools/run) provides crates
-/// built into it and hosts HAL programs on the main thread; the `relax` binary adds nothing (no
-/// host), so every crate of a program, the HAL and Splash included, is JIT-compiled from source.
+/// built into it and hosts HAL programs on the main thread; the `relax` binary links the bare
+/// host, so every crate of a program, the HAL and Splash included, is JIT-compiled from source.
 pub struct Host {
     /// what the `makepad` loader was built from (tools/run/build.rs), for its `--version`; None:
     /// the bare runner, whose `--version` names its binary by the linker's id (binary_id)
@@ -123,35 +123,72 @@ pub enum HelpLine {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, compile_time_code: relax_compiler::sandbox::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[], pure_macro_crates: &[], env: relax_compiler::progenv::HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] }, tool: "relax" };
+pub static BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, compile_time_code: relax_compiler::sandbox::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[], pure_macro_crates: &[], env: relax_compiler::progenv::HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] }, tool: "relax" };
+
+#[doc(hidden)]
+pub use relax_base as __relax_base;
+#[doc(hidden)]
+pub use relax_native_macros;
+
+/// Declare the host whose facts the first reader in this binary will apply.
+#[macro_export]
+macro_rules! linked_host {
+    ($host:path) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        const _: () = {
+            fn apply() { $crate::apply_host(&$host); }
+
+            #[used]
+            #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__relax_host")]
+            #[cfg_attr(all(not(target_vendor = "apple"), not(windows)), link_section = "relax_host")]
+            #[cfg_attr(windows, link_section = ".relaxhost$m")]
+            static ENTRY: $crate::__relax_base::host::Entry = $crate::__relax_base::host::Entry {
+                name: $host.tool,
+                apply: Some(apply),
+            };
+        };
+    };
+}
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
 fn host() -> &'static Host {
+    relax_base::host::init();
     HOST.get().copied().unwrap_or(&BARE)
 }
 
-/// The runner's host, once, before `main`/`init_embedded`/`run_checkout`.
-pub fn set_host(host: &'static Host) {
-    if HOST.set(host).is_ok() {
-        for &set in host.native_sets {
-            relax_native_macros::register(set);
-        }
-        for &a in host.script_answers {
-            relax_compiler::unitgraph::register_script_answer(a);
-        }
-        relax_compiler::sandbox::set_policy(host.compile_time_code);
-        relax_compiler::macro_reg::set_pure_crates(host.pure_macro_crates);
-        relax_compiler::progenv::set_host_env(host.env);
-        relax_compiler::set_tool_name(host.tool);
-        relax_compiler::reload::set_loader_package(host.package, host.manifest);
+/// Register the linked host's compile-time facts on their first read.
+#[doc(hidden)]
+pub fn apply_host(host: &'static Host) {
+    assert!(HOST.set(host).is_ok(), "the runner's host was already registered");
+    for &set in host.native_sets {
+        relax_native_macros::register(set);
+    }
+    for &a in host.script_answers {
+        relax_compiler::unitgraph::register_script_answer(a);
+    }
+    relax_compiler::sandbox::set_policy(host.compile_time_code);
+    relax_compiler::macro_reg::set_pure_crates(host.pure_macro_crates);
+    relax_compiler::progenv::set_host_env(host.env);
+    relax_compiler::set_tool_name(host.tool);
+    relax_compiler::reload::set_loader_package(host.package, host.manifest);
+}
+
+/// Start the linked host once the entry point has prepared its environment.
+pub fn start_host(host: &'static Host) {
+    relax_base::host::init();
+    let linked = HOST.get().copied().expect("no host is linked into this binary (relax_runner::linked_host!)");
+    assert!(std::ptr::eq(linked, host), "this binary links host `{}`; it was started as `{}`", linked.tool, host.tool);
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        relax_compiler::reload::snapshot_loader();
         // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
         // carries it to the session (options.rs) and to every process this one starts
         if std::env::var_os("RELAX_AHEAD").is_none() {
             std::env::set_var("RELAX_AHEAD", host.ahead.name());
         }
         (host.init)();
-    }
+    });
 }
 
 fn provided() {
@@ -240,7 +277,7 @@ pub fn main(host: &'static Host) {
     if let Some(args) = bin.or(relaunch) {
         relax_compiler::os::proc::set_args(args);
     }
-    set_host(host);
+    start_host(host);
     warn_legacy_env();
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
@@ -264,7 +301,7 @@ fn warn_legacy_env() {
 /// loader's executable (the Android host library in an Activity's process): `exe` is Relax's own
 /// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
-    set_host(host);
+    start_host(host);
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);

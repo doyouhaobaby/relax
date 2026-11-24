@@ -19,6 +19,7 @@ name = "relax"
 path = "src/bin/relax.rs"
 
 [dependencies]
+relax-base = { workspace = true }
 relax-compiler = { workspace = true }
 # a provided crate's read of the program's environment (relax-api env), pointed at the program's
 relax-api = { workspace = true }

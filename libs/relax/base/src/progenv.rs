@@ -167,12 +167,13 @@ pub struct HostEnv {
 
 static HOST_ENV: std::sync::OnceLock<HostEnv> = std::sync::OnceLock::new();
 
-/// The host's table, once, before anything reads it (relax-runner set_host).
+/// The linked host's table, applied on the first read of its facts.
 pub fn set_host_env(env: HostEnv) {
     let _ = HOST_ENV.set(env);
 }
 
 pub fn host_env() -> HostEnv {
+    crate::host::init();
     HOST_ENV.get().copied().unwrap_or(HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] })
 }
 

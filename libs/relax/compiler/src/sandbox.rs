@@ -272,7 +272,7 @@ pub struct Domain {
 /// What third-party packages' compile-time code may do (proc macros, pmhost.rs; build scripts,
 /// unitgraph.rs): the entry point's choice, one per process (runner Host `compile_time_code`).
 /// Kept in relax-base, where the build-script runs read it too.
-pub use relax_base::compile_time::{policy, set_policy, Policy};
+pub use relax_base::compile_time::{policy, replace_policy_in_test, set_policy, Policy};
 
 /// The run-time modules' domain: what every domain may call, nothing more; metered (a module's
 /// arena may set a per-call budget).
