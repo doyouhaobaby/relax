@@ -173,7 +173,10 @@ fn a_copy_in_another_worktree_reuses_its_verdicts_with_its_own_paths() {
     std::fs::write(b.join("data.txt"), "two!").unwrap();
     let reused = check_in_child_store(&b, true, &store, &in_b);
     assert_eq!((reused.hits, &reused.diags), (1, &cold.diags), "the copy's included file edited: the library checked again: {reused:?}");
-    let note = format!("#[deprecated(note = \"see {a_path}/notes\")]\npub fn old() {{}}\n");
+    // the note names the folder as printed, and its literal escapes it (its `"`, and on Windows
+    // its `\`): the warning prints the note's value, as rustc does
+    let noted = format!("see {a_path}/notes, \"as written\"");
+    let note = format!("#[deprecated(note = {noted:?})]\npub fn old() {{}}\n");
     let bin = BIN.replace("let x = pkg::f();", "let x = pkg::f(); pkg::old();");
     for d in [&a, &b] {
         std::fs::write(d.join("data.txt"), "two!").unwrap();
@@ -183,7 +186,7 @@ fn a_copy_in_another_worktree_reuses_its_verdicts_with_its_own_paths() {
     let first = check_in_child_store(&a, true, &store, &in_a);
     let reused = check_in_child_store(&b, true, &store, &in_b);
     let cold = check_in_child_store(&b, true, &store, &verify);
-    assert!(first.code == 0 && cold.diags.iter().any(|d| d.contains(&format!("see {a_path}/notes"))), "the note as written: {first:?}, {cold:?}");
+    assert!(first.code == 0 && cold.diags.iter().any(|d| d.contains(&noted)), "the note as written: {first:?}, {cold:?}");
     assert_eq!((reused.hits, &reused.diags), (1, &cold.diags), "a diagnostic naming the first worktree's folder: the binary checked again in the copy: {reused:?}, {cold:?}");
     std::fs::remove_dir_all(&a).unwrap();
     std::fs::remove_dir_all(&b).unwrap();
