@@ -23,8 +23,7 @@ pub const BUILTIN_MACROS: &[&str] = &[
     "format", "format_args", "print", "println", "eprint", "eprintln", "write", "writeln", "panic", "vec",
     "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "matches",
     "unreachable", "todo", "unimplemented", "cfg", "concat", "stringify", "line", "file", "column",
-    "module_path", "include_str", "include_bytes", "env", "option_env", "thread_local", "msg_send", "sel",
-    "class", "log", "error", "warning", "warn", "trace", "debug", "asm", "smallvec",
+    "module_path", "include_str", "include_bytes", "env", "option_env", "thread_local", "asm", "smallvec",
     // core::prelude::v1's other built-in macros (`use core::{compile_error, prelude::v1::derive}`)
     "compile_error", "include", "global_asm", "naked_asm", "derive", "test", "bench", "global_allocator",
     "test_case", "trace_macros", "log_syntax", "concat_idents", "cfg_accessible", "cfg_eval", "derive_const",

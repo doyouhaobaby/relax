@@ -780,14 +780,7 @@ impl<'a> Parser<'a> {
             Some(s) => self.bytes(s.name.lo, s.name.hi).to_vec(),
             None => return NO_MAC_ARGS,
         };
-        let known = matches!(
-            name.as_slice(),
-            b"format" | b"print" | b"println" | b"eprint" | b"eprintln" | b"write" | b"writeln" | b"panic" | b"format_args"
-                | b"vec" | b"assert" | b"assert_eq" | b"assert_ne" | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne"
-                | b"matches" | b"assert_matches" | b"debug_assert_matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
-                | b"global_asm" | b"naked_asm"
-        );
-        if !known {
+        if !args_in_place(&name) {
             return NO_MAC_ARGS;
         }
         let is_matches = matches!(name.as_slice(), b"matches" | b"assert_matches" | b"debug_assert_matches");
@@ -7515,4 +7508,16 @@ pub(crate) unsafe fn reset_statics() {
     reset(&LAZY_WHY_PARSED, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
     reset(&LAZY_AUTO, std::sync::atomic::AtomicBool::new(false));
     reset(&LAZY_PARSED, [const { std::sync::atomic::AtomicU64::new(0) }; 2]);
+}
+
+/// The built-in macros whose arguments the parser reads in place (MacArgs): a call of another name
+/// that no macro resolved keeps no arguments, and is no macro of its scope.
+pub fn args_in_place(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"format" | b"print" | b"println" | b"eprint" | b"eprintln" | b"write" | b"writeln" | b"panic" | b"format_args"
+            | b"vec" | b"assert" | b"assert_eq" | b"assert_ne" | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne"
+            | b"matches" | b"assert_matches" | b"debug_assert_matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
+            | b"global_asm" | b"naked_asm"
+    )
 }
