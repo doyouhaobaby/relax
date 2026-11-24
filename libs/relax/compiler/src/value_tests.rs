@@ -280,7 +280,8 @@ fn a_128_bit_value_by_one_word_and_its_quotients_are_rustcs() {
 
 /// `IoSlice` / `IoSliceMut` (now real std's `iovec`-shaped wrappers, WARNZERO class 8): the
 /// slices they borrow, `advance_slices` across them, a vectored write, writes through a mutable
-/// one, and the `iovec` layout (base, then length) FFI code relies on.
+/// one, and the layout FFI code relies on: unix's `iovec` (base, then length), Windows' `WSABUF`
+/// (a 32-bit length, then base), as rustc's std has them.
 const IO_SLICES: &str = r#"
 use std::io::{IoSlice, IoSliceMut, Write};
 pub fn values(out: &mut [usize; 8]) {
@@ -301,9 +302,11 @@ pub fn values(out: &mut [usize; 8]) {
         out[4] = s.len();
     }
     out[5] = m[1] as usize;
-    let words: [usize; 2] = unsafe { core::mem::transmute(IoSlice::new(&b)) };
-    out[6] = (words[0] == b.as_ptr() as usize) as usize;
-    out[7] = words[1];
+    #[cfg(not(windows))] #[repr(C)] struct Raw { base: *const u8, len: usize }
+    #[cfg(windows)] #[repr(C)] struct Raw { len: u32, base: *const u8 }
+    let raw: Raw = unsafe { core::mem::transmute(IoSlice::new(&b)) };
+    out[6] = (raw.base == b.as_ptr()) as usize;
+    out[7] = raw.len as usize;
 }
 "#;
 
@@ -556,28 +559,40 @@ pub(crate) mod vfs_store;
 
 /// A game's store (asset client cache.rs fsync_dir: `File::open(dir)?.sync_all()`): a folder
 /// opens for reading as it does on the disk (open(2) of a directory O_RDONLY succeeds; its reads
-/// fail EISDIR), so a virtual one (an overlay run's sources) is fsync'd, not refused EISDIR.
+/// fail EISDIR), so a virtual one (an overlay run's sources) is fsync'd, not refused EISDIR. On
+/// Windows rustc's std opens no folder (no backup semantics: access denied), and the virtual
+/// one is refused as the disk's is.
 #[test]
 fn a_virtual_folder_opens_for_reading_as_a_disk_folder_does() {
     isolated_test!(a_virtual_folder_opens_for_reading_as_a_disk_folder_does);
     let fixture = vfs_store::Fixture::new(&[("app/cache/a.bin", b"a")]);
     let root = "/relax-values-vfs-dir/vfs/m";
     crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+    let disk = std::env::temp_dir().join(format!("relax-values-disk-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&disk).unwrap();
+    let (disk_dir, virtual_dir) = (disk.to_str().unwrap().to_string(), format!("{root}/app/cache"));
     let src = format!(r#"
-pub fn values(out: &mut [usize; 5]) {{
-    let dir = std::fs::File::open("{root}/app/cache");
-    out[0] = dir.is_ok() as usize;
-    if let Ok(mut d) = dir {{
-        out[1] = d.sync_all().is_ok() as usize;
-        out[2] = d.metadata().map_or(0, |m| m.is_dir() as usize);
-        let mut buf = [0u8; 4];
-        out[3] = matches!(std::io::Read::read(&mut d, &mut buf), Err(e) if e.kind() == std::io::ErrorKind::IsADirectory) as usize;
+pub fn values(out: &mut [usize; 12]) {{
+    for (k, path) in [{disk_dir:?}, {virtual_dir:?}].into_iter().enumerate() {{
+        let out = &mut out[k * 6..k * 6 + 6];
+        let dir = std::fs::File::open(path);
+        out[0] = dir.is_ok() as usize;
+        out[5] = dir.as_ref().err().map_or(0, |e| e.raw_os_error().map_or(usize::MAX, |c| c as usize));
+        if let Ok(mut d) = dir {{
+            out[1] = d.sync_all().is_ok() as usize;
+            out[2] = d.metadata().map_or(0, |m| m.is_dir() as usize);
+            let mut buf = [0u8; 4];
+            out[3] = matches!(std::io::Read::read(&mut d, &mut buf), Err(e) if e.kind() == std::io::ErrorKind::IsADirectory) as usize;
+        }}
+        // a write still needs the edits folder
+        out[4] = std::fs::OpenOptions::new().write(true).open(path).is_err() as usize;
     }}
-    // a write still needs the edits folder
-    out[4] = std::fs::OpenOptions::new().write(true).open("{root}/app/cache").is_err() as usize;
 }}
 "#);
-    assert_eq!(values::<5>(&src, "vfs_dir"), [1, 1, 1, 1, 1]);
+    let got = values::<12>(&src, "vfs_dir");
+    std::fs::remove_dir_all(&disk).unwrap();
+    assert_eq!(&got[6..], &got[..6], "the virtual folder as the disk folder: {got:?}");
+    if cfg!(unix) { assert_eq!(&got[..6], [1, 1, 1, 1, 1, 0], "a folder opens for reading"); }
 }
 
 /// std::backtrace (it was a stub that printed "unsupported backtrace", so a lane learned who held a

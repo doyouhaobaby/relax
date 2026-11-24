@@ -1015,15 +1015,17 @@ mod provenance_tests {
         let source = root.join("later.rs");
         std::fs::write(&source, r#"
             extern "C" {
-                fn labs(x: i64) -> i64;
+                fn llabs(x: i64) -> i64;
                 #[link_name = "abs"] fn abs_later(x: i32) -> i32;
             }
         "#).unwrap();
+        // (llabs, not labs: a 32-bit `long` makes Windows' labs the same code as abs, at abs's
+        // address, which names abs_b)
         u.prog.load_crate("later", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
-        let labs = def(&u, "labs");
-        let addr_labs = u.loaded_foreign_addr(labs).unwrap();
-        let sym_labs = provenance(&u, addr_labs).unwrap();
-        assert_eq!(u.syms.foreign_def(sym_labs.id), Some(labs));
+        let llabs = def(&u, "llabs");
+        let addr_llabs = u.loaded_foreign_addr(llabs).unwrap();
+        let sym_llabs = provenance(&u, addr_llabs).unwrap();
+        assert_eq!(u.syms.foreign_def(sym_llabs.id), Some(llabs));
         assert_eq!(provenance(&u, addr), Some(sym));
         assert_eq!(u.syms.foreign_by_addr.lock().unwrap().defs_scanned, u.prog.defs.len());
         std::fs::remove_dir_all(root).unwrap();
