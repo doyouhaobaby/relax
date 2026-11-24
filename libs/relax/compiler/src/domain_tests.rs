@@ -462,7 +462,7 @@ struct TestLoad {
 }
 
 impl TestLoad {
-    fn run(&self, up: usize) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
+    fn run(&self, up: usize) -> Result<(u32, usize, Vec<String>), Vec<String>> {
         unsafe { load_graph(up as *mut Unit, &self.graph, &self.order, &self.cfgs, &self.idents, self.id, true) }
     }
 }
@@ -521,7 +521,7 @@ fn a_waiting_request_is_served_between_load_steps() {
             release_load_step();
             assert_eq!(rx.recv().unwrap(), k, "a waiting request was overtaken at step {k}");
         }
-        let (_, reused, new, _) = loader.join().unwrap().unwrap();
+        let (_, reused, new) = loader.join().unwrap().unwrap();
         assert_eq!((reused, new.len()), (0, 3));
         assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 3);
     });
@@ -564,7 +564,7 @@ fn a_parse_error_keeps_the_crates_before_it() {
     assert_eq!(lookup_loaded(bad.idents[2]), None, "the load continued past the failing crate");
 
     let good = f.chain(&["a", "e"]);
-    let (root, reused, _, _) = std::thread::scope(|s| s.spawn(|| good.run(up)).join().unwrap().unwrap());
+    let (root, reused, _) = std::thread::scope(|s| s.spawn(|| good.run(up)).join().unwrap().unwrap());
     assert_eq!(reused, 1);
     assert_eq!(shared_dependency(&f.unit, root), a, "e must depend on the first load's a");
     assert_eq!(lookup_loaded(good.idents[0]), Some(a));
@@ -583,10 +583,37 @@ fn a_recorded_crate_with_extern_crate_aliases_is_reused() {
     std::thread::scope(|s| s.spawn(|| ab.run(up)).join().unwrap().unwrap());
     let a = lookup_loaded(ab.idents[0]).expect("a was recorded");
     let ad = f.chain_with(&["a", "d"], alias);
-    let (root, reused, new, _) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
+    let (root, reused, new) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
     assert_eq!((reused, new.len()), (1, 1), "a was loaded again: {new:?}");
     assert_eq!(shared_dependency(&f.unit, root), a);
     assert_eq!(records_for(ab.idents[0]), 1);
+}
+
+#[test]
+fn a_crate_recorded_by_a_cancelled_load_links_for_the_load_that_reuses_it() {
+    isolated_test!(a_crate_recorded_by_a_cancelled_load_links_for_the_load_that_reuses_it);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let link = "#[link(name = \"step_a\")] extern \"C\" {}\n";
+    let abc = f.chain_with(&["a", "b", "c"], link);
+    let up = f.address();
+    let err = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| abc.run(up));
+        hold_after_first_crate();
+        retire(abc.id).unwrap();
+        drop(hold);
+        loader.join().unwrap().unwrap_err()
+    });
+    assert_eq!(err, ["domain compilation cancelled"]);
+    let a = lookup_loaded(abc.idents[0]).expect("a was recorded before the cancel");
+    // the cancelled load never linked: the next domain's link must find a's library
+    let ad = f.chain_with(&["a", "d"], link);
+    let (root, reused, _) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
+    assert_eq!(reused, 1);
+    assert_eq!(shared_dependency(&f.unit, root), a, "d reuses the cancelled load's a");
+    let libs = crate::run::link_attr_libs(&f.unit.prog, Some(&domain_crates(&f.unit.prog, root)));
+    assert_eq!(libs, [("step_a".to_owned(), false)], "the reused crate's library is linked");
 }
 
 #[test]
@@ -622,10 +649,9 @@ fn two_loads_of_a_shared_crate_load_it_once() {
     assert_eq!(records_for(ab.idents[0]), 1);
     assert_eq!(shared_dependency(&f.unit, b.0), a);
     assert_eq!(shared_dependency(&f.unit, d.0), a);
-    assert_eq!(b.3, d.3, "both file ranges include both roots");
     for (root, lib) in [(b.0, "step_b"), (d.0, "step_d")] {
         let selected = HashSet::from([a, root]);
-        let libs = crate::run::link_attr_libs(&f.unit.prog, b.3, Some(&selected));
+        let libs = crate::run::link_attr_libs(&f.unit.prog, Some(&selected));
         assert_eq!(libs, [(lib.to_owned(), false)], "a domain links only its own root's library");
     }
 }
@@ -652,7 +678,7 @@ fn a_crate_loaded_by_an_earlier_step_compiles_before_the_load_ends() {
         assert_ne!(installed, 0);
         assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 1, "the install finished before b began");
         drop(hold);
-        let (_, _, new, _) = loader.join().unwrap().unwrap();
+        let (_, _, new) = loader.join().unwrap().unwrap();
         assert_eq!(new.len(), 3);
     });
 }

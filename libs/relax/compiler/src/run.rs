@@ -2337,7 +2337,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // static failed ("foreign static not found in the loaded libraries", relax#75) where the
         // run binds it.
         if selftest {
-            match link_libraries(&u.prog, &g.link_libs, g.native.as_ref(), 0, None) {
+            match link_libraries(&u.prog, &g.link_libs, g.native.as_ref(), None) {
                 Ok((_, missing, _)) => if !missing.is_empty() { verbose!("relax: libraries not found: {:?}", missing); },
                 Err(error) => {
                     eprintln!("relax: {error}");
@@ -2457,7 +2457,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0, None) {
+    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), None) {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("relax: {error}");
@@ -3350,12 +3350,12 @@ pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks, owner: Optio
 }
 
 /// Loads the libraries the build scripts link (one a confined script named never from the working
-/// folder: os/proc.rs `load_library_outside_cwd`) and the ones `#[link]` blocks of files from
-/// `first_file` on name: (how many, the optional ones not found, the native library's callbacks
+/// folder: os/proc.rs `load_library_outside_cwd`) and the ones `#[link]` blocks of the files of
+/// `crates` name (None: every crate): (how many, the optional ones not found, the native library's callbacks
 /// to bind once the unit is made). A native bundle's load failure is fatal, with the loader's
 /// diagnostic and the crates it carries, and so is a callback the program does not define.
 /// The native library's callbacks are the fns of `crates` (a domain's; None: any).
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool, bool)], native: Option<&crate::native::NativeLib>, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool, bool)], native: Option<&crate::native::NativeLib>, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
@@ -3384,7 +3384,12 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
     // with #[link] (frameworks register their Objective-C classes and protocols on load, and
     // the program looks those up by name at run time)
     let mut n_link = link_libs.len();
-    for (name, fw) in link_attr_libs(prog, first_file, crates) {
+    let t_scan = Instant::now();
+    let attr_libs = link_attr_libs(prog, crates);
+    if crate::preload::trace() {
+        eprintln!("boot-trace: link scan of {} crate(s) {:.2} ms ({} libraries)", crates.map_or(prog.crates.len(), |c| c.len()), t_scan.elapsed().as_secs_f64() * 1e3, attr_libs.len());
+    }
+    for (name, fw) in attr_libs {
         if link_libs.iter().any(|l| l.0 == name && l.1 == fw) || provided_static(&name) {
             continue;
         }
@@ -3591,11 +3596,13 @@ fn link_trace() -> bool {
 }
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
-/// are active (got definitions), or an empty link-only block without a cfg; files from
-/// `first_file` on that belong to the selected crates (all crates at boot).
-pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Vec<(String, bool)> {
+/// are active (got definitions), or an empty link-only block without a cfg, in the files of the
+/// selected crates (None: every crate). A domain selects all of its crates, the ones another load
+/// recorded included: a load stopped before its link leaves its recorded crates unlinked, and a
+/// library loaded twice is the one already loaded.
+pub(crate) fn link_attr_libs(prog: &crate::program::Program, crates: Option<&std::collections::HashSet<u32>>) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
-    for (fi, f) in prog.files.iter().enumerate().skip(first_file) {
+    for (fi, f) in prog.files.iter().enumerate() {
         let Some(&k) = prog.file_crate.get(fi) else { continue };
         if crates.is_some_and(|selected| !selected.contains(&k)) { continue; }
         let Some(cfg) = prog.crates.get(k as usize).map(|c| &c.cfg) else { continue };

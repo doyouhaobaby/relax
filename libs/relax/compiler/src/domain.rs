@@ -1602,7 +1602,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let t1 = std::time::Instant::now();
     let upn = up as usize;
     let loaded = unsafe { load_graph(up, &g, &order, &cfgs, &idents, id, !from_boot) };
-    let (root, n_reused, new_names, first_file) = match loaded {
+    let (root, n_reused, new_names) = match loaded {
         Ok(x) => x,
         Err(e) => return fail(id, e),
     };
@@ -1616,14 +1616,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let linked = {
         let read = crate::jit::front_read("domain link");
         let (prog, _) = read.unit(up);
-        let mut seen = std::collections::HashSet::from([root]);
-        let mut todo = vec![root];
-        while let Some(k) = todo.pop() {
-            for &(_, d) in &prog.crates[k as usize].deps {
-                if seen.insert(d) { todo.push(d); }
-            }
-        }
-        crate::run::link_libraries(prog, &g.link_libs, g.native.as_ref(), first_file, Some(&seen))
+        crate::run::link_libraries(prog, &g.link_libs, g.native.as_ref(), Some(&domain_crates(prog, root)))
     };
     let (_, missing, callbacks) = match linked {
         Ok(linked) => linked,
@@ -1862,6 +1855,18 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
     start(up, spec)
 }
 
+/// The crates of a domain: its root and everything that depends on, std's included.
+pub(crate) fn domain_crates(prog: &crate::program::Program, root: u32) -> HashSet<u32> {
+    let mut seen = HashSet::from([root]);
+    let mut todo = vec![root];
+    while let Some(k) = todo.pop() {
+        for &(_, d) in &prog.crates[k as usize].deps {
+            if seen.insert(d) { todo.push(d); }
+        }
+    }
+    seen
+}
+
 #[cfg(test)]
 mod load_step_gate {
     use std::collections::VecDeque;
@@ -1947,19 +1952,19 @@ unsafe fn reread_loaded(up: *mut Unit, idents: &[u64], changed: &mut HashSet<u32
 
 /// The loader asks the owner for one complete crate at a time. Between requests the crate
 /// indices belong to the loader and the program can serve other domains.
-unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
+unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     use crate::owner::{call, Class::Program};
     let epochs = || (crate::reload::program_edits(), crate::jit::patch_epoch());
     let mut changed = HashSet::new();
-    let (first_file, std_deps, mut checked) = call(Program, || {
+    let (std_deps, mut checked) = call(Program, || {
         let checked = epochs();
         // The boot graph was just read. A later edit invalidates that shortcut too.
         if reread { reread_loaded(up, idents, &mut changed); }
         let prog = &(*up).prog;
         let std_count = crate::std_pre_crates(&prog.session, prog.std_simd, prog.std_overflow_checks).len();
         let deps: Vec<_> = (0..std_count).map(|k| (prog.syms.str(prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
-        (prog.files.len(), deps, checked)
+        (deps, checked)
     });
     let mut crate_of = vec![u32::MAX; g.crates.len()];
     let mut reused = 0;
@@ -2029,7 +2034,7 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
     if root == u32::MAX {
         return Err(vec![format!("the package root {} did not load", g.crates[g.root].name)]);
     }
-    Ok((root, reused, why_new, first_file))
+    Ok((root, reused, why_new))
 }
 
 // ---- the test vehicle: `makepad run <package> --domain <package2> ..`
