@@ -1569,9 +1569,9 @@ fn round50_inline_const_reload() {
 fn live_o3_split_keeps_the_saved_host_current() {
     const CHILD: &str = "RELAX_TEST_OUTLINE_OPT";
     let Ok(tokens) = std::env::var(CHILD) else {
-        // the in-function form is the default; outline_requested_needs_plus_outline_without_minus
-        // pins which tokens choose it, and the expected values hold for both forms
-        for opt in ["+outline"] {
+        // the default (in-function) form every user runs, and the outlined one; which tokens choose
+        // each is outline_requested_needs_plus_outline_without_minus's
+        for opt in ["", "+outline"] {
             let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::live_o3_split_keeps_the_saved_host_current", "--nocapture"])
                 .env(CHILD, opt).env("RELAX_OPT", opt).env("RELAX_CACHE", "off").env("RELAX_O3_STATS", "1")
@@ -1622,9 +1622,16 @@ fn live_o3_split_keeps_the_saved_host_current() {
     {
         let tables = u.code.read().unwrap();
         let part = tables.function_base(saved, end - 1);
-        assert!(part > saved && part < end, "the joined continuation has its own function base");
-        assert_eq!(tables.function_base(saved, part - 1), saved);
-        assert_eq!(tables.function_base(saved, part), part);
+        if tokens == "+outline" {
+            assert!(part > saved && part < end, "the joined continuation has its own function base");
+            assert_eq!(tables.function_base(saved, part - 1), saved);
+            assert_eq!(tables.function_base(saved, part), part);
+        } else {
+            assert_eq!(part, saved, "the default build keeps its patched path in the function");
+            let mut split = false;
+            host.pc_map.each(|off, pos| { split |= off != u32::MAX && relax_backend::rir::pos_patched(pos); true });
+            assert!(split, "the default build has a patched path");
+        }
     }
     let run_saved = || {
         let mut result = 0u32;
