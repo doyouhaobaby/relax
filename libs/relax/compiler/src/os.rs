@@ -13,6 +13,7 @@
 //!   reads it through.
 //! - [`proc`]: foreign symbols and libraries, power state, process arguments, private files.
 //! - `progsig` (unix): the program's signal handlers, run on program threads outside compiles.
+//! - `progexc` (Windows): the program's exception handlers, run on program threads outside compiles.
 
 // explicit paths: the file is also loaded through #[path] by the bring-up driver, where nested
 // modules would otherwise resolve next to it (the Win32 declarations are not here: relax_session::win32)
@@ -22,6 +23,9 @@ pub mod fault;
 pub mod mem;
 #[path = "os/proc.rs"]
 pub mod proc;
+#[cfg(windows)]
+#[path = "os/progexc.rs"]
+pub(crate) mod progexc;
 #[cfg(unix)]
 #[path = "os/progsig.rs"]
 pub(crate) mod progsig;
@@ -34,26 +38,19 @@ pub mod tls;
 #[cfg(windows)]
 pub(crate) use relax_session::win32;
 
-/// While it lives, the calling thread runs the program's code: its signal handlers run there
-/// (os/progsig.rs). Taken where a thread starts the program's main or a thread of it.
+/// While it lives, the calling thread runs the program's code and its handlers may run there.
 #[cfg(unix)]
 pub(crate) use progsig::program_thread;
 #[cfg(windows)]
-pub(crate) struct ProgramThread;
-#[cfg(windows)]
-pub(crate) fn program_thread() -> ProgramThread {
-    ProgramThread
-}
-#[cfg(windows)]
-impl ProgramThread {
-    pub(crate) fn end_with_thread(self) {}
-}
+pub(crate) use progexc::{program_thread, ProgramThread};
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     fault::reset_statics();
     #[cfg(unix)]
     progsig::reset_statics();
+    #[cfg(windows)]
+    progexc::reset_statics();
     proc::reset_statics();
     tls::reset_statics();
 }

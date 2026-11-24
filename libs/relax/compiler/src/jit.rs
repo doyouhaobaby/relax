@@ -11289,7 +11289,11 @@ struct Compiling;
 fn compiling(_slot: u32) -> Compiling {
     Compiling
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn adopt_thread() {
+    os::progexc::adopt();
+}
+#[cfg(not(any(unix, windows)))]
 fn adopt_thread() {}
 
 thread_local! {
@@ -11300,6 +11304,11 @@ thread_local! {
 
 /// Sets COMPILE_INNERMOST while it lives; the value before comes back after.
 struct CompileInnermost(bool);
+
+#[cfg(windows)]
+pub(crate) fn compile_innermost() -> bool {
+    CompileInnermost::get()
+}
 
 impl CompileInnermost {
     fn set(v: bool) -> CompileInnermost {
@@ -11372,6 +11381,7 @@ fn compile_reentered(slot: u32) -> ! {
 /// program thread of a fn whose name contains <name part> sends <signal> from inside the compile
 /// (os/progsig.rs `test_send`: `self`, `process`, `raw-self`, `rt3-self`); with `block` that
 /// compile never ends. The signal tests' one hook, and a hand repro of a signal in a compile.
+/// On Windows, `<name part>,<code>` raises a continuable exception with that decimal or hex code.
 unsafe fn test_signal_in_compile(up: *mut Unit, id: u32) {
     #[cfg(unix)]
     {
@@ -11392,7 +11402,29 @@ unsafe fn test_signal_in_compile(up: *mut Unit, id: u32) {
             os::progsig::test_send(*sig, to, *block, &name);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        static WANT: std::sync::OnceLock<Option<(String, u32)>> = std::sync::OnceLock::new();
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        let want = WANT.get_or_init(|| crate::zone_alloc::kept_with(|| {
+            let v = std::env::var("RELAX_TEST_SIGNAL_IN_COMPILE").ok()?;
+            let (part, code) = v.split_once(',')?;
+            let code = match code.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => code.parse().ok()?,
+            };
+            Some((part.to_string(), code))
+        }));
+        let Some((part, code)) = want else { return };
+        if FIRED.load(Ordering::Relaxed) || !os::progexc::on_program_thread() {
+            return;
+        }
+        let name = owner::call(owner::Class::Program, || (&*up).fns[id as usize].name.to_string());
+        if name.contains(part.as_str()) && !FIRED.swap(true, Ordering::AcqRel) {
+            os::win32::RaiseException(*code, 0, 0, std::ptr::null());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = (up, id);
 }
 
@@ -28712,6 +28744,17 @@ fn lookup_interposer(link: &str) -> Option<u64> {
         "pthread_create" => Some(crate::domain_threads::pthread_create as *const () as usize as u64),
         #[cfg(windows)]
         "CreateThread" => Some(crate::domain_threads::create_thread as *const () as usize as u64),
+        // the program's exception handlers run only on program threads outside a compile
+        #[cfg(windows)]
+        "AddVectoredExceptionHandler" => Some(os::progexc::add_vectored_exception_handler as *const () as usize as u64),
+        #[cfg(windows)]
+        "RemoveVectoredExceptionHandler" => Some(os::progexc::remove_vectored_exception_handler as *const () as usize as u64),
+        #[cfg(windows)]
+        "AddVectoredContinueHandler" => Some(os::progexc::add_vectored_continue_handler as *const () as usize as u64),
+        #[cfg(windows)]
+        "RemoveVectoredContinueHandler" => Some(os::progexc::remove_vectored_continue_handler as *const () as usize as u64),
+        #[cfg(windows)]
+        "SetUnhandledExceptionFilter" => Some(os::progexc::set_unhandled_exception_filter as *const () as usize as u64),
         // the program's own environment values, apart from its host's (relax-base progenv.rs)
         #[cfg(unix)]
         "getenv" => Some(relax_base::progenv::program_getenv as *const () as usize as u64),

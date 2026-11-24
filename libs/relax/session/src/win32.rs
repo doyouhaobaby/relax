@@ -60,8 +60,12 @@ extern "system" {
     pub fn TlsSetValue(index: u32, v: *mut u8) -> i32;
     // exceptions
     pub fn AddVectoredExceptionHandler(first: u32, handler: extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut u8;
+    pub fn RemoveVectoredExceptionHandler(handle: *mut u8) -> u32;
+    pub fn AddVectoredContinueHandler(first: u32, handler: extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut u8;
+    pub fn RemoveVectoredContinueHandler(handle: *mut u8) -> u32;
     pub fn SetUnhandledExceptionFilter(filter: Option<extern "system" fn(*mut ExceptionPointers) -> i32>) -> usize;
     pub fn UnhandledExceptionFilter(ep: *mut ExceptionPointers) -> i32;
+    pub fn RaiseException(code: u32, flags: u32, n_args: u32, args: *const usize);
     // modules
     pub fn LoadLibraryA(name: *const u8) -> HANDLE;
     pub fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> HANDLE;

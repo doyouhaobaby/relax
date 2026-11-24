@@ -1522,6 +1522,7 @@ mod imp {
 mod imp {
     use super::{Action, Fault, Hooks, Kind};
     use crate::os::win32::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     /// never delivered as an exception on Windows (the watchdog suspends the thread instead);
     /// kept so Fault::sig values never collide with it
@@ -1619,16 +1620,24 @@ mod imp {
     }
 
     extern "system" fn vectored(ep: *mut ExceptionPointers) -> i32 {
-        unsafe { handle(ep, true) }
+        let r = unsafe { handle(ep, true) };
+        if r == EXCEPTION_CONTINUE_SEARCH { crate::os::progexc::dispatch_vectored(ep) } else { r }
+    }
+
+    extern "system" fn continued(ep: *mut ExceptionPointers) -> i32 {
+        crate::os::progexc::dispatch_continue(ep)
     }
 
     /// The end of every search, on a thread's own stack and on a program stack (its last frame):
-    /// what the runtime does not resume ends the process here, with its code. The system's way on
+    /// what neither the runtime nor the program's filter resumes ends here, with its code. The system's way on
     /// is an error report, and with no one to answer it (no desktop, a dialog) the process stays.
     extern "system" fn unhandled(ep: *mut ExceptionPointers) -> i32 {
         unsafe {
             let r = handle(ep, false);
             if r != EXCEPTION_CONTINUE_EXECUTION {
+                if crate::os::progexc::program_filter(ep) == Some(EXCEPTION_CONTINUE_EXECUTION) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
                 TerminateProcess(GetCurrentProcess(), (*(*ep).record).code);
             }
             r
@@ -1648,8 +1657,20 @@ mod imp {
     pub fn this_thread_done(_sp: u64) {}
 
     pub fn install() {
+        static VECTORED: AtomicUsize = AtomicUsize::new(0);
+        static CONTINUED: AtomicUsize = AtomicUsize::new(0);
+        // Reassert first place for each new unit. Keep the old handler if the add failed.
+        unsafe fn replace(slot: &AtomicUsize, new: *mut u8, remove: unsafe extern "system" fn(*mut u8) -> u32) {
+            if !new.is_null() {
+                let old = slot.swap(new as usize, SeqCst);
+                if old != 0 {
+                    remove(old as *mut u8);
+                }
+            }
+        }
         unsafe {
-            AddVectoredExceptionHandler(1, vectored);
+            replace(&VECTORED, AddVectoredExceptionHandler(1, vectored), RemoveVectoredExceptionHandler);
+            replace(&CONTINUED, AddVectoredContinueHandler(1, continued), RemoveVectoredContinueHandler);
             SetUnhandledExceptionFilter(Some(unhandled));
         }
     }

@@ -1672,6 +1672,8 @@ mod value_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
 mod progsig_tests;
+#[cfg(all(test, windows))]
+mod progexc_tests;
 
 #[cfg(test)]
 mod check_lint_tests;
