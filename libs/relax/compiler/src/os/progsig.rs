@@ -1039,8 +1039,8 @@ pub(crate) fn futex_wake(w: &AtomicU32) {
     };
 }
 
-/// The signal thread's mask once it satisfies `want` (it resyncs after each change).
-#[cfg(test)]
+/// The signal thread's mask once it satisfies `want` (it resyncs after each change; progsig_tests).
+#[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
 pub(crate) fn applied_mask(want: impl Fn(u64) -> bool) -> u64 {
     loop {
         let g = APPLIED_GEN.load(Acquire);

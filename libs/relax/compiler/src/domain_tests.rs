@@ -1923,7 +1923,7 @@ fn held_by_the_program() -> Option<Vec<u64>> {
 
 /// The path the Unix socket `fd` is bound to, as `getsockname` gives it (a connection a listener
 /// accepted has the listener's). None for another descriptor or an unnamed socket.
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn socket_path(fd: i32) -> Option<String> {
     extern "C" {
         fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
@@ -1948,7 +1948,7 @@ fn socket_path(fd: i32) -> Option<String> {
 /// socket where the system names none; a Unix socket with the path it is bound to), but the
 /// listing's own; on Windows, each handle with its object type, a disk file with its path).
 fn open_now() -> Vec<(u64, String)> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     return std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).map(|e| {
         let fd = e.file_name().to_string_lossy().parse().unwrap_or(u64::MAX);
         let file = std::fs::read_link(e.path()).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();

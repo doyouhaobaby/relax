@@ -361,8 +361,9 @@ impl Env {
             Reloc::Slot(id) => self.slots.table(id),
             Reloc::Thunk(id) => self.slots.callable(id),
             Reloc::Call(id) => self.slots.thunk(id),
-            // the TSD slot's byte offset (ldr x16, [x16, x17])
-            Reloc::TlsKey => self.tls_key * 8,
+            // the TSD slot's byte offset (ldr x16, [x16, x17]); under Relax on Android the
+            // two-load key as it is (`TLS_TWO_LOAD`)
+            Reloc::TlsKey => if TLS_TWO_LOAD { self.tls_key } else { self.tls_key * 8 },
             Reloc::TlsSlow => self.tls_slow,
             Reloc::Resume => self.resume,
             Reloc::Value(v) => v,
@@ -2439,15 +2440,26 @@ impl<'a> Gen<'a> {
 
     /// x16 = this thread's thread-local block. Fast path: the block pointer sits in a word of
     /// the thread's slot array (macOS: pthread TSD slot `key` at tpidrro_el0; Android: bionic
-    /// TLS_SLOT_APP at tpidr_el0, os/tls.rs); a null slot calls `tls_slow`, which keeps every
+    /// TLS_SLOT_APP at tpidr_el0, os/tls.rs; under Relax on Android a word of the outermost
+    /// runtime's block, `TLS_TWO_LOAD`); a null slot or word calls `tls_slow`, which keeps every
     /// register but x16/x17 (glue), so no saves here; lr is preserved by the frame record.
     fn tls_block_ip0(&mut self) {
-        // mrs x16, <thread slot base>; and x16, x16, #~7; ldr x17, =key*8; ldr x16, [x16, x17]
+        // mrs x16, <thread slot base>; and x16, x16, #~7; ldr x17, =key
         self.a.e(MRS_SLOT_BASE | IP0 as u32);
         self.a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
         self.ldr_reloc(IP1, Reloc::TlsKey);
-        self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+        let none = if TLS_TWO_LOAD {
+            Some(tls_two_loads(&mut self.a))
+        } else {
+            // ldr x16, [x16, x17] (the key is the slot's byte offset)
+            self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+            None
+        };
         let p = self.a.cbnz(IP0);
+        if let Some(none) = none {
+            let slow = self.a.pos();
+            self.a.patch(none, slow);
+        }
         if self.near {
             self.bl_reloc(Reloc::TlsSlow);
         } else {
@@ -6025,9 +6037,19 @@ pub fn entry_thunk(id: u32, tls: u32, key: u64, slow: u64, body: u64) -> Vec<u8>
     let mut a = Asm { w: Vec::new(), flags: None };
     a.e(MRS_SLOT_BASE | IP0 as u32);
     a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
-    a.mov_imm(IP1, (key * 8) as i64);
-    a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+    let none = if TLS_TWO_LOAD {
+        a.mov_imm(IP1, key as i64);
+        Some(tls_two_loads(&mut a))
+    } else {
+        a.mov_imm(IP1, (key * 8) as i64);
+        a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+        None
+    };
     let ready = a.cbnz(IP0);
+    if let Some(none) = none {
+        let slow = a.pos();
+        a.patch(none, slow);
+    }
     a.stp_pre(FP, LR, SP, -16);
     a.mov_imm64_fixed(IP1, slow);
     a.blr(IP1);
@@ -6255,18 +6277,31 @@ pub const TLS_SLOW_FRAME: u32 = 640;
 
 /// This thread's thread-local block in x16, preserving every other register JIT code may hold
 /// (x0-x15, q0-q31): the fast path `tls_addr` inlines (slot `key` of the thread's slot
-/// array), and when the slot is still null `host() -> block`. `tls_addr` calls it after its own
-/// fast path found null; a prologue that needs the domain base calls it directly.
+/// array, or under Relax on Android the word `TLS_TWO_LOAD` reads), and when the slot is still
+/// null `host() -> block`. `tls_addr` calls it after its own fast path found null; a prologue
+/// that needs the domain base calls it directly.
 pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
-    // mrs x16, <slot base>; and x16, x16, #~7; mov x17, #key*8; ldr x16, [x16, x17]
+    // mrs x16, <slot base>; and x16, x16, #~7
     a.e(MRS_SLOT_BASE | IP0 as u32);
     a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
-    a.mov_imm(IP1, (key * 8) as i64);
-    a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
-    // cbz x16, +2 (past the ret): the block exists, return it
-    a.e(0xB400_0000 | 2 << 5 | IP0 as u32);
-    a.ret();
+    if TLS_TWO_LOAD {
+        // mov x17, #key; the two loads; cbz x16, slow; ret
+        a.mov_imm(IP1, key as i64);
+        let none = tls_two_loads(&mut a);
+        let unset = a.cbz(IP0);
+        a.ret();
+        let slow = a.pos();
+        a.patch(none, slow);
+        a.patch(unset, slow);
+    } else {
+        // mov x17, #key*8; ldr x16, [x16, x17]
+        a.mov_imm(IP1, (key * 8) as i64);
+        a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+        // cbz x16, +2 (past the ret): the block exists, return it
+        a.e(0xB400_0000 | 2 << 5 | IP0 as u32);
+        a.ret();
+    }
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
     a.sub_imm(SP, SP, TLS_SLOW_FRAME);
@@ -6300,12 +6335,50 @@ const MRS_SLOT_BASE: u32 = 0xD53B_D060;
 #[cfg(target_os = "android")]
 const MRS_SLOT_BASE: u32 = 0xD53B_D040;
 
+/// Under Relax on Android a runtime's block pointer is a word of the outermost runtime's block,
+/// which that runtime keeps in bionic's TLS_SLOT_APP: the key holds the slot's byte offset from
+/// tpidr_el0 in its high half and the word's offset in that block in its low half (os/tls.rs
+/// android `cell_key`), as `x64::TLS_TWO_LOAD`.
+pub const TLS_TWO_LOAD: bool = cfg!(target_os = "android") && cfg!(relax);
+
+/// With x16 = the thread's slot array and x17 = a two-load key (`TLS_TWO_LOAD`): x16 = the
+/// outermost runtime's block, then this runtime's word in it. Returns the `cbz` taken when the
+/// thread has no outermost block yet, for the caller to patch to its slow path.
+fn tls_two_loads(a: &mut Asm) -> usize {
+    // add x16, x16, x17, lsr #32; ldr x16, [x16]
+    a.e(0x8B40_8000 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(0xF940_0000 | (IP0 as u32) << 5 | IP0 as u32);
+    let none = a.cbz(IP0);
+    // ldr x16, [x16, w17, uxtw]
+    a.e(0xF860_4800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+    none
+}
+
 pub fn tsd_reader() -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
     a.e(MRS_SLOT_BASE | IP0 as u32);
     a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
     // ldr x0, [x16, x0, lsl #3]
     a.e(0xF860_7800 | (IP0 as u32) << 5);
+    a.ret();
+    words_to_bytes(&a.w)
+}
+
+/// `tls_read(key) -> u64` (key in x0): the word the two-load fetch (`TLS_TWO_LOAD`) reads for
+/// `key`, 0 when the slot word is null. A runtime checks its key with it.
+pub fn tls2_reader() -> Vec<u8> {
+    let mut a = Asm { w: Vec::new(), flags: None };
+    a.e(MRS_SLOT_BASE | IP0 as u32);
+    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    // add x16, x16, x0, lsr #32; ldr x16, [x16]; cbz x16, +3
+    a.e(0x8B40_8000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(0xF940_0000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(0xB400_0000 | 3 << 5 | IP0 as u32);
+    // ldr x0, [x16, w0, uxtw]; ret
+    a.e(0xF860_4800 | (IP0 as u32) << 5);
+    a.ret();
+    // movz x0, #0; ret
+    a.e(0xD280_0000);
     a.ret();
     words_to_bytes(&a.w)
 }

@@ -792,10 +792,15 @@ mod imp {
     use super::{Action, Fault, Hooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // ART uses SIGUSR1. Resolve bionic's available RT range at installation.
+    // ART uses SIGUSR1. The watchdog takes bionic's fifth RT signal, as Linux does, from the
+    // first call on: a thread that ends before `install` blocks it too (os::thread kicks_done).
     // NDK r28 signal.h declares __libc_current_sigrtmin / __libc_current_sigrtmax.
-    static WATCHDOG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    pub fn watchdog_signal() -> i32 { WATCHDOG.load(Ordering::Relaxed) }
+    pub fn watchdog_signal() -> i32 {
+        extern "C" {
+            fn __libc_current_sigrtmin() -> i32;
+        }
+        unsafe { __libc_current_sigrtmin() + 4 }
+    }
 
     /// LP64 bionic offsets, in bytes, derived from NDK 28.2.13676358 headers.
     /// uc_mcontext is 16-byte aligned: 40-byte prefix + 128-byte signal mask,
@@ -982,13 +987,10 @@ mod imp {
         // sigaction is deliberately the public libc entry: ART's libsigchain intercepts it
         // in an Activity process. Keep its chaining, then preserve prior user handlers.
         extern "C" {
-            fn __libc_current_sigrtmin() -> i32;
             fn __libc_current_sigrtmax() -> i32;
         }
         unsafe {
-            let signal = __libc_current_sigrtmin() + 4;
-            assert!(signal <= __libc_current_sigrtmax(), "no watchdog RT signal");
-            WATCHDOG.store(signal, Ordering::Relaxed);
+            assert!(watchdog_signal() <= __libc_current_sigrtmax(), "no watchdog RT signal");
             for sig in our_signals() {
                 let act = SigAction { handler: on_signal as *const () as usize, mask: 0, flags: OUR_FLAGS, pad: 0, restorer: 0 };
                 let mut old = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };

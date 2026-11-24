@@ -1240,13 +1240,14 @@ fn tls_block_alloc(size: u32, align: u32) -> u32 {
     at
 }
 
-/// `__relax_tls_cell` (os/tls.rs, Linux x86-64): a runtime this process runs under Relax, at
-/// any depth, keeps its thread's block pointer in a word of the outermost runtime's (this
-/// native one's) thread-local block, which the JIT code it compiles reads with two loads
-/// (relax_backend x64::TLS_TWO_LOAD). Key 0 takes a word and returns its key (os::tls::cell_key).
+/// `__relax_tls_cell` (os/tls.rs, Linux x86-64 and Android): a runtime this process runs under
+/// Relax, at any depth, keeps its thread's block pointer in a word of the outermost runtime's
+/// (this native one's) thread-local block, which the JIT code it compiles reads with two loads
+/// (relax_backend x64::TLS_TWO_LOAD, arm64::TLS_TWO_LOAD). Key 0 takes a word and returns its key
+/// (os::tls::cell_key).
 /// A runtime under Relax gives the next caller a word an ended run's runtime held, asking the
 /// runtime above for one when all are in use. Any other key asks for that word's address on the
-/// calling thread (its block made when it has none) and is forwarded up. 0 off Linux x86-64.
+/// calling thread (its block made when it has none) and is forwarded up. 0 elsewhere.
 pub extern "C" fn relax_tls_cell(key: u64) -> u64 {
     #[cfg(relax)]
     {
@@ -1256,14 +1257,14 @@ pub extern "C" fn relax_tls_cell(key: u64) -> u64 {
         }
         unsafe { os::tls::__relax_tls_cell(key) }
     }
-    #[cfg(all(not(relax), target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(not(relax), any(all(target_os = "linux", target_arch = "x86_64"), target_os = "android")))]
     {
         if key == 0 {
             return os::tls::cell_key(tls_block_alloc(8, 8));
         }
         tls_block() + key as u32 as u64
     }
-    #[cfg(all(not(relax), not(all(target_os = "linux", target_arch = "x86_64"))))]
+    #[cfg(all(not(relax), not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "android"))))]
     {
         let _ = key;
         0
