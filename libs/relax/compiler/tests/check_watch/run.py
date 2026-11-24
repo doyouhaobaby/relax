@@ -11,6 +11,22 @@ steps = json.loads(pathlib.Path(spec).read_text())
 assert len(steps) == 5, 'expected body error, revert, signature, new fn, unresolved name'
 tmp = pathlib.Path(tempfile.mkdtemp(prefix='relax-check-watch-'))
 relative = edit.relative_to(app)
+# The copy is a workspace of its own, outside the tree. Offline, the workspace resolves the registry crates it
+# carries in-tree (libs/: smallvec, bitflags, ..) through its root's [patch.crates-io]; the copy takes that table,
+# its paths made absolute, or it would ask the (empty, offline) registry for their index entries.
+def workspace_patches(start):
+    for d in [start, *start.parents]:
+        m = d / 'Cargo.toml'
+        # (a root: a `[workspace]` table, a `[workspace.<key>]` one or a dotted `workspace.<key> =`)
+        if m.is_file() and re.search(r'^(\[workspace[\].]|workspace\.)', m.read_text(), re.M):
+            text = m.read_text()
+            sec = re.search(r'^\[patch\.crates-io\]\n(.*?)(?=^\[|\Z)', text, re.M | re.S)
+            if not sec:
+                return ''
+            body = re.sub(r'(\bpath\s*=\s*")([^"]+)(")', lambda x: x[1] + str((d / x[2]).resolve()) + x[3], sec[1])
+            return '\n[patch.crates-io]\n' + body
+    return ''
+patches = workspace_patches(app.parent)
 for name in ('warm', 'reference'):
     dst = tmp / name
     shutil.copytree(app, dst, ignore=shutil.ignore_patterns('target', '.git'))
@@ -19,6 +35,9 @@ for name in ('warm', 'reference'):
     source = re.sub(r'(\bpath\s*=\s*")([^"]+)(")', lambda m: m[0] if (app / m[2]).resolve().is_relative_to(app) else m[1] + str((app / m[2]).resolve()) + m[3], source)
     if '[workspace]' not in source:
         source += '\n[workspace]\n'
+    # (a table header, not the words in a comment)
+    if not re.search(r'^\[patch\.crates-io\]', source, re.M):
+        source += patches
     manifest.write_text(source)
 base = (tmp / 'warm' / relative).read_text()
 env = dict(os.environ, RELAX_STD=str(pathlib.Path(__file__).resolve().parents[2] / 'std'),
