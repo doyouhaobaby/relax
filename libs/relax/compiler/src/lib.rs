@@ -660,6 +660,7 @@ fn session_of(options: crate::options::Options, runtime: crate::options::Runtime
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     crate::pool::thread_start(crate::jit::ensure_altstack);
     keep_toolchain_homes();
+    crate::harness::take_test_package();
     if crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed {
         drop_ambient_grants();
     }
@@ -1133,15 +1134,16 @@ fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_
 /// Loads core, alloc (when present) and std; returns core and the dependency list user crates
 /// get ([core, alloc, std]).
 /// core, alloc (when the std has it) and std, as load_std_crates loads them (for a preload).
-/// `simd`: with core::simd / std::simd (see `std_simd_wanted`).
-pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<preload::PreCrate> {
+/// `simd`: with core::simd / std::simd (see `std_simd_wanted`); `overflow_checks`: the program's
+/// profile has overflow checks (`std_cfg`).
+pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> Vec<preload::PreCrate> {
     let dir = std_dir();
     let mut v = vec![preload::PreCrate {
         
         name: "core".to_string(),
         root: format!("{}/core/lib.rs", dir),
         edition: 2021,
-        cfg: std_cfg(sess, simd),
+        cfg: std_cfg(sess, simd, overflow_checks),
         deps: Vec::new(),
         proc_macro: false,
         image_deps: Vec::new(),
@@ -1154,7 +1156,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<
             name: "alloc".to_string(),
             root: alloc_root,
             edition: 2021,
-            cfg: std_cfg(sess, simd),
+            cfg: std_cfg(sess, simd, overflow_checks),
             deps: Vec::new(),
             proc_macro: false,
             image_deps: Vec::new(),
@@ -1166,7 +1168,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool) -> Vec<
         name: "std".to_string(),
         root: format!("{}/std/lib.rs", dir),
         edition: 2021,
-        cfg: std_cfg(sess, simd),
+        cfg: std_cfg(sess, simd, overflow_checks),
         deps: Vec::new(),
         proc_macro: false,
         image_deps: Vec::new(),
@@ -1190,8 +1192,11 @@ pub(crate) fn program_cfg(sess: &std::sync::Arc<crate::Session>, features: &[Str
 }
 
 /// The cfg set of the std crates: the host's, plus relax_portable_simd when the program uses
-/// core::simd.
-pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool) -> cfg::CfgSet {
+/// core::simd, and relax_overflow_checks when the program's profile has overflow checks: std's
+/// code that inherits them (`#[rustc_inherit_overflow_checks]`, `intrinsics::overflow_checks`)
+/// is compiled for the program's setting, and the cfg keeps the two compilations apart in every
+/// cache, side by side.
+pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> cfg::CfgSet {
     // a web target's std is read as rustc's std for the triple (cfg.rs `web`), with Relax std's
     // web layer (`relax_web`: core::arch::wasm32, std/sys/web.rs)
     let mut c = match sess.options.check_target {
@@ -1204,6 +1209,9 @@ pub fn std_cfg(sess: &std::sync::Arc<crate::Session>, simd: bool) -> cfg::CfgSet
     };
     if simd {
         c.set.push("relax_portable_simd".to_string());
+    }
+    if overflow_checks {
+        c.set.push("relax_overflow_checks".to_string());
     }
     c
 }
@@ -1234,18 +1242,18 @@ pub(crate) fn load_std_crates_with(sess: &std::sync::Arc<crate::Session>, prog: 
 }
 
 fn load_std_crates_inner(sess: &std::sync::Arc<crate::Session>, prog: &mut program::Program, loaded: &mut impl FnMut(&mut program::Program, u32)) -> Result<(u32, Vec<(program::Sym, u32)>), String> {
-    let simd = prog.std_simd;
-    let pre = std_pre_crates(sess, simd);
-    let core = prog.load_crate_deferred("core", &pre[0].root, 2021, std_cfg(sess, simd), Vec::new())?;
+    let (simd, checks) = (prog.std_simd, prog.std_overflow_checks);
+    let pre = std_pre_crates(sess, simd, checks);
+    let core = prog.load_crate_deferred("core", &pre[0].root, 2021, std_cfg(sess, simd, checks), Vec::new())?;
     loaded(prog, core);
     let core_sym = prog.syms.intern("core");
     let mut deps = vec![(core_sym, core)];
     if pre.len() == 3 {
-        let alloc = prog.load_crate_deferred("alloc", &pre[1].root, 2021, std_cfg(sess, simd), deps.clone())?;
+        let alloc = prog.load_crate_deferred("alloc", &pre[1].root, 2021, std_cfg(sess, simd, checks), deps.clone())?;
         loaded(prog, alloc);
         deps.push((prog.syms.intern("alloc"), alloc));
     }
-    let std = prog.load_crate_deferred("std", &pre[pre.len() - 1].root, 2021, std_cfg(sess, simd), deps.clone())?;
+    let std = prog.load_crate_deferred("std", &pre[pre.len() - 1].root, 2021, std_cfg(sess, simd, checks), deps.clone())?;
     loaded(prog, std);
     deps.push((prog.syms.intern("std"), std));
     Ok((core, deps))
@@ -1260,9 +1268,21 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
 /// `load_with_std` with the file's crate under a cargo profile's checks: its cfg has them, as
 /// run.rs gives a test's crates the profile's (`makepad test <package>`); Relax's std keeps its own.
 pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
+    let loaded = load_resolved(sess, root, name, test, checks)?;
+    if !loaded.0.errors.is_empty() {
+        return Err(loaded.0.errors.clone());
+    }
+    Ok(loaded)
+}
+
+/// `load_with_std_checks` that keeps a program whose names did not all resolve: its resolution errors
+/// stay in `prog.errors` (the file form of `makepad test` reports them with the item checks after
+/// them, as rustc carries on from resolution to the analysis). Err: the file or std did not load.
+fn load_resolved(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
     pmhost::install();
     let mut prog = program::Program::new(sess);
     prog.std_simd = std_simd_wanted([root]);
+    prog.std_overflow_checks = checks.overflow_checks;
     let (core, deps) = load_std_crates(sess, &mut prog).map_err(|e| vec![e])?;
     let mut cfgset = program_cfg(sess, &[]);
     if test {
@@ -1280,9 +1300,6 @@ pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, n
     };
     prog.prelude_crate = Some(core);
     prog.resolve_imports();
-    if !prog.errors.is_empty() {
-        return Err(prog.errors.clone());
-    }
     Ok((prog, core, krate))
 }
 
@@ -1325,7 +1342,9 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // import of the file was reported unused
     relax_types::macros::uses::record(true);
     relax_front::program::set_record_import_uses(true);
-    let (mut prog, core, krate) = match load_with_std(sess, &path, "test_crate", true) {
+    // (a resolution error does not end it here: the up-front check below reports it with the item
+    // checks rustc runs after resolution, E0046 for an impl item of the wrong kind)
+    let (mut prog, core, krate) = match load_resolved(sess, &path, "test_crate", true, crate::resolve::ProfileChecks { debug_assertions: false, overflow_checks: false }) {
         Ok(x) => x,
         Err(e) => {
             for m in e {
@@ -1352,7 +1371,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // in the up-front check below, as in the package form)
     tcx.collect_declarations(&prog);
     if !tcx.errors.is_empty() {
-        for m in &tcx.errors {
+        for m in prog.errors.iter().chain(&tcx.errors) {
             eprintln!("error: {}", m);
         }
         return 1;
@@ -1360,11 +1379,8 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let t2 = Instant::now();
     let tests = jit::find_tests(&prog, krate);
     let mut u = jit::Unit::new(prog, tcx, core);
-    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
-    if !enum_errors.is_empty() {
-        for error in enum_errors { eprintln!("error: {}", error); }
-        return 1;
-    }
+    // (a failed enum discriminant does not end it before the check: the check's item checks report
+    // it beside the rest, as rustc's analysis carries on past it, tcx.rs check_def_signature)
     let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
     // (what the tests' own code resolves and expands from now on is no lint's input)
     relax_types::macros::uses::record(false);
@@ -1372,6 +1388,13 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     if check_errors > 0 {
         eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
         return 101;
+    }
+    // (the check reported a failed discriminant with its item checks; a check it replayed from a stored
+    // clean verdict had none, and the tests need the values: a failure here still stops them)
+    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
+    if !enum_errors.is_empty() {
+        for error in enum_errors { eprintln!("error: {}", error); }
+        return 1;
     }
     jit::enable_pipelining(options);
     println!(

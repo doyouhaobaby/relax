@@ -160,7 +160,8 @@ pub enum Builtin {
     Memmove,
     /// (dst, byte, n) -> [dst]: memory.fill
     Memset,
-    /// (f, data) -> u64: calls fn pointer `f(data)`; 0 when it returned, 1 when it unwound
+    /// (f, data, caught) -> u64: calls `f(data)` and returns 0 if it returned or 1 if it unwound.
+    /// Both kinds of catch use the same Wasm handler.
     CatchPanic,
     /// does nothing; its results are zero (single-threaded waits and wakes)
     Nop,
@@ -1596,7 +1597,7 @@ fn direct_callee(c: &Callee, fn_ix: &HashMap<u32, u32>, link: &dyn Link) -> bool
         Callee::Fn(id) | Callee::CFn(id, _) => fn_ix.contains_key(id),
         Callee::Host(s) | Callee::CHost(s, _) => !matches!(link.host(s.id), HostBind::Trap),
         Callee::Indirect(_) | Callee::CIndirect(..) => true,
-        Callee::Asm(_) => false,
+        Callee::Part | Callee::Asm(_) => false,
     }
 }
 
@@ -3800,7 +3801,10 @@ impl<'a> Fx<'a> {
             _ => None,
         };
         match callee {
+            // black_box's block: no instruction to run (the passes kept what it stands for)
+            Callee::Asm(a) if a.is_empty() => return Ok(()),
             Callee::Asm(_) => return Err("inline assembly (asm!) has no wasm form".to_string()),
+            Callee::Part => return Err("outlined calls are native only".to_string()),
             Callee::Fn(id) | Callee::CFn(id, _) => match self.fn_ix.get(id) {
                 Some(&u) => {
                     let want = sig(self)?;
@@ -4906,8 +4910,9 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                 Builtin::CatchPanic => {
                     sh.uses_tag = true;
                     let fty = sh.ty(FnType { params: vec![I64], results: vec![] });
+                    let saved_sp = t.params.len() as u8;
                     locals.push((1, aty));
-                    c.extend_from_slice(&[GGET, 0, LSET, 2]);
+                    c.extend_from_slice(&[GGET, 0, LSET, saved_sp]);
                     if o.exnref {
                         c.extend_from_slice(&[BLOCK, 0x40, TRY_TABLE, 0x40, 1, 2, 0]);
                     } else {
@@ -4929,7 +4934,7 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                         c.push(CATCH_ALL);
                     }
                     c.push(END);
-                    c.extend_from_slice(&[LGET, 2, GSET, 0]);
+                    c.extend_from_slice(&[LGET, saved_sp, GSET, 0]);
                     c.push(I64C);
                     c.push(1);
                 }

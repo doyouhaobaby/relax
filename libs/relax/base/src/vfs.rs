@@ -111,9 +111,27 @@ static ANY_FOLDER: AtomicBool = AtomicBool::new(false);
 static EDITS: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 // A verified binary std always reads the store bytes that were compared, even with app edits.
 static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// A verified std's files the edits folder changed when it was verified ([`verify_std`]): path
+/// (normalized) -> the bytes compared (None: deleted there). Its reads give those, whatever the
+/// edits folder holds later.
+static STD_VIEW: RwLock<BTreeMap<String, Option<Arc<[u8]>>>> = RwLock::new(BTreeMap::new());
+static ANY_STD_VIEW: AtomicBool = AtomicBool::new(false);
+/// The places in the edits folder the program wrote, removed or made ([`relax_vfs_edit`]), and
+/// their folders: a live session tells the program of a file it read that a save changed, never of
+/// its own writes ([`program_edited`]). A game that keeps its store in its home was told of 17 of
+/// its own writes (its objects, their temporary parts, its session files) in its first minute
+/// (11-22).
+static PROGRAM_EDITS: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
 
 /// Verify a complete subtree directly from the store (no disk/edits reads), then protect it
 /// from the app's edit overlay. Paths and bytes use the same digest as the compiler build.
+///
+/// A binary built from a tree with std edits (a lane's own JIT, built when its edits reach the
+/// JIT's inputs) matches the store's std with the edits folder's std files laid over it: those
+/// are compared then, and its reads give the bytes compared ([`STD_VIEW`]). Every run of such a
+/// binary on its lane's overlay fell back to the disk std of the tree it was built in, absent on
+/// another box or once that tree went ("std digest mismatch", then "std/core/lib.rs: No such
+/// file", 11-22).
 pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
     // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
@@ -130,20 +148,79 @@ pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
     if files.is_empty() {
         return Err("mounted commit has no Relax std".into());
     }
-    let actual = crate::std_digest::digest(files);
+    let path = normalize_path(path);
+    let actual = crate::std_digest::digest(files.clone());
+    let mut view = Vec::new();
     if actual != expected {
-        return Err(format!("std digest mismatch (binary {expected}, store {actual})"));
+        view = std_edits(&path);
+        if view.is_empty() {
+            return Err(format!("std digest mismatch (binary {expected}, store {actual})"));
+        }
+        let mut tree: BTreeMap<String, Vec<u8>> = files.into_iter().collect();
+        for (rel, bytes) in &view {
+            match bytes {
+                Some(b) => { tree.insert(rel.clone(), b.to_vec()); }
+                None => { tree.remove(rel); }
+            }
+        }
+        let edited = crate::std_digest::digest(tree.into_iter().collect());
+        if edited != expected {
+            return Err(format!("std digest mismatch (binary {expected}, store {actual}, with its {} edited files {edited})", view.len()));
+        }
     }
     // A nested mount would change what readers see after verification.
-    let path = normalize_path(path);
     if MOUNTS.read().unwrap().iter().any(|m| relative(&m.root, &path).is_some_and(|r| !r.is_empty())) {
         return Err("std contains a nested mount".into());
     }
+    let mut held = STD_VIEW.write().unwrap();
+    held.retain(|p, _| relative(p, &path).is_none());
+    for (rel, bytes) in view {
+        held.insert(format!("{path}/{rel}"), bytes);
+    }
+    ANY_STD_VIEW.store(!held.is_empty(), Ordering::Release);
+    drop(held);
     let mut frozen = FROZEN.write().unwrap();
     if !frozen.contains(&path) {
         frozen.push(path);
     }
     Ok(())
+}
+
+/// The edits folder's files and whiteouts under the std at `path` (normalized), each by its path
+/// in that std: what a tree built with them had there (None: no file). Read only when the store's
+/// std alone does not match.
+fn std_edits(path: &str) -> Vec<(String, Option<Arc<[u8]>>)> {
+    let Some(dir) = EDITS.read().unwrap().clone() else { return Vec::new() };
+    let Some(rel) = outer_rel(path) else { return Vec::new() };
+    let base = if rel.is_empty() { dir.clone() } else { dir.join(&rel) };
+    let mut out = Vec::new();
+    let mut todo = vec![(base, String::new())];
+    while let Some((at, under)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".makepad-run-") { continue; }
+            let inner = if under.is_empty() { name } else { format!("{under}/{name}") };
+            match e.file_type() {
+                Ok(t) if t.is_dir() => todo.push((e.path(), inner)),
+                Ok(t) if t.is_file() => if let Ok(bytes) = std::fs::read(e.path()) { out.push((inner, Some(Arc::from(bytes)))) },
+                _ => {}
+            }
+        }
+    }
+    let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
+    for gone in deleted_paths(&dir).iter() {
+        if let Some(inner) = gone.strip_prefix(&prefix).filter(|i| !i.is_empty() && !out.iter().any(|(p, _)| p == i)) {
+            out.push((inner.to_string(), None));
+        }
+    }
+    out
+}
+
+/// What a read of `path` gives in a verified std the edits folder changed ([`verify_std`]).
+fn std_view(path: &str) -> Option<Option<Arc<[u8]>>> {
+    if !ANY_STD_VIEW.load(Ordering::Acquire) { return None; }
+    STD_VIEW.read().unwrap().get(&normalize_path(path)).cloned()
 }
 
 /// Serves `root` (a folder that does not exist on disk) from `store` at `commit`.
@@ -175,15 +252,27 @@ pub fn mount_folder(root: &str, folder: &std::path::Path) {
     ANY.store(true, Ordering::Release);
 }
 
+#[inline(always)]
+#[track_caller]
+fn mount_read<T>(table: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    let guard = table.read().unwrap();
+    #[cfg(test)]
+    tests::pause_after_first_mount_read();
+    guard
+}
+
 /// The folder mount whose root is the innermost mount containing `p` (normalized): (root, disk
 /// folder, `p` relative to the root). A store mount inside it wins for its own folder.
 fn folder_mount(p: &str) -> Option<(String, std::path::PathBuf, String)> {
     if !ANY_FOLDER.load(Ordering::Acquire) {
         return None;
     }
-    let folders = FOLDER_MOUNTS.read().unwrap();
+    // MOUNTS before FOLDER_MOUNTS, the order find nests its reads in: opposite orders deadlock
+    // once a writer queues on each (a_folder_mount_is_its_folder_under_another_name).
+    let mounts = mount_read(&MOUNTS);
+    let folders = mount_read(&FOLDER_MOUNTS);
     let (root, dir, rel) = folders.iter().find_map(|(r, d)| relative(p, r).map(|rel| (r, d, rel)))?;
-    if MOUNTS.read().unwrap().iter().any(|m| m.root.len() > root.len() && relative(p, &m.root).is_some()) {
+    if mounts.iter().any(|m| m.root.len() > root.len() && relative(p, &m.root).is_some()) {
         return None;
     }
     Some((root.clone(), dir.clone(), rel.to_string()))
@@ -398,10 +487,10 @@ fn relative<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 /// A path whose innermost mount is a folder mount has none ([`folder_path`]).
 fn find(path: &str) -> Option<(Arc<Mount>, String)> {
     let p = normalize_path(path);
-    let m = MOUNTS.read().unwrap();
+    let m = mount_read(&MOUNTS);
     for mount in m.iter() {
         if let Some(rest) = relative(&p, &mount.root) {
-            if ANY_FOLDER.load(Ordering::Acquire) && FOLDER_MOUNTS.read().unwrap().iter().any(|(r, _)| r.len() > mount.root.len() && relative(&p, r).is_some()) {
+            if ANY_FOLDER.load(Ordering::Acquire) && mount_read(&FOLDER_MOUNTS).iter().any(|(r, _)| r.len() > mount.root.len() && relative(&p, r).is_some()) {
                 return None;
             }
             return Some((mount.clone(), rest.to_string()));
@@ -463,6 +552,61 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
 /// The whiteout list changes on disk during a live run; stat it, parse only when it changes.
 static WHITEOUTS: RwLock<Option<(std::path::PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>> = RwLock::new(None);
 
+#[cfg(unix)]
+mod fork {
+    use super::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::sync::RwLockWriteGuard as Write;
+
+    // Tuple fields drop in declaration order, the reverse of acquisition.
+    type Guards = (
+        Write<'static, BTreeSet<String>>,
+        Write<'static, Option<(PathBuf, Option<FileStat>, Arc<BTreeSet<String>>)>>,
+        Write<'static, BTreeMap<String, Option<Arc<[u8]>>>>,
+        Write<'static, Vec<String>>,
+        Write<'static, Option<PathBuf>>,
+        Write<'static, Vec<(String, PathBuf)>>,
+        Write<'static, Vec<Arc<Mount>>>,
+    );
+    thread_local! { static HELD: Cell<Option<Guards>> = const { Cell::new(None) }; }
+
+    /// Keep every mount and overlay table writable by the forking thread across a plain fork.
+    pub fn fork_prepare() {
+        let mounts = MOUNTS.write().unwrap_or_else(|e| e.into_inner());
+        let folders = FOLDER_MOUNTS.write().unwrap_or_else(|e| e.into_inner());
+        let edits = EDITS.write().unwrap_or_else(|e| e.into_inner());
+        let frozen = FROZEN.write().unwrap_or_else(|e| e.into_inner());
+        let view = STD_VIEW.write().unwrap_or_else(|e| e.into_inner());
+        let whiteouts = WHITEOUTS.write().unwrap_or_else(|e| e.into_inner());
+        let program = PROGRAM_EDITS.write().unwrap_or_else(|e| e.into_inner());
+        HELD.with(|h| h.set(Some((program, whiteouts, view, frozen, edits, folders, mounts))));
+    }
+
+    /// Release the forking thread's VFS guards in the parent.
+    pub fn fork_parent() { drop(HELD.with(Cell::take)); }
+    /// Release the surviving thread's VFS guards in the child.
+    pub fn fork_child() { drop(HELD.with(Cell::take)); }
+
+    // The compiler's integration test links this crate as an ordinary dependency.
+    #[doc(hidden)]
+    pub fn fork_locks_available(exclusive: bool) -> [bool; 7] {
+        macro_rules! probe { ($lock:ident) => {
+            if exclusive { $lock.try_write().is_ok() } else { $lock.try_read().is_ok() }
+        }; }
+        [probe!(MOUNTS), probe!(FOLDER_MOUNTS), probe!(EDITS), probe!(FROZEN),
+         probe!(STD_VIEW), probe!(WHITEOUTS), probe!(PROGRAM_EDITS)]
+    }
+}
+#[cfg(unix)]
+pub use fork::{fork_prepare, fork_parent, fork_child, fork_locks_available};
+
+/// The edits folder's whiteouts (`.makepad-run-deleted`): each deleted file's place there, as
+/// [`edit_rel`] gives it; none without an edits folder. One read of the list.
+pub fn edits_deleted() -> BTreeSet<String> {
+    EDITS.read().unwrap().clone().map(|d| load_deleted(&d)).unwrap_or_default()
+}
+
 fn load_deleted(dir: &std::path::Path) -> BTreeSet<String> {
     std::fs::read_to_string(dir.join(".makepad-run-deleted")).unwrap_or_default().lines()
         .filter(|p| !p.is_empty()).map(str::to_string).collect()
@@ -519,8 +663,10 @@ pub fn release_read(path: Option<&str>) {
     ANY_LANDING_READ.store(!reads.is_empty(), Ordering::Release);
 }
 
-/// What a read of `path` gives while a landing holds it back ([`hold_read`]).
+/// What a read of `path` gives while a landing holds it back ([`hold_read`]), and in a verified
+/// std the edits folder changed ([`std_view`]).
 fn landing_read(path: &std::path::Path) -> Option<Option<Arc<[u8]>>> {
+    if let Some(held) = std_view(&path.to_string_lossy()) { return Some(held); }
     if !ANY_LANDING_READ.load(Ordering::Acquire) { return None; }
     LANDING_READS.lock().unwrap().get(&normalize_path(&path.to_string_lossy())).cloned()
 }
@@ -828,6 +974,12 @@ fn metadata_inner(path: &std::path::Path) -> io::Result<Metadata> {
         if let Some(edited) = edited_file(&s) { return metadata(edited); }
         let is_dir = mount.is_dir(&rel);
         let entry = mount.file(&rel);
+        // a verified std's edited file: the bytes it was compared with
+        if let Some(held) = std_view(&s) {
+            let len = held.ok_or_else(|| not_found(&s))?.len() as u64;
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(store_time_ns(&mount, entry));
+            return Ok(Metadata { len, modified, is_dir: false, is_file: true, is_symlink: false });
+        }
         if !is_dir && entry.is_none() { return Err(not_found(&s)); }
         return Ok(Metadata {
             len: if is_dir { 0 } else { read(path)?.len() as u64 },
@@ -1146,7 +1298,7 @@ pub fn identity(path: &str) -> Option<String> {
         return None;
     }
     let (m, _) = find(path)?;
-    if whiteout(path) || edited_file(path).is_some() {
+    if whiteout(path) || edited_file(path).is_some() || std_view(path).is_some() {
         return None;
     }
     Some(match m.store.range {
@@ -1548,6 +1700,17 @@ pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
     (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
 }
 
+/// The disk file a read-only open of the virtual `path` reads, so that it sees later writes as it
+/// would natively: a file the run wrote (its edits folder's copy) or a folder mount's file. None
+/// while a held landing answers the file's reads ([`hold_read`]), which every read then gives
+/// alike, and for a file only the store holds (read from a copy).
+pub fn read_disk_path(path: &str) -> Option<std::path::PathBuf> {
+    if landing_read(std::path::Path::new(path)).is_some() {
+        return None;
+    }
+    edited_disk_path(path)
+}
+
 /// Whether `path`'s edit is gone from the edits folder while the ledger still names it and no
 /// whiteout does: taken back, its ledger not rewritten yet. devhub's ship-done removes such a
 /// file first, then renames the ship's files in, the whiteouts and the ledger last, so until then
@@ -1757,17 +1920,44 @@ fn reconcile_seeded(dir: &std::path::Path) {
     }
 }
 
+/// Whether the program wrote, removed or made the edits folder's `rel` (or a file in it, for a
+/// folder): its change there is the program's own, no save's.
+pub fn program_edited(rel: &str) -> bool {
+    PROGRAM_EDITS.read().unwrap().contains(rel)
+}
+
+/// The program's write, removal or new folder at `disk` ([`PROGRAM_EDITS`]): its place in the
+/// edits folder and the folders above it (none for a folder mount's path, which writes in place).
+fn program_edit(disk: &std::path::Path) {
+    let Some(dir) = EDITS.read().unwrap().clone() else { return };
+    let Ok(rel) = disk.strip_prefix(&dir) else { return };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if PROGRAM_EDITS.read().unwrap().contains(&rel) { return; }
+    let mut edited = PROGRAM_EDITS.write().unwrap();
+    let mut at = rel.as_str();
+    // (a place's folders went in with it)
+    while !at.is_empty() && !edited.contains(at) {
+        edited.insert(at.to_string());
+        at = at.rsplit_once('/').map_or("", |(up, _)| up);
+    }
+}
+
 /// std's write into a virtual path (fs_vfs.rs): mode 0 the edited file or folder if any, 1 a
-/// write keeping the content, 2 a write replacing it, 3 a folder. The disk path, held until
-/// `relax_vfs_release`; 0 when the path cannot be written.
+/// write keeping the content, 2 a write replacing it, 3 a folder; and its read-only open, mode 4:
+/// the disk file it opens ([`read_disk_path`]). The disk path, held until `relax_vfs_release`; 0
+/// when there is none (the path cannot be written, or a read-only open reads a copy). A write,
+/// removal or folder (modes 0 to 3) is the program's own ([`program_edited`]).
 pub extern "C" fn relax_vfs_edit(p: *const u8, n: usize, mode: u32, out: *mut *const u8, out_len: *mut usize) -> u64 {
     let path = unsafe { path_arg(p, n) };
     let r = match mode {
         0 => edited_disk_path(path).ok_or_else(|| not_found(path)),
         1 => prepare_edit(path, true),
         2 => prepare_edit(path, false),
-        _ => prepare_edit_dir(path),
+        3 => prepare_edit_dir(path),
+        4 => read_disk_path(path).ok_or_else(|| not_found(path)),
+        _ => Err(io::Error::new(io::ErrorKind::Unsupported, "an unknown edit mode")),
     };
+    if let (Ok(disk), 0..=3) = (&r, mode) { program_edit(disk); }
     match r {
         Ok(d) => hold(d.to_string_lossy().into_owned().into_bytes(), out, out_len),
         Err(_) => 0,
@@ -1781,10 +1971,31 @@ mod test_store;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, sync::mpsc, thread, time::{Duration, Instant}};
 
     /// The mounts' outermost root and the edits folder are process state: the tests that set
     /// them run one at a time.
     static EDITS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        static FIRST_MOUNT_READ: Cell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn pause_after_first_mount_read() {
+        if let Some((held, release)) = FIRST_MOUNT_READ.with(Cell::take) {
+            held.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
+
+    fn paused_mount_lookup(held: mpsc::Sender<()>, lookup: impl FnOnce() + Send + 'static) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (release, wait) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            FIRST_MOUNT_READ.with(|p| p.set(Some((held, wait))));
+            lookup();
+        });
+        (release, reader)
+    }
 
     /// A held landing's files read as they were before it: changed, removed (still there) and
     /// added (not there yet) alike, through every read; the live watch reads them as they are; a
@@ -1811,6 +2022,21 @@ mod tests {
         assert_eq!(read(&removed).unwrap(), b"was here", "one release, one file");
         release_read(None);
         assert!(!exists(&removed) && read(&added).unwrap() == b"new");
+        // A read-only open of a held file under a folder mount reads what every other read gives
+        // (std reads the held copy): no disk file while it is held, the disk's after the release.
+        {
+            let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let root = normalize_path(&dir.join("vfs/share/held").to_string_lossy());
+            mount_folder(&root, &dir);
+            let virt = format!("{root}/changed.rs");
+            assert_eq!(read_disk_path(&virt), Some(dir.join("changed.rs")), "an unheld folder-mount file opens on the disk");
+            hold_read(&virt, Some(Arc::from(&b"before"[..])));
+            assert_eq!(read_disk_path(&virt), None, "a held file has no disk file to open");
+            assert_eq!(read(&virt).unwrap(), b"before");
+            release_read(Some(&virt));
+            assert_eq!(read_disk_path(&virt), Some(dir.join("changed.rs")), "released, it opens on the disk again");
+            FOLDER_MOUNTS.write().unwrap().retain(|m| m.0 != root);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2006,6 +2232,17 @@ mod tests {
     /// dependency's `src/lib.rs` from the checkout's).
     #[test]
     fn a_folder_mount_is_its_folder_under_another_name() {
+        // If the readers deadlock, leave their threads in this test's process so the
+        // remaining VFS tests can still use both mount tables.
+        const CHILD: &str = "RELAX_VFS_MOUNT_ORDER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "vfs::tests::a_folder_mount_is_its_folder_under_another_name", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed"),
+                "folder mount test failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        }
         let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("relax-vfs-folder-{}", std::process::id()));
         let checkout = base.join("checkout");
@@ -2063,9 +2300,62 @@ mod tests {
         mount_text(&format!("{other}\t{}\tdir\n", checkout.display())).unwrap();
         assert_eq!(read_to_string(format!("{other}/Cargo.toml")).unwrap(), "[package]", "the table's text mounts it again");
 
+        let writer_root = format!("{other}/extra");
+        {
+            const DEADLOCK: &str = "deadlock: folder_mount and find took MOUNTS and FOLDER_MOUNTS in opposite orders";
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let remaining = || deadline.saturating_duration_since(Instant::now());
+            let wait_tick = || {
+                let left = remaining();
+                assert!(!left.is_zero(), "{DEADLOCK}");
+                thread::sleep(Duration::from_millis(2).min(left));
+            };
+            let (ready, reached) = mpsc::channel();
+            let wait_ready = || reached.recv_timeout(remaining()).expect(DEADLOCK);
+
+            let (release_a, a) = paused_mount_lookup(ready.clone(), move || {
+                assert_eq!(folder_mount(&lib).unwrap().2, "src/lib.rs");
+            });
+            wait_ready();
+            let nested_file = format!("{inner_root}/src/lib.rs");
+            let (release_b, b) = paused_mount_lookup(ready.clone(), move || {
+                assert_eq!(find(&nested_file).unwrap().1, "src/lib.rs");
+            });
+            wait_ready();
+            // Both readers should hold MOUNTS. Keep the folder writer queued even in
+            // that case. With the old order A itself holds FOLDER_MOUNTS for read.
+            let mounts_first = FOLDER_MOUNTS.try_write().is_ok();
+            let folders = FOLDER_MOUNTS.read().unwrap();
+            let (store_root, store, commit) = (dep_root.clone(), dep.store.clone(), dep.commit);
+            let mounting = ready.clone();
+            let c = thread::spawn(move || {
+                mounting.send(()).unwrap();
+                mount(&store_root, store, &commit).unwrap();
+            });
+            let folder_root = writer_root.clone();
+            let d = thread::spawn(move || {
+                ready.send(()).unwrap();
+                mount_folder(&folder_root, &checkout);
+            });
+            wait_ready();
+            wait_ready();
+            thread::sleep(Duration::from_millis(50).min(remaining()));
+            // Each table still has a reader, so a refused read here observes a queued
+            // writer. A descheduled writer cannot let the old order slip through.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            while MOUNTS.try_read().is_ok() || FOLDER_MOUNTS.try_read().is_ok() { wait_tick(); }
+            drop(folders);
+            release_a.send(()).unwrap();
+            release_b.send(()).unwrap();
+
+            let workers = [a, b, c, d];
+            while !workers.iter().all(thread::JoinHandle::is_finished) { wait_tick(); }
+            for worker in workers { worker.join().unwrap(); }
+            assert!(mounts_first, "both readers must take MOUNTS first even if the backend admits a reader past a queued writer");
+        }
         MOUNTS.write().unwrap().retain(|m| m.root != dep_root && m.root != inner_root);
         let mut folders = FOLDER_MOUNTS.write().unwrap();
-        folders.retain(|(r, _)| *r != root && *r != other);
+        folders.retain(|(r, _)| *r != root && *r != other && *r != writer_root);
         if folders.is_empty() {
             ANY_FOLDER.store(false, Ordering::Release);
         }
@@ -2211,6 +2501,23 @@ mod tests {
         let digest = crate::std_digest::digest(vec![("counter.rs".into(), bytes.to_vec())]);
         assert_eq!(verify_std(&format!("{}/examples/counter/src", roots[0]), &digest).unwrap_err(), "std contains a nested mount");
         MOUNTS.write().unwrap().retain(|m| m.commit != nested.commit);
+        // A binary built with std edits (a lane's own JIT): the store's std with the edits
+        // folder's over it is what matches, and its reads give the bytes compared, whatever the
+        // folder holds later; a digest neither matches is refused, naming both.
+        let src = format!("{}/examples/counter/src", roots[0]);
+        let edited = crate::std_digest::digest(vec![("counter.rs".into(), b"edited".to_vec())]);
+        let refused = verify_std(&src, "neither").unwrap_err();
+        assert!(refused.starts_with(&format!("std digest mismatch (binary neither, store {digest}, with its 1 edited files ")), "{refused}");
+        verify_std(&src, &edited).unwrap();
+        std::fs::write(&disk, b"later").unwrap();
+        for root in roots {
+            let path = format!("{root}/{file}");
+            assert_eq!(read(&path).unwrap(), b"edited", "{path}");
+            assert_eq!(metadata(&path).unwrap().len, 6, "{path}");
+            assert!(exists(&path) && is_file(&path) && super::identity(&path).is_none(), "{path}");
+            assert_eq!(prepare_edit(&path, true).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
+        // verified again, it is what that verify compared
         verify_std(&format!("{}/examples/counter/src", roots[0]), &digest).unwrap();
         for root in roots {
             assert_eq!(read(format!("{root}/{file}")).unwrap(), bytes);
@@ -2228,4 +2535,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&HELD, relax_session::sync::Mutex::new(Vec::new()));
     reset(&LANDING_READS, relax_session::sync::Mutex::new(BTreeMap::new()));
     reset(&ANY_LANDING_READ, AtomicBool::new(false));
+    reset(&STD_VIEW, RwLock::new(BTreeMap::new()));
+    reset(&ANY_STD_VIEW, AtomicBool::new(false));
+    reset(&PROGRAM_EDITS, RwLock::new(BTreeSet::new()));
 }

@@ -314,6 +314,22 @@ fn table<'a>(t: &'a TomlTable, k: &str) -> Option<&'a TomlTable> {
     t.get(k).and_then(|v| v.as_table())
 }
 
+/// The manifest's targets of one kind (`bin`, `test`, `example`, `bench`), as cargo reads them:
+/// `[[bin]]` headers or an inline array of tables (`bin = [{ name = "x" }]`), both in source
+/// order. Anything else under the key is an error, as in cargo, never a package without them.
+fn target_tables<'a>(t: &'a TomlTable, kind: &str, manifest: &str) -> Result<Vec<&'a TomlTable>, String> {
+    match t.get(kind) {
+        None => Ok(Vec::new()),
+        Some(Toml::ArrayOfTables(tables)) => Ok(tables.iter().collect()),
+        Some(Toml::Array(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v.as_table().ok_or_else(|| format!("{manifest}: `{kind}` entry {} is not a table: each target is `{{ name = .. }}`", i + 1)))
+            .collect(),
+        Some(_) => Err(format!("{manifest}: `{kind}` is not an array of tables: write `[[{kind}]]` or `{kind} = [{{ name = .. }}]`")),
+    }
+}
+
 /// A `[patch]` replacement: a path package or a git source.
 #[derive(Clone, Debug)]
 enum Patch {
@@ -586,15 +602,16 @@ impl Resolver {
             allow_c: sess.options.allow_c || sess.options.const_fuel, metadata: false })
     }
 
-    /// The registry version the requesting package's Cargo.lock edge names, if unambiguous and
-    /// accepted by the requirement. Missing or ambiguous edges leave requirement-based resolution.
-    fn locked_edge(&self, from: (&str, &str), dep: &str, req: &str) -> Option<String> {
-        let mut parents = self.ws.lock_by_name.get(from.0)?.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| p.version == from.1);
-        let parent = parents.next()?;
+    /// Return the sole registry version selected by the requesting package's lock edges and the
+    /// requirement. Ignore explicit non-registry sources. Every other versioned edge for this
+    /// dependency must name a package present in Cargo.lock.
+    fn locked_edge(&self, from: (&str, &str), dep: &str, req: &str) -> Result<Option<String>, String> {
+        let mut parents = self.ws.lock_by_name.get(from.0).into_iter().flatten().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| p.version == from.1);
+        let Some(parent) = parents.next() else { return Ok(None) };
         if parents.next().is_some() {
-            return None;
+            return Ok(None);
         }
-        let targets = self.ws.lock_by_name.get(dep)?;
+        let targets = self.ws.lock_by_name.get(dep).map(Vec::as_slice).unwrap_or_default();
         let mut versions = BTreeSet::new();
         for edge in &parent.deps {
             let (id, source) = match edge.split_once(" (") {
@@ -605,7 +622,7 @@ impl Resolver {
                 None => (edge.as_str(), None),
             };
             let mut parts = id.split_whitespace();
-            if parts.next() != Some(dep) {
+            if parts.next() != Some(dep) || source.is_some_and(|s| !s.starts_with("registry+")) {
                 continue;
             }
             let version = parts.next();
@@ -613,23 +630,28 @@ impl Resolver {
                 continue;
             }
             let mut named = targets.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| {
-                p.source.as_deref().is_some_and(|s| s.starts_with("registry+"))
-                    && (version.is_none() || version == Some(p.version.as_str()))
-                    && (source.is_none() || source == p.source.as_deref())
-            });
-            let Some(pkg) = named.next() else { continue };
-            if named.next().is_some() {
+                (version.is_none() || version == Some(p.version.as_str())) && (source.is_none() || source == p.source.as_deref())
+            }).peekable();
+            if version.is_some() && named.peek().is_none() {
+                return Err(format!(
+                    "Cargo.lock has no package matching `{edge}` for dependency `{dep}` of `{} {}`. Regenerate the lock entry with `cargo update -p {dep}`.",
+                    parent.name, parent.version
+                ));
+            }
+            let mut registry = named.filter(|p| p.source.as_deref().is_some_and(|s| s.starts_with("registry+")));
+            let Some(pkg) = registry.next() else { continue };
+            if registry.next().is_some() {
                 continue;
             }
             if crate::registry::Version::parse(&pkg.version).is_some_and(|ver| crate::registry::matches(req, &ver)) {
                 versions.insert(pkg.version.as_str());
             }
         }
-        if versions.len() == 1 { versions.into_iter().next().map(str::to_string) } else { None }
+        Ok(if versions.len() == 1 { versions.into_iter().next().map(str::to_string) } else { None })
     }
 
     fn registry_dir(&self, name: &str, req: &str, from: Option<(&str, &str)>) -> Result<String, String> {
-        let exact = from.and_then(|from| self.locked_edge(from, name, req));
+        let exact = from.map(|f| self.locked_edge(f, name, req)).transpose()?.flatten();
         match &self.vendor {
             Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name, req, exact.as_deref()),
             // the repository's package of that name (cargo's discovery, as for a git dependency)
@@ -816,7 +838,8 @@ impl Resolver {
         });
         // [[bin]] + discovered bins
         let mut bins: Vec<Target> = Vec::new();
-        let explicit = t.get("bin").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let manifest = format!("{}/Cargo.toml", dir);
+        let explicit = target_tables(&t, "bin", &manifest)?;
         for bt in &explicit {
             let Some(bname) = s(bt, "name") else { continue };
             let path = match s(bt, "path") {
@@ -867,7 +890,7 @@ impl Resolver {
         // unless `autotests = false`; an explicit target replaces the discovered one of its name
         // or path; edition 2015 packages with explicit [[test]] targets discover none)
         let mut tests: Vec<Target> = Vec::new();
-        let explicit_tests = t.get("test").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let explicit_tests = target_tables(&t, "test", &manifest)?;
         for tt in &explicit_tests {
             let Some(tname) = s(tt, "name") else { continue };
             let path = match s(tt, "path") {
@@ -911,7 +934,7 @@ impl Resolver {
         // examples/*/main.rs unless `autoexamples = false`, as for tests). A `crate-type` other
         // than `bin` is a library example: no program to run.
         let mut examples: Vec<Target> = Vec::new();
-        let explicit_examples = t.get("example").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let explicit_examples = target_tables(&t, "example", &manifest)?;
         for et in &explicit_examples {
             let Some(ename) = s(et, "name") else { continue };
             let path = match s(et, "path") {
@@ -1756,8 +1779,12 @@ pub struct Profile {
 }
 
 /// The profile `name` of the workspace that the start folder `dir` belongs to (find_root).
+/// A folder with no Cargo.toml in or above it (a unit graph given as a file, `--units`) has cargo's
+/// own profiles, as the config files and the environment set them: no manifest tables, no members.
 pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
-    let root = find_root(dir)?;
+    let mut up = Some(normalize(dir));
+    let manifest_above = std::iter::from_fn(|| { let d = up.take()?; up = parent(&d); Some(d) }).any(|d| crate::vfs::is_file(format!("{d}/Cargo.toml")));
+    let root = if manifest_above { find_root(dir)? } else { normalize(dir) };
     let manifest = format!("{}/Cargo.toml", root);
     // the `[profile]` tables, the highest precedence first: the config files', then the manifest's
     let mut files: Vec<(String, TomlTable)> = Vec::new();
@@ -1766,8 +1793,10 @@ pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
             files.push((path, p.clone()));
         }
     }
-    if let Some(p) = table(&read_toml(&manifest)?, "profile") {
-        files.push((manifest, p.clone()));
+    if manifest_above {
+        if let Some(p) = table(&read_toml(&manifest)?, "profile") {
+            files.push((manifest, p.clone()));
+        }
     }
     let env = |p: &str, key: &str| {
         let var = format!("CARGO_PROFILE_{}_{}", p.to_uppercase().replace('-', "_"), key);
@@ -2847,12 +2876,13 @@ fn metadata_targets(m: &Manifest) -> Result<Vec<String>, String> {
     if let Some(lib) = &m.lib { targets.push(target(&lib.kind, &lib.kind, &lib.name, &lib.path)); }
     for t in m.bins.iter().chain(&m.tests) { targets.push(target(&t.kind, &bin, &t.name, &t.path)); }
     // Examples and benches have no units in a normal run, but are still manifest targets.
-    let t = read_toml(&format!("{}/Cargo.toml", m.dir))?;
+    let manifest = format!("{}/Cargo.toml", m.dir);
+    let t = read_toml(&manifest)?;
     let pkg = table(&t, "package").unwrap();
     for (kind, folder, auto) in [("example", "examples", "autoexamples"), ("bench", "benches", "autobenches")] {
-        let explicit = t.get(kind).and_then(|x| x.as_array_of_tables()).unwrap_or_default();
+        let explicit = target_tables(&t, kind, &manifest)?;
         let mut found = Vec::new();
-        for e in explicit {
+        for e in &explicit {
             let Some(name) = s(e, "name") else { continue };
             let path = match s(e, "path") {
                 Some(path) => join(&m.dir, &path),
@@ -3359,6 +3389,63 @@ required-features = ["b", "manual"]
         assert!(bin.enabled(&BTreeSet::new(), true).unwrap());
     }
 
+    /// Targets written as inline arrays of tables (`bin = [{ .. }]`, cargo's other spelling of
+    /// `[[bin]]`) are the package's targets with their settings, in the unit graph's targets and
+    /// in the metadata's; a key that holds anything but tables is the manifest's error, as in cargo
+    /// (relax PR 232: an inline bin had been dropped, and with it its CARGO_BIN_EXE_<name>).
+    #[test]
+    fn inline_target_arrays_are_targets() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("inline-targets", &[
+            ("Cargo.toml", r#"
+bin = [{ name = "tool", path = "other/tool.rs", test = false, required-features = ["extra"] }]
+test = [{ name = "checks", path = "other/checks.rs", harness = false }]
+example = [{ name = "demo", path = "other/demo.rs", crate-type = ["rlib"] }]
+bench = [{ name = "speed", path = "other/speed.rs", harness = false }]
+
+[package]
+name = "inline"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+extra = []
+"#),
+            ("src/lib.rs", ""),
+            ("other/tool.rs", "fn main() {}"),
+            ("other/checks.rs", "fn main() {}"),
+            ("other/demo.rs", "pub fn demo() {}"),
+            ("other/speed.rs", "fn main() {}"),
+        ]);
+        let mut r = Resolver::new(sess, &root).unwrap();
+        let i = r.load(&root, Source::Path).unwrap();
+        let m = &r.manifests[i];
+        let bins: Vec<_> = m.bins.iter().map(|t| (t.name.as_str(), t.test, t.required_features.clone())).collect();
+        assert_eq!(bins, [("tool", false, vec!["extra".to_string()])], "the inline bin, its `test` and `required-features`");
+        let tests: Vec<_> = m.tests.iter().map(|t| (t.name.as_str(), t.harness, t.path.ends_with("/other/checks.rs"))).collect();
+        assert_eq!(tests, [("checks", false, true)], "the inline test, at its path, with its `harness`");
+        let examples: Vec<_> = m.examples.iter().map(|t| (t.name.as_str(), t.kind.clone())).collect();
+        assert_eq!(examples, [("demo", vec!["rlib".to_string()])], "the inline example with its crate type");
+        let meta = metadata_targets(m).unwrap();
+        for (kind, name) in [("bin", "tool"), ("test", "checks"), ("example", "demo"), ("bench", "speed")] {
+            let (kind_field, name_field) = (format!("\"kind\":[\"{kind}\"]"), format!("\"name\":\"{name}\""));
+            assert!(meta.iter().any(|t| t.contains(&kind_field) && t.contains(&name_field)), "metadata names the inline {kind} `{name}`: {meta:?}");
+        }
+        for (text, why) in [("bin = 1", "not an array"), ("bin = { name = 'a' }", "a table"), ("bin = [{ name = 'a' }, 'b']", "an entry that is not a table")] {
+            assert!(target_tables(&parse_toml(text).unwrap().root, "bin", "Cargo.toml").is_err(), "{why}: {text}");
+        }
+        assert!(target_tables(&parse_toml("bin = []").unwrap().root, "bin", "Cargo.toml").unwrap().is_empty(), "an empty inline array");
+        let names = |text: &str| target_tables(&parse_toml(text).unwrap().root, "bin", "Cargo.toml").unwrap().iter().filter_map(|t| s(t, "name")).collect::<Vec<_>>();
+        assert_eq!(names("[[bin]]\nname = 'a'\n[[bin]]\nname = 'b'"), ["a", "b"], "headers, in source order");
+        assert_eq!(names("bin = [{ name = 'b' }, { name = 'a' }]"), ["b", "a"], "an inline array, in source order");
+        let _ = std::fs::remove_dir_all(&root);
+        // a malformed target key fails the package's load, naming its manifest
+        let bad = tree("inline-targets-bad", &[("Cargo.toml", "test = 'checks'\n[package]\nname = \"bad\"\nversion = \"0.1.0\"\n"), ("src/lib.rs", "")]);
+        let err = Resolver::new(sess, &bad).unwrap().load(&bad, Source::Path).err().expect("a string `test` is refused");
+        assert!(err.contains("Cargo.toml") && err.contains("`test`"), "{err}");
+        let _ = std::fs::remove_dir_all(&bad);
+    }
+
     fn tree(name: &str, files: &[(&str, &str)]) -> String {
         let root = std::env::temp_dir().join(format!("relax-resolve-{}-{}", name, std::process::id()));
         for (p, text) in files {
@@ -3636,10 +3723,18 @@ required-features = ["b", "manual"]
         let sess = &std::sync::Arc::new(crate::Session::default());
         let one = "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
         let two = "[package]\nname = \"dep\"\nversion = \"2.0.0\"\nedition = \"2021\"\n";
+        let registry = "registry+https://github.com/rust-lang/crates.io-index";
+        let registry_pkg = |version: &str| format!("[[package]]\nname = \"dep\"\nversion = \"{version}\"\nsource = \"{registry}\"\n");
+        let lock = |edge: Option<&str>, packages: &str| {
+            let deps = edge.map(|e| format!("dependencies = [\"{e}\"]\n")).unwrap_or_default();
+            format!("version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n{deps}\n{packages}")
+        };
+        let locked_one = registry_pkg("1.0.0");
+        let locked_both = format!("{locked_one}\n{}", registry_pkg("2.0.0"));
         let root = tree("lock-edge", &[
             ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
             (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
-            ("Cargo.lock", "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep 2.0.0\"]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
+            ("Cargo.lock", &lock(Some("dep 2.0.0"), &locked_both)),
             ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep = \">=1, <3\"\n"),
             ("app/src/lib.rs", ""),
             ("vendor/dep-1.0.0/Cargo.toml", one),
@@ -3655,16 +3750,55 @@ required-features = ["b", "manual"]
         let paths: Vec<_> = g.units.iter().filter(|u| u.name == "dep").map(|u| u.src_path.clone()).collect();
         assert_eq!(paths, vec![normalize(&format!("{root}/vendor/dep-2.0.0/src/lib.rs"))], "the vendored dependency must use the version named by the requesting package's lock edge");
 
-        std::fs::remove_file(format!("{root}/.cargo/config.toml")).unwrap();
         let mut r = Resolver::new(sess, &root).unwrap();
+        r.vendor = None;
         r.registry_src = format!("{root}/cache");
         assert_eq!(r.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).unwrap(), format!("{root}/cache/index.test-0/dep-2.0.0"), "the cached dependency must use the version named by the requesting package's lock edge");
         assert_eq!(r.registry_dir("dep", ">=1, <3", None).unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "without a requesting package the first matching locked version must still win");
 
-        std::fs::write(format!("{root}/Cargo.lock"), "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep\"]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
-        let mut r = Resolver::new(sess, &root).unwrap();
-        r.registry_src = format!("{root}/cache");
-        assert_eq!(r.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "a bare dependency name must resolve to its only locked registry package");
+        let resolve = |edge: Option<&str>, packages: &str, req: &str| {
+            std::fs::write(format!("{root}/Cargo.lock"), lock(edge, packages)).unwrap();
+            let mut r = Resolver::new(sess, &root).unwrap();
+            r.offline = true;
+            r.registry_src = format!("{root}/cache");
+            let from = Some(("app", "0.1.0"));
+            let vendored = r.registry_dir("dep", req, from);
+            r.vendor = None;
+            [vendored, r.registry_dir("dep", req, from)]
+        };
+        let plain = "dep 2.0.0";
+        let qualified = format!("{plain} ({registry})");
+        let other_versions = format!("{locked_one}\n{}", registry_pkg("1.1.0"));
+        let with_path = format!("{locked_one}\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\n");
+        let missing: &[(&str, &str)] = &[
+            (plain, &locked_one),
+            (&qualified, &locked_one),
+            (plain, &other_versions),
+            (&qualified, &other_versions),
+            (plain, ""),
+            (&qualified, &with_path),
+        ];
+        for &(edge, packages) in missing {
+            for result in resolve(Some(edge), packages, ">=1, <3") {
+                let err = result.expect_err("a missing locked target must stop registry resolution");
+                assert!(err.contains(edge) && err.contains("Cargo.lock has no package") && err.contains("app 0.1.0") && err.contains("cargo update -p dep"), "{err}");
+            }
+        }
+
+        let git = "git+https://example.org/dep";
+        let git_edge = format!("{plain} ({git})");
+        let with_git = format!("{with_path}source = \"{git}#0123456789abcdef0123456789abcdef01234567\"\n");
+        let resolving: &[(Option<&str>, &str, &str)] = &[
+            (None, &locked_one, ">=1, <3"),
+            (Some("dep"), &locked_one, ">=1, <3"),
+            (Some(plain), &with_path, "1"),
+            (Some(&git_edge), &with_git, "1"),
+        ];
+        for &(edge, packages, req) in resolving {
+            let [vendored, cached] = resolve(edge, packages, req);
+            assert_eq!(vendored.unwrap(), normalize(&format!("{root}/vendor/dep-1.0.0")), "vendor lookup for {edge:?}");
+            assert_eq!(cached.unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "cache lookup for {edge:?}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

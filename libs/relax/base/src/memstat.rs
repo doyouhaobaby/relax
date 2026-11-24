@@ -1077,7 +1077,11 @@ mod sites {
         let mut h: u64 = 0xcbf29ce484222325;
         for f in fr { h = (h ^ f as u64).wrapping_mul(0x100000001b3); }
         if h == 0 { h = 1; }
-        while LOCK.swap(true, Acquire) { std::hint::spin_loop(); }
+        // (in a plain fork's child the holder may be a thread it does not have: unattributed)
+        while LOCK.swap(true, Acquire) {
+            if crate::zone_alloc::arenas_closed() { return 0; }
+            std::hint::spin_loop();
+        }
         let mut i = (h as usize) & (N - 1);
         let mut id = 0u32;
         for _ in 0..64 {

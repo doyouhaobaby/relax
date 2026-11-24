@@ -254,3 +254,104 @@ again. That check is the type checker's: names, types, traits.
 
 Start in compiler/src/typeck_bg.rs (the background check and its stored verdicts) and jit.rs
 install_error (the report when a body's build fails).
+
+## 13. A lint in a local `macro_rules!` expansion is reported at the call, rustc in the macro
+
+```rust
+#![warn(unsafe_code)]
+pub unsafe trait Plain {}  // (in a dependency, so the trait itself is not linted)
+macro_rules! plain {
+    ($t:ident) => {
+        unsafe impl Plain for $t {}
+    };
+}
+pub struct S(pub u8);
+plain!(S);
+```
+
+- rustc: the `unsafe_code` warning points at `unsafe impl` inside the macro's body, with the
+  expansion as a note.
+- Relax: the same warning, at `plain!(S);`.
+
+Diagnostics of expanded code take the call site's position. Start where lints map a position in a
+local rules expansion back to the file (types/src/lint.rs, front/src/parser.rs expansion_kind and
+the origin tables).
+
+## 14. `unsafe_code` misses an unsafe block in a function an attribute macro passes on
+
+A proc-macro crate with `#[proc_macro_attribute] pub fn pass(_: TokenStream, item: TokenStream)
+-> TokenStream { item }`, and in a crate with `#![warn(unsafe_code)]`:
+
+```rust
+#[mac::pass]
+pub fn first(v: &[u8]) -> u8 {
+    unsafe { *v.get_unchecked(0) }
+}
+```
+
+- rustc: warns "usage of an `unsafe` block" (the tokens are the input's, written by the crate).
+- Relax: nothing; the same function without the attribute is reported.
+
+Start in types/src/lint_late2.rs (the unsafe block lint) and how lint::external and expansion_kind
+classify the tokens an attribute macro passes on from its input.
+
+## 15. On Windows, a TcpStream's vectored write sends only its first non-empty buffer
+
+`write_vectored` with several non-empty buffers on a `TcpStream`, on Windows:
+
+```rust
+use std::io::{IoSlice, Read, Write};
+use std::net::{TcpListener, TcpStream};
+fn main() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut tx = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut rx, _) = listener.accept().unwrap();
+    let parts = [IoSlice::new(b"a"), IoSlice::new(b"b")];
+    println!("{}", tx.write_vectored(&parts).unwrap());
+    drop(tx);
+    let mut got = String::new();
+    rx.read_to_string(&mut got).unwrap();
+    println!("{got}");
+}
+```
+
+- rustc: one WSASend takes every buffer, so this prints `2`, then `ab`.
+- Relax: net/socket_windows.rs has no `write_vectored`, so the trait's default writes the first
+  non-empty buffer: `1`, then `a`. A short write, not an error: `write_all` loops still work.
+
+Start in net/socket_windows.rs: a `write_vectored` that makes one WSASend of the buffers (an
+`IoSlice` is a `WSABUF` on Windows), called from net/tcp.rs as on unix (net/socket_unix.rs).
+Windows' File, stdio and pipes keep the trait's default, as in rustc's std.
+
+## 16. Std's code that inherits overflow checks follows the program's profile, not its caller's crate
+
+rustc's std marks some functions and closures `#[rustc_inherit_overflow_checks]`, and reads
+`intrinsics::overflow_checks` in others: they check for overflow as the crate they are instantiated in
+does.
+
+- rustc: the crate's own profile decides. A dependency built with
+  `[profile.dev.package.<name>] overflow-checks = false` wraps `(255u8..)` past its end in its own
+  code, while the program's crate, built with checks, panics there.
+- Relax: the program's profile decides for every crate: its root crate's `cfg(overflow_checks)`
+  (the package it runs or tests, its cargo profile resolved as cargo resolves it). Std is compiled
+  once for each setting, and both stay cached side by side. In the example above the dependency
+  panics too.
+
+This is by design: std's compiled code is shared by every crate of a run, so one value for the whole
+program compiles std once per profile rather than once per calling crate. A per-crate value comes
+back if a real program needs a dependency's own setting. In constant evaluation
+`intrinsics::overflow_checks` is true, as rustc's.
+
+## 17. A reader opened on a store-only file before the run's first write to it keeps the store copy
+
+Under a mount with an edits folder (a shared workspace, an app's repository store), a file that
+only the repository's store holds has no disk file of its own until the run writes it.
+
+- rustc: a reader that opened a file sees the program's later writes to it in place.
+- Relax: a read-only open of such a file reads from a copy. The run's first write to it copies the
+  file into the edits folder, and that reader keeps the store copy. A reader opened after that
+  write, or on a file the run already wrote, opens the disk file and follows the writer, as
+  natively.
+
+This is by design, as with an overlay's copy-up: closing it would copy every file the run opens
+for reading into the edits folder, which is the user's change set.

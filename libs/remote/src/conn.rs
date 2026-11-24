@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 /// Bytes a sender may have outstanding on a channel before the receiver grants more.
@@ -23,7 +23,25 @@ const GRANT_AT: usize = 64 << 10;
 /// Bytes queued per channel before `try_send` says Full (a single larger message is accepted when
 /// the queue is empty).
 pub const QUEUE_CAP: usize = 1 << 20;
-const KEEPALIVE: Duration = Duration::from_secs(5);
+/// How long a connection's writer stays idle before it pings the peer.
+pub const KEEPALIVE: Duration = Duration::from_secs(5);
+
+/// Every connection of this process that has not ended yet ([`shut_down_all`]).
+static LIVE: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
+
+/// Shuts down every connection of this process, both ways, before it execs in place. The exec
+/// closes this process's descriptors, but a child that inherited a copy of a connection's socket
+/// holds that socket open, and its peer waited on it for good: macOS sets close-on-exec on an
+/// accepted or dialled socket only once accept or socket returns, and a spawn on another thread
+/// in between inherits it (11-23). Shut down, the copy holds a dead socket and the peer sees the
+/// end at once, as at any close; its calls fail as lost and dial again. An exec that fails leaves
+/// them shut down: their peers dial again.
+pub fn shut_down_all() {
+    let live: Vec<Arc<Shared>> = LIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    for c in live {
+        (c.shutdown)();
+    }
+}
 
 pub const CLOSE_NORMAL: u16 = 0;
 pub const CLOSE_UNSUPPORTED: u16 = 1;
@@ -138,6 +156,11 @@ struct Shared {
     shutdown: Box<dyn Fn() + Send + Sync>,
     handler: Option<OpenHandler>,
     hooks: Hooks,
+    /// how long a ping may go unanswered before the link is lost, ns ([`Conn::set_ping_limit`];
+    /// 0: never)
+    ping_limit_ns: AtomicU64,
+    /// when the oldest ping that nothing came back after went ([`mono_ns`], 0: none is out)
+    ping_out_ns: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -147,6 +170,8 @@ enum Work {
     Frame(Frame),
     Flush,
     Exit,
+    /// a ping went unanswered past the limit ([`Conn::set_ping_limit`])
+    Lost(String),
 }
 
 impl State {
@@ -227,7 +252,14 @@ impl Conn {
             shutdown: io.shutdown,
             handler,
             hooks,
+            ping_limit_ns: AtomicU64::new(0),
+            ping_out_ns: AtomicU64::new(0),
         });
+        {
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            live.retain(|c| c.strong_count() > 0);
+            live.push(Arc::downgrade(&shared));
+        }
         let conn = Conn(shared);
         let (c1, c2) = (conn.clone(), conn.clone());
         let writer = io.writer;
@@ -286,6 +318,30 @@ impl Conn {
 
     pub fn ping(&self) {
         self.ctrl(0, kind::PING, mono_ns().to_le_bytes().to_vec());
+        self.ping_out();
+    }
+
+    /// Ends the connection as lost once a ping has gone `limit` with nothing back from the peer
+    /// (any frame answers it), and pings at least twice within `limit` while idle; zero (the
+    /// default) never does. A peer's reader answers pings whatever its services do, so only a
+    /// process that holds its end without serving it stays silent: a run that inherited a
+    /// master's connection kept it open past that master's exec into its next build, and a request
+    /// on it waited for good, never told the link had gone. Its open requests fail with
+    /// [`crate::link::Error::LinkLost`], and a client dials again for the next.
+    pub fn set_ping_limit(&self, limit: Duration) {
+        self.0.ping_limit_ns.store(limit.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
+        self.0.work.notify_one();
+    }
+
+    /// A ping went: the oldest one out is the one the limit counts from.
+    fn ping_out(&self) {
+        let _ = self.0.ping_out_ns.compare_exchange(0, mono_ns().max(1), Relaxed, Relaxed);
+    }
+
+    /// Why the link is lost, once a ping has gone unanswered past the limit.
+    fn ping_lost(&self) -> Option<String> {
+        let (limit, out) = (self.0.ping_limit_ns.load(Relaxed), self.0.ping_out_ns.load(Relaxed));
+        (limit > 0 && out > 0 && mono_ns().saturating_sub(out) >= limit).then(|| format!("the peer answered no ping for {:.1} s", Duration::from_nanos(limit).as_secs_f32()))
     }
 
     /// Sends a channel-0 control message (see `hello`).
@@ -386,6 +442,8 @@ impl Conn {
                     return;
                 }
             };
+            // anything from the peer answers the pings out
+            self.0.ping_out_ns.store(0, Relaxed);
             if let Err(msg) = self.on_frame(f) {
                 self.close(&msg);
                 return;
@@ -535,10 +593,17 @@ impl Conn {
                     if st.draining {
                         break Work::Exit;
                     }
-                    let (g, to) = self.0.work.wait_timeout(st, KEEPALIVE).unwrap();
+                    if let Some(why) = self.ping_lost() {
+                        break Work::Lost(why);
+                    }
+                    // a ping limit pings at least twice within it
+                    let limit = self.0.ping_limit_ns.load(Relaxed);
+                    let every = if limit == 0 { KEEPALIVE } else { KEEPALIVE.min(Duration::from_nanos(limit / 2)) };
+                    let (g, to) = self.0.work.wait_timeout(st, every).unwrap();
                     st = g;
-                    if to.timed_out() && idle_since.elapsed() >= KEEPALIVE {
+                    if to.timed_out() && idle_since.elapsed() >= every {
                         st.push_ctrl(0, kind::PING, mono_ns().to_le_bytes().to_vec());
+                        self.ping_out();
                     }
                 }
             };
@@ -559,6 +624,10 @@ impl Conn {
                 Work::Exit => {
                     let _ = w.flush();
                     self.terminate("closed");
+                    return;
+                }
+                Work::Lost(why) => {
+                    self.terminate(&why);
                     return;
                 }
             };

@@ -418,8 +418,8 @@ impl Tcx {
             callable_output = Some(output);
             vec![self.tys.intern(TyKind::Tuple(self.tys.mk_list(&ps)))]
         } else { self.lower_generic_args(cx, prog, def.file, def.scope, &env, &path) };
-        let ta = self.fill_trait_defaults(cx, prog, td, ty, written);
         let regions = self.lower_region_args(cx.infcx, prog, def.file, def.scope, &env, &path);
+        let ta = self.fill_trait_defaults(cx, prog, td, ty, written, regions);
         let mut compact = vec![ty]; compact.extend_from_slice(&ta);
         let args = self.complete_args(prog, td, &compact, regions);
         let vars: Arc<[BoundVariableKind]> = env.regions.bound_vars().into();

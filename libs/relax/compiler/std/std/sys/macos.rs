@@ -7,6 +7,8 @@ use core::time::Duration;
 
 pub type clockid_t = u32;
 pub const CLOCK_REALTIME: clockid_t = 0;
+/// The most buffers one writev(2) takes (real std's fd max_iov: IOV_MAX on Apple targets).
+pub const MAX_IOV: usize = 1024;
 /// What real std's Instant uses on Apple targets (does not advance while asleep, like
 /// mach_absolute_time).
 pub const CLOCK_INSTANT: clockid_t = 8; // CLOCK_UPTIME_RAW
@@ -168,6 +170,8 @@ extern "C" {
     pub fn fstat(fd: c_int, buf: *mut stat_t) -> c_int;
     pub fn readdir(dir: *mut c_void) -> *mut dirent_t;
     fn pthread_setname_np(name: *const c_char) -> c_int;
+    fn pthread_getname_np(thread: usize, name: *mut c_char, len: usize) -> c_int;
+    fn pthread_self() -> usize;
     fn _NSGetEnviron() -> *mut *const *const c_char;
     fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> c_int;
     fn pthread_threadid_np(thread: usize, id: *mut u64) -> c_int;
@@ -218,6 +222,12 @@ pub fn set_thread_name(name: *const c_char) {
     unsafe {
         pthread_setname_np(name);
     }
+}
+
+/// The calling thread's name at the OS into `buf`: its length (0: none).
+pub fn thread_os_name(buf: &mut [u8; 64]) -> usize {
+    unsafe { pthread_getname_np(pthread_self(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    buf.iter().position(|&c| c == 0).unwrap_or(0)
 }
 
 pub fn fill_random(buf: &mut [u8]) {

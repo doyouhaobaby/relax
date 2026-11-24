@@ -44,17 +44,18 @@ struct TestFront {
     lock: std::sync::RwLock<()>,
 }
 impl TestFront {
-    fn new(block_call: u64) -> Arc<Self> {
-        let (prog, tcx) = fixture("app", SOURCE);
+    fn new(block_call: u64) -> Arc<Self> { Self::of(SOURCE, block_call) }
+    fn of(source: &str, block_call: u64) -> Arc<Self> {
+        let (prog, tcx) = fixture("app", source);
         Arc::new(Self { prog, tcx, quiet: AtomicU64::new(0), calls: AtomicU64::new(0), block_call,
             entered: Barrier::new(2), release: Barrier::new(2), panic_stored: AtomicBool::new(false), lock: std::sync::RwLock::new(()) })
     }
-    /// A live patch: the next collect epoch, with `keep`'s owners carried, under the front end's
-    /// write lock as the driver does it (no check runs meanwhile, none sees the new epoch early).
-    fn patch(&self, keep: &dyn Fn(DefId) -> bool) {
+    /// A live patch: the next collect epoch, each owner carried as `owner` says, under the front
+    /// end's write lock as the driver does it (no check runs meanwhile, none sees the new epoch early).
+    fn patch(&self, owner: &dyn Fn(DefId) -> Carry) {
         let _w = self.lock.write().unwrap();
         let from = self.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst);
-        carry_epoch(self.identity(), from, from + 1, keep);
+        carry_epoch(self.identity(), from, from + 1, owner);
     }
     fn epoch(&self) -> u64 { self.tcx.collect_epoch.load(Ordering::SeqCst) }
     fn enqueue(self: &Arc<Self>, name: &str, cached_clean: bool) -> DefId {
@@ -164,6 +165,31 @@ fn a_live_edits_check_goes_ahead_of_hot_code() {
     unsubscribe(id); stop();
 }
 
+/// After a start, a body no earlier run checked clean (RANK_EDITED: the one just edited) is
+/// checked while compiles go on, ahead of hot code's checks; the startup's other checks wait
+/// for the compiles to go quiet (an edited per-frame body's error came 228 s after its app's
+/// start, behind them, W14431, 11-19).
+#[test]
+fn an_edited_bodys_check_goes_ahead_of_the_startups_while_compiles_go_on() {
+    if child("an_edited_bodys_check_goes_ahead_of_the_startups_while_compiles_go_on") { return; }
+    let front = TestFront::new(0);
+    let (id, rx) = subscribe();
+    // the startup queued a, b and c; the edited bad compiles after them, and hot code promotes b
+    let (a, b) = (front.enqueue("a", false), front.enqueue("b", false));
+    front.enqueue("c", false);
+    let bad = named(&front.prog, "bad");
+    let src: Arc<dyn FrontSource> = front.clone();
+    note_compiled(&front.prog.session.options, &src, NoteFn { def: bad, args: Vec::new(), cache_key: None, epoch: front.epoch(), rank: Some(RANK_EDITED), cached: None });
+    set_ranks(front.identity(), front.epoch(), &[(b, vec![], RANK_HOT)]);
+    // (compiles go on: the quiet gate stays shut)
+    let events = [event(&rx), event(&rx)];
+    assert_eq!(events.each_ref().map(|e| e.error.owner), [bad, b], "the edited body first, then hot code, while compiles go on");
+    assert_eq!(verdict(front.identity(), a, &[], front.epoch()), FnVerdict::Pending, "the startup's other checks wait for quiet");
+    front.ungate();
+    assert_eq!(event(&rx).error.owner, a, "and run once it is quiet");
+    unsubscribe(id); stop();
+}
+
 #[test]
 fn gate_returns_app_errors() {
     if child("gate_returns_app_errors") { return; }
@@ -204,11 +230,16 @@ fn guard_filters_non_app() {
     assert!(app_crate(&prog, 0));
     set_app_scope(Vec::new());
     assert!(!app_crate(&prog, 0));
-    // The one all-crates switch applies on top of the compiled default.
+    // The one all-crates switch applies on top of the compiled default. It is read once a run: a
+    // change of the environment is seen after the run's end (reset_statics), as a fresh process
+    // sees it.
     assert!(!admit(&prog, 0));
     std::env::set_var("RELAX_GANDALF_ALL", "1");
+    assert!(!admit(&prog, 0), "the switch is read once a run");
+    unsafe { super::super::event::reset_statics() };
     assert!(admit(&prog, 0));
     std::env::set_var("RELAX_GANDALF_ALL", "0");
+    unsafe { super::super::event::reset_statics() };
     assert!(!admit(&prog, 0));
     std::env::remove_var("RELAX_GANDALF_ALL");
     unsubscribe(id);
@@ -388,7 +419,7 @@ fn live_epoch_carries_verdicts_of_unreached_owners() {
     // queued (or already running) when the patch lands: its check counts at the new epoch
     let queued = front.enqueue("c", false);
     // a live patch of `a`: every other owner reads what it read before
-    front.patch(&|d| d != edited);
+    front.patch(&|d| if d == edited { Carry::Drop } else { Carry::Keep });
     assert_eq!(verdict(front.identity(), clean, &[], front.epoch()), FnVerdict::Clean);
     assert_eq!(verdict(front.identity(), fail, &[], front.epoch()), FnVerdict::Unchecked("typeck".into()));
     assert_eq!(verdict(front.identity(), edited, &[], front.epoch()), FnVerdict::Unchecked("not queued".into()));
@@ -399,6 +430,66 @@ fn live_epoch_carries_verdicts_of_unreached_owners() {
     assert!(matches!(wait_verdict(&front, edited), FnVerdict::Errors(_)));
     assert!(matches!(wait_verdict(&front, queued), FnVerdict::Errors(_)));
     assert_eq!(wait_checked(checked0 + 2) - checked0, 2, "the carried clean owner was checked again");
+    stop();
+}
+
+#[test]
+fn a_live_patch_only_asks_about_its_own_owners() {
+    if child("a_live_patch_only_asks_about_its_own_owners") { return; }
+    let front = TestFront::new(0);
+    let world = TestFront::of(&[SOURCE, "fn helper() {} fn world_clean() {}"].concat(), 0);
+    let clean = front.enqueue("clean", false);
+    let world_clean = world.enqueue("world_clean", false);
+    assert!(world_clean.0 as usize >= front.prog.defs.len(), "the world's owner must be outside the patched program's defs");
+    front.ungate();
+    world.ungate();
+    assert_eq!(wait_verdict(&front, clean), FnVerdict::Clean);
+    assert_eq!(wait_verdict(&world, world_clean), FnVerdict::Clean);
+
+    let asked = std::cell::RefCell::new(Vec::new());
+    front.patch(&|d| {
+        asked.borrow_mut().push(d);
+        Carry::Drop
+    });
+    assert_eq!(asked.into_inner(), [clean]);
+    assert_eq!(verdict(front.identity(), clean, &[], front.epoch()), FnVerdict::Unchecked("not queued".into()));
+    assert_eq!(verdict(world.identity(), world_clean, &[], world.epoch()), FnVerdict::Clean);
+    stop();
+}
+
+/// A live patch that lands while the background pass still has checks queued: those of the owners
+/// whose text it did not change stay queued, and each gets its verdict, stored under the key it was
+/// queued with, or under none when the patch changed a declaration its owner may read. Dropped
+/// with their file's changed fn, they were never queued again (no discovery below the aot levels):
+/// the rest of an edited file went unchecked for the session, and the next start checked it (60
+/// of a fixture's 95 fns, 11-19).
+#[test]
+fn a_patch_mid_pass_keeps_the_queued_checks_of_unchanged_owners() {
+    if child("a_patch_mid_pass_keeps_the_queued_checks_of_unchanged_owners") { return; }
+    let front = TestFront::new(0);
+    // queued behind the quiet gate: none is checked before the patch
+    let note = |name: &str, key: u128| {
+        let def = named(&front.prog, name);
+        let src: Arc<dyn FrontSource> = front.clone();
+        note_compiled(&front.prog.session.options, &src, NoteFn { def, args: Vec::new(), cache_key: Some(key), epoch: front.epoch(), rank: None, cached: None });
+        def
+    };
+    let (edited, same, clean, reads) = (note("a", 1), note("b", 2), note("clean", 3), note("typefail", 4));
+    // a body edit of `a`: `b` and `clean` are its file's unchanged text; `typefail` stands for an
+    // owner that reads a declaration the patch changed
+    front.patch(&|d| if d == edited { Carry::Drop } else if d == reads { Carry::Again { keyed: false } } else { Carry::Again { keyed: true } });
+    assert_eq!(verdict(front.identity(), edited, &[], front.epoch()), FnVerdict::Unchecked("not queued".into()), "the changed owner's check goes (the patch notes its code again)");
+    for d in [same, clean, reads] {
+        assert_eq!(verdict(front.identity(), d, &[], front.epoch()), FnVerdict::Pending, "{}: an unchanged owner's queued check stays queued", front.prog.def_path(d));
+    }
+    front.ungate();
+    assert!(matches!(wait_verdict(&front, same), FnVerdict::Errors(_)), "the kept check reports its error");
+    assert_eq!(wait_verdict(&front, clean), FnVerdict::Clean);
+    assert_eq!(wait_verdict(&front, reads), FnVerdict::Unchecked("typeck".into()));
+    assert_eq!(wait_checked(3), 3, "the dropped owner is not checked");
+    let keys = take_verdict_keys();
+    assert!(keys.contains(&(3, StoredVerdict::Clean)), "kept keyed: stored under the key it was queued with: {keys:?}");
+    assert!(keys.iter().all(|(k, _)| *k != 4), "kept over a declaration it may read: stored under no key: {keys:?}");
     stop();
 }
 

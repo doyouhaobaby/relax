@@ -36,6 +36,32 @@ pub(crate) enum Dg {
     Unknown,
 }
 
+/// The install path that supplied a code version's digests (or had none to supply).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DigestOrigin {
+    StartupImage,
+    CacheLink,
+    Built,
+    Linked,
+    O3First,
+    O3,
+    PatchBuild,
+}
+
+impl DigestOrigin {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::StartupImage => "startup image",
+            Self::CacheLink => "cache link",
+            Self::Built => "built",
+            Self::Linked => "linked",
+            Self::O3First => "O3 first",
+            Self::O3 => "O3",
+            Self::PatchBuild => "patch build",
+        }
+    }
+}
+
 /// What a code version was built from: its own lowering's digest and, per inline context, the
 /// context's slot (NO_SLOT: unknown), the digest of the body it took in, and whether a frame can
 /// wait inside that copy (it holds a call or a cycle).
@@ -53,6 +79,19 @@ static DIGEST_NS: AtomicU64 = AtomicU64::new(0);
 static DIGEST_N: AtomicU64 = AtomicU64::new(0);
 /// cpu ns of lowering while a patch is open
 static PATCH_LOWER_NS: AtomicU64 = AtomicU64::new(0);
+/// Closure ordinals whose owner has no item in the file version the closure names.
+pub(crate) static CLOSURE_ORDINAL_FILE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`).
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&DIGEST_NS, AtomicU64::new(0));
+    reset(&DIGEST_N, AtomicU64::new(0));
+    reset(&PATCH_LOWER_NS, AtomicU64::new(0));
+    reset(&CLOSURE_ORDINAL_FILE_MISSES, AtomicU64::new(0));
+    reset(&PATCH, relax_session::sync::Mutex::new(None));
+    reset(&UNNOTED, relax_session::sync::Mutex::new(None));
+}
 
 /// The digest of `f` as lowered (`Func::lowering_digest`), kept off the compile's scratch heap.
 pub(crate) fn take(f: &Func) -> Arc<BodyDigest> {
@@ -105,6 +144,10 @@ pub(crate) fn running(u: &Unit, id: u32) -> Option<Arc<CodeDigest>> {
 pub(crate) trait Ids {
     fn slot(&mut self, u: &Unit, x: u32) -> Option<u128>;
     fn def(&mut self, u: &Unit, d: crate::program::DefId) -> Option<u128>;
+    /// (probes only) where slot `x`'s identity bytes come from now, and the bytes
+    fn slot_bytes_from(&mut self, _u: &Unit, _x: u32) -> (&'static str, Option<Vec<u8>>) {
+        ("this run's id", None)
+    }
 }
 
 /// This run's ids (no cache: nothing is recorded, only this run compares).
@@ -161,6 +204,36 @@ impl<'a, I: Ids + ?Sized> Resolver<'a, I> {
                 r
             }
         }
+    }
+
+    /// Every name a taken digest holds, slots first, then symbols, with its identity (a probe's
+    /// listing: which name's identity moved). A slot's bytes and their source are read before its
+    /// identity, so a source is the one this resolution used.
+    pub(crate) fn listing(&mut self, d: &BodyDigest) -> Vec<Named> {
+        let mut v = Vec::with_capacity(d.slots.len() + d.syms.len());
+        for &s in &d.slots {
+            let (from, bytes) = if self.slots.contains_key(&s) { ("resolved before", None) } else { self.ids.slot_bytes_from(self.u, s) };
+            v.push(Named { name: slot_name(self.u, s), id: self.slot(s), from, bytes });
+        }
+        for &y in &d.syms {
+            v.push(Named { name: sym_name(self.u, y), id: self.sym(y), from: "", bytes: None });
+        }
+        v
+    }
+
+    /// The first identity that kept a taken digest unknown, using the comparison's memo.
+    pub(crate) fn first_unresolved(&mut self, d: &BodyDigest) -> Option<String> {
+        for &s in &d.slots {
+            if self.slot(s).is_none() {
+                return Some(slot_name(self.u, s));
+            }
+        }
+        for &y in &d.syms {
+            if self.sym(y).is_none() {
+                return Some(sym_name(self.u, y));
+            }
+        }
+        None
     }
 
     fn slot(&mut self, x: u32) -> Option<u128> {
@@ -268,6 +341,14 @@ impl<'a, I: Ids + ?Sized> Resolver<'a, I> {
                 h.u8(17);
                 h.str(&n);
             }
+            SymKind::Note(n) => {
+                h.u8(18);
+                h.str(&n);
+            }
+            SymKind::Made(v) => {
+                h.u8(19);
+                h.u128(self.sym(v)?);
+            }
         }
         Some(h.finish128())
     }
@@ -333,8 +414,14 @@ pub(crate) fn encode(resolve: &mut dyn FnMut(&Dg) -> Option<u128>, id: u32, d: O
     };
     put(out, resolve(&d.own), false);
     out.extend_from_slice(&(d.ctx.len() as u32).to_le_bytes());
+    // (each slot's first position: a large body has thousands of contexts and of inlined keys,
+    // and a scan per context made this quadratic: 2-4 ms of a record)
+    let mut at: HashMap<u32, u32> = HashMap::with_capacity(inlined.len());
+    for (i, &x) in inlined.iter().enumerate() {
+        at.entry(x).or_insert(i as u32);
+    }
     for (s, g, waits) in d.ctx.iter() {
-        let ix = if *s == id { CTX_SELF } else { inlined.iter().position(|x| x == s).map_or(NO_SLOT, |i| i as u32) };
+        let ix = if *s == id { CTX_SELF } else { at.get(s).copied().unwrap_or(NO_SLOT) };
         out.extend_from_slice(&ix.to_le_bytes());
         put(out, resolve(g), *waits);
     }
@@ -381,11 +468,85 @@ pub(crate) fn decode(b: &[u8], id: u32, slot_of: &dyn Fn(u32) -> Option<u32>) ->
 
 // ------------------------------------------------------------ the patch's count
 
+/// A code version's start address and the digests kept for it.
+pub(crate) type CodeVersion = (u64, Option<Arc<CodeDigest>>);
+
 struct PatchCount {
-    /// per slot this patch installed: the digests of the code it ran before and of its new code
-    builds: Vec<(u32, Option<Arc<CodeDigest>>, Option<Arc<CodeDigest>>)>,
+    /// per slot this patch installed: the code it ran before and its new code
+    builds: Vec<(u32, CodeVersion, CodeVersion)>,
     at: HashMap<u32, usize>,
     digest_ns: u64,
+    closure_ordinal_file_misses: u64,
+    stable_closure_name_file_misses: u64,
+    /// RELAX_GATE_PROBE: the probed slots' lowerings before the edit's commit
+    probes: Vec<Probe>,
+}
+
+/// A slot's lowering from the program's text now, outside a build: its body's digest, or why not.
+type Lowered = Result<Arc<BodyDigest>, String>;
+
+/// One name of a probe's listing: its identity, and for a slot where its key bytes came from.
+pub(crate) struct Named {
+    name: String,
+    id: Option<u128>,
+    from: &'static str,
+    bytes: Option<Vec<u8>>,
+}
+
+/// A probed slot: its lowering before the edit's commit, and that lowering's identity and listing
+/// as resolved then.
+struct Probe {
+    id: u32,
+    before: Lowered,
+    identity: Option<u128>,
+    listing: Vec<Named>,
+}
+
+/// RELAX_GATE_PROBE=<part>[,<part>..]: the running slots whose names hold one of the parts are
+/// lowered before an edit's commit and after it. Before: compared with the running code's own
+/// digest (a mismatch with no edit is the run, not the edit). Across: per name, which identity
+/// moved.
+fn probe_parts() -> &'static [String] {
+    static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("RELAX_GATE_PROBE").map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default())
+}
+
+fn hex(x: Option<u128>) -> String {
+    x.map_or("unknown".to_string(), |x| format!("{:012x}", x >> 80))
+}
+
+/// The names whose identities differ between two listings, position by position; for a slot,
+/// where its key bytes came from on each side and the bytes from their first difference.
+fn listing_diff(a: &[Named], b: &[Named]) -> Vec<String> {
+    let side = |x: Option<&Named>| x.map_or("-".to_string(), |x| if x.from.is_empty() { format!("{} {}", x.name, hex(x.id)) } else { format!("{} {} ({})", x.name, hex(x.id), x.from) });
+    let mut out = Vec::new();
+    if a.len() != b.len() {
+        out.push(format!("{} names before, {} after", a.len(), b.len()));
+    }
+    for k in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(k), b.get(k));
+        if let (Some(x), Some(y)) = (x, y) {
+            // (the same identity is the same name, whatever its slot or symbol number this run)
+            if x.id.is_some() && x.id == y.id {
+                continue;
+            }
+        }
+        out.push(format!("#{k}: {} -> {}", side(x), side(y)));
+        if let (Some(Some(p)), Some(Some(q))) = (x.map(|x| &x.bytes), y.map(|y| &y.bytes)) {
+            let at = p.iter().zip(q.iter()).position(|(c, d)| c != d).unwrap_or(p.len().min(q.len()));
+            let show = |v: &[u8]| v[at.min(v.len())..(at + 8).min(v.len())].iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+            out.push(format!("#{k}:   key bytes {} and {} long, first tag {} and {}, first difference at {}: [{}] -> [{}]", p.len(), q.len(),
+                p.first().map_or("-".to_string(), |c| c.to_string()), q.first().map_or("-".to_string(), |c| c.to_string()), at, show(p), show(q)));
+        }
+    }
+    out
+}
+
+fn with_resolver<R>(u: &Unit, f: impl FnOnce(&mut Resolver<'_, dyn Ids + '_>) -> R) -> R {
+    match u.cache.as_ref() {
+        Some(c) => f(&mut Resolver::new(u, unsafe { &mut *c.get() } as &mut dyn Ids)),
+        None => f(&mut Resolver::new(u, &mut Session as &mut dyn Ids)),
+    }
 }
 
 static PATCH: relax_session::sync::Mutex<Option<PatchCount>> = relax_session::sync::Mutex::new(None);
@@ -399,27 +560,81 @@ fn gate_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("RELAX_GATE_TRACE").is_some())
 }
 
-/// A patch opens: its installs are counted from here (RELAX_RELOAD_TRACE).
-pub(crate) fn patch_opened() {
+/// A patch opens, before its edit commits: its installs are counted from here
+/// (RELAX_RELOAD_TRACE), and RELAX_GATE_PROBE's slots are lowered from the text the running code
+/// was built from.
+pub(crate) unsafe fn patch_opened(up: *mut Unit) {
     if !counting() {
         return;
     }
+    let mut probes = Vec::new();
+    if !probe_parts().is_empty() {
+        let ids: Vec<u32> = {
+            let u = &*up;
+            (0..u.fns.len() as u32).filter(|&i| u.fns[i as usize].code != 0 && { let n = u.fns[i as usize].name.to_string(); probe_parts().iter().any(|p| n.contains(p.as_str())) }).collect()
+        };
+        for id in ids {
+            let before = crate::jit::gate_lower(up, id);
+            let u = &*up;
+            let (identity, listing) = with_resolver(u, |r| {
+                // (listed first: a slot's key bytes and their source are read before any resolution
+                // memoises its identity)
+                let listing = before.as_ref().map(|x| r.listing(x)).unwrap_or_default();
+                let run = running(u, id);
+                let a = run.as_ref().and_then(|d| r.resolve(&d.own));
+                let b = before.as_ref().ok().and_then(|x| r.resolve(&Dg::Taken(x.clone())));
+                let verdict = match &before {
+                    Err(e) => format!(" (not lowered: {e})"),
+                    Ok(_) if a.is_some() && a == b => " -- same".to_string(),
+                    Ok(_) => " -- DIFFERS".to_string(),
+                };
+                eprintln!("relax reload: gate probe, no edit: {}: running {} ({}), lowered now {}{verdict}", slot_name(u, id), hex(a), origin_name(u, u.fns[id as usize].code), hex(b));
+                // (a running digest still taken can be split; a resolved one, from the cache, cannot)
+                if let (Some(Dg::Taken(x)), Ok(_)) = (run.as_ref().map(|d| &d.own), &before) {
+                    if a.is_none() || a != b {
+                        for line in listing_diff(&r.listing(x), &listing) {
+                            eprintln!("relax reload: gate probe, no edit:   running -> lowered now {line}");
+                        }
+                    }
+                }
+                (b, listing)
+            });
+            probes.push(Probe { id, before, identity, listing });
+        }
+    }
     PATCH_LOWER_NS.store(0, Ordering::Relaxed);
-    *PATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(PatchCount { builds: Vec::new(), at: HashMap::new(), digest_ns: DIGEST_NS.load(Ordering::Relaxed) });
+    *PATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(PatchCount {
+        builds: Vec::new(), at: HashMap::new(), digest_ns: DIGEST_NS.load(Ordering::Relaxed),
+        closure_ordinal_file_misses: CLOSURE_ORDINAL_FILE_MISSES.load(Ordering::Relaxed),
+        stable_closure_name_file_misses: relax_front::program::STABLE_CLOSURE_NAME_FILE_MISSES.load(Ordering::Relaxed),
+        probes,
+    });
 }
 
 /// The running code's digests before a patch install (None when not counting).
-pub(crate) fn before_install(u: &Unit, id: u32) -> Option<Option<Arc<CodeDigest>>> {
+pub(crate) fn before_install(u: &Unit, id: u32) -> Option<CodeVersion> {
     if !counting() || PATCH.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return None;
     }
-    Some(running(u, id))
+    let at = if (id as usize) < u.fns.len() { u.fns[id as usize].code } else { 0 };
+    Some((at, running(u, id)))
 }
 
+/// (trace) the patch's new code that no install path noted digests for, and what the slot held
+/// at its install: the reason's origin (`origin_name`)
+static UNNOTED: relax_session::sync::Mutex<Option<HashMap<u64, &'static str>>> = relax_session::sync::Mutex::new(None);
+
 /// A patch installed new code for slot `id` at `at`; `old`: `before_install`'s answer.
-pub(crate) fn installed(u: &Unit, id: u32, old: Option<Option<Arc<CodeDigest>>>, at: u64) {
+pub(crate) fn installed(u: &Unit, id: u32, old: Option<CodeVersion>, at: u64) {
     let Some(old) = old else { return };
-    let new = u.code.read().unwrap_or_else(|e| e.into_inner()).digest_at(at);
+    let (new, noted) = {
+        let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+        ((at, code.digest_at(at)), code.digest_origin_at(at).is_some())
+    };
+    if !noted && gate_trace() {
+        let held = if u.fns[id as usize].rir.is_some() { "not noted; the slot holds its RIR" } else { "not noted; the slot held no RIR at its install" };
+        UNNOTED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(at, held);
+    }
     let mut g = PATCH.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = g.as_mut() else { return };
     match p.at.get(&id) {
@@ -435,20 +650,46 @@ pub(crate) fn installed(u: &Unit, id: u32, old: Option<Option<Arc<CodeDigest>>>,
 /// A patch closes (on the owner thread): its installs classed as the gate would class them.
 pub(crate) unsafe fn patch_closed(up: *mut Unit) {
     let Some(p) = PATCH.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    // the contexts of the running code that this patch built no code for: lowered from the new
+    // text, once each, to compare with what the running code copied (never "absent means
+    // unchanged": an always-inlined reader has no code of its own, so no walk selects it)
+    let tl = relax_session::clock::cpu_ns();
+    let misses = (CLOSURE_ORDINAL_FILE_MISSES.load(Ordering::Relaxed), relax_front::program::STABLE_CLOSURE_NAME_FILE_MISSES.load(Ordering::Relaxed));
+    let mut lowered: HashMap<u32, Lowered> = HashMap::new();
+    {
+        let mut built: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (id, _, (_, new)) in &p.builds {
+            built.insert(*id);
+            if let Some(n) = new {
+                built.extend(n.ctx.iter().map(|c| c.0));
+            }
+        }
+        let mut need: Vec<u32> = p.builds.iter().filter_map(|b| b.1 .1.as_ref()).flat_map(|o| o.ctx.iter().map(|c| c.0)).filter(|s| *s != NO_SLOT && !built.contains(s)).collect();
+        need.sort_unstable();
+        need.dedup();
+        for s in need {
+            lowered.insert(s, crate::jit::gate_lower(up, s));
+        }
+    }
+    let lower_ns = relax_session::clock::cpu_ns().saturating_sub(tl);
     let u = &*up;
     let t = relax_session::clock::cpu_ns();
-    let (line, names) = match u.cache.as_ref() {
-        Some(c) => classify(u, &mut Resolver::new(u, &mut *c.get()), &p.builds),
-        None => classify(u, &mut Resolver::new(u, &mut Session), &p.builds),
-    };
+    let (line, names) = with_resolver(u, |r| classify(u, r, &p.builds, &lowered));
     let resolve_ns = relax_session::clock::cpu_ns().saturating_sub(t);
     eprintln!(
-        "relax reload: gate: {line}; digests {:.1} ms at lowering this patch ({:.1} ms over {} bodies this run), resolving {:.1} ms, lowering {:.1} ms",
+        "relax reload: gate: {line}; digests {:.1} ms at lowering this patch ({:.1} ms over {} bodies this run), resolving {:.1} ms, lowering {:.1} ms, {} contexts lowered for the check ({:.1} ms, {} not lowered), closure ordinal file misses {} ({} more in the check), stable closure name file misses {} ({} more in the check)",
         DIGEST_NS.load(Ordering::Relaxed).saturating_sub(p.digest_ns) as f64 / 1e6,
         DIGEST_NS.load(Ordering::Relaxed) as f64 / 1e6,
         DIGEST_N.load(Ordering::Relaxed),
         resolve_ns as f64 / 1e6,
-        PATCH_LOWER_NS.load(Ordering::Relaxed) as f64 / 1e6
+        PATCH_LOWER_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        lowered.len(),
+        lower_ns as f64 / 1e6,
+        lowered.values().filter(|l| l.is_err()).count(),
+        misses.0.saturating_sub(p.closure_ordinal_file_misses),
+        CLOSURE_ORDINAL_FILE_MISSES.load(Ordering::Relaxed).saturating_sub(misses.0),
+        misses.1.saturating_sub(p.stable_closure_name_file_misses),
+        relax_front::program::STABLE_CLOSURE_NAME_FILE_MISSES.load(Ordering::Relaxed).saturating_sub(misses.1)
     );
     if gate_trace() {
         for (class, id) in names {
@@ -456,35 +697,118 @@ pub(crate) unsafe fn patch_closed(up: *mut Unit) {
             eprintln!("relax reload: gate {class}: {name}");
         }
     }
+    // the probes across the commit: per name, which identity moved (the before side as resolved
+    // before the commit)
+    for pr in &p.probes {
+        let after = crate::jit::gate_lower(up, pr.id);
+        let u = &*up;
+        with_resolver(u, |r| {
+            let listing = after.as_ref().map(|y| r.listing(y)).unwrap_or_default();
+            let b = after.as_ref().ok().and_then(|x| r.resolve(&Dg::Taken(x.clone())));
+            let verdict = match (&pr.before, &after) {
+                (Err(e), _) | (_, Err(e)) => format!(" (not lowered: {e})"),
+                _ if pr.identity.is_some() && pr.identity == b => " -- same".to_string(),
+                _ => " -- DIFFERS".to_string(),
+            };
+            eprintln!("relax reload: gate probe, across the edit: {}: before {}, after {}{verdict}", slot_name(u, pr.id), hex(pr.identity), hex(b));
+            if let (Ok(x), Ok(y)) = (&pr.before, &after) {
+                if pr.identity.is_none() || pr.identity != b {
+                    if x.raw != y.raw {
+                        eprintln!("relax reload: gate probe, across the edit:   the body itself differs");
+                    }
+                    for line in listing_diff(&pr.listing, &listing) {
+                        eprintln!("relax reload: gate probe, across the edit:   {line}");
+                    }
+                }
+            }
+        });
+    }
+    UNNOTED.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+fn sym_name(u: &Unit, y: u32) -> String {
+    let def = |d: crate::program::DefId| if (d.0 as usize) < u.prog.defs.len() { u.prog.def_path(d) } else { format!("def #{}", d.0) };
+    let name = match u.syms.kind(y) {
+        Some(SymKind::Rt(n)) => format!("Rt {n}"),
+        Some(SymKind::Data(i)) => format!("Data #{i} {}", u.syms.obj_name(i).as_deref().unwrap_or("(unnamed)")),
+        Some(SymKind::Static(d)) => format!("Static {}", def(d)),
+        Some(SymKind::Foreign(n)) => format!("Foreign {n}"),
+        Some(SymKind::Missing(n)) => format!("Missing {n}"),
+        Some(SymKind::StaticAddr(d)) => format!("StaticAddr {}", def(d)),
+        Some(SymKind::Site(i)) => format!("Site #{i}"),
+        Some(SymKind::Thunk(s)) => format!("Thunk {}", slot_name(u, s)),
+        Some(SymKind::TierRec(s)) => format!("TierRec {}", slot_name(u, s)),
+        Some(SymKind::Rw(i)) => format!("Rw #{i}"),
+        Some(SymKind::Provided(n)) => format!("Provided {n}"),
+        Some(SymKind::ThreadLocal(d)) => format!("ThreadLocal {}", def(d)),
+        Some(SymKind::SbThunk(s)) => format!("SbThunk {}", slot_name(u, s)),
+        Some(SymKind::SbPlace(s)) => format!("SbPlace symbol #{s}"),
+        Some(SymKind::SbTls(s)) => format!("SbTls symbol #{s}"),
+        Some(SymKind::SbTable) => "SbTable".to_string(),
+        Some(SymKind::SbHost(n)) => format!("SbHost {n}"),
+        Some(SymKind::Note(n)) => format!("Note {n}"),
+        Some(SymKind::Made(v)) => format!("Made of symbol #{v}"),
+        None => "no kind recorded".to_string(),
+    };
+    format!("symbol #{y} {name}")
+}
+
+fn slot_name(u: &Unit, id: u32) -> String {
+    let name = if (id as usize) < u.fns.len() { &u.fns[id as usize].name } else { "?" };
+    format!("slot #{id} {name}")
+}
+
+fn origin_name(u: &Unit, at: u64) -> &'static str {
+    if let Some(o) = u.code.read().unwrap_or_else(|e| e.into_inner()).digest_origin_at(at) {
+        return o.name();
+    }
+    UNNOTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&at).copied()).unwrap_or("no origin recorded")
+}
+
+/// Called only for an unresolved digest while tracing; no diagnostic work on the count path.
+fn unknown_digest<I: Ids + ?Sized>(u: &Unit, r: &mut Resolver<'_, I>, g: &Dg, at: u64) -> String {
+    match g {
+        Dg::Unknown => format!("recorded unknown; origin: {}", origin_name(u, at)),
+        Dg::Taken(d) => format!("unresolved {}", r.first_unresolved(d).unwrap_or_else(|| "(no unresolved name found)".to_string())),
+        Dg::Resolved(_) => "resolved".to_string(),
+    }
 }
 
 /// Classes each install: changed (its own digest differs), a host (its own is equal, and a body
 /// its running code copied changed or is unknown), digest-equal (dropped by the gate), unknown.
-fn classify<I: Ids + ?Sized>(_u: &Unit, r: &mut Resolver<'_, I>, builds: &[(u32, Option<Arc<CodeDigest>>, Option<Arc<CodeDigest>>)]) -> (String, Vec<(String, u32)>) {
+fn classify<I: Ids + ?Sized>(u: &Unit, r: &mut Resolver<'_, I>, builds: &[(u32, CodeVersion, CodeVersion)], lowered: &HashMap<u32, Lowered>) -> (String, Vec<(String, u32)>) {
     let traced = gate_trace();
     // the new digest of each body this patch's code took in, its own and its copies' (two
     // different ones: unknown)
     let mut new_of: HashMap<u32, Option<u128>> = HashMap::new();
-    let mut put = |s: u32, v: Option<u128>| {
+    let mut new_unknown = HashMap::new();
+    let mut put = |s: u32, g: &Dg, at: u64| {
+        let v = r.resolve(g);
         if s == NO_SLOT {
             return;
+        }
+        if traced && v.is_none() {
+            new_unknown.entry(s).or_insert_with(|| format!("new digest for {}: {}", slot_name(u, s), unknown_digest(u, r, g, at)));
         }
         let e = new_of.entry(s).or_insert(v);
         if *e != v {
             *e = None;
+            if traced {
+                new_unknown.entry(s).or_insert_with(|| format!("two different new digests for {}", slot_name(u, s)));
+            }
         }
     };
-    for (id, _, new) in builds {
+    for (id, _, (at, new)) in builds {
         if let Some(n) = new {
-            put(*id, r.resolve(&n.own));
+            put(*id, &n.own, *at);
             for (s, g, _) in n.ctx.iter() {
-                put(*s, r.resolve(g));
+                put(*s, g, *at);
             }
         }
     }
     let (mut d, mut h, mut hu, mut c, mut un) = (0, 0, 0, 0, 0);
     let mut names = Vec::new();
-    for (id, old, new) in builds {
+    for (id, (old_at, old), (new_at, new)) in builds {
         let own = match (old, new) {
             (Some(o), Some(n)) => (r.resolve(&o.own), r.resolve(&n.own)),
             _ => (None, None),
@@ -509,11 +833,42 @@ fn classify<I: Ids + ?Sized>(_u: &Unit, r: &mut Resolver<'_, I>, builds: &[(u32,
                 let o = old.as_ref().unwrap();
                 let mut changed = false;
                 let mut unknown = false;
+                let mut reason = None;
                 for (s, g, _) in o.ctx.iter() {
                     match (r.resolve(g), new_of.get(s)) {
-                        _ if *s == NO_SLOT => unknown = true,
-                        (None, _) | (_, Some(None)) => unknown = true,
+                        _ if *s == NO_SLOT => {
+                            unknown = true;
+                            if traced && reason.is_none() { reason = Some("a context without a slot".to_string()); }
+                        }
+                        (None, _) => {
+                            unknown = true;
+                            if traced && reason.is_none() { reason = Some(unknown_digest(u, r, g, *old_at)); }
+                        }
+                        (_, Some(None)) => {
+                            unknown = true;
+                            if traced && reason.is_none() { reason = Some(new_unknown.get(s).cloned().unwrap_or_else(|| format!("no new digest for {}", slot_name(u, *s)))); }
+                        }
                         (Some(a), Some(Some(b))) if a != *b => changed = true,
+                        // no code of this patch took it in: its lowering from the new text decides
+                        (Some(a), None) => match lowered.get(s) {
+                            Some(Ok(b)) => match r.resolve(&Dg::Taken(b.clone())) {
+                                Some(x) if x != a => changed = true,
+                                Some(_) => {}
+                                None => {
+                                    unknown = true;
+                                    if traced && reason.is_none() { reason = Some(format!("{} lowered now: unresolved {}", slot_name(u, *s), r.first_unresolved(b).unwrap_or_else(|| "(no unresolved name found)".to_string()))); }
+                                }
+                            },
+                            Some(Err(e)) => {
+                                unknown = true;
+                                if traced && reason.is_none() { reason = Some(format!("{} not lowered: {e}", slot_name(u, *s))); }
+                            }
+                            // (the check lowers every context the patch built nothing for)
+                            None => {
+                                unknown = true;
+                                if traced && reason.is_none() { reason = Some(format!("{} built by this patch without a digest", slot_name(u, *s))); }
+                            }
+                        },
                         _ => {}
                     }
                 }
@@ -523,6 +878,10 @@ fn classify<I: Ids + ?Sized>(_u: &Unit, r: &mut Resolver<'_, I>, builds: &[(u32,
                 } else if unknown {
                     h += 1;
                     hu += 1;
+                    if let Some(reason) = reason {
+                        names.push((format!("host (unknown context: {reason})"), *id));
+                        continue;
+                    }
                     "host (unknown context)"
                 } else {
                     d += 1;
@@ -531,6 +890,16 @@ fn classify<I: Ids + ?Sized>(_u: &Unit, r: &mut Resolver<'_, I>, builds: &[(u32,
             }
             _ => {
                 un += 1;
+                if traced {
+                    let reason = match (old, new) {
+                        (None, _) => format!("running code has no digest; origin: {}", origin_name(u, *old_at)),
+                        (_, None) => format!("new code has no digest; origin: {}", origin_name(u, *new_at)),
+                        (Some(o), _) if own.0.is_none() => format!("running code: {}", unknown_digest(u, r, &o.own, *old_at)),
+                        (_, Some(n)) => format!("new code: {}", unknown_digest(u, r, &n.own, *new_at)),
+                    };
+                    names.push((format!("unknown ({reason})"), *id));
+                    continue;
+                }
                 "unknown"
             }
         };

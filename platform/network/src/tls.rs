@@ -877,6 +877,10 @@ mod platform {
         pub fn tcp(&self) -> &TcpStream {
             &self.tcp
         }
+        /// Decrypted bytes not read yet: a read returns them without the socket.
+        pub fn buffered(&self) -> usize {
+            self.plain.len().saturating_sub(self.at)
+        }
         pub fn shutdown(&mut self) {
             let bye = self.session.close();
             let _ = self.tcp.write_all(&bye);
@@ -961,6 +965,9 @@ mod platform {
     impl ServerStream {
         pub fn tcp(&self) -> &TcpStream {
             &self.0
+        }
+        pub fn buffered(&self) -> usize {
+            0
         }
         pub fn shutdown(&mut self) {}
     }

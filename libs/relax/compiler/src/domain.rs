@@ -18,7 +18,7 @@
 //!   data) are rebased, words that point into shared read-only data stay. The attribution of
 //!   words and the image bytes are the sandbox's (`sandbox::provenance_words`, `initial_bytes`):
 //!   the same "one data image, pointers relocated per copy" machinery, a second client.
-//! - A static laid out after a domain exists is copied into every live block (`materialize`).
+//! - A late static is copied into the live blocks that use its unit's layout (`materialize`).
 //! - Threads: a thread JIT code starts inherits its parent's base (std's thread start calls
 //!   `relax_domain_base` / `relax_domain_enter`); `call_jit` runs in the unit's domain 0; a
 //!   thread that native code starts gets the runtime unit's compile domain from `rt_tls_block`,
@@ -163,8 +163,9 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     new
 }
 
-/// Blocks of the domains other than the compile domain, by base.
-static BLOCKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Each block made by `create` and its creating unit's compile-domain base. Only that unit's
+/// symbols describe the statics at offsets in the block.
+static BLOCKS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Bytes of a domain block (the unit's writable region; a block is address space until touched).
 pub const BLOCK_SIZE: usize = crate::jit::UNIT_RW_SIZE as usize;
@@ -185,14 +186,42 @@ pub fn current() -> u64 {
 
 /// Puts the calling thread in the domain whose block is `base`; returns the one it was in.
 pub fn enter(base: u64) -> u64 {
-    let slot = crate::jit::tls_block() as *mut u64;
     register_current(base);
+    select(base)
+}
+
+/// Switches the static block and heap together, preserving the thread's registrations.
+pub(crate) fn select(base: u64) -> u64 {
+    let slot = crate::jit::tls_block() as *mut u64;
     let heap = domains().iter().find(|d| d.info.base == base && base != 0)
         .and_then(|d| d.heap.as_deref()).map_or(std::ptr::null(), |h| h as *const _);
     unsafe {
         crate::zone_alloc::domain::enter(heap);
         std::mem::replace(&mut *slot, base)
     }
+}
+
+/// An initializer borrows the compiler thread. Its scope owns only a registration it added.
+pub(crate) fn enter_initializer(base: u64, previous: u64) -> impl Drop {
+    struct Initializer {
+        base: u64,
+        previous: u64,
+        token: u64,
+        _thread: std::marker::PhantomData<*mut ()>,
+    }
+    impl Drop for Initializer {
+        fn drop(&mut self) {
+            if current() != self.previous { select(self.previous); }
+            if self.token != 0 {
+                let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+                t.registrations.retain(|&r| r != (self.base, self.token));
+                thread_finished(self.base, self.token);
+            }
+        }
+    }
+    let scope = Initializer { base, previous, token: register_current(base), _thread: std::marker::PhantomData };
+    if base != previous { select(base); }
+    scope
 }
 
 /// A domain's code as something native calls it back with (`foreign_scope`): its static block
@@ -348,11 +377,11 @@ pub extern "C" fn relax_domain_enter(base: u64, token: u64) {
     })
 }
 
-fn register_current(base: u64) {
-    if base == 0 { return; }
+fn register_current(base: u64) -> u64 {
+    if base == 0 { return 0; }
     let _kept = crate::zone_alloc::kept();
     let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
-    if t.registrations.iter().any(|r| r.0 == base) { return; }
+    if t.registrations.iter().any(|r| r.0 == base) { return 0; }
     let token = relax_domain_reserve(base);
     if token != 0 {
         t.registrations.push((base, token));
@@ -364,6 +393,7 @@ fn register_current(base: u64) {
             }
         }
     }
+    token
 }
 
 static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -438,8 +468,8 @@ pub extern "C" fn relax_domain_name(name: *const u8) {
     })
 }
 
-/// Called after the TLS block and every Relax std TLS destructor are finished (also on a
-/// failed OS spawn, while the parent still holds its own registration).
+/// Releases one reservation when a thread finishes its TLS destructors, its spawn fails, or
+/// the initializer that reserved it returns. The last release can complete domain teardown.
 pub extern "C" fn thread_finished(base: u64, token: u64) {
     crate::jit::host_boundary("thread_finished", move || {
         if token == 0 { return; }
@@ -488,6 +518,61 @@ fn materialize_in(u: &Unit, base: u64, sym: u32, seen: &mut HashSet<u32>) {
     }
 }
 
+/// The statics of the definitions `ours` takes whose bytes in the compile domain (domain 0) are no
+/// longer their initial images, counting the writable blocks and data each points to: how many
+/// statics, and every symbol whose bytes differ (`restore_initial` writes them back). A live test
+/// session's rerun reads it (harness_live.rs `fresh_statics`). Domain 0's images already hold its
+/// own addresses, so no word needs rebasing.
+pub(crate) fn changed_statics(u: &Unit, ours: impl Fn(crate::program::DefId) -> bool) -> (usize, Vec<u32>) {
+    let ids: Vec<u32> = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    let mut seen = HashSet::new();
+    let mut syms = Vec::new();
+    let mut statics = 0;
+    for id in ids {
+        if matches!(u.syms.kind(id), Some(SymKind::Static(d)) if ours(d)) && changed_in(u, id, &mut seen, &mut syms) {
+            statics += 1;
+        }
+    }
+    (statics, syms)
+}
+
+/// `changed_statics` of one symbol and the writable storage its image points to (a static it
+/// names is its own entry): whether any of it differs.
+fn changed_in(u: &Unit, sym: u32, seen: &mut HashSet<u32>, syms: &mut Vec<u32>) -> bool {
+    if !seen.insert(sym) {
+        return false;
+    }
+    let Some(own) = offset_of(u, Sym::new(sym)) else { return false };
+    let Ok(bytes) = initial_bytes(u, sym) else { return false };
+    let now = unsafe { std::slice::from_raw_parts((u.syms.dom0() + own) as *const u8, bytes.len()) };
+    let mut changed = now != &bytes[..];
+    if changed {
+        syms.push(sym);
+    }
+    for (_, t) in provenance_words(u, &bytes) {
+        if !matches!(u.syms.kind(t.id), Some(SymKind::Static(_))) {
+            changed |= changed_in(u, t.id, seen, syms);
+        }
+    }
+    changed
+}
+
+/// Writes the initial images of `syms` (`changed_statics`) back into the compile domain. The
+/// caller makes sure no thread runs in it.
+pub(crate) fn restore_initial(u: &Unit, syms: &[u32]) {
+    for &sym in syms {
+        let (Some(own), Ok(bytes)) = (offset_of(u, Sym::new(sym)), initial_bytes(u, sym)) else { continue };
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (u.syms.dom0() + own) as *mut u8, bytes.len()) };
+    }
+}
+
+/// The threads the domain whose block is at `base` counts on besides the one whose OS id is
+/// `but` (a live test session's harness): their names. One reserved and not started yet counts.
+pub(crate) fn threads_besides(base: u64, but: u64) -> Vec<String> {
+    domains().iter().find(|d| d.info.base == base)
+        .map_or_else(Vec::new, |d| d.threads.iter().filter(|t| t.os_id != but).map(|t| t.name.clone()).collect())
+}
+
 /// Makes a new domain's block: reserved once (it never moves), holding the initial image of
 /// every static laid out so far. Returns its base.
 pub fn create(u: &Unit) -> u64 {
@@ -500,7 +585,7 @@ pub fn create(u: &Unit) -> u64 {
     }
     {
         let _kept = crate::zone_alloc::kept();
-        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((base, u.syms.dom0()));
     }
     base
 }
@@ -511,22 +596,24 @@ pub fn destroy(base: u64) {
         let _ = sc.base.compare_exchange(base, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
     }
     forget_tls_keys(base);
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| *b != base);
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(b, _)| b != base);
     if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
-/// A static was just laid out (jit.rs `static_addr`, after its initial image was captured): copy
-/// it into the live blocks. No other domain: nothing to do.
+/// Copies a newly captured image into this unit's live blocks. Another unit can have an
+/// unrelated static at the same offset, including while a live edit runs its proc macros.
 pub(crate) fn materialize(u: &Unit, sym: Sym) {
     let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    for &base in blocks.iter() {
-        materialize_in(u, base, sym.id, &mut HashSet::new());
+    for &(base, owner) in blocks.iter() {
+        if owner == u.syms.dom0() {
+            materialize_in(u, base, sym.id, &mut HashSet::new());
+        }
     }
 }
 
 /// The live blocks other than domain 0 (tests, inspect).
 pub fn blocks() -> Vec<u64> {
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(base, _)| base).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1753,6 +1840,16 @@ pub fn wait_thread_done(id: DomainId) {
 
 /// The host starts an app as a domain of the program `makepad run` booted (`start` on its unit).
 pub fn start_prepared_in_run(spec: AppSpec, id: DomainId) -> Result<DomainId, Vec<String>> {
+    // the run's boot, handed to its app domain's load, is over when this returns or unwinds: the
+    // program started, or it will not (run.rs BOOT_IN_DOMAIN). Only the run's end clears the app
+    // domain, and it waits for this.
+    struct BootOver(DomainId);
+    impl Drop for BootOver {
+        fn drop(&mut self) {
+            if crate::run::app_domain() == Some(self.0) { crate::run::domain_boot_over(); }
+        }
+    }
+    let _boot = BootOver(id);
     let up = crate::run::running_unit();
     if up.is_null() { let _loading = Loading(id); return fail(id, vec!["no program is running".into()]); }
     start_prepared(up, spec, id)
@@ -1770,7 +1867,7 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
 unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd).len();
+    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd, u.prog.std_overflow_checks).len();
     let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
     let mut crate_of = vec![u32::MAX; g.crates.len()];
     let mut batch_of = vec![usize::MAX; g.crates.len()];
@@ -1927,13 +2024,96 @@ mod tests {
     use crate::jit::FnKey;
     use crate::program::DefId;
 
+    /// A host worker's call into a domain (Callback::call, jit::domain_callback) runs on a block
+    /// and a registration of its own; after it the worker is back in the domain it was in, with
+    /// no registration there it did not have and none left in the domain it called.
+    #[test]
+    fn a_host_callback_leaves_the_worker_as_it_found_it() {
+        isolated_test!(a_host_callback_leaves_the_worker_as_it_found_it);
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (0x7100_0000u64, 0x7200_0000u64);
+        // two running domains, booted on threads that end; b is an app domain (id 0 calls direct)
+        for (name, base) in [("a", a), ("b", b)] {
+            std::thread::spawn(move || register_boot(name, base)).join().unwrap();
+        }
+        domains().iter_mut().find(|d| d.info.base == b).unwrap().info.id = 7;
+        std::thread::spawn(move || {
+            let registered = |base: u64| unsafe { crate::domain_threads::data(crate::jit::tls_block()) }.registrations.iter().any(|r| r.0 == base);
+            select(b);
+            let into_b = callback().expect("b is a running domain");
+            // the worker is in a, which it only selected (a native worker's domain)
+            select(a);
+            assert_eq!(into_b.call(current), Some(b), "the call runs in b");
+            assert_eq!(current(), a, "the worker is back in a");
+            assert!(!registered(a), "the call's return registered the worker in a");
+            assert!(!registered(b) && threads_besides(b, 0).is_empty(), "the call's registration in b ended with it");
+        }).join().unwrap();
+        domains().retain(|d| d.info.base != a && d.info.base != b);
+    }
+
+    #[test]
+    fn initializer_scopes_only_retire_their_own_registration() {
+        isolated_test!(initializer_scopes_only_retire_their_own_registration);
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 0x7000_0000;
+        let saved = current();
+        register_boot("fixture", base);
+        let harness = crate::inspect::threads::self_os_id();
+        std::thread::spawn(move || {
+            let previous = current();
+            let count = || threads_besides(base, harness).len();
+            {
+                let _outer = enter_initializer(base, previous);
+                assert_eq!(current(), base);
+                assert_eq!(count(), 1, "outer initializer owns one reservation");
+                {
+                    let _inner = enter_initializer(base, base);
+                    assert_eq!(count(), 1, "nested initializer shares the reservation");
+                }
+                assert_eq!(current(), base);
+                assert_eq!(count(), 1, "outer initializer is still running");
+            }
+            assert_eq!(current(), previous);
+            assert_eq!(count(), 0, "return releases the outer reservation");
+
+            let panic = std::panic::catch_unwind(|| {
+                let _scope = enter_initializer(base, previous);
+                panic!("unwind through the initializer");
+            });
+            assert!(panic.is_err());
+            assert_eq!(current(), previous);
+            assert_eq!(count(), 0, "unwinding releases the reservation");
+
+            select(base);
+            {
+                let _scope = enter_initializer(base, base);
+                assert_eq!(count(), 1, "an already selected domain can still need a reservation");
+            }
+            assert_eq!(count(), 0, "the scope owned that reservation");
+            { let _scope = enter_initializer(previous, base); }
+            assert_eq!(current(), base);
+            assert_eq!(count(), 0, "restoring a selected domain must leave it unregistered");
+            enter(base);
+            { let _scope = enter_initializer(base, base); }
+            assert_eq!(count(), 1, "a plain entry lasts until thread exit");
+        }).join().unwrap();
+        assert!(threads_besides(base, harness).is_empty(), "the worker's TLS retired its plain entry");
+        select(saved);
+        let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+        t.registrations.retain(|&(b, _)| b != base);
+        domains().retain(|d| d.info.base != base);
+    }
+
     /// Two domains on the same compiled code: each has its own statics, a pointer inside a static
     /// image points into its own block, a static laid out after a domain exists is copied into it.
     #[test]
     fn domains_have_their_own_statics() {
         isolated_test!(domains_have_their_own_statics);
         let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let sess = &std::sync::Arc::new(crate::Session::default());
+        // initializers run as code (no CTFE), each through call_jit_initializer on this thread
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let sess = &std::sync::Arc::new(session);
         let root = std::env::temp_dir().join(format!("relax-domains-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("fixture.rs");
@@ -1962,12 +2142,20 @@ mod tests {
             out
         };
         let dom0 = u.syms.dom0();
+        let start = current();
+        // the unit's domain as a booted program's (a thread that enters it takes a reservation),
+        // booted on a thread that ends: this one starts outside it
+        std::thread::spawn(move || register_boot("fixture", dom0)).join().unwrap();
+        let registered = |base: u64| unsafe { crate::domain_threads::data(crate::jit::tls_block()) }.registrations.iter().any(|r| r.0 == base);
+        assert!(!registered(dom0), "this thread starts outside the unit's domain");
         // the statics exist (and have offsets) before the second domain is made
         for d in [counter, cell, pcell] {
             let s = u.static_sym(d);
             assert!(u.syms.value(s) > 0 && u.syms.value(s) < BLOCK_SIZE as u64, "an offset, not an address");
             assert_eq!(u.syms.addr(s), dom0 + u.syms.value(s));
         }
+        // their initializers ran in dom0 on this thread, each registering it for its call only
+        assert!(!registered(dom0), "an initializer's call left this thread registered in the unit's domain");
         let (e_bump, e_through) = (entry(&mut u, bump), entry(&mut u, through));
         assert_eq!(call(dom0, e_bump), 6);
         let b = create(&u);
@@ -1998,11 +2186,15 @@ mod tests {
         assert_eq!(call(b, e_late), 42);
         assert_eq!(call(dom0, e_late), 42);
         // the thread is back in the domain it was in
-        assert_eq!(current(), dom0);
-        assert_eq!(enter(b), dom0);
+        assert_eq!(current(), start);
+        assert_eq!(enter(b), start);
         assert_eq!(enter(dom0), b);
         destroy(b);
         assert!(!blocks().contains(&b));
+        select(start);
+        let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+        t.registrations.retain(|&(r, _)| r != dom0);
+        domains().retain(|d| d.info.base != dom0);
         std::fs::remove_dir_all(root).unwrap();
     }
 

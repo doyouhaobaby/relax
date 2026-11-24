@@ -702,12 +702,70 @@ fn a_front_made_after_a_patch_of_its_file_is_taken() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A closure's front lowers it from its parent's checked body, and its take refuses a lowering
+/// from a body the parent no longer has. The take of the parent's own lowering made ahead puts the
+/// body that lowering came from (a new one), and the closure's next front found the old lowering,
+/// said "already lowered" and counted as made: the tries went to a front no take could use, and
+/// the O3 build of a hot caller left the closure out ("made, and needed again": 109 of 114
+/// left-out lines of the runs of a scenario test of a large app, 11-20).
+#[test]
+fn a_closure_front_from_its_parents_old_body_is_made_again() {
+    isolated_test!(a_closure_front_from_its_parents_old_body_is_made_again);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-closure-old-body-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, HINTED_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "closure_old_body", false).unwrap();
+    let fit_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "fit").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    enable_pipelining(&u.prog.session.options);
+    // fit's build makes the closure's slot
+    let (fit, closure) = crate::owner::call(crate::owner::Class::Program, || {
+        let u = unsafe { &mut *up };
+        let fit = u.fn_id(FnKey::Inst(fit_d, Vec::new()));
+        unsafe { compile_fn(up, fit) }.unwrap();
+        (fit, (0..u.fns.len() as u32).find(|&id| matches!(u.fns[id as usize].key, FnKey::Closure(_, _, p) if p == fit)))
+    });
+    let closure = closure.expect("fit's closure has a slot");
+    let front = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).front.clone() });
+    assert!(prefront_slot(&front, closure), "the closure's first front was not made off the owner");
+    // fit's lowering made ahead is taken: the parent's body is the new one that lowering came from
+    crate::owner::call(crate::owner::Class::Program, || {
+        let u = unsafe { &mut *up };
+        let FnKey::Closure(cfile, _, _) = u.fns[closure as usize].key else { unreachable!() };
+        let checked = crate::typeck::try_codegen_body(&u.prog, &u.tcx, fit_d, &[]).expect("fit's body is checked");
+        assert_eq!(checked.file, cfile, "the fixture: the closure is in fit's body");
+        let again = std::sync::Arc::new((*checked).clone());
+        assert!(u.body_of(fit, cfile).is_none_or(|b| !std::sync::Arc::ptr_eq(b, &again)), "the fixture: fit's body is a new one");
+        u.put_body(fit, again);
+    });
+    assert!(prefront_slot(&front, closure), "the closure's front was not made off the owner after its parent's new body");
+    let taken = crate::owner::call(crate::owner::Class::Program, || unsafe { take_lowered_ahead(&mut *up, closure).is_some() });
+    assert!(taken, "the closure's front after its parent's new body was refused at its take: lowered from the old body");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A hot fn whose O3 take gives way for a cause that lasts (TAKE_GIVES_WAY stands in for one: a
 /// front never made off the owner, a wait that never ends) is tried again once per change, not
 /// once per call. A take that gave way counted the slot again from the cost it had, over the
 /// threshold, so its next call queued it for the same take: a live session's O3 workers ran ~68
 /// builds a second for minutes with nothing edited (11-17). A build on the owner or an edit is a
-/// change: one more take each.
+/// change: one more take each. A slot in flight is no such cause: a take that meets one waits for
+/// its end off the owner and builds.
 #[test]
 fn a_take_that_gives_way_waits_for_a_change() {
     isolated_test!(a_take_that_gives_way_waits_for_a_change);
@@ -783,6 +841,36 @@ fn a_take_that_gives_way_waits_for_a_change() {
     assert_eq!(state(), T_QUEUED, "one take per change: twice waits for the next one");
     rearm_bailed(up);
     assert_eq!(state(), T_QUEUED, "nothing changed since: twice still waits");
+    // a take that meets a slot in flight (a candidate's preparation waiting for another thread's
+    // back end) waits for that flight's end off the owner and takes again: it builds, rather than
+    // give way and wait for an unrelated change ("gave way on a wait again")
+    TAKE_GIVES_WAY.store(u32::MAX, Ordering::Relaxed);
+    let m = crate::owner::call(crate::owner::Class::Program, || u.fn_id(FnKey::Inst(main, Vec::new())));
+    *TAKE_MEETS_FLIGHT.lock().unwrap() = Some((id, m));
+    let waits = || crate::owner::BAILS[3].load(Ordering::Relaxed);
+    let waits0 = waits();
+    struct P(*mut Unit);
+    unsafe impl Send for P {}
+    let p = P(up);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let p = p;
+        let me = crate::waits::me();
+        crate::owner::call(crate::owner::Class::Program, || unsafe { begin_flight(p.0, m, me, &[m]) });
+        tx.send(()).unwrap();
+        // the flight ends once the take gave the owner back for it (bounded: a take that never
+        // waits is the failure below, not a hang)
+        let t0 = std::time::Instant::now();
+        while waits() == waits0 && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::owner::call(crate::owner::Class::Program, || unsafe { end_flight(p.0, &[m]) });
+    });
+    rx.recv().unwrap();
+    assert!(unsafe { compile_tier1(up, id) }, "twice's take met a slot in flight: it waited for the flight's end and built");
+    holder.join().unwrap();
+    assert_eq!(waits(), waits0 + 1, "the take met the flight once (a wait bail), then took again after its end");
+    *TAKE_MEETS_FLIGHT.lock().unwrap() = None;
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
@@ -798,7 +886,9 @@ fn main() {
 
 /// A hot fn edited mid-run counts its calls again, in front of its patch's code, and returns to O3
 /// within its normal count: whether the edit found it counting, at O3, in its counted (PGO)
-/// window, or with its O3 take running. A patch left a slot marked queued (O3 code, a counted
+/// window, with its O3 take running, or final by the verdict an earlier run stored (which the
+/// settled state's periodic look counts again at a raised bar, final again unless its rate rose
+/// to it, where it counts a slot this run made final again at the threshold). A patch left a slot marked queued (O3 code, a counted
 /// window, a take) with its count stub gone, and a take it dropped left its slot the same: their
 /// calls were never counted again, and a live app's edited draw ran O1 code for the rest of the
 /// run (11-17).
@@ -903,6 +993,69 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     queue_again();
     assert!(unsafe { compile_tier1(up, id) }, "hot gets O3 code after its dropped take");
     assert_eq!(run(), 10);
+    // final by the verdict an earlier run stored (a warm launch linking its code: never hot): the
+    // settled state's periodic look counts it again at STORED_RISE x the threshold, and its sweep
+    // makes it final again, the marks kept; edited while final, the settle's re-arm for the patch
+    // counts it again, in front of the patch's code. A warm session re-decided its stored tiers at
+    // the periodic look's second every launch, and built a few dozen O3s then
+    edit("= 10;", "= 11;");
+    counting("at O3, then edited before its stored verdict");
+    let w5 = || unsafe { (*rec.add(5)).load(Ordering::Relaxed) };
+    let final_now = |what: &str| crate::owner::call(crate::owner::Class::Program, || unsafe {
+        let u = &*up;
+        assert_eq!((*rec.add(3)).load(Ordering::Acquire), T_FINAL, "{what}: hot is final");
+        assert_eq!(SlotWord::of(&u.slots, id).load(Ordering::SeqCst), (*rec.add(1)).load(Ordering::Relaxed), "{what}: hot's slot calls its code, no count stub");
+    });
+    let rearm = |periodic: bool| crate::owner::call(crate::owner::Class::Program, || unsafe { settle_rearm_all(up, periodic) });
+    let stored = |v: crate::cache::TierVerdict| crate::owner::call(crate::owner::Class::Program, || unsafe { stored_tier_verdict(&*up, id, v, false) });
+    stored(crate::cache::TierVerdict::None);
+    final_now("its stored verdict: never hot");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), STORED_FINAL, "a never-hot verdict marks hot final by a stored verdict, not parked");
+    let (_, recounted, _) = rearm(true);
+    assert!(recounted >= 1, "the periodic look counts hot among the stored decisions it recounts");
+    counting("the periodic look over a stored verdict");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED | STORED_RECOUNT), STORED_FINAL | STORED_RECOUNT, "a recount keeps the stored marks");
+    // half a threshold over it: the check of its next call (rt_hot's) leaves it counting
+    unsafe { tier_charge(rec, threshold + threshold / 2) };
+    let (now, wall) = tier_clocks();
+    assert_eq!(unsafe { tier_check(rec, threshold, now, wall) }, None, "a recount half a threshold over it counts on");
+    let cost = counting("over the threshold, under a recount's bar");
+    assert!(cost >= threshold, "the recount's cost is over the threshold: {cost} of {threshold}");
+    assert_eq!(w5() & STORED_FINAL, STORED_FINAL, "a cost under the raised bar reopens nothing");
+    assert!(crate::owner::call(crate::owner::Class::Program, || unsafe { settle_recount_end(&*up, id) }), "the sweep ends the recount");
+    final_now("a recount under its bar");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED | STORED_RECOUNT), STORED_FINAL, "final again by its stored verdict");
+    // risen to the raised bar: its check queues it (rt_hot), the decision is this run's again
+    rearm(true);
+    counting("recounted again");
+    unsafe { tier_charge(rec, STORED_RISE * threshold + threshold) };
+    let (now, wall) = tier_clocks();
+    assert!(unsafe { tier_check(rec, threshold, now, wall) }.is_some(), "a recount over its bar is for the queue (rt_hot queues it)");
+    assert_eq!(w5() & (STORED_FINAL | STORED_RECOUNT), 0, "a rise clears the stored marks");
+    stored(crate::cache::TierVerdict::None);
+    final_now("its stored verdict again");
+    assert_eq!(run(), 11);
+    edit("= 11;", "= 12;");
+    let (n, _, _) = rearm(false);
+    assert!(n >= 1, "the settle's re-arm for a patch counts the stored decisions again");
+    counting("final by a stored verdict, then edited");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), 0, "counting again clears the stored marks");
+    assert_eq!(run(), 12);
+    // made final by this run's own counts: the periodic look counts it again
+    assert!(crate::owner::call(crate::owner::Class::Program, || unsafe { settle_final(&*up, id) }), "hot gets final from counting");
+    assert_eq!(w5() & STORED_FINAL, 0, "this run's decision is no stored one");
+    rearm(true);
+    counting("final by this run's counts, then the periodic look");
+    // parked by a stored verdict: final, its loops included, until a phase change re-arms it
+    stored(crate::cache::TierVerdict::Parked);
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), STORED_FINAL | STORED_PARKED, "a parked verdict marks hot parked and final by a stored verdict");
+    let (_, _, kept) = rearm(true);
+    assert!(kept >= 1, "the periodic look keeps a parked decision");
+    final_now("the periodic look over a parked verdict");
+    rearm(false);
+    counting("parked by a stored verdict, then new code reached");
+    assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), 0, "counting again clears the parked marks");
+    assert_eq!(run(), 12);
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();

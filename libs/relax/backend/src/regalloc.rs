@@ -931,7 +931,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     drop(live_in);
     let ranges = build_ranges(f, &reach, &tab, &block_start, &block_end, &live_out);
     drop(live_out);
-    let wts = block_weights(f, &reach, freq);
+    let wts = block_weights(options, f, &reach, freq);
     let aff = affinities(f, &reach, &block_start, &ranges, &wts);
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
     // base + k is recomputed at its uses: the base must be live (hold its one value) at each of
@@ -2809,18 +2809,28 @@ fn region_windows_alloc(
 ) {
     let nv = f.vregs.len();
     let nb = f.blocks.len();
-    let cand: Vec<bool> = (0..nv).map(|v| matches!(loc[v], Loc::Stack(_)) && f.vregs[v] == Cls::I && !remat[v].is_some()).collect();
-    if !cand.iter().any(|x| *x) {
+    // the candidates, numbered densely (ci: vreg -> its number)
+    let mut ci = vec![u32::MAX; nv];
+    let mut ncand = 0usize;
+    for v in 0..nv {
+        if matches!(loc[v], Loc::Stack(_)) && f.vregs[v] == Cls::I && !remat[v].is_some() {
+            ci[v] = ncand as u32;
+            ncand += 1;
+        }
+    }
+    if ncand == 0 {
         return;
     }
     // per candidate: blocks it is used in (count) and blocks that define it, with whether every
     // definition there leaves its result in a window's register (the emitters compute it there
     // through def_i, or copy it there in fin_i / the register-to-slot move): a block that redefines
-    // the value stays in its region (a loop-carried value, `pos = pos + 1` in the loop body)
-    let mut uses_in: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
-    let mut def_in: HashMap<(u32, u32), bool> = HashMap::new();
-    // (vreg, block) -> the definition positions in it
-    let mut def_at: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    // the value stays in its region (a loop-carried value, `pos = pos + 1` in the loop body).
+    // Lists per candidate in ascending block order, looked up by binary search: maps hashed by
+    // (vreg, block), probed per candidate x register x block, were most of this pass's time and
+    // half an O3 worker's in big functions (drum16's circuit sim: its hot code waited in baseline)
+    let mut uses_in: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ncand];
+    // (block, definition position, whether it leaves the result in the register)
+    let mut defs: Vec<Vec<(u32, u32, bool)>> = vec![Vec::new(); ncand];
     for (bi, b) in f.blocks.iter().enumerate() {
         if !reach[bi] {
             continue;
@@ -2828,14 +2838,20 @@ fn region_windows_alloc(
         let k0 = tab.first[bi] as usize;
         for k in 0..=b.insts.len() {
             for &u in tab.uses(k0 + k) {
-                if cand[u as usize] {
-                    *uses_in.entry(u).or_default().entry(bi as u32).or_insert(0) += 1;
+                let cu = ci[u as usize];
+                if cu != u32::MAX {
+                    let l = &mut uses_in[cu as usize];
+                    match l.last_mut() {
+                        Some(x) if x.0 == bi as u32 => x.1 += 1,
+                        _ => l.push((bi as u32, 1)),
+                    }
                 }
             }
             if k < b.insts.len() {
                 let ds = tab.defs(k0 + k);
                 for &d in ds {
-                    if cand[d as usize] {
+                    let cd = ci[d as usize];
+                    if cd != u32::MAX {
                         let i = &b.insts[k];
                         let ok = def_regions
                             && ds.len() == 1
@@ -2844,9 +2860,7 @@ fn region_windows_alloc(
                                 Inst::IBin(..) | Inst::IBinI(..) | Inst::Load(Mem::Int(..), ..) | Inst::LoadX(Mem::Int(..), ..) | Inst::Conv(Conv::IntToInt(_), ..) => true,
                                 _ => false,
                             };
-                        let e = def_in.entry((d, bi as u32)).or_insert(true);
-                        *e &= ok;
-                        def_at.entry((d, bi as u32)).or_default().push(block_start[bi] + 2 * k as u32 + 1);
+                        defs[cd as usize].push((bi as u32, block_start[bi] + 2 * k as u32 + 1, ok));
                     }
                 }
             }
@@ -2864,26 +2878,61 @@ fn region_windows_alloc(
     let depth = if edge_loads { loop_depths(f, reach) } else { Vec::new() };
     let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
     let min_blocks = if edge_loads { 1 } else { 2 };
-    let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= min_blocks)).collect();
-    // weighted uses, computed once (the comparator summed every use block per comparison)
-    let mut heat: HashMap<u32, f32> = HashMap::with_capacity(order.len());
+    let mut order: Vec<u32> = (0..nv as u32).filter(|v| ci[*v as usize] != u32::MAX && uses_in[ci[*v as usize] as usize].len() >= min_blocks).collect();
+    // weighted uses, computed once (the comparator summed every use block per comparison), in
+    // block order (a hashed map's order made the sum, and so ties in this order, vary by run)
+    let mut heat = vec![0f32; ncand];
     for &v in &order {
-        heat.insert(v, uses_in[&v].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum());
+        let cv = ci[v as usize] as usize;
+        heat[cv] = uses_in[cv].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum();
     }
-    order.sort_by(|a, b| heat[b].partial_cmp(&heat[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+    order.sort_by(|a, b| heat[ci[*b as usize] as usize].partial_cmp(&heat[ci[*a as usize] as usize]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
     let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
+    // an eligible block of the value at hand: its pieces, its definitions (a range of its list),
+    // and what does not depend on the register
+    struct Elig {
+        b: u32,
+        piece: usize,
+        defs: (usize, usize),
+        // entered live (from the block start)
+        entered: bool,
+        used: bool,
+        // a call over its live part (a caller-saved register cannot hold it)
+        call: bool,
+        // no use, no definition (or a skippable block): dropped when it would load for nothing
+        idle: bool,
+    }
+    let mut elig: Vec<Elig> = Vec::new();
+    // per block: its index in `elig` (valid for the value at hand's eligible blocks)
+    let mut eidx = vec![0u32; nb];
+    // per block: in the register's set when equal to `epoch`
+    let mut mark = vec![0u32; nb];
+    let mut epoch = 0u32;
+    let mut set: Vec<u32> = Vec::new();
+    let mut used_elig: Vec<usize> = Vec::new();
+    let mut queue: Vec<u32> = Vec::new();
+    let mut at_end: Vec<u32> = Vec::new();
+    let (mut plan, mut edge): (Vec<(u32, bool)>, Vec<u32>) = (Vec::new(), Vec::new());
+    let (mut best_plan, mut best_edge): (Vec<(u32, bool)>, Vec<u32>) = (Vec::new(), Vec::new());
+    // per block the value at hand is live in: (block, its live pieces there: a range of `pp`)
+    let mut pieces: Vec<(u32, usize, usize)> = Vec::new();
+    let mut pp: Vec<(u32, u32)> = Vec::new();
+    let live_in = |b: u32, ps: &[(u32, u32)]| ps.first().map_or(false, |x| x.0 == block_start[b as usize]);
     for v in order {
+        let cv = ci[v as usize] as usize;
+        let (ul, dl) = (&uses_in[cv], &defs[cv]);
         let rv = ranges.of(v);
-        // per block the value is live in: its live pieces there
-        let mut pieces: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
+        pieces.clear();
+        pp.clear();
         for &(a, z) in rv {
             let mut p = a;
             loop {
                 let b = block_of(p);
                 let e = z.min(block_end[b]);
+                pp.push((p, e));
                 match pieces.last_mut() {
-                    Some((lb, ps)) if *lb == b as u32 => ps.push((p, e)),
-                    _ => pieces.push((b as u32, vec![(p, e)])),
+                    Some(x) if x.0 == b as u32 => x.2 = pp.len(),
+                    _ => pieces.push((b as u32, pp.len() - 1, pp.len())),
                 }
                 if e >= z || b + 1 >= nb {
                     break;
@@ -2891,52 +2940,76 @@ fn region_windows_alloc(
                 p = block_start[b + 1];
             }
         }
-        let live_in = |b: u32, ps: &Vec<(u32, u32)>| ps.first().map_or(false, |x| x.0 == block_start[b as usize]);
-        // pieces are in ascending block order: a block's pieces by binary search (a linear find
-        // per lookup made big O3 functions quadratic: 43-49% of arm64 O3 worker time, ARM64CG3)
-        let piece_of = |b: u32| pieces.binary_search_by_key(&b, |x| x.0).ok().map(|k| &pieces[k].1);
         // a block that defines the value: in a region only when every definition there leaves the
-        // result in the register
-        let elig: Vec<(u32, &Vec<(u32, u32)>)> = pieces
-            .iter()
-            .filter(|(b, ps)| {
-                reach[*b as usize]
-                    && match def_in.get(&(v, *b)) {
-                        None => live_in(*b, ps),
-                        Some(ok) => *ok,
-                    }
-            })
-            .map(|(b, ps)| (*b, ps))
-            .collect();
-        // one block is enough when its entry loads move into its predecessors (a single-block
-        // loop: the loop's own edge holds the value): the gain decides
-        if elig.len() < if edge_loads { 1 } else { 2 } {
-            continue;
-        }
-        let used = &uses_in[&v];
-        // (gain, register, plan: (block, loads at its start), predecessors that load at their end)
-        let mut best: Option<(f32, u8, Vec<(u32, bool)>, Vec<u32>)> = None;
-        for &c in &regs {
-            let callee = used_callee_int.contains(&c);
-            let o = &occ[c as usize];
-            let mut set: Vec<u32> = Vec::new();
-            for (b, ps) in &elig {
-                // the register is also written at each definition: free over its operands and the
-                // instruction before (deferred fused compares read at the next one)
-                let defs_free = def_at.get(&(v, *b)).map_or(true, |dp| dp.iter().all(|&p| o.is_empty() || !bits_any(o, p.saturating_sub(4).max(block_start[*b as usize]), p + 1)));
-                let free = o.is_empty() || !ps.iter().any(|&(a, z)| bits_any(o, a, z));
-                let call = !callee && ps.iter().any(|&(a, z)| {
-                    let k = call_pos.partition_point(|q| *q < a);
-                    k < call_pos.len() && call_pos[k] <= z
-                });
-                if free && defs_free && !call {
-                    set.push(*b);
-                }
-            }
-            if set.len() < if edge_loads { 1 } else { 2 } {
+        // result in the register (pieces are in ascending block order, and so are the lists)
+        elig.clear();
+        for (k, &(b, p0, p1)) in pieces.iter().enumerate() {
+            let (b, ps) = (&b, &pp[p0..p1]);
+            if !reach[*b as usize] {
                 continue;
             }
-            let entered = |b: u32| -> bool { piece_of(b).map_or(false, |ps| live_in(b, ps)) };
+            let d0 = dl.partition_point(|x| x.0 < *b);
+            let d1 = d0 + dl[d0..].partition_point(|x| x.0 == *b);
+            let has_def = d1 > d0;
+            if !(if has_def { dl[d0..d1].iter().all(|x| x.2) } else { live_in(*b, ps) }) {
+                continue;
+            }
+            let used = ul.binary_search_by_key(b, |x| x.0).is_ok();
+            let call = ps.iter().any(|&(a, z)| {
+                let k = call_pos.partition_point(|q| *q < a);
+                k < call_pos.len() && call_pos[k] <= z
+            });
+            eidx[*b as usize] = elig.len() as u32;
+            elig.push(Elig {
+                b: *b,
+                piece: k,
+                defs: (d0, d1),
+                entered: live_in(*b, ps),
+                used,
+                call,
+                idle: skippable[*b as usize] || (!used && !has_def),
+            });
+        }
+        // one block is enough when its entry loads move into its predecessors (a single-block
+        // loop: the loop's own edge holds the value): the gain decides
+        if elig.len() < min_blocks {
+            continue;
+        }
+        // a region saves loads only in blocks that use the value (its gain sums their weights,
+        // less its loads): with none, no register can give a gain above zero
+        used_elig.clear();
+        used_elig.extend((0..elig.len()).filter(|&i| elig[i].used));
+        let tried: &[u8] = if used_elig.is_empty() { &[] } else { &regs };
+        // (gain, register), its plan ((block, loads at its start), in best_plan) and the
+        // predecessors that load at their end (best_edge)
+        let mut best: Option<(f32, u8)> = None;
+        for &c in tried {
+            let callee = used_callee_int.contains(&c);
+            let o = &occ[c as usize];
+            // the register is free over a block's live pieces, and at each definition there over its
+            // operands and the instruction before (deferred fused compares read at the next one),
+            // and no call crosses it there unless it is callee-saved
+            let free = |e: &Elig| {
+                if (e.call && !callee) || (!o.is_empty() && { let x = pieces[e.piece]; pp[x.1..x.2].iter().any(|&(a, z)| bits_any(o, a, z)) }) {
+                    return false;
+                }
+                let bs = block_start[e.b as usize];
+                o.is_empty() || dl[e.defs.0..e.defs.1].iter().all(|x| !bits_any(o, x.1.saturating_sub(4).max(bs), x.1 + 1))
+            };
+            // a register free in no block that uses the value gives no gain (a value live through
+            // many blocks and used in a few: most registers stop here)
+            if !used_elig.iter().any(|&i| free(&elig[i])) {
+                continue;
+            }
+            set.clear();
+            for e in &elig {
+                if free(e) {
+                    set.push(e.b);
+                }
+            }
+            if set.len() < min_blocks {
+                continue;
+            }
             // the outside predecessors of b that load at their end instead (before their
             // terminator) when together they run less often than b: a loop's preheader or guard,
             // the join of a cold path. The register must be free from the predecessor's last two
@@ -2945,13 +3018,13 @@ fn region_windows_alloc(
             // successor is live out). A predecessor in a loop b is not in (deeper: b is its exit)
             // runs every iteration, whatever the weights say: past the depth cap they tie, and
             // estimated frequencies put a loop's latch below its exit (a nested search loop loaded
-            // five outer values per iteration). None: b loads at its start.
-            let edge_preds = |b: u32, inset: &dyn Fn(u32) -> bool| -> Option<Vec<u32>> {
+            // five outer values per iteration). False (`at_end` left empty): b loads at its start.
+            let edge_preds = |b: u32, inset: &dyn Fn(u32) -> bool, at_end: &mut Vec<u32>| -> bool {
+                at_end.clear();
                 let bu = b as usize;
                 if !edge_loads || invoke_pred[bu] || preds[bu].is_empty() {
-                    return None;
+                    return false;
                 }
-                let mut at_end: Vec<u32> = Vec::new();
                 for &p in &preds[bu] {
                     if inset(p) || at_end.contains(&p) {
                         continue;
@@ -2960,56 +3033,71 @@ fn region_windows_alloc(
                     let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
                     let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::BranchCmp(..) | Term::Switch(..));
                     if p == b || !reach[pu] || !term_ok || depth[pu] > depth[bu] || (!o.is_empty() && bits_any(o, from, block_end[pu])) {
-                        return None;
+                        at_end.clear();
+                        return false;
                     }
                     at_end.push(p);
                 }
                 if at_end.is_empty() || at_end.iter().map(|p| wts[*p as usize]).sum::<f32>() >= wts[bu] {
-                    return None;
+                    at_end.clear();
+                    return false;
                 }
-                Some(at_end)
+                true
             };
             // drop blocks that only load for nothing (no use, no definition, and a load of their
             // own needed), and skippable blocks that would load at their start, until stable.
             // Dropping a block only makes its successors' loads more needed (more predecessors
             // outside), so a worklist over the successors of dropped blocks reaches the same
             // fixpoint (a round-by-round rescan cascaded one block per round along chains)
-            {
-                let idle = |b: u32| skippable[b as usize] || (!used.contains_key(&b) && !def_in.contains_key(&(v, b)));
-                let mut inset_h: std::collections::HashSet<u32> = set.iter().copied().collect();
-                let mut queue: Vec<u32> = set.iter().copied().filter(|b| idle(*b)).collect();
-                while let Some(b) = queue.pop() {
-                    if !inset_h.contains(&b) {
-                        continue;
-                    }
-                    let inset = |x: u32| inset_h.contains(&x);
-                    let needs = entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
-                    if needs {
-                        inset_h.remove(&b);
-                        for t in f.blocks[b as usize].term.succs() {
-                            if inset_h.contains(&t) && idle(t) {
-                                queue.push(t);
-                            }
+            if epoch == u32::MAX {
+                mark.fill(0);
+                epoch = 0;
+            }
+            epoch += 1;
+            for &b in &set {
+                mark[b as usize] = epoch;
+            }
+            queue.clear();
+            queue.extend(set.iter().copied().filter(|b| elig[eidx[*b as usize] as usize].idle));
+            let mut dropped = false;
+            while let Some(b) = queue.pop() {
+                if mark[b as usize] != epoch {
+                    continue;
+                }
+                let needs = {
+                    let inset = |x: u32| mark[x as usize] == epoch;
+                    let bu = b as usize;
+                    elig[eidx[bu] as usize].entered && (invoke_pred[bu] || preds[bu].is_empty() || preds[bu].iter().any(|p| !inset(*p))) && !edge_preds(b, &inset, &mut at_end)
+                };
+                if needs {
+                    mark[b as usize] = 0;
+                    dropped = true;
+                    for t in f.blocks[b as usize].term.succs() {
+                        if mark[t as usize] == epoch && elig[eidx[t as usize] as usize].idle {
+                            queue.push(t);
                         }
                     }
                 }
-                if inset_h.len() != set.len() {
-                    set.retain(|b| inset_h.contains(b));
-                }
             }
-            if set.len() < if edge_loads { 1 } else { 2 } {
+            if dropped {
+                set.retain(|b| mark[*b as usize] == epoch);
+            }
+            if set.len() < min_blocks {
                 continue;
             }
-            let inset = |b: u32| set.binary_search(&b).is_ok();
+            let inset = |b: u32| mark[b as usize] == epoch;
             let mut gain = 0f32;
-            let mut plan: Vec<(u32, bool)> = Vec::new();
-            let mut edge: Vec<u32> = Vec::new();
+            plan.clear();
+            edge.clear();
             for &b in &set {
                 let bu = b as usize;
-                let load = entered(b) && (invoke_pred[bu] || preds[bu].is_empty() || preds[bu].iter().any(|p| !inset(*p)));
+                let e = &elig[eidx[bu] as usize];
+                let load = e.entered && (invoke_pred[bu] || preds[bu].is_empty() || preds[bu].iter().any(|p| !inset(*p)));
                 // without the region: one load per block that uses it (windows join a block's uses)
-                let before = if used.contains_key(&b) { 1.0 } else { 0.0 };
-                let at_end = if load { edge_preds(b, &inset).unwrap_or_default() } else { Vec::new() };
+                let before = if e.used { 1.0 } else { 0.0 };
+                if !(load && edge_preds(b, &inset, &mut at_end)) {
+                    at_end.clear();
+                }
                 // a predecessor that already loads (for another successor in the region) is free
                 let cost = if !load {
                     0.0
@@ -3020,24 +3108,26 @@ fn region_windows_alloc(
                 };
                 gain += wts[bu] * before - cost;
                 plan.push((b, load && at_end.is_empty()));
-                for p in at_end {
+                for &p in &at_end {
                     if !edge.contains(&p) {
                         edge.push(p);
                     }
                 }
             }
-            if gain > 0.0 && best.as_ref().map_or(true, |x| gain > x.0) {
-                best = Some((gain, c, plan, edge));
+            if gain > 0.0 && best.map_or(true, |x| gain > x.0) {
+                best = Some((gain, c));
+                std::mem::swap(&mut plan, &mut best_plan);
+                std::mem::swap(&mut edge, &mut best_edge);
             }
         }
         if trace_on(f) && best.is_none() {
-            let eb: Vec<String> = elig.iter().map(|(b, _)| format!("b{}", b)).collect();
+            let eb: Vec<String> = elig.iter().map(|e| format!("b{}", e.b)).collect();
             eprintln!("ra-region {} v{}: no gain over {}", f.name, v, eb.join(" "));
         }
-        let Some((gain, c, plan, edge)) = best else { continue };
+        let Some((gain, c)) = best else { continue };
         if trace_on(f) {
-            let bs: Vec<String> = plan.iter().map(|(b, l)| format!("b{}{}{}", b, if *l { "L" } else { "" }, if def_in.contains_key(&(v, *b)) { "D" } else { "" })).collect();
-            let es: Vec<String> = edge.iter().map(|b| format!("b{}", b)).collect();
+            let bs: Vec<String> = best_plan.iter().map(|(b, l)| format!("b{}{}{}", b, if *l { "L" } else { "" }, if { let e = &elig[eidx[*b as usize] as usize]; e.defs.1 > e.defs.0 } { "D" } else { "" })).collect();
+            let es: Vec<String> = best_edge.iter().map(|b| format!("b{}", b)).collect();
             eprintln!("ra-region {} v{} r{} gain {:.0}: {} | end-loads {}", f.name, v, c, gain, bs.join(" "), es.join(" "));
         }
         region_reg.insert(v, c);
@@ -3045,23 +3135,23 @@ fn region_windows_alloc(
         if o.is_empty() {
             o.resize(pos_words, 0);
         }
-        for (b, load) in plan {
+        for &(b, load) in &best_plan {
             let bu = b as usize;
-            let ps = piece_of(b).unwrap();
+            let e = &elig[eidx[bu] as usize];
+            let ps = { let x = pieces[e.piece]; &pp[x.1..x.2] };
             for &(a, z) in ps.iter() {
                 bits_fill(o, a, z);
             }
             let z = ps.last().unwrap().1;
-            let dps = def_at.get(&(v, b));
-            if let Some(dp) = dps {
-                for &p in dp {
-                    bits_fill(o, p.saturating_sub(4).max(block_start[bu]), p + 1);
-                    // the definition's marker: def_i / fin_i put the result in the register
-                    chained.push((v, p + 1, p + 1, c));
-                }
+            let dps = &dl[e.defs.0..e.defs.1];
+            for x in dps {
+                let p = x.1;
+                bits_fill(o, p.saturating_sub(4).max(block_start[bu]), p + 1);
+                // the definition's marker: def_i / fin_i put the result in the register
+                chained.push((v, p + 1, p + 1, c));
             }
             // entered live: from the block start; otherwise from its first definition
-            let a = if live_in(b, ps) { block_start[bu] + 1 } else { dps.map_or(ps[0].0, |dp| dp[0] + 1) };
+            let a = if live_in(b, ps) { block_start[bu] + 1 } else { dps.first().map_or(ps[0].0, |x| x.1 + 1) };
             if load {
                 loading.push((v, a, z, c));
             } else {
@@ -3069,7 +3159,7 @@ fn region_windows_alloc(
             }
             in_region.insert((v, b));
         }
-        for p in edge {
+        for &p in &best_edge {
             let pu = p as usize;
             let pos = block_end[pu] - 1;
             bits_fill(o, block_end[pu].saturating_sub(5).max(block_start[pu]), block_end[pu]);
@@ -3557,10 +3647,18 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
     (remat, base_only)
 }
 
-/// How often each block runs, relative: with measured frequencies (O3: samples of the code
-/// the block's instructions came from, 0..=1 of the hottest block) mostly those, a sliver of loop
-/// depth for blocks no sample hit; without, 8^loop depth (capped).
-fn block_weights(f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
+/// How often each block runs, relative: a counted body's frequencies themselves
+/// (`profile::freqs`: the counts, and uncounted blocks estimated from counted predecessors; 0..=1
+/// of the hottest block, floored); other frequencies (structural estimates) raise the static
+/// weight up to 8x; without, 8^loop depth (capped).
+fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
+    // counts rank a hot loop's blocks on their own: a never-run block of the loop is not 1/8 of
+    // its header, nor is a block of a deeper loop that ran less above one that ran more
+    if let Some(fr) = freq {
+        if fr.len() == f.blocks.len() && crate::profile::has_counts(f) && !crate::stats::opt_off(options, "-cntweights") {
+            return fr.to_vec();
+        }
+    }
     let depth = loop_depths(f, reach);
     let st = static_weights(f, reach, &depth);
     match freq {
@@ -4132,11 +4230,13 @@ fn ra_stat(i: usize, v: u64) {
 /// live), so the allocator can give the loop piece a register while the rest stays in memory
 /// (LLVM's region splitting around loops, done as renaming before a second allocation). Loops are
 /// split innermost first; pieces that still spill share the original's slot (the copies between
-/// them are then no-ops). Returns the function the allocation is for when it differs from `f`.
+/// them are then no-ops). Returns the function the allocation is for when it differs from `f`,
+/// with its block frequencies when `freq` was given (the made blocks run about as often as the
+/// block they stand for): the emitter's loop alignment reads them by the returned function's blocks.
 /// `freq`: measured block frequencies of `f` (see block_weights), if any.
-pub fn allocate_split(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc) {
+pub fn allocate_split(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc, Option<Vec<f32>>) {
     let t0 = crate::stats::pass_clock();
-    let (g, al) = allocate_split_inner(options, f, cfg, thorough, freq, t0);
+    let (g, al, gfreq) = allocate_split_inner(options, f, cfg, thorough, freq, t0);
     if t0 != 0 {
         ra_stat(3, f.vregs.len() as u64);
         ra_stat(4, f.blocks.len() as u64);
@@ -4145,10 +4245,11 @@ pub fn allocate_split(options: &relax_session::Options, f: &Func, cfg: &RegConfi
         ra_stat(6, h.blocks.len() as u64);
         ra_stat(7, al.loc.iter().filter(|l| matches!(l, Loc::Stack(_))).count() as u64);
     }
-    (g, al)
+    (g, al, gfreq)
 }
 
-fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>, t0: u64) -> (Option<Func>, Alloc) {
+/// (the split function's frequencies are None when nothing was split)
+fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>, t0: u64) -> (Option<Func>, Alloc, Option<Vec<f32>>) {
     let al = if !thorough && f.baseline && !options.no_quick_ra { allocate_baseline(options, f, cfg) } else { allocate_with(options, f, cfg, thorough, freq) };
     let t1 = crate::stats::pass_clock();
     if t0 != 0 {
@@ -4159,7 +4260,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
     // Quick allocation is complete. Avoid the spill vector and loop-splitting
     // setup (including its copied frequencies) for every O1 function.
     if !thorough {
-        return (None, al);
+        return (None, al, None);
     }
     if let (true, Some(fr)) = (thorough && split_on(options), freq) {
         // spilled values that are not recomputed instead
@@ -4175,11 +4276,12 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
                     let sp: Vec<String> = (0..f.vregs.len()).filter(|v| cand[*v]).map(|v| format!("v{}{}", v, match al2.loc[v] { Loc::Reg(r) => format!("=r{}", r), Loc::Stack(_) => "=S".to_string(), _ => "=-".to_string() })).collect();
                     eprintln!("cold-split {}: first-pass spills now: {}", f.name, sp.join(" "));
                 }
-                let (h, al3) = allocate_split_loops(options, &g, al2, cfg, thorough, freq);
+                // (the cold split adds no blocks: g has f's frequencies)
+                let (h, al3, hfreq) = allocate_split_loops(options, &g, al2, cfg, thorough, freq);
                 if t0 != 0 {
                     ra_stat(2, crate::stats::pass_clock() - t2);
                 }
-                return (Some(h.unwrap_or(g)), al3);
+                return (Some(h.unwrap_or(g)), al3, hfreq.or_else(|| freq.map(|x| x.to_vec())));
             }
         }
     }
@@ -4323,6 +4425,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         if sites.is_empty() {
             continue;
         }
+        let (nv_blk, np_blk) = (g.vregs.len(), pieces.len());
         // sites are back to front: inserting at a later index keeps the earlier ones valid
         for (ii, across) in sites {
             let p = g.blocks[bi].pos[ii];
@@ -4354,9 +4457,14 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         // a copy pair per value per cold call: a big loop with many cold calls made
         // thousands (an app's video editing store worker: 10.6k vregs -> 69k after both splits,
         // 7.4 s of allocation, 1.8 MB of code): past half again the function's values the
-        // split costs more than its spills, and the first allocation stands
+        // split costs more than its spills: this block stays as it was, and the blocks after it
         if g.vregs.len() - nv0 > SPLIT_GROWTH_MAX(nv0) / 2 {
-            return None;
+            g.blocks[bi] = f.blocks[bi].clone();
+            g.vregs.truncate(nv_blk);
+            pieces.truncate(np_blk);
+            changed = !pieces.is_empty();
+            eprintln!("relax ra: {}: cold-call pieces at the cap ({} over {} values): calls from b{} on left as they were", f.name, SPLIT_GROWTH_MAX(nv0) / 2, nv0, bi);
+            break;
         }
     }
     if changed {
@@ -4367,9 +4475,11 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
     }
 }
 
-fn allocate_split_loops(options: &relax_session::Options, f: &Func, al: Alloc, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc) {
-    let (h, al, _, _) = allocate_split_loops_inner(options, f, al, cfg, thorough, freq);
-    (h, al)
+/// (with the split function's frequencies: None when nothing was split)
+fn allocate_split_loops(options: &relax_session::Options, f: &Func, al: Alloc, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc, Option<Vec<f32>>) {
+    let (h, al, _, gf) = allocate_split_loops_inner(options, f, al, cfg, thorough, freq);
+    let gf = if h.is_some() { gf } else { None };
+    (h, al, gf)
 }
 
 fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Alloc, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc, Vec<bool>, Option<Vec<f32>>) {
@@ -4634,8 +4744,10 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
     let mut defd = vec![false; n_orig];
     let mut refall = vec![false; n_orig];
     let mut through_pieces: Vec<u32> = Vec::new();
+    let (mut capped, mut capped_at) = (0usize, None::<u32>);
     for li in 0..loops.len() {
         let header = loops[li].0;
+        let (nv_loop, nt_loop) = (f.vregs.len(), through_pieces.len());
         let inl = |b: u32, member: &Vec<Vec<u16>>| member[b as usize].contains(&(li as u16));
         // spilled originals referenced inside the loop (pieces made for inner loops are reached
         // through their originals' copies, which are split here too)
@@ -4739,9 +4851,15 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
                 k -= 1;
             }
         }
-        // (see split_cold_calls): too many pieces, no split
+        // (see split_cold_calls): past the cap this loop stays whole; the loops split before it
+        // (innermost first) keep their pieces
         if f.vregs.len() - n_orig > SPLIT_GROWTH_MAX(n_orig) {
-            return None;
+            f.vregs.truncate(nv_loop);
+            origin.truncate(nv_loop);
+            through_pieces.truncate(nt_loop);
+            split.clear();
+            capped += 1;
+            capped_at.get_or_insert(header);
         }
         for &bi in &blocks_of[li] {
             for i in &f.blocks[bi as usize].insts {
@@ -4895,6 +5013,9 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
             preds.push(vec![from]);
             placed.push((from, true, nbk));
         }
+    }
+    if capped > 0 {
+        eprintln!("relax ra: {}: live-range pieces at the cap ({} over {} values): {} loops left whole, the first headed b{}", f.name, SPLIT_GROWTH_MAX(n_orig), n_orig, capped, capped_at.unwrap_or(0));
     }
     if !changed {
         return None;
@@ -6016,6 +6137,150 @@ pub fn compares_into_readers(options: &relax_session::Options, f: &Func, sel_ok:
         }
     }
     Some(g)
+}
+
+/// Overflow checks branch on the op's own overflow flag (`Cmp::O`: x64 `add; jo`, arm64 `cmn;
+/// b.vs`). `lower` makes rustc's checked signed arithmetic with plain RIR ops, which reach here as
+/// branches on `(a ^ d) & (b ^ d) < 0` for `d = a + b`, `(a ^ d) & (a ^ b) < 0` for `d = a - b`,
+/// the 64-bit product's high word against its low word's sign (`mulhi(a, b) != (a * b) >> 63`)
+/// and the 32-bit product against the 64-bit one; 4 to 6 instructions and a test each, a quarter
+/// of the instructions in a large app's hottest loop where native has the op's `jo`. A branch on one of
+/// these, its pieces all in the branch's block and the op's operands written by nothing from the
+/// op on, reads `O(op, ty, a, b)`, the op made again on the flags (at 32 or 64 bits); the pieces
+/// left without readers go. `mul`: the back end makes a multiply's overflow flag (x64 `imul`).
+/// RELAX_OPT=-ovfbr.
+pub fn overflows_into_branches(options: &relax_session::Options, f: &Func, mul: bool) -> Option<Func> {
+    if crate::stats::opt_off(options, "-ovfbr") {
+        return None;
+    }
+    let found: Vec<(usize, Cmp)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, b)| match b.term {
+            Term::BranchCmp(c, ..) => overflow_check(&b.insts, c, mul).map(|o| (bi, o)),
+            _ => None,
+        })
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    let mut g = f.clone();
+    for &(bi, o) in &found {
+        if let Term::BranchCmp(c, ..) = &mut g.blocks[bi].term {
+            *c = o;
+        }
+    }
+    // the checks' pieces nothing reads any more (an xor, an and, a multiply's high word, a
+    // shift, a product), till none is left
+    loop {
+        let mut uses = vec![0u32; g.vregs.len()];
+        let mut tu = Vec::new();
+        for b in &g.blocks {
+            for i in &b.insts {
+                for_uses(i, |u| uses[u.0 as usize] += 1);
+            }
+            term_uses(&b.term, &mut tu);
+            for u in &tu {
+                uses[u.0 as usize] += 1;
+            }
+        }
+        let mut gone = false;
+        for &(bi, _) in &found {
+            let blk = &mut g.blocks[bi];
+            let keep_pos = blk.pos.len() == blk.insts.len();
+            let mut k = 0;
+            while k < blk.insts.len() {
+                let unread = match blk.insts[k] {
+                    Inst::IBin(IOp::Xor | IOp::And | IOp::Mul | IOp::MulHi, _, d, _, _) | Inst::IBinI(IOp::Shr, _, d, _, _) => uses[d.0 as usize] == 0,
+                    _ => false,
+                };
+                if unread {
+                    blk.insts.remove(k);
+                    if keep_pos {
+                        blk.pos.remove(k);
+                    }
+                    gone = true;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        if !gone {
+            break;
+        }
+    }
+    Some(g)
+}
+
+/// The overflow check a block's branch on `c` is (`overflows_into_branches`), as the `Cmp::O` it
+/// reads instead.
+fn overflow_check(insts: &[Inst], c: Cmp, mul: bool) -> Option<Cmp> {
+    // the last write of v before `at`: where, and what
+    let def = |v: VReg, at: usize| -> Option<(usize, Inst)> {
+        (0..at).rev().find(|&j| {
+            let mut w = false;
+            for_defs(&insts[j], |d| w |= d == v);
+            w
+        })
+        .map(|j| (j, insts[j].clone()))
+    };
+    // a and b hold at the branch what the op at k read: nothing from it on writes them
+    let held = |k: usize, a: VReg, b: VReg| {
+        !insts[k..].iter().any(|i| {
+            let mut w = false;
+            for_defs(i, |d| w |= d == a || d == b);
+            w
+        })
+    };
+    let same = |x: (VReg, VReg), y: (VReg, VReg)| x == y || x == (y.1, y.0);
+    let wide = |t: IntTy| t.signed && (t.bits == 32 || t.bits == 64);
+    match c {
+        // add / sub: (a ^ d) & (b ^ d) < 0, (a ^ d) & (a ^ b) < 0
+        Cmp::K(Cond::Lt, true, s, 0) => {
+            let n = insts.len();
+            let (ks, Inst::IBin(IOp::And, _, _, p, q)) = def(s, n)? else { return None };
+            let (kp, Inst::IBin(IOp::Xor, _, _, p1, p2)) = def(p, ks)? else { return None };
+            let (kq, Inst::IBin(IOp::Xor, _, _, q1, q2)) = def(q, ks)? else { return None };
+            for d in [p1, p2, q1, q2] {
+                let Some((kd, Inst::IBin(op @ (IOp::Add | IOp::Sub), t, _, a, b))) = def(d, kp.min(kq)) else { continue };
+                if !wide(t) || def(d, kp.max(kq)).map(|x| x.0) != Some(kd) || !held(kd, a, b) {
+                    continue;
+                }
+                let other = if op == IOp::Add { (b, d) } else { (a, b) };
+                let (x, y) = ((p1, p2), (q1, q2));
+                if (same(x, (a, d)) && same(y, other)) || (same(y, (a, d)) && same(x, other)) {
+                    return Some(Cmp::O(op, t, a, b));
+                }
+            }
+            None
+        }
+        // mul: mulhi(a, b) != (a * b) >> 63 (64 bits), a * b at 64 bits != a * b at 32
+        Cmp::R(Cond::Ne, _, x, y) if mul => {
+            let n = insts.len();
+            let (kx, ix) = def(x, n)?;
+            let (ky, iy) = def(y, n)?;
+            let pair = [(kx, ix.clone(), ky, iy.clone()), (ky, iy, kx, ix)];
+            for (k1, i1, k2, i2) in pair {
+                match (i1, i2) {
+                    (Inst::IBin(IOp::MulHi, t @ I64, _, a, b), Inst::IBinI(IOp::Shr, I64, _, m, 63)) => {
+                        let Some((km, Inst::IBin(IOp::Mul, I64, _, ma, mb))) = def(m, k2) else { continue };
+                        if same((ma, mb), (a, b)) && held(k1.min(km), a, b) {
+                            return Some(Cmp::O(IOp::Mul, t, a, b));
+                        }
+                    }
+                    (Inst::IBin(IOp::Mul, I64, _, a, b), Inst::IBin(IOp::Mul, t @ I32, _, a2, b2)) => {
+                        if same((a, b), (a2, b2)) && held(k1.min(k2), a, b) {
+                            return Some(Cmp::O(IOp::Mul, t, a, b));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// The blocks whose start reads the running thread's domain base for a function that names domain

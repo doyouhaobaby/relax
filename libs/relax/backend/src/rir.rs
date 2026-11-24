@@ -373,6 +373,11 @@ pub enum Cmp {
     K(Cond, bool, VReg, i64),
     /// `FCmp(cond, f64, _, a, b)`
     F(Cond, bool, VReg, VReg),
+    /// `a op b` overflows the signed type (Add, Sub or Mul at 32 or 64 bits): rustc's checked
+    /// arithmetic, branched on the op's own overflow flag. Made by
+    /// `regalloc::overflows_into_branches` for a `Term::BranchCmp` only, after every pass that
+    /// turns a compare back into an instruction (`inst`) or reads its condition (`cond`).
+    O(IOp, IntTy, VReg, VReg),
 }
 
 impl Cmp {
@@ -391,11 +396,13 @@ impl Cmp {
             Cmp::R(c, s, a, b) => Inst::ICmp(c, s, d, a, b),
             Cmp::K(c, s, a, k) => Inst::ICmpI(c, s, d, a, k),
             Cmp::F(c, w, a, b) => Inst::FCmp(c, w, d, a, b),
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that makes a compare's instruction"),
         }
     }
     pub fn cond(self) -> Cond {
         match self {
             Cmp::R(c, ..) | Cmp::K(c, ..) | Cmp::F(c, ..) => c,
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that reads a compare's condition"),
         }
     }
     /// The compare that is true exactly when this one is false (None: an ordered float compare,
@@ -406,6 +413,8 @@ impl Cmp {
             Cmp::K(c, s, a, k) => Some(Cmp::K(c.not(), s, a, k)),
             Cmp::F(c @ (Cond::Eq | Cond::Ne), w, a, b) => Some(Cmp::F(c.not(), w, a, b)),
             Cmp::F(..) => None,
+            // (no Cond says "does not overflow")
+            Cmp::O(..) => None,
         }
     }
     /// Whether it reads v.
@@ -417,7 +426,7 @@ impl Cmp {
     /// The registers it reads.
     pub fn uses(self, mut f: impl FnMut(VReg)) {
         match self {
-            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
                 f(a);
                 f(b);
             }
@@ -426,7 +435,7 @@ impl Cmp {
     }
     pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
         match self {
-            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
                 f(a);
                 f(b);
             }
@@ -563,6 +572,9 @@ pub enum RelocKind {
     X64Branch32,
     /// arm64 `b`/`bl` at `at`: (value - pc) / 4 in imm26 (+-128 MB); out of reach: a veneer
     A64Branch26,
+    /// An embedder note with no code effect. `at` is zero and `target` names a symbol from
+    /// `Func::notes`. Relax uses these notes for the call sites of its real-time reach.
+    Note,
 }
 
 /// Reach of a pc-relative branch field from the branch's own pc (`RelocKind::X64Branch32`: from
@@ -744,6 +756,9 @@ pub fn link(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc
 /// (None: no veneer, the link fails).
 pub fn link_with(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc) -> u64, veneer: &dyn Fn(RelocKind, u64, u64) -> Option<u64>) -> Result<(), String> {
     for r in relocs {
+        if r.kind == RelocKind::Note {
+            continue;
+        }
         let at = r.at as usize;
         let mut v = value(r.target);
         if matches!(r.kind, RelocKind::X64Branch32 | RelocKind::A64Branch26) {
@@ -760,6 +775,7 @@ pub fn link_with(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(
         };
         let wr32 = |c: &mut [u8], o: usize, w: u32| c[o..o + 4].copy_from_slice(&w.to_le_bytes());
         match r.kind {
+            RelocKind::Note => {}
             RelocKind::A64CoverageBit { bit, words } => {
                 if bit >= 64 || words == 0 || words >= 1 << 25 || at % 4 != 0 || at + words as usize * 4 > code.len() || rd32(code, at)? != 0xD503_201F {
                     return Err(format!("invalid coverage probe at {}", at));
@@ -841,7 +857,7 @@ pub enum Reloc {
     /// code (a direct branch the runtime keeps in step with the table word)
     Call(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
-    /// x64 Windows: `x64::win_tls_key`)
+    /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`)
     TlsKey,
     /// `Env::tls_slow`
     TlsSlow,
@@ -869,6 +885,9 @@ pub enum Callee {
     /// call (side effects, memory, no motion); the register allocator keeps all other values out
     /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.
     Asm(Box<AsmBlock>),
+    /// Direct call to this native build's outlined part, with the Relax calling convention.
+    /// The joiner resolves it within the body. It may capture arguments, access memory and unwind.
+    Part,
 }
 
 /// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
@@ -897,6 +916,23 @@ pub struct AsmBlock {
     pub writes: u64,
     /// ASM_* bits
     pub opts: u32,
+}
+
+impl AsmBlock {
+    /// The empty block rustc makes `black_box` of (rustc_codegen_llvm intrinsic.rs: an empty
+    /// `asm!` with the value's address as its input and a memory clobber; for a ZST the clobber
+    /// alone): it runs no instruction, but every pass sees a call that may read and write any
+    /// memory, the input's included, so none sees through it.
+    pub fn opaque(ins: Vec<crate::asm::PReg>) -> AsmBlock {
+        let regs = ins.iter().fold(0u64, |m, r| m | 1 << r.bit());
+        AsmBlock { code: Vec::new(), fixups: Vec::new(), ins, outs: Vec::new(), regs, writes: 0, opts: ASM_NOSTACK | ASM_PRESERVES_FLAGS }
+    }
+
+    /// A block of no instructions (`opaque`): code that cannot run inline assembly (wasm,
+    /// sandboxed code) keeps it as the barrier it is to the passes and emits nothing for it.
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty() && self.fixups.is_empty() && self.outs.is_empty()
+    }
 }
 
 /// An aggregate passed or returned by value under the C ABI.
@@ -1368,6 +1404,10 @@ pub struct Func {
     /// slot passed there is written by the call, not read (forward_slot_dests_x builds such a
     /// result straight where it is copied to)
     pub sret_callees: Vec<u32>,
+    /// Symbols the embedder attaches to this body for Relax's real-time call-site notes.
+    /// `relax_codegen::native::compile_freq` emits them as `RelocKind::Note` after the code's
+    /// relocations. A caller that inlines this body takes its notes too (opt.rs).
+    pub notes: Vec<Sym>,
     /// (callee, argument index, may return it) of calls whose callee keeps no copy of that
     /// pointer argument (codegen opt::param_escape over its body): a frame address passed there
     /// does not escape for sibling calls (tail.rs), the call's result is one when it may be
@@ -1458,7 +1498,9 @@ pub struct Func {
     pub copy_ver: Option<(Sym, u64)>,
     /// A live session: the size of the guards of the copies this body inlined (`opt::inline_site`):
     /// code only a patch runs, which a caller's inliner prices the body without, so a live session
-    /// inlines what a run without patches does.
+    /// inlines what a run without patches does. Every session: the made cells' sets of the trait
+    /// objects it makes (the compiler's lowering; a load and a branch, the store once), priced out
+    /// alike: a body inlines as it would without them.
     pub guard_size: GuardSize,
     /// A live session's root build split after its first inlining round (`opt::split_patched_path`):
     /// its copy-version compares are exits, each leaving for the patched path (a copy of the rest of
@@ -1507,24 +1549,29 @@ impl FirstSeen {
     }
 }
 
-/// The guards' share of a body (`Func::guard_size`): their compares at the sites (the check and
-/// slow blocks they branch to are found from the slow calls: `opt::guard_blocks`).
+/// The share of a body its callers' inliner prices it without (`Func::guard_size`): the guards'
+/// compares at the sites (the check and slow blocks they branch to are found from the slow calls:
+/// `opt::guard_blocks`), and the made cells' sets with their blocks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GuardSize {
     pub insts: u32,
     /// their rustc inline cost (`opt::rustc_inline_cost`; the sites' branches included)
     pub cost: u32,
+    /// blocks no slow call tells: a made cell's set and the join after it
+    pub blocks: u32,
 }
 
 impl GuardSize {
     pub fn add(&mut self, o: GuardSize) {
         self.insts += o.insts;
         self.cost += o.cost;
+        self.blocks += o.blocks;
     }
 
     pub fn sub(&mut self, o: GuardSize) {
         self.insts = self.insts.saturating_sub(o.insts);
         self.cost = self.cost.saturating_sub(o.cost);
+        self.blocks = self.blocks.saturating_sub(o.blocks);
     }
 }
 
@@ -1602,7 +1649,7 @@ impl Func {
     /// compared through its own map (`ma` for self, `mb` for `o`; block counts by bits). With
     /// injective maps: the bodies are equal up to a renaming of their slots.
     pub fn same_body_mapped(&self, ma: &mut dyn FnMut(u32) -> u32, o: &Func, mb: &mut dyn FnMut(u32) -> u32) -> bool {
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
         let callee_eq = |a: &Callee, ma: &mut dyn FnMut(u32) -> u32, b: &Callee, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
             (Callee::Fn(x), Callee::Fn(y)) => ma(*x) == mb(*y),
             (Callee::CFn(x, xs), Callee::CFn(y, ys)) => ma(*x) == mb(*y) && xs == ys,
@@ -1639,6 +1686,7 @@ impl Func {
             && *sret == o.sret
             && sret_callees.len() == o.sret_callees.len()
             && sret_callees.iter().zip(&o.sret_callees).all(|(x, y)| ma(*x) == mb(*y))
+            && *notes == o.notes
             && nocapture.len() == o.nocapture.len()
             && nocapture.iter().zip(&o.nocapture).all(|(x, y)| x.1 == y.1 && x.2 == y.2 && x.3 == y.3 && callee_eq(&x.0, ma, &y.0, mb))
             && nounwind_inputs.len() == o.nounwind_inputs.len()
@@ -1671,7 +1719,7 @@ impl Func {
     /// noalias facts count as one set, withheld or not (SPEC-V moves them by verdict, not text).
     pub fn lowering_digest(&self) -> BodyDigest {
         use std::hash::Hash;
-        let Func { name: _, blocks, vregs, slots, params, rets, file: _, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline: _, lowering: _, pending: _, full: _, owned, nonnull, param_ints, ranged, naked, inl: _, inl_slots: _, dbg: _, halves, patch_flag: _, guard_calls: _, unguarded_flags: _, copy_ver: _, guard_size: _, patched_path: _, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file: _, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline: _, lowering: _, pending: _, full: _, owned, nonnull, param_ints, ranged, naked, inl: _, inl_slots: _, dbg: _, halves, patch_flag: _, guard_calls: _, unguarded_flags: _, copy_ver: _, guard_size: _, patched_path: _, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
         fn sym(s: &Sym, h: &mut relax_session::sip::Sip128, sy: &mut FirstSeen) {
             sy.get(s.id).hash(h);
             s.off.hash(h);
@@ -1679,6 +1727,7 @@ impl Func {
         fn callee(c: &Callee, h: &mut relax_session::sip::Sip128, sl: &mut FirstSeen, sy: &mut FirstSeen) {
             std::mem::discriminant(c).hash(h);
             match c {
+                Callee::Part => {}
                 Callee::Fn(x) => sl.get(*x).hash(h),
                 Callee::CFn(x, g) => {
                     sl.get(*x).hash(h);
@@ -1742,6 +1791,10 @@ impl Func {
         for x in sret_callees {
             sl.get(*x).hash(&mut h);
         }
+        notes.len().hash(&mut h);
+        for note in notes {
+            sym(note, &mut h, &mut sy);
+        }
         nocapture.len().hash(&mut h);
         for (c, i, r, e) in nocapture {
             callee(c, &mut h, &mut sl, &mut sy);
@@ -1759,7 +1812,7 @@ impl Func {
     /// A hash of what `same_body_mapped` compares, the function slots replaced by `m(slot)`.
     pub fn hash_body_mapped<H: std::hash::Hasher>(&self, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
         use std::hash::Hash;
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
         fn callee<H: std::hash::Hasher>(c: &Callee, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
             match c {
                 Callee::Fn(x) => {
@@ -1808,6 +1861,7 @@ impl Func {
         for x in sret_callees {
             m(*x).hash(h);
         }
+        notes.hash(h);
         nocapture.len().hash(h);
         for (c, i, r, e) in nocapture {
             callee(c, h, m);
@@ -2004,9 +2058,75 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
     f.inl.iter().flat_map(|&(call, callee)| [(u32::MAX, call), (u32::MAX, callee)])
 }
 
+// An ordinary dbgloc table begins with a canonical varint (variable count), so it
+// never starts with this two-byte encoding of zero. Joined tables use the same outer
+// PC_VARS length/chunks as ordinary ones, including in mapped images.
+const PART_LOCALS: [u8; 2] = [0x80, 0];
+
+/// Select the local table for a lookup PC and return its function-relative PC.
+pub fn part_local_table(bytes: &[u8], off: u32) -> Option<(&[u8], u32)> {
+    let Some(b) = bytes.strip_prefix(&PART_LOCALS) else { return Some((bytes, off)) };
+    let p_off = u32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+    let host_len = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+    let part_len = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?) as usize;
+    let tables = b.get(12..)?;
+    if host_len.checked_add(part_len)? != tables.len() { return None; }
+    let (host, part) = tables.split_at(host_len);
+    Some(if off < p_off { (host, off) } else { (part, off - p_off) })
+}
+
+fn join_part_pc_maps(host: &mut Vec<(u32, u64)>, part: &[(u32, u64)], p_off: u32, text_len: u32) -> Result<(), String> {
+    use crate::dbgloc::{self, PC_VARS};
+    let hm = host.split_off(host.partition_point(|e| e.0 < PC_VARS));
+    let (part_rows, pm) = part.split_at(part.partition_point(|e| e.0 < PC_VARS));
+    let (hv, hi) = hm.split_at(hm.partition_point(|e| e.0 == PC_VARS));
+    let (pv, pi) = pm.split_at(pm.partition_point(|e| e.0 == PC_VARS));
+    if hi.len() % 2 != 0 || pi.len() % 2 != 0 {
+        return Err("incomplete inline context in outlined body".into());
+    }
+    // The split may have inherited a common prefix. Keep those IDs, then place P's
+    // remaining call/anchor pairs after the host's. Never alias an unrepresentable ID.
+    let shared = hi.chunks_exact(2).zip(pi.chunks_exact(2)).take_while(|(h, p)| h == p).count();
+    let ctx = |c: u64| -> Result<u64, &'static str> {
+        if c <= shared as u64 || c == POS_CTX_LOST { return Ok(c); }
+        let new = c + (hi.len() / 2 - shared) as u64;
+        if new >= POS_CTX_LOST { return Err("joined inline context exceeds the position format"); }
+        Ok(new)
+    };
+    let pos = |p| ctx(pos_ctx(p)).map(|c| pos_with_ctx(p, c));
+    host.push((p_off, pos(part_rows.first().map_or(0, |e| e.1))?));
+    for &(off, p) in part_rows {
+        host.push((p_off.checked_add(off).ok_or("part source offset overflow")?, pos(p)?));
+    }
+    if let Some(&(_, file_pos)) = hv.first().or(pv.first()) {
+        let h = dbgloc::from_pc_entries(hv.iter().copied());
+        let mut p = dbgloc::from_pc_entries(pv.iter().copied());
+        if !p.is_empty() && hi.len() / 2 > shared && pi.len() / 2 > shared {
+            let mut t = dbgloc::decode(&p).ok_or("invalid part local table")?;
+            for v in &mut t.vars { v.ctx = ctx(v.ctx.into())? as u16; }
+            p = dbgloc::encode(&t);
+        }
+        let mut bytes = Vec::from(PART_LOCALS);
+        bytes.extend_from_slice(&p_off.to_le_bytes());
+        for n in [h.len(), p.len()] {
+            bytes.extend_from_slice(&u32::try_from(n).map_err(|_| "local table exceeds PC_VARS length")?.to_le_bytes());
+        }
+        bytes.extend(h);
+        bytes.extend(p);
+        u32::try_from(bytes.len()).map_err(|_| "joined local tables exceed PC_VARS length")?;
+        // A patched source run ends within text. A byte-counting reader must never
+        // extend the last patched run to the synthetic PC_VARS offset.
+        if host.last().is_some_and(|e| pos_patched(e.1)) { host.push((text_len, 0)); }
+        host.extend(dbgloc::pc_entries(&bytes, pos_file(file_pos)));
+    }
+    host.extend_from_slice(hi);
+    for &(_, p) in &pi[2 * shared..] { host.push((u32::MAX, pos(p)?)); }
+    Ok(())
+}
+
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, lowering: None, pending: Vec::new(), full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default(), patched_path: false, keep_frames: false, digest: None, inl_digest: Vec::new(), inl_waits: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), notes: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, lowering: None, pending: Vec::new(), full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default(), patched_path: false, keep_frames: false, digest: None, inl_digest: Vec::new(), inl_waits: Vec::new() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
@@ -2040,6 +2160,9 @@ impl Func {
             let d: Vec<String> = self.param_ints.iter().map(|(v, n, sg)| format!("{:?}:{}{}", v, if *sg { "i" } else { "u" }, *n as u32 * 8)).collect();
             s.push_str(&format!("; declared params: {}\n", d.join(" ")));
         }
+        if !self.noalias.is_empty() || !self.withheld_noalias.is_empty() {
+            s.push_str(&format!("; noalias {:?} withheld {:?}\n", self.noalias, self.withheld_noalias));
+        }
         if self.slots.iter().any(|x| x.size >= 1024) {
             let big: Vec<String> = self.slots.iter().enumerate().filter(|(_, x)| x.size >= 1024).map(|(i, x)| format!("{}:{}", i, x.size)).collect();
             s.push_str(&format!("; slots >= 1 KB: {}\n", big.join(" ")));
@@ -2057,7 +2180,7 @@ impl Func {
     /// A compare's operands against its kind.
     fn check_cmp(&self, c: &Cmp, what: &str) -> Result<(), String> {
         let want = match c {
-            Cmp::R(..) | Cmp::K(..) => Cls::I,
+            Cmp::R(..) | Cmp::K(..) | Cmp::O(..) => Cls::I,
             Cmp::F(_, true, ..) => Cls::F64,
             Cmp::F(_, false, ..) => Cls::F32,
         };
@@ -2314,7 +2437,7 @@ impl Func {
                     if *t >= nb || *u >= nb {
                         return Err(format!("{}: bad invoke target", self.name));
                     }
-                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
                         return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
                     }
                 }
@@ -2484,6 +2607,14 @@ pub const UNWIND_MAGIC: u32 = 0xA5;
 /// any of its calls (`UnwindInfo::fp_from_sp`): a thread walked without its registers (blocked in
 /// a syscall). A function without staged calls keeps UNWIND_MAGIC and costs nothing more.
 pub const UNWIND_MAGIC_STAGED: u32 = 0xA6;
+/// Two ordinary trailers (host, then part), followed by the part's code offset and this magic
+/// with the part trailer's word count in the low 24 bits. Each trailer is function-relative.
+pub const UNWIND_MAGIC_PART: u32 = 0xA7;
+
+pub fn part_trailer_words(p_off: u32, p_words: usize) -> [u32; 2] {
+    assert!(p_words <= 0xff_ffff, "part trailer word count must fit the head");
+    [p_off, UNWIND_MAGIC_PART << 24 | p_words as u32]
+}
 
 pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32)], sp_off: u32) -> Vec<u32> {
     let mut w = Vec::with_capacity(2 * pads.len() + 2 * staged.len() + saved.len() / 4 + 4);
@@ -2506,7 +2637,8 @@ pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32
 }
 
 /// Parsed trailer of a function's code (see `unwind_info_words`). Boxed slices: the code tables
-/// keep one per installed body.
+/// keep one per installed function.
+#[derive(Clone)]
 pub struct UnwindInfo {
     pub saved: Box<[u32]>,
     pub pads: Box<[(u32, u32)]>,
@@ -2516,11 +2648,6 @@ pub struct UnwindInfo {
 }
 
 impl UnwindInfo {
-    /// u32 words of the trailer
-    fn words(&self) -> usize {
-        2 * self.pads.len() + 2 * self.staged.len() + (self.saved.len() + 3) / 4 + 2 + usize::from(!self.staged.is_empty())
-    }
-
     /// The frame pointer of this function's frame from its stack pointer at the call whose
     /// return address is `ret_off` bytes into the code: the body's frame below it, and the
     /// call's stack arguments when it staged them.
@@ -2530,60 +2657,175 @@ impl UnwindInfo {
     }
 }
 
-/// Reads the trailer at the end of `code` (`len` bytes at `code`, a multiple of 4).
+fn unwind_word(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+}
+
+/// The ordinary trailer at the end of a word-aligned slice. Locating it reads just the header
+/// fields, so the startup image can keep the register and call tables mapped until a walk.
+struct UnwindTrailer<'a> {
+    bytes: &'a [u8],
+    n_pads: usize,
+    n_staged: usize,
+    n_saved: usize,
+}
+
+impl<'a> UnwindTrailer<'a> {
+    fn at_end(bytes: &'a [u8], joined: bool) -> Option<Self> {
+        let end = bytes.len();
+        let head = unwind_word(bytes, end.checked_sub(4)?);
+        let n_staged = match head >> 24 {
+            UNWIND_MAGIC => 0,
+            UNWIND_MAGIC_STAGED => {
+                let n = unwind_word(bytes, end.checked_sub(12)?);
+                if joined && n == 0 { return None; }
+                n
+            }
+            _ => return None,
+        };
+        let n_saved = (head >> 19) & 0x1f;
+        let n_pads = head & 0x7_ffff;
+        let words = 2 * (n_pads as u64 + n_staged as u64) + ((n_saved + 3) / 4) as u64 + 2 + u64::from(n_staged != 0);
+        let start = end.checked_sub(usize::try_from(words * 4).ok()?)?;
+        Some(Self { bytes: &bytes[start..], n_pads: n_pads as usize, n_staged: n_staged as usize, n_saved: n_saved as usize })
+    }
+
+    fn info(&self) -> UnwindInfo {
+        let pair = |k: usize| (unwind_word(self.bytes, 8 * k), unwind_word(self.bytes, 8 * k + 4));
+        let pads = (0..self.n_pads).map(pair).collect();
+        let staged = (self.n_pads..self.n_pads + self.n_staged).map(pair).collect();
+        let sbase = 8 * (self.n_pads + self.n_staged);
+        let saved = self.bytes[sbase..sbase + self.n_saved].iter().map(|&b| {
+            if b & 0x80 != 0 { 0x100 | (b & 0x7f) as u32 } else { b as u32 }
+        }).collect();
+        let sp_off = unwind_word(self.bytes, self.bytes.len() - 8);
+        UnwindInfo { saved, pads, sp_off, staged }
+    }
+}
+
+/// Reads one ordinary trailer at the end of `code`. A joined body's head describes two
+/// functions and must go through `split_unwind_info`.
 ///
 /// # Safety
 /// `code..code + len` must be readable.
 pub unsafe fn read_unwind_info(code: u64, len: u64) -> Option<UnwindInfo> {
-    if len < 8 {
-        return None;
-    }
-    let rd = |off: u64| -> u32 { std::ptr::read_unaligned((code + off) as *const u32) };
-    let end = len & !3;
-    let head = rd(end - 4);
-    let n_staged = match head >> 24 {
-        UNWIND_MAGIC => 0,
-        UNWIND_MAGIC_STAGED if end >= 12 => rd(end - 12) as u64,
-        _ => return None,
-    };
-    let n_saved = ((head >> 19) & 0x1f) as u64;
-    let n_pads = (head & 0x7_ffff) as u64;
-    let sp_off = rd(end - 8);
-    let saved_words = (n_saved + 3) / 4;
-    let words = 2 * n_pads + 2 * n_staged + saved_words + 2 + u64::from(n_staged != 0);
-    if words * 4 > end {
-        return None;
-    }
-    let base = end - words * 4;
-    let pair = |k: u64| (rd(base + 8 * k), rd(base + 8 * k + 4));
-    let pads = (0..n_pads).map(pair).collect();
-    let staged = (n_pads..n_pads + n_staged).map(pair).collect();
-    let sbase = base + 8 * (n_pads + n_staged);
-    let saved = (0..n_saved)
-        .map(|k| {
-            let b = (rd(sbase + 4 * (k / 4)) >> (8 * (k % 4))) & 0xff;
-            if b & 0x80 != 0 {
-                0x100 | (b & 0x7f)
-            } else {
-                b
-            }
-        })
-        .collect();
-    Some(UnwindInfo { saved, pads, sp_off, staged })
+    if len < 8 { return None; }
+    let bytes = std::slice::from_raw_parts(code as *const u8, (len & !3) as usize);
+    Some(UnwindTrailer::at_end(bytes, false)?.info())
 }
 
-/// Splits a compiled function into its code and its unwind trailer: (code length without
-/// the trailer, the trailer). The runtime keeps the trailer out of the code memory.
-pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
-    let n = code.len() & !3;
-    if n < 8 {
-        return (code.len(), None);
+pub struct SplitUnwindInfo {
+    pub code_len: usize,
+    pub host: Option<UnwindInfo>,
+    pub part: Option<(u32, UnwindInfo)>,
+}
+
+impl SplitUnwindInfo {
+    pub fn no_trailer(code_len: usize) -> Self {
+        Self { code_len, host: None, part: None }
     }
-    let info = unsafe { read_unwind_info(code.as_ptr() as u64, n as u64) };
-    match info {
-        Some(i) => (n - 4 * i.words(), Some(i)),
-        None => (code.len(), None),
+}
+
+/// Walk backwards from the head. For a mapped image the code is separate and the host
+/// trailer must consume everything before the part trailer.
+fn unwind_trailers(bytes: &[u8], image_code_len: Option<usize>) -> Option<(usize, UnwindTrailer<'_>, Option<(u32, UnwindTrailer<'_>)>)> {
+    let end = bytes.len() & !3;
+    let head = unwind_word(bytes, end.checked_sub(4)?);
+    let joined = head >> 24 == UNWIND_MAGIC_PART;
+    let (host_end, part) = if joined {
+        if end != bytes.len() { return None; }
+        let p_end = end.checked_sub(8)?;
+        let p_start = p_end.checked_sub((head & 0xff_ffff) as usize * 4)?;
+        let p = UnwindTrailer::at_end(&bytes[p_start..p_end], true)?;
+        if p.bytes.len() != p_end - p_start { return None; }
+        (p_start, Some((unwind_word(bytes, p_end), p)))
+    } else {
+        (end, None)
+    };
+    let host = UnwindTrailer::at_end(&bytes[..host_end], joined)?;
+    let start = host_end - host.bytes.len();
+    if image_code_len.is_some() && start != 0 { return None; }
+    let code_len = image_code_len.unwrap_or(start);
+    if let Some((off, _)) = &part {
+        if *off == 0 || *off as usize >= code_len { return None; }
     }
+    Some((code_len, host, part))
+}
+
+/// Splits the emitted body into its code length and the unwind info of each function.
+pub fn split_unwind_info(code: &[u8]) -> SplitUnwindInfo {
+    match unwind_trailers(code, None) {
+        Some((code_len, host, part)) => SplitUnwindInfo { code_len, host: Some(host.info()), part: part.map(|(off, p)| (off, p.info())) },
+        None => SplitUnwindInfo::no_trailer(code.len()),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+use crate::arm64 as native;
+#[cfg(not(target_arch = "aarch64"))]
+use crate::x64 as native;
+
+/// Both backends install the same layout. Only the four-byte private call field differs.
+pub(crate) fn join_native_part(mut host: native::Compiled, part: native::Compiled, call_word: fn(u32, u32) -> Result<u32, &'static str>) -> Result<native::Compiled, String> {
+    if !part.part_calls.is_empty() { return Err("outlined part calls another part".into()); }
+    let code_len = |c: &native::Compiled| {
+        let s = split_unwind_info(&c.code);
+        if s.host.is_none() || s.part.is_some() || c.code.len() % 4 != 0 || c.text_len == 0 || c.text_len as usize > s.code_len {
+            return Err("expected native function text, pool and one unwind trailer");
+        }
+        Ok(s.code_len)
+    };
+    let h_len = code_len(&host)?;
+    let p_len = code_len(&part)?;
+    let p_off = u32::try_from((h_len as u64 + 15) & !15).map_err(|_| "outlined part offset overflow")?;
+    let joined_len = u64::from(p_off) + part.code.len() as u64 + (host.code.len() - h_len) as u64 + 8;
+    if joined_len > u32::MAX as u64 { return Err("joined body exceeds code offset range".into()); }
+    let p_words = (part.code.len() - p_len) / 4;
+    if p_words > 0xff_ffff { return Err("part unwind trailer exceeds word count range".into()); }
+
+    let text = &mut host.code[..host.text_len as usize];
+    for site in host.part_calls.drain(..) {
+        let word = call_word(site, p_off)?;
+        let field = text.get_mut(site as usize..).and_then(|b| b.get_mut(..4)).ok_or("private call outside host text")?;
+        field.copy_from_slice(&word.to_le_bytes());
+    }
+    let trailer = host.code.split_off(h_len);
+    host.code.reserve(joined_len as usize - h_len);
+    host.code.resize(p_off as usize, 0);
+    host.code.extend_from_slice(&part.code[..p_len]);
+    host.code.extend(trailer);
+    host.code.extend_from_slice(&part.code[p_len..]);
+    for w in part_trailer_words(p_off, p_words) { host.code.extend_from_slice(&w.to_le_bytes()); }
+    for mut r in part.relocs {
+        r.at = p_off.checked_add(r.at).ok_or("part relocation offset overflow")?;
+        host.relocs.push(r);
+    }
+    host.text_len = p_off + part.text_len;
+    join_part_pc_maps(&mut host.pc_map, &part.pc_map, p_off, host.text_len)?;
+
+    // The assembly dump indexes instructions by block number alone. Give P's emitted
+    // blocks distinct labels there, keeping their function-local numbers for reading jumps.
+    let mut block_base = 0;
+    if !part.rir_emitted.is_empty() {
+        let block_label = |line: &str| line.strip_prefix('b')?.strip_suffix(':')?.parse::<u32>().ok();
+        block_base = host.rir_emitted.lines().filter_map(block_label).count() as u32;
+        for line in part.rir_emitted.lines() {
+            if let Some(b) = block_label(line) {
+                host.rir_emitted.push_str(&format!("b{}:  (part b{})\n", block_base + b, b));
+            } else {
+                host.rir_emitted.push_str(line);
+                host.rir_emitted.push('\n');
+            }
+        }
+    }
+    host.rir_map.extend(part.rir_map.into_iter().map(|(off, b, i)| (p_off + off, block_base + b, i)));
+    Ok(host)
+}
+
+/// Borrows each function's ordinary trailer from the image's trailer region.
+pub fn split_unwind_region(trailer: &[u8], code_len: u32) -> Option<(&[u8], Option<(u32, &[u8])>)> {
+    let (_, host, part) = unwind_trailers(trailer, Some(code_len as usize))?;
+    Some((host.bytes, part.map(|(off, p)| (off, p.bytes))))
 }
 
 /// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
@@ -2607,6 +2849,134 @@ pub fn used_slots(f: &Func) -> Vec<bool> {
         }
     }
     used
+}
+
+#[cfg(test)]
+mod join_part_tests {
+    use super::*;
+
+    // Both functions add their own constant to the argument. The host then calls P
+    // with its sum. With relocations the two constants come from distinct pool words.
+    fn body(host: bool, relocated: bool) -> native::Compiled {
+        let mut f = Func::new(if host { "host" } else { "part" }.into(), 0);
+        let (x, k, sum) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.push(x);
+        f.rets.push(Cls::I);
+        f.block();
+        let n = if host { 3 } else { 7 };
+        let constant = if relocated { Inst::Addr(k, Sym::new(n)) } else { Inst::Iconst(k, n as i64) };
+        let add = Inst::IBin(IOp::Add, IntTy { bits: 64, signed: false }, sum, x, k);
+        f.blocks[0].insts = vec![constant, add];
+        f.blocks[0].pos = vec![n as u64; 2];
+        f.blocks[0].term = Term::Ret(vec![sum]);
+        if host {
+            let result = f.vreg(Cls::I);
+            f.blocks[0].insts.push(Inst::Call(Callee::Part, vec![sum], vec![result]));
+            f.blocks[0].pos.push(4);
+            if relocated {
+                let (normal, pad) = (f.block(), f.block());
+                f.blocks[0].term = Term::Invoke(normal, pad);
+                f.blocks[normal as usize].term = Term::Ret(vec![result]);
+                f.blocks[pad as usize].term = Term::Ret(vec![x]);
+            } else {
+                f.blocks[0].term = Term::Ret(vec![result]);
+            }
+        }
+        native::compile(&relax_session::Options::default(), &f, &native::Env::standalone(false)).unwrap()
+    }
+
+    #[test]
+    fn join_part_call_returns_and_keeps_both_frames() {
+        assert!(native::join_part(body(true, false), body(true, false)).is_err(), "recursive private call");
+        for relocated in [false, true] {
+            let mut h = body(true, relocated);
+            let mut p = body(false, relocated);
+            let [site] = h.part_calls[..] else { panic!("expected one private call") };
+            let (hs, ps) = (split_unwind_info(&h.code), split_unwind_info(&p.code));
+            let p_off = ((hs.code_len + 15) & !15) as u32;
+            let p_first = p.pc_map[0].1;
+            assert_eq!(h.relocs.is_empty(), !relocated);
+            assert_eq!(p.relocs.is_empty(), !relocated);
+            let mut relocs = h.relocs.clone();
+            relocs.extend(p.relocs.iter().map(|r| RelocAt { at: r.at + p_off, ..*r }));
+            let (frame, end) = (h.frame_size, p_off + p.text_len);
+            let site = site as usize;
+            // Exercise dump and map joining without changing the process-wide dump flag.
+            h.rir_map = vec![(0, 0, 0)];
+            p.rir_map = vec![(4, 0, u32::MAX)];
+            h.rir_emitted = "fn host\nb0:\n".into();
+            p.rir_emitted = if relocated { "fn part\nb0:\n".into() } else { String::new() };
+            let mut joined = native::join_part(h, p).unwrap();
+            assert_eq!(joined.rir_map, [(0, 0, 0), (p_off + 4, u32::from(relocated), u32::MAX)]);
+            if relocated { assert!(joined.rir_emitted.contains("b1:  (part b0)")); }
+            assert!(joined.part_calls.is_empty());
+            assert_eq!((joined.frame_size, joined.text_len), (frame, end));
+            assert_eq!(joined.relocs, relocs, "ordered relocated fields");
+            assert!(joined.pc_map.contains(&(p_off, p_first)), "source at the part entry");
+            let w = i32::from_le_bytes(joined.code[site..site + 4].try_into().unwrap());
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(w as u32 >> 26, 0b100101);
+                assert_eq!(site as i64 + ((w << 6 >> 6) as i64) * 4, p_off as i64);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                assert_eq!(joined.code[site - 1], 0xe8);
+                assert_eq!(site as i64 + 4 + w as i64, p_off as i64);
+            }
+            let s = split_unwind_info(&joined.code);
+            assert_eq!(s.code_len, p_off as usize + ps.code_len);
+            let (base, pu) = s.part.unwrap();
+            assert_eq!(base, p_off);
+            for (got, orig) in [(s.host.unwrap(), hs.host.unwrap()), (pu, ps.host.unwrap())] {
+                assert_eq!((got.sp_off, got.saved, got.staged, got.pads), (orig.sp_off, orig.saved, orig.staged, orig.pads));
+            }
+            link(&mut joined.code, 0, &joined.relocs, &|r| match r {
+                Reloc::Sym(s) => s.id.into(),
+                _ => panic!("unexpected relocation {r:?}"),
+            }).unwrap();
+            let code = crate::exec::Code::new(&joined.code).unwrap();
+            let f: crate::host_fn_ptr!(fn(u64) -> u64) = unsafe { std::mem::transmute(code.ptr()) };
+            assert_eq!(unsafe { f(32) }, 42, "argument and return through the private call");
+        }
+    }
+
+    #[test]
+    fn join_part_locals_and_inline_contexts() {
+        use crate::dbgloc::{self, Home, Table, Var, VarKind};
+        let table = |disp| Table {
+            vars: vec![Var { ctx: 0, local: 3, kind: VarKind::Frame(disp), consts: vec![] },
+                       Var { ctx: 2, local: 4, kind: VarKind::Regs(1), consts: vec![] }],
+            sites: vec![(4, vec![(1, 0, Home::Fp(disp))])],
+        };
+        let shared = [(u32::MAX, 11), (u32::MAX, 12)];
+        let mut h = vec![(0, 10)];
+        h.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-16)), 1));
+        h.extend(shared);
+        h.extend([(u32::MAX, 13), (u32::MAX, 14)]);
+        let flagged = POS_GUARD | POS_PATCHED | 21;
+        let lost = pos_with_ctx(flagged, POS_CTX_LOST);
+        let mut p = vec![(4, 0), (8, pos_with_ctx(flagged, 2)), (12, lost)];
+        p.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-48)), 2));
+        p.extend(shared);
+        p.extend([(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                  (u32::MAX, pos_with_ctx(flagged, 2)), (u32::MAX, 17)]);
+        join_part_pc_maps(&mut h, &p, 32, 48).unwrap();
+        assert_eq!(&h[..5], &[(0, 10), (32, 0), (36, 0), (40, pos_with_ctx(flagged, 3)), (44, lost)]);
+        assert_eq!(&h[h.len() - 4..], &[(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                                         (u32::MAX, pos_with_ctx(flagged, 3)), (u32::MAX, 17)]);
+        let bytes = dbgloc::from_pc_entries(h.into_iter());
+        for (pc, disp, ctx) in [(3, -16, 2), (35, -48, 3)] {
+            let (b, off) = part_local_table(&bytes, pc).unwrap();
+            let t = dbgloc::decode(b).unwrap();
+            assert_eq!(t.vars[0].kind, VarKind::Frame(disp), "root local in this frame");
+            assert_eq!(t.vars[1].ctx, ctx);
+            assert_eq!(t.site(off + 1).unwrap(), &[(1, 0, Home::Fp(disp))]);
+        }
+        assert_eq!(part_local_table(&bytes, 31).unwrap().1, 31);
+        assert_eq!(part_local_table(&bytes, 32).unwrap().1, 0);
+        assert!(part_local_table(&bytes[..bytes.len() - 1], 32).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2663,6 +3033,14 @@ mod succs_tests {
 
 #[cfg(test)]
 mod unwind_trailer_tests {
+    use super::*;
+
+    fn append_words(bytes: &mut Vec<u8>, words: &[u32]) {
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
     /// A trailer reads back as written behind its code, with and without staged calls; a frame's
     /// pointer from sp adds the staged bytes at that call only. Without staged calls the trailer
     /// keeps the plain magic (and its size).
@@ -2673,18 +3051,80 @@ mod unwind_trailer_tests {
         let pads = [(8u32, 40u32)];
         for staged in [&[][..], &[(8u32, 16u32), (12, 32)][..]] {
             let mut bytes = code.to_vec();
-            for w in super::unwind_info_words(&saved, &pads, staged, 48) {
-                bytes.extend_from_slice(&w.to_le_bytes());
-            }
-            let (n, info) = super::split_unwind_info(&bytes);
-            let info = info.expect("a trailer");
-            assert_eq!(n, code.len());
+            append_words(&mut bytes, &unwind_info_words(&saved, &pads, staged, 48));
+            let split = split_unwind_info(&bytes);
+            let info = split.host.expect("a trailer");
+            assert_eq!(split.code_len, code.len());
+            assert!(split.part.is_none());
+            let region = &bytes[split.code_len..];
+            let (host, part) = split_unwind_region(region, split.code_len as u32).unwrap();
+            assert!(std::ptr::eq(host, region) && part.is_none());
             assert_eq!((&info.saved[..], &info.pads[..], &info.staged[..], info.sp_off), (&saved[..], &pads[..], staged, 48));
             let extra = staged.iter().find(|s| s.0 == 12).map_or(0, |s| s.1 as u64);
             assert_eq!(info.fp_from_sp(12, 0x1000), 0x1000 + 48 + extra);
             assert_eq!(info.fp_from_sp(4, 0x1000), 0x1000 + 48);
         }
         assert_eq!(super::unwind_info_words(&saved, &pads, &[], 48).last().map(|h| h >> 24), Some(super::UNWIND_MAGIC));
+    }
+
+    #[test]
+    fn joined_unwind_trailers_keep_function_relative_offsets() {
+        let (code_len, p_off) = (64, 32);
+        for h_staged in [&[][..], &[(8, 16)][..]] {
+            for p_staged in [&[][..], &[(8, 32)][..]] {
+                let mut bytes = vec![0x90; code_len];
+                append_words(&mut bytes, &unwind_info_words(&[3], &[(8, 20)], h_staged, 48));
+                let p_start = bytes.len();
+                let p_words = unwind_info_words(&[12, 0x108], &[(8, 24)], p_staged, 80);
+                append_words(&mut bytes, &p_words);
+                let p_end = bytes.len();
+                append_words(&mut bytes, &part_trailer_words(p_off, p_words.len()));
+                assert!(unsafe { read_unwind_info(bytes.as_ptr() as u64, bytes.len() as u64) }.is_none());
+
+                let split = split_unwind_info(&bytes);
+                assert_eq!(split.code_len, code_len);
+                let h = split.host.unwrap();
+                let (off, p) = split.part.unwrap();
+                assert_eq!(off, p_off);
+                assert_eq!((&*h.saved, &*h.pads, &*h.staged, h.sp_off), (&[3][..], &[(8, 20)][..], h_staged, 48));
+                assert_eq!((&*p.saved, &*p.pads, &*p.staged, p.sp_off), (&[12, 0x108][..], &[(8, 24)][..], p_staged, 80));
+
+                let (h, part) = split_unwind_region(&bytes[split.code_len..], code_len as u32).unwrap();
+                let (off, p) = part.unwrap();
+                assert_eq!(off, p_off);
+                assert!(std::ptr::eq(h, &bytes[code_len..p_start]), "mapped host trailer");
+                assert!(std::ptr::eq(p, &bytes[p_start..p_end]), "mapped part trailer");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_part_discards_both_unwind_trailers() {
+        let plain = [16, UNWIND_MAGIC << 24];
+        let staged = [4, 16, 1, 32, UNWIND_MAGIC_STAGED << 24];
+        for (host, part, count, off) in [
+            (&plain[..], &plain[..], 0, 4),               // no part trailer
+            (&plain[..], &plain[..], 0xff_ffff, 4),       // count exceeds body
+            (&plain[..], &plain[..], 3, 4),               // count includes host head
+            (&plain[..], &staged[..], 4, 4),              // count omits a staged word
+            (&plain[..], &staged[2..], 3, 4),             // truncated staged table
+            (&plain[..], &[0, 32, UNWIND_MAGIC_STAGED << 24][..], 3, 4),
+            (&plain[..1], &plain[..], 2, 4),              // missing host head
+            (&plain[..], &plain[..], 2, 0),               // no host code
+            (&plain[..], &plain[..], 2, 8),               // no part code
+            (&plain[..], &plain[..], 2, 12),              // offset lies in trailers
+        ] {
+            let mut bytes = vec![0x90; 8];
+            append_words(&mut bytes, host);
+            append_words(&mut bytes, part);
+            append_words(&mut bytes, &part_trailer_words(off, count));
+            let split = split_unwind_info(&bytes);
+            assert_eq!(split.code_len, bytes.len(), "bad trailer stripped code");
+            assert!(split.host.is_none() && split.part.is_none(), "bad trailer supplied frame info");
+            assert!(split_unwind_region(&bytes[8..], 8).is_none(), "bad mapped trailer");
+        }
+        let head = (UNWIND_MAGIC_PART << 24 | 2).to_le_bytes();
+        assert!(split_unwind_info(&head).host.is_none(), "part head without offset");
     }
 }
 

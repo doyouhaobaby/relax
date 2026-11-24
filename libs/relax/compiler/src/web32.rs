@@ -143,6 +143,11 @@ fn map_rw(at: u64, len: usize) -> u64 {
     at
 }
 
+/// Whether native address `a` is in the window (a program pointer can name it).
+pub fn in_window(a: u64) -> bool {
+    a >= BASE && a - BASE <= 0xffff_ffff
+}
+
 /// Whether native address `a` is in the window's misc region (where `alloc` places blocks).
 pub fn in_misc(a: u64) -> bool {
     a >= BASE + MISC_AT && a < BASE + MISC_END
@@ -280,10 +285,10 @@ pub fn w32_panic_impl(msg: u64, len: u64, file: u64, file_len: u64, line: u64, c
 }
 
 rt_fn! {
-pub fn w32_catch_panic(f: u64, data: u64) -> u64 {
+pub fn w32_catch_panic(f: u64, data: u64, caught: u64) -> u64 {
     // an unwind skips the frames' returns: the shadow stack is put back at the recovery point
     let s = ss_save();
-    let r = crate::jit::rt_catch_panic(native(f), data);
+    let r = crate::jit::rt_catch_panic(native(f), data, caught);
     ss_restore(s);
     r
 }

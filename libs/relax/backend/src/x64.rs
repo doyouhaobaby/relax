@@ -47,6 +47,12 @@ const TLS_SEG: u8 = match cabi::HOST {
     cabi::Target::Win64 => 0x65,
     _ => 0x64,
 };
+/// The thread-local block fetch takes two loads, `seg:[key >> 32]` (sign-extended: `sar`) then
+/// `[that + key as u32]`, instead of one (`fs:[key]`): Windows (the TEB word, then the TlsAlloc
+/// index's word: `win_tls_key`) and a runtime that Relax itself runs on Linux (the outermost
+/// runtime's block cell, then this runtime's word in that block: compiler os/tls.rs). A
+/// constant of the build, so a native runtime's code is as it was.
+pub const TLS_TWO_LOAD: bool = matches!(cabi::HOST, cabi::Target::Win64) || (cfg!(target_os = "linux") && cfg!(relax));
 const CALLEE_SAVED: [u8; 5] = [RBX, R12, R13, R14, R15];
 /// bytes per slot thunk (`thunk`) and lazy stub (`stub`); a power of two (sandbox thunk masks)
 pub const THUNK_SIZE: usize = 32;
@@ -61,13 +67,16 @@ pub struct Compiled {
     /// (code offset, source position) in ascending offset order
     pub pc_map: Vec<(u32, u64)>,
     pub frame_size: u32,
-    /// bytes of instructions (the float constant pool follows)
+    /// End of the last function's instructions (a joined body includes the host pool and alignment).
+    /// The float constant pool follows.
     pub text_len: u32,
     /// regalloc::alloc_sig of the allocation (0 unless regalloc::SIG_ON)
     pub alloc_sig: u64,
     /// the relocated fields, emitted zeroed: the embedder links the code (`rir::link`) where it
     /// installs it
     pub relocs: Vec<RelocAt>,
+    /// Offsets of private call rel32 fields to resolve when joining the outlined part.
+    pub part_calls: Vec<u32>,
     /// (code offset, block, instruction index; u32::MAX = the terminator) of the function as
     /// emitted -- filled only while `set_rir_map(true)` (asm dumps: tools/run/tools/asmcmp)
     pub rir_map: Vec<(u32, u32, u32)>,
@@ -76,6 +85,14 @@ pub struct Compiled {
 }
 
 static RIR_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resolve the host's private calls and keep both functions in one installable body.
+pub fn join_part(host: Compiled, part: Compiled) -> Result<Compiled, String> {
+    crate::rir::join_native_part(host, part, |site, p_off| {
+        let d = i64::from(p_off) - (i64::from(site) + 4);
+        i32::try_from(d).map(|d| d as u32).map_err(|_| "private call exceeds rel32 range")
+    })
+}
 
 /// Record `Compiled::rir_map` (code offset -> RIR block/instruction) in later compiles.
 pub fn set_rir_map(on: bool) {
@@ -86,8 +103,8 @@ pub fn set_rir_map(on: bool) {
 pub struct Env {
     /// where the function slots' tables and thunks are
     pub slots: SlotsPtr,
-    /// where the runtime's per-thread block pointer is: Linux the fs-relative offset of its
-    /// static-TLS cell; Windows `win_tls_key` (a gs-relative word, then an offset into it)
+    /// where the runtime's per-thread block pointer is: native Linux the fs-relative offset of
+    /// its static-TLS cell; Linux under Relax and Windows (`win_tls_key`) a two-load key (`TLS_TWO_LOAD`)
     pub tls_key: u64,
     /// glue that allocates the calling thread's block: returns it in r11, preserves all else
     pub tls_slow: u64,
@@ -107,6 +124,13 @@ pub struct Env {
 }
 
 impl Env {
+    /// The environment of standalone code (code outside Relax's Rust JIT): no function slots, no
+    /// thread-local block, no resume trampoline, no symbol table; host calls go through pool words, so
+    /// the code is position independent. `opt_regs`: thorough register allocation.
+    pub fn standalone(opt_regs: bool) -> Env {
+        Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs, syms: 0, sym_class: 0, near: false }
+    }
+
     /// The current value of a relocated word.
     pub fn reloc_value(&self, r: Reloc) -> u64 {
         match r {
@@ -128,9 +152,29 @@ struct Asm {
     b: Vec<u8>,
     /// pending scaled index (index reg, shift) for the next memory operand
     sib: Option<(u8, u8)>,
+    /// Flags an instruction set for a later jcc (`mark_flags`): where the run of it and the
+    /// flag-neutral code after it ends. The neutral encoders (mov, load, store, lea, movsx /
+    /// movzx) extend the run (`neutral`); any other byte leaves the code past it, and the flags
+    /// count as gone (`flags_kept`): what reads them makes them again.
+    flags: Option<usize>,
 }
 
 impl Asm {
+    /// The flags of the instruction just emitted are read later, past flag-neutral code only.
+    fn mark_flags(&mut self) {
+        self.flags = Some(self.pos());
+    }
+    /// The flags `mark_flags` marked still hold here.
+    fn flags_kept(&self) -> bool {
+        self.flags == Some(self.pos())
+    }
+    /// A flag-neutral encoder wrote the bytes from `p` on: a run of marked flags it continues
+    /// goes on (it may start inside the run: one neutral encoder calling another).
+    fn neutral(&mut self, p: usize) {
+        if let Some(e) = self.flags {
+            self.flags = (p <= e).then_some(self.pos());
+        }
+    }
     fn byte(&mut self, x: u8) {
         self.b.push(x);
     }
@@ -222,12 +266,15 @@ impl Asm {
     }
     fn mov_rr(&mut self, dst: u8, src: u8) {
         if dst != src {
+            let p = self.pos();
             self.alu_rr(0x89, dst, src);
+            self.neutral(p);
         }
     }
     /// mov_ri that leaves the flags alone (no `xor r, r` for 0): operands materialised between a
     /// fused compare and its jcc / cmovcc / setcc
     fn mov_ri_nf(&mut self, dst: u8, v: i64) {
+        let p = self.pos();
         if v == 0 {
             self.rex(false, 0, 0, dst, false);
             self.byte(0xb8 + (dst & 7));
@@ -235,6 +282,7 @@ impl Asm {
         } else {
             self.mov_ri(dst, v);
         }
+        self.neutral(p);
     }
     fn mov_ri(&mut self, dst: u8, v: i64) {
         if v == 0 {
@@ -258,9 +306,11 @@ impl Asm {
         }
     }
     fn load64(&mut self, dst: u8, base: u8, disp: i32) {
+        let p = self.pos();
         self.rex(true, dst, 0, base, false);
         self.byte(0x8b);
         self.modrm_mem(dst, base, disp);
+        self.neutral(p);
     }
     /// add dst, [base + disp] (64-bit)
     fn add_load64(&mut self, dst: u8, base: u8, disp: i32) {
@@ -269,14 +319,18 @@ impl Asm {
         self.modrm_mem(dst, base, disp);
     }
     fn store64(&mut self, base: u8, disp: i32, src: u8) {
+        let p = self.pos();
         self.rex(true, src, 0, base, false);
         self.byte(0x89);
         self.modrm_mem(src, base, disp);
+        self.neutral(p);
     }
     fn lea(&mut self, dst: u8, base: u8, disp: i32) {
+        let p = self.pos();
         self.rex(true, dst, 0, base, false);
         self.byte(0x8d);
         self.modrm_mem(dst, base, disp);
+        self.neutral(p);
     }
     /// and dst, k (64-bit, k sign-extended)
     fn and_ri(&mut self, dst: u8, k: i32) {
@@ -369,6 +423,7 @@ impl Asm {
     /// d = the low `bits` of s, sign/zero extended: one instruction, no copy first (movzx / movsx
     /// read any source register)
     fn extend_from(&mut self, d: u8, s: u8, bits: u8, signed: bool) {
+        let p = self.pos();
         match (bits, signed) {
             (8, true) => {
                 self.rex(true, d, 0, s, s >= 4);
@@ -404,6 +459,7 @@ impl Asm {
             }
             _ => self.mov_rr(d, s),
         }
+        self.neutral(p);
     }
     fn load_ext(&mut self, dst: u8, base: u8, disp: i32, bytes: u8, signed: bool) {
         match (bytes, signed) {
@@ -1094,6 +1150,7 @@ struct Gen<'a> {
     /// empty: the function names no domain symbol)
     dom_read: Vec<bool>,
     relocs: Vec<RelocAt>,
+    part_calls: Vec<u32>,
     /// emission order successor of each block (u32::MAX for the last)
     next_block: Vec<u32>,
     /// block -> where its code goes on: blocks that emit only their jump (moves the allocator
@@ -1163,6 +1220,14 @@ struct Gen<'a> {
     /// the integer compare the flags hold, made by the instruction just emitted (a compare for its
     /// value, or a select on it): its condition code. A select or branch on it next reads them.
     sel_flags: Option<(Cmp, u8)>,
+    /// The overflow branch (`Cmp::O`) this block ends with, when the block's last instruction is
+    /// its op: `ibin` makes that op once with flags that are the check's (`ovf_form`)
+    ovf_op: Option<Cmp>,
+    /// `ibin` is making `ovf_op`'s op now: in a form whose overflow flag is the check's
+    ovf_form: bool,
+    /// `ovf_op`'s op set the flags (`Asm::mark_flags`): its branch is a `jo` while they are
+    /// kept (`Asm::flags_kept`: flag-neutral code only between)
+    ovf_flags: Option<Cmp>,
     /// C ABI body: its plan, per-argument buffer (rbp disp, 0 = none), result buffer,
     /// the cell keeping an indirect result address for rax
     cplan: Option<Plan>,
@@ -1198,11 +1263,24 @@ struct Gen<'a> {
     align_loops: bool,
     freq: Option<Vec<f32>>,
     /// per forward jump (fwd_at): loop-head paddings emitted before it; per block: before its start
-    /// (a padding may grow by up to 15 bytes in the second pass: short_fwd's bound counts them)
+    /// (a padding may grow by up to 15 bytes in the second pass, a fitted loop's by up to
+    /// LOOP_LINE - 1: short_fwd's bound counts them, `pad_room`)
     fwd_pads: Vec<u32>,
     block_pads: Vec<u32>,
     pads_n: u32,
+    /// fit small hot loops into one fetch line (`fit_lens`; O3 code starts on a line: the
+    /// compiler's jit::hot_align)
+    loop_fit: bool,
+    /// the second pass: per block, the length of the innermost loop it heads when that fits a
+    /// line (0: none); per padding (in order), the bytes it may take
+    fit_len: Vec<u32>,
+    pad_room: Vec<u32>,
 }
+
+/// The fetch line a small hot loop is kept inside: 64 bytes (the op cache's and the uop
+/// cache's windows; O3 code starts on one). A 25-byte loop over a line ran at IPC 4.5 on a Zen 4
+/// part, inside one at 7.7.
+const LOOP_LINE: usize = 64;
 
 impl<'a> Gen<'a> {
     /// Saves (or restores) a caller-saved register's value around a call: 16 bytes for a vector.
@@ -1330,6 +1408,20 @@ impl<'a> Gen<'a> {
         match (self.al.loc[v.0 as usize], self.al.remat[v.0 as usize]) {
             (Loc::None, Remat::Const(k)) if k == k as i32 as i64 && self.win_reg(v).is_none() => Some(k),
             _ => None,
+        }
+    }
+    /// The region windows that begin at `at`: their values into their registers (from the slot, or
+    /// recomputed)
+    fn window_loads(&mut self, at: u32) {
+        if let Some(ls) = self.win_start.get(&at).cloned() {
+            for (v, r) in ls {
+                if let Loc::Stack(o) = self.al.loc[v as usize] {
+                    let d = self.spill_disp(o);
+                    self.load_spill(r, d);
+                } else {
+                    self.remat_into(r, VReg(v));
+                }
+            }
         }
     }
     /// Recomputes a value without a location (Alloc::remat) into r, flags-preserving: a fused
@@ -1806,13 +1898,21 @@ impl<'a> Gen<'a> {
         }
         self.thru_blocks(&reach);
         let align = self.loop_heads(&reach);
+        self.fit_len = self.fit_lens(&align, &reach);
+        self.pad_room = (0..nb).filter(|&b| reach[b] && align.get(b) == Some(&true)).map(|b| if self.fit_len[b] > 0 { LOOP_LINE as u32 - 1 } else { 15 }).collect();
         self.block_pads = vec![0; nb];
         for bi in 0..nb {
             if !reach[bi] {
                 continue;
             }
             if align.get(bi) == Some(&true) {
-                let pad = (16 - self.a.pos() % 16) % 16;
+                let p = self.a.pos();
+                let mut pad = (16 - p % 16) % 16;
+                // a small hot loop that would cross a fetch line starts on the next one
+                let l = self.fit_len[bi] as usize;
+                if l > 0 && (p + pad) % LOOP_LINE + l > LOOP_LINE {
+                    pad = (LOOP_LINE - p % LOOP_LINE) % LOOP_LINE;
+                }
                 self.a.nops(pad);
                 self.pads_n += 1;
             }
@@ -1889,6 +1989,17 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            // a checked op that ends the block, its overflow the branch's: made once, flags kept
+            self.ovf_op = None;
+            self.ovf_flags = None;
+            self.a.flags = None;
+            if let (Some(cmp @ Cmp::O(op, t, x, y)), true) = (bcmp, ne >= 1) {
+                if let Inst::IBin(op2, t2, _, a2, b2) = &b.insts[ne - 1] {
+                    if (*op2, *t2) == (op, t) && ((*a2, *b2) == (x, y) || (op != IOp::Sub && (*a2, *b2) == (y, x))) && !crate::stats::opt_off(options, "-ovfonce") {
+                        self.ovf_op = Some(cmp);
+                    }
+                }
+            }
             // the instruction emitted with the branch
             let into_branch = self.test_fuse.is_some() || self.load_cmp.is_some() || self.fload_cmp.is_some() || self.load_fuse.is_some();
             // a block start can be a jump target: no spill store before it carries over, nor
@@ -1896,8 +2007,7 @@ impl<'a> Gen<'a> {
             self.last_spill = None;
             self.last_alu = None;
             self.r11_base = None;
-            // window lookups of this block never see the previous block's last position (an empty
-            // block's terminator reads at its start: no window there, the slot is read)
+            // window lookups of this block never see the previous block's last position
             self.cur_pos = self.al.block_start[bi];
             self.sel_flags = None;
             for (ii, inst) in b.insts.iter().enumerate().take(ne) {
@@ -1912,16 +2022,7 @@ impl<'a> Gen<'a> {
                         self.sel_flags = None;
                     }
                 }
-                if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
-                    for (v, r) in ls {
-                        if let Loc::Stack(o) = self.al.loc[v as usize] {
-                            let d = self.spill_disp(o);
-                            self.load_spill(r, d);
-                        } else {
-                            self.remat_into(r, VReg(v));
-                        }
-                    }
-                }
+                self.window_loads(self.cur_pos);
                 if into_branch && ii + 1 == ne {
                     break;
                 }
@@ -1980,13 +2081,25 @@ impl<'a> Gen<'a> {
                     }
                     break;
                 }
+                self.ovf_form = self.ovf_op.is_some() && ii + 1 == ne;
                 self.inst(options, inst);
+                self.ovf_form = false;
                 // an integer compare made for its value leaves its flags for a select or branch on it next
                 if let Some((d, cmp @ (Cmp::R(cc, sg, ..) | Cmp::K(cc, sg, ..)))) = Cmp::of(inst) {
                     if !cmp.reads(d) {
                         self.sel_flags = Some((cmp, icc(cc, sg)));
                     }
                 }
+            }
+            // a block whose one instruction is the compare fused into its branch: the compare reads
+            // where it stands, its windows loaded first, as unfused (with an instruction before it,
+            // it reads after that one ran, which regalloc accounts for). Read at the block's start, a
+            // window entered live there (from block_start + 1) had not begun: a value the region
+            // holds in a register came from its slot, stale where the region skips its stores (the
+            // empty block's case below; with RELAX_OPT=-cmpread, or a compare that writes its operand)
+            if fused && ne == 0 && n == 1 {
+                self.cur_pos = self.al.inst_pos(bi, 0);
+                self.window_loads(self.cur_pos);
             }
             // a sibling call ended the block: its Ret is the callee's
             if self.tail.get(bi).is_some_and(|t| t.is_some()) {
@@ -2009,6 +2122,13 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+            }
+            // an empty block's terminator reads where regalloc puts terminator uses (block_end - 1),
+            // where a region's window entered live starts: read at the block's start, a value the
+            // region holds in a register came from its slot, stale where the region skips its
+            // stores (an app's slicer `gaps` at O3: `cap + 1 < cap` rebuilt from cap's slot)
+            if b.insts.is_empty() {
+                self.cur_pos = self.al.block_end[bi] - 1;
             }
             self.term(options, &b.term, bi, bcmp);
         }
@@ -2685,15 +2805,14 @@ impl<'a> Gen<'a> {
     }
 
     /// r11 = this thread's thread-local block, slow path `tls_slow` when it is still null (keeps
-    /// every register but rax/r11). Linux: `mov r11, fs:[key]` (the runtime's static-TLS block
-    /// pointer). Windows: two loads for any TlsAlloc index (`win_tls_key`): `r11 = gs:[key >> 32]`
-    /// (the TEB itself, or its TlsExpansionSlots array, null until the thread sets an index there),
-    /// then `r11 = [r11 + key as u32]`.
+    /// every register but rax/r11). Native Linux: `mov r11, fs:[key]` (the runtime's static-TLS
+    /// cell). Windows and Linux under Relax: the signed high half selects a gs/fs-relative word,
+    /// then the low half selects this runtime's word in the block it points to (`TLS_TWO_LOAD`).
     fn tls_block_r11(&mut self) {
         self.mov_reloc(RAX, Reloc::TlsKey);
-        let p = if matches!(cabi::HOST, cabi::Target::Win64) {
-            // mov r11, rax; shr r11, 32; mov r11, gs:[r11]
-            self.a.b.extend_from_slice(&[0x49, 0x89, 0xc3, 0x49, 0xc1, 0xeb, 0x20, TLS_SEG, 0x4d, 0x8b, 0x1b]);
+        let p = if TLS_TWO_LOAD {
+            // mov r11, rax; sar r11, 32; mov r11, seg:[r11]
+            self.a.b.extend_from_slice(&[0x49, 0x89, 0xc3, 0x49, 0xc1, 0xfb, 0x20, TLS_SEG, 0x4d, 0x8b, 0x1b]);
             self.a.test_rr(R11, R11);
             let none = self.a.jcc32(CC_E);
             // mov eax, eax; mov r11, [r11 + rax]
@@ -2983,8 +3102,9 @@ impl<'a> Gen<'a> {
     fn loop_heads(&self, reach: &[bool]) -> Vec<bool> {
         let nb = self.f.blocks.len();
         let mut a = vec![false; nb];
-        // (no frequencies, e.g. after the allocator split loops: no padding -- aligning every head
-        // of every loop, cold ones included, cost reconcile 3.5% of its bytes in nops)
+        // (no frequencies, as in builds below O3: no padding -- aligning every head of every loop,
+        // cold ones included, cost reconcile 3.5% of its bytes in nops; the allocator's loop split
+        // hands on frequencies for its blocks)
         if !self.align_loops || self.freq.is_none() {
             return a;
         }
@@ -3018,6 +3138,41 @@ impl<'a> Gen<'a> {
             }
         }
         a
+    }
+
+    /// The second pass: per loop head `align` picked, the bytes from its start to the end of its
+    /// last latch in the first pass, when that is at most a fetch line and the loop is innermost
+    /// (no other aligned head between: an inner padding may grow in this pass, the code around it
+    /// only shrinks, so the first pass's length bounds this pass's); 0 otherwise. The first pass
+    /// knows no lengths yet: its paddings are the 16-byte ones.
+    fn fit_lens(&self, align: &[bool], reach: &[bool]) -> Vec<u32> {
+        let nb = self.f.blocks.len();
+        let mut out = vec![0u32; nb];
+        let Some(h) = self.fwd_hint.as_ref().filter(|_| self.loop_fit) else { return out };
+        let mut latch = vec![usize::MAX; nb];
+        for bj in 0..nb {
+            if !reach[bj] {
+                continue;
+            }
+            for s in self.f.blocks[bj].term.succs() {
+                let t = self.thru(s) as usize;
+                if t <= bj && align.get(t) == Some(&true) && (latch[t] == usize::MAX || latch[t] < bj) {
+                    latch[t] = bj;
+                }
+            }
+        }
+        for t in 0..nb {
+            let l = latch[t];
+            if l == usize::MAX || (t + 1..=l).any(|b| align.get(b) == Some(&true)) {
+                continue;
+            }
+            let start = h.1.get(t).copied().unwrap_or(usize::MAX);
+            let end = self.next_block.get(l).and_then(|&n| h.1.get(n as usize)).copied().unwrap_or(usize::MAX);
+            if start != usize::MAX && end != usize::MAX && end > start && end - start <= LOOP_LINE {
+                out[t] = (end - start) as u32;
+            }
+        }
+        out
     }
 
     fn thru(&self, b: u32) -> u32 {
@@ -3071,7 +3226,10 @@ impl<'a> Gen<'a> {
         self.fwd_pads.push(self.pads_n);
         let Some(h) = &self.fwd_hint else { return false };
         match (h.0.get(k), h.1.get(target as usize), h.2.get(k), h.3.get(target as usize)) {
-            (Some(&c1), Some(&t1), Some(&p1), Some(&pt)) if t1 != usize::MAX && t1 > c1 => t1 - c1 - 2 + 15 * pt.saturating_sub(p1) as usize <= 127,
+            (Some(&c1), Some(&t1), Some(&p1), Some(&pt)) if t1 != usize::MAX && t1 > c1 => {
+                let room: usize = self.pad_room.get(p1 as usize..(pt as usize).max(p1 as usize)).map_or(15 * pt.saturating_sub(p1) as usize, |r| r.iter().map(|&x| x as usize).sum());
+                t1 - c1 - 2 + room <= 127
+            }
             _ => false,
         }
     }
@@ -3212,6 +3370,10 @@ impl<'a> Gen<'a> {
                             Some(icc(cond, signed))
                         }
                     },
+                    // the op just made for its value set them (ovf_op), and only flag-neutral code
+                    // came after it
+                    Some(cmp @ Cmp::O(..)) if self.ovf_flags == Some(cmp) && self.a.flags_kept() => Some(CC_O),
+                    Some(cmp @ Cmp::O(..)) => Some(self.cmp_flags(options, cmp).0),
                     Some(Cmp::F(cond, f64_, x, y)) => {
                         let pfx = if f64_ { 0x66 } else { 0 };
                         if let Some((base, off, t)) = self.fload_cmp.take() {
@@ -5501,6 +5663,40 @@ impl<'a> Gen<'a> {
                 self.cmp_imm(rx, k);
                 (icc(cc, signed), None)
             }
+            Cmp::O(IOp::Sub, it, x, y) => {
+                // cmp sets the flags of the subtraction without writing it
+                let rx = self.use_i(options, x, R10);
+                let ry = self.use_i(options, y, R11);
+                if it.bits == 64 {
+                    self.a.alu_rr(0x39, rx, ry);
+                } else {
+                    self.a.alu_rr32(0x39, rx, ry);
+                }
+                (CC_O, None)
+            }
+            Cmp::O(op, it, x, y) => {
+                // the op again in r11 for its overflow flag (its value is the one the code keeps)
+                let rx = self.use_i(options, x, R10);
+                self.a.mov_rr(R11, rx);
+                let ry = self.use_i(options, y, R10);
+                let wide = it.bits == 64;
+                match op {
+                    IOp::Add if wide => self.a.alu_rr(0x01, R11, ry),
+                    IOp::Add => self.a.alu_rr32(0x01, R11, ry),
+                    IOp::Sub if wide => self.a.alu_rr(0x29, R11, ry),
+                    IOp::Sub => self.a.alu_rr32(0x29, R11, ry),
+                    IOp::Mul if wide => self.a.imul_rr(R11, ry),
+                    IOp::Mul => {
+                        // imul r32, r/m32 (0F AF /r)
+                        self.a.rex(false, R11, 0, ry, false);
+                        self.a.byte(0x0f);
+                        self.a.byte(0xaf);
+                        self.a.modrm_rr(R11, ry);
+                    }
+                    _ => unreachable!("an overflow branch is an add, a sub or a mul"),
+                }
+                (CC_O, None)
+            }
             Cmp::F(cc, w, x, y) => {
                 let xa = self.use_f(x, XS);
                 let xb = self.use_f(y, XS2);
@@ -5685,6 +5881,9 @@ impl<'a> Gen<'a> {
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
         assert!(!matches!(op.crc32(), Some((_, false))), "crc32 (IEEE) is lowered for aarch64 targets only");
+        // the block's branch reads this op's overflow flag (ovf_op): the op at its type's width (a
+        // 32-bit op for i32, then the extension), never lea or neg + add
+        let ovf = std::mem::take(&mut self.ovf_form);
         // a spilled first operand of a register result loads straight into it, unless b lives there
         // (uloc covers a spilled b's window; a rematerialised b's window register counts too: b's
         // last read can share d's register, and the load would overwrite b before the operation
@@ -5706,8 +5905,9 @@ impl<'a> Gen<'a> {
             let disp = self.spill_disp(o);
             let rd = self.def_i(d, R10);
             self.a.mov_rr(rd, ra);
-            // 32-bit forms read the slot's low half and zero-extend: u32 as the register forms
-            let w = it != U32;
+            // 32-bit forms read the slot's low half and zero-extend: u32 as the register forms (and
+            // an i32 whose overflow the branch reads, extended after)
+            let w = if ovf { it.bits == 64 } else { it != U32 };
             self.a.rex(w, rd, 0, RBP, false);
             match op {
                 IOp::Mul => {
@@ -5721,7 +5921,11 @@ impl<'a> Gen<'a> {
                 _ => self.a.byte(0x33),
             }
             self.a.modrm_mem(rd, RBP, disp);
-            if w && it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
+            if ovf {
+                self.a.mark_flags();
+                self.ovf_flags = self.ovf_op;
+            }
+            if (w || ovf) && it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
                 self.a.extend(rd, it.bits, it.signed);
             }
             self.fin_i(d, rd);
@@ -5859,14 +6063,14 @@ impl<'a> Gen<'a> {
         let (ra, rb) = if rd == rb && rd != ra && commutative { (rb, ra) } else { (ra, rb) };
         // a 64-bit sum into a third register: lea rd, [ra + rb] (one instruction for mov + add;
         // flags are not read after a register-register add, see last_alu)
-        if op == IOp::Add && it.bits == 64 && rd != ra && rd != rb && rb != RSP {
+        if op == IOp::Add && it.bits == 64 && rd != ra && rd != rb && rb != RSP && !ovf {
             self.a.sib = Some((rb, 0));
             self.a.lea(rd, ra, 0);
             self.fin_i(d, rd);
             return;
         }
         // d = a - b with d in b's register: neg d; add d, a (no copy through rax and back)
-        if op == IOp::Sub && rd == rb && rd != ra && !crate::stats::opt_off(options, "-negadd") {
+        if op == IOp::Sub && rd == rb && rd != ra && !ovf && !crate::stats::opt_off(options, "-negadd") {
             self.a.rex(it != U32, 0, 0, rd, false);
             self.a.byte(0xf7);
             self.a.modrm_rr(3, rd);
@@ -5884,8 +6088,9 @@ impl<'a> Gen<'a> {
         // (r10: rb is never r10 -- its scratch is r11 -- and ra may be r10 already)
         let work = if rd == rb && rd != ra { R10 } else { rd };
         self.a.mov_rr(work, ra);
-        if it == U32 {
-            // 32-bit forms zero-extend for free
+        if it == U32 || (ovf && it.bits == 32) {
+            // 32-bit forms zero-extend for free (an i32 is extended after: its overflow is the
+            // 32-bit op's)
             match op {
                 IOp::Add => self.a.alu_rr32(0x01, work, rb),
                 IOp::Sub => self.a.alu_rr32(0x29, work, rb),
@@ -5900,6 +6105,13 @@ impl<'a> Gen<'a> {
                     self.a.modrm_rr(work, rb);
                 }
             }
+            if ovf {
+                self.a.mark_flags();
+                self.ovf_flags = self.ovf_op;
+            }
+            if it != U32 && !self.low_only[d.0 as usize] {
+                self.a.extend(work, it.bits, it.signed);
+            }
             self.a.mov_rr(rd, work);
             self.fin_i(d, rd);
             return;
@@ -5912,6 +6124,10 @@ impl<'a> Gen<'a> {
             IOp::Xor => self.a.alu_rr(0x31, work, rb),
             IOp::Mul => self.a.imul_rr(work, rb),
             _ => {}
+        }
+        if ovf {
+            self.a.mark_flags();
+            self.ovf_flags = self.ovf_op;
         }
         if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
             self.a.extend(work, it.bits, it.signed);
@@ -6257,6 +6473,11 @@ impl<'a> Gen<'a> {
         }
         match c {
             Callee::Fn(id) => self.call_reloc(Reloc::Call(*id)),
+            Callee::Part => {
+                self.a.byte(0xe8);
+                self.part_calls.push(self.a.pos() as u32);
+                self.a.u32(0);
+            }
             Callee::Indirect(_) => self.a.call_r(R11),
             Callee::Host(sym) => {
                 if !self.near {
@@ -6765,6 +6986,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // branches and selects on their compares' flags (cmp + jcc, cmp + cmov)
     let cmps = if env.opt_regs || f.full { regalloc::compares_into_readers(options, f, x64_sel_ok) } else { None };
     let f = cmps.as_ref().unwrap_or(f);
+    // overflow checks on the op's own flag (mov; add / sub / imul; jo)
+    let ovfs = if env.opt_regs || f.full { regalloc::overflows_into_branches(options, f, true) } else { None };
+    let f = ovfs.as_ref().unwrap_or(f);
     // the backend-internal rewrites above run after the last pipeline verify
     f.verify_after("x64 backend rewrites (legalize/pair256/switch/hoist/sink)")?;
     let mut cfg = reg_config(options);
@@ -6776,8 +7000,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     }
     let _cost_ra = crate::probe::phase(9);
     let t_ra = crate::stats::pass_clock();
-    let (split, al) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
+    let (split, al, split_freq) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
     let f = split.as_ref().unwrap_or(f);
+    // the loop split's made blocks have frequencies too: its loop heads are aligned as any other's
+    // (RELAX_OPT=-splitfreq: a split function gets none, its heads no padding; A/B)
+    let freq = if split.is_none() { freq } else if crate::stats::opt_off(options, "-splitfreq") { None } else { split_freq.as_deref() };
     if split.is_some() {
         f.verify_after("split_loops")?;
     }
@@ -6806,7 +7033,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         (w, ws)
     };
     let mut g = Gen {
-        a: Asm { b: Vec::with_capacity(256), sib: None },
+        a: Asm { b: Vec::with_capacity(256), sib: None, flags: None },
         f,
         al,
         saved: 0,
@@ -6869,6 +7096,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         byte_masks: crate::bitops::vector_byte_masks(f),
         sel_cmp: None,
         sel_flags: None,
+        ovf_op: None,
+        ovf_form: false,
+        ovf_flags: None,
         vpool: Vec::new(),
         apool: Vec::new(),
         asm_veneers: Vec::new(),
@@ -6877,6 +7107,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         dom_slot: 0,
         dom_read: Vec::new(),
         relocs: Vec::new(),
+        part_calls: Vec::new(),
         cplan: None,
         cbuf: Vec::new(),
         cret_buf: 0,
@@ -6898,6 +7129,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         fwd_pads: Vec::new(),
         block_pads: Vec::new(),
         pads_n: 0,
+        loop_fit: env.opt_regs && !crate::stats::opt_off(options, "-loopfit") && !crate::stats::opt_off(options, "-hotalign"),
+        fit_len: Vec::new(),
+        pad_room: Vec::new(),
     };
     // read only at integer casts: a function without one needs no table
     g.zero_above = if g.f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Conv(Conv::IntToInt(_), ..)))) {
@@ -6962,13 +7196,13 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         crate::dbgloc::note_stats(&pc_map, &[], 0);
     }
-    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
+    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, part_calls: g.part_calls, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
 }
 
 /// `jmp target` through r11 (caller-saved, never an argument register): every argument
 /// register (incl. al for variadic calls) and the stack arrive at `target` unchanged.
 pub fn jump_to(target: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.mov_ri(R11, target as i64);
     a.jmp_r(R11);
     a.b
@@ -6976,7 +7210,7 @@ pub fn jump_to(target: u64) -> Vec<u8> {
 
 /// `rdi = arg; jmp target` (tail jump: [rsp] stays the JIT caller's return address).
 pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.mov_ri(RDI, arg as i64);
     a.mov_ri(R11, target as i64);
     a.jmp_r(R11);
@@ -6984,16 +7218,16 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
 }
 
 /// This thread's thread-local block in r11, preserving every other register JIT code may hold:
-/// the fast path `tls_addr` inlines (`mov r11, fs:[key]`, gs on Windows), and when the cell is
+/// the fast path `tls_addr` inlines (`tls_block_r11`), and when the cell is
 /// still null `host() -> block`. `tls_addr` calls it after its own fast path found null; a
 /// prologue that needs the domain base calls it directly. Entered with rsp = 8 mod 16.
 pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     const XMM: u32 = TLS_SLOW_FRAME - 7 * 8;
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     // mov r11, seg:[disp32]: modrm 00/011/100 + SIB 0x25 (no base, no index)
     a.b.extend_from_slice(&[TLS_SEG, 0x4c, 0x8b, 0x1c, 0x25]);
-    if matches!(cabi::HOST, cabi::Target::Win64) {
-        // Windows (win_tls_key): r11 = gs:[key >> 32]; null -> host; r11 = [r11 + key as u32]
+    if TLS_TWO_LOAD {
+        // Windows or Linux under Relax: r11 = seg:[signed high half]; null -> host; r11 = [r11 + key as u32]
         a.u32((key >> 32) as u32);
         a.test_rr(R11, R11);
         // jz +7 (past the load)
@@ -7050,7 +7284,7 @@ pub const TLS_SLOW_FRAME: u32 = 7 * 8 + 264;
 /// restores everything and returns to the interrupted pc. The host never returns when it
 /// unwinds the call with a hang report.
 pub fn hang_tramp(host: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.byte(0x9c); // pushfq
     let regs = [RAX, RCX, RDX, RBX, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15];
     for r in regs {
@@ -7103,14 +7337,13 @@ pub fn win_tls_key(index: u64) -> Option<u64> {
     }
 }
 
-/// `tls_read(key) -> u64` (Relax's convention: key in rdi): the word `TlsAddr` reads on Windows
-/// for a `win_tls_key` key, the same two loads (0 when the gs word is null); the runtime checks
-/// it against TlsSetValue.
-pub fn win_tls_reader() -> Vec<u8> {
+/// `tls_read(key) -> u64` (Relax's convention: key in rdi): the word the two-load fetch
+/// (`TLS_TWO_LOAD`) reads for `key`, 0 when the segment word is null. A runtime checks its key with it.
+pub fn tls2_reader() -> Vec<u8> {
     vec![
         0x48, 0x89, 0xf8, // mov rax, rdi
-        0x48, 0xc1, 0xe8, 0x20, // shr rax, 32
-        0x65, 0x48, 0x8b, 0x00, // mov rax, gs:[rax]
+        0x48, 0xc1, 0xf8, 0x20, // sar rax, 32
+        TLS_SEG, 0x48, 0x8b, 0x00, // mov rax, seg:[rax]
         0x48, 0x85, 0xc0, // test rax, rax
         0x74, 0x06, // jz ret
         0x89, 0xff, // mov edi, edi
@@ -7129,7 +7362,7 @@ pub fn fs_reader() -> Vec<u8> {
 /// `compile_fn(slot) -> code address`, restores them and jumps to the code.
 /// On entry rax holds the slot index.
 pub fn lazy_entry(host_compile: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.push(RBP);
     a.mov_rr(RBP, RSP);
     // A 128-byte area saves rdi rsi rdx rcx r8 r9 and the low words of xmm0-7, 16-byte aligned.
@@ -7180,7 +7413,7 @@ pub const LAZY_ENTRY_FRAME: u32 = 128 + 160;
 /// head (`thunk_head`) is `jmp rel32` straight to the slot's code, or, when that is out of reach
 /// or not known, to `+8`: `mov rax, table_word; jmp [rax]`. Built with the head to `+8`.
 pub fn thunk(slot_addr: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::with_capacity(THUNK_SIZE), sib: None };
+    let mut a = Asm { b: Vec::with_capacity(THUNK_SIZE), sib: None, flags: None };
     a.u64(THUNK_HEAD_TABLE);
     a.mov_ri(RAX, slot_addr as i64);
     a.jmp_mem(RAX, 0);
@@ -7193,12 +7426,12 @@ pub fn thunk(slot_addr: u64) -> Vec<u8> {
 /// Loader-only entry mark, followed by a jump through the replaceable body word. Slot ids
 /// and TLS addresses belong to this process; none of these bytes are part of a cached body.
 pub fn entry_thunk(id: u32, tls: u32, key: u64, slow: u64, body: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.b.extend_from_slice(&[TLS_SEG, 0x4c, 0x8b, 0x1c, 0x25]); // mov r11, seg:[disp32]
-    if matches!(cabi::HOST, cabi::Target::Win64) {
+    if TLS_TWO_LOAD {
         a.u32((key >> 32) as u32);
         a.test_rr(R11, R11);
-        a.b.extend_from_slice(&[0x74, 0x07]); // null expansion array: skip its load
+        a.b.extend_from_slice(&[0x74, 0x07]); // null expansion array or outer runtime block: skip its load
         a.b.extend_from_slice(&[0x4d, 0x8b, 0x9b]);
         a.u32(key as u32);
     } else {
@@ -7251,7 +7484,7 @@ pub const COUNT_STUB_SIZE: usize = 64;
 /// jumps to `hot` (lazy_entry-style glue: rax = slot, returns the address to continue at), else to
 /// the code: `jmp rel32` when in reach, else through r11. Uses rax and r11 only.
 pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64, weight: u32) -> Vec<u8> {
-    let mut a = Asm { b: Vec::with_capacity(COUNT_STUB_SIZE), sib: None };
+    let mut a = Asm { b: Vec::with_capacity(COUNT_STUB_SIZE), sib: None, flags: None };
     a.mov_ri(RAX, counter as i64);
     // sub qword [rax], imm32
     for x in [0x48u8, 0x81, 0x28] {
@@ -7286,7 +7519,7 @@ pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64, weight:
 
 /// Per-slot stub: `mov eax, slot; jmp lazy_entry` (absolute via r11).
 pub fn stub(slot: u32, lazy: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::with_capacity(48), sib: None };
+    let mut a = Asm { b: Vec::with_capacity(48), sib: None, flags: None };
     a.mov_ri(RAX, slot as i64);
     a.mov_ri(R11, lazy as i64);
     a.rex(false, 0, 0, R11, false);
@@ -7303,7 +7536,7 @@ pub const ENTER_FRAME: u32 = 5 * 8 + 8;
 /// Returns 0 normally. `leave_with(ctx, code)` restores them and returns `code`
 /// from enter (used by panics, faults and hangs to get back to the host).
 pub fn enter_leave() -> (Vec<u8>, usize) {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     // enter: rdi = fn, rsi = arg, rdx = ctx
     a.push(RBP);
     a.mov_rr(RBP, RSP);
@@ -7345,7 +7578,7 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
 /// register block `regs` ([rbp, return address, rbx, r12, r13, r14, r15], the panic
 /// trampoline's layout), rbp = fp and rsp = sp. Never returns.
 pub fn land() -> Vec<u8> {
-    let mut a = Asm { b: Vec::new(), sib: None };
+    let mut a = Asm { b: Vec::new(), sib: None, flags: None };
     a.load64(RBX, RDI, 16);
     a.load64(R12, RDI, 24);
     a.load64(R13, RDI, 32);
@@ -7392,7 +7625,7 @@ mod tests {
         push(&mut f, b4, Inst::Iconst(one, 1));
         f.blocks[b4 as usize].term = Term::Ret(vec![one]);
         f.blocks[b5 as usize].term = Term::Ret(vec![x]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+        let env = Env::standalone(true);
         let r = compile(options, &f, &env).expect("compiles");
         let code = &r.code[..r.text_len as usize];
         // add r64, 12: REX.W(+B) 83 /0 ib
@@ -7428,7 +7661,7 @@ mod tests {
             f.blocks[b0 as usize].insts.push(Inst::IBinI(op, u64t, p, p, k));
             f.blocks[b0 as usize].pos.push(0);
             f.blocks[b0 as usize].term = Term::Ret(vec![p]);
-            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+            let env = Env::standalone(true);
             let r = compile(options, &f, &env).expect("compiles");
             let code = &r.code[..r.text_len as usize];
             // no REX.W 81 /n with an imm32 that is not k (the truncated constant)

@@ -70,7 +70,7 @@ impl Cache {
         // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
         // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
         // own verdict is clean and asks for no run-time disjoint-index checks, and never from a twin
-        // (Unit::unverified_code_calls_bases). Later warm launches then never run the cold launch's twins (the race's
+        // (Unit::twin_caller_kept). Later warm launches then never run the cold launch's twins (the race's
         // draw path: draw_view .. set_uniform), at no link cost (twin_link_target for the lazy path).
         crate::run::yield_section("image twins");
         let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
@@ -110,8 +110,14 @@ impl Cache {
             let sum = if pend.contains_key(k) { crate::store::sum64(payload) } else { let Some(s) = self.entry_sum(*k) else { continue }; s };
             let Some(bytes) = self.slot_bytes_known(*id) else { continue };
             let mut cr: Vec<u32> = crates.clone();
-            let clean = twinlink && u.unverified_code_calls_bases(*id);
-            let retarget = |t: &[u8]| -> bool { clean && t.first().copied().and_then(KeyKind::of) == Some(KeyKind::Twin) && in_image.contains(&t[1..]) };
+            // (a twin call kept counts the first failing clause: crate::jit::twin_kept_summary)
+            let caller_kept = if twinlink { u.twin_caller_kept(*id) } else { Some(crate::jit::TwinKept::Off) };
+            let retarget = |t: &[u8]| -> bool {
+                if t.first().copied().and_then(KeyKind::of) != Some(KeyKind::Twin) { return false; }
+                let why = caller_kept.or_else(|| (!in_image.contains(&t[1..])).then_some(crate::jit::TwinKept::BaseNoCode));
+                if let Some(why) = why { crate::jit::TWIN_KEPT[1][why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                why.is_none()
+            };
             if image_slot(tab, slots, blob, *k, sum, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
                 n += 1;
                 set_bit(&mut placed, *id);
@@ -588,7 +594,7 @@ impl ImageTables {
     fn sym(&mut self, d: &mut D) -> Option<u32> {
         let s = d.p;
         match d.u8()? {
-            1 | 5 | 9 => {
+            1 | 5 | 9 | 19 => {
                 d.str()?;
             }
             2 | 10 => {
@@ -881,7 +887,7 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
     e.u32(blob.len() as u32);
     e.u32(code.len() as u32);
     // the code without its unwind trailer (the trailer stays in the image: Unit::unwind_at)
-    e.u32(relax_backend::rir::split_unwind_info(code).0 as u32);
+    e.u32(relax_backend::rir::split_unwind_info(code).code_len as u32);
     e.u32(rel.len() as u32);
     for (at, kind, t, ix) in rel {
         e.u32(at);
@@ -1871,8 +1877,8 @@ impl Linker {
     }
 
     /// Places the code of resolved slots `keep` (that still have no code) in one block of code
-    /// memory, each 16-byte aligned without its unwind trailer, links it there in one pass and
-    /// writes the block with one write.
+    /// memory, each 16-byte aligned (O3 code on a fetch line: jit::hot_align) without its unwind
+    /// trailer, links it there in one pass and writes the block with one write.
     fn img_place(&mut self, u: &mut Unit, im: &mut Img, keep: Vec<(usize, u32)>) -> Vec<PrelinkedSlot> {
         let mut out = Vec::new();
         let mut layout = Vec::with_capacity(keep.len());
@@ -1895,7 +1901,9 @@ impl Linker {
                 if (hot_first && (im.slots[e.0].tier == super::TIER_O3) != pass) || (!hot_first && !pass) {
                     continue;
                 }
-                e.2 = (total + 15) & !15;
+                // O3 code starts on a fetch line (jit::hot_align), the rest 16-aligned
+                let a = if im.slots[e.0].tier == super::TIER_O3 { crate::jit::hot_align() as usize } else { 16 };
+                e.2 = (total + a - 1) & !(a - 1);
                 total = e.2 + e.3;
             }
         }
@@ -1917,7 +1925,6 @@ impl Linker {
         // what each slot's code references, as linked
         let mut refs: Vec<crate::jit::RefList> = (0..layout.len()).map(|_| Default::default()).collect();
         {
-            let env = &u.env;
             let syms = &u.syms;
             let im = &*im;
             unsafe {
@@ -1933,27 +1940,27 @@ impl Linker {
                                 ok = false;
                                 break;
                             };
-                            let v = match t {
+                            let target = match t {
                                 IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| {
                                     refs[k].slot(x, t == IMG_THUNK);
-                                    env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })
+                                    match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) }
                                 }),
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| {
                                     if live && (s.off == crate::jit::PATCH_FLAG_OFF || s.off == crate::jit::COPY_VER_OFF) {
                                         guards[k].push(s);
                                     }
-                                    refs[k].sym(syms.kind(s.id));
+                                    refs[k].sym(s.id, syms.kind(s.id));
                                     if is_vt.get(ix as usize).copied().unwrap_or(false) && !im.fresh.contains_key(&ri) {
                                         makes[k].push(syms.value(s));
                                     }
-                                    syms.value(s)
+                                    Reloc::Sym(s)
                                 }),
-                                IMG_TLS_KEY => Some(env.reloc_value(Reloc::TlsKey)),
-                                IMG_TLS_SLOW => Some(env.reloc_value(Reloc::TlsSlow)),
-                                _ => Some(env.reloc_value(Reloc::Resume)),
+                                IMG_TLS_KEY => Some(Reloc::TlsKey),
+                                IMG_TLS_SLOW => Some(Reloc::TlsSlow),
+                                _ => Some(Reloc::Resume),
                             };
-                            match v {
-                                Some(v) if (r_at as usize) < n => rl.push(RelocAt { at: r_at, kind, target: Reloc::Value(v) }),
+                            match target {
+                                Some(target) if (r_at as usize) < n => rl.push(RelocAt { at: r_at, kind, target }),
                                 _ => {
                                     ok = false;
                                     break;

@@ -10,8 +10,8 @@
 //! their build scripts run verbatim: `cargo check --release -p <package> --message-format=json`
 //! in the run's workspace, same Cargo.lock, same cargo flags. Cargo's `RUSTC_WRAPPER` is this
 //! executable (`wrapper`): it compiles with the real rustc only what the native scripts need (the
-//! scripts of the native packages and their build-dependency closure) and answers every other
-//! crate with empty outputs, so cargo decides features, cfgs and env for the whole graph and
+//! scripts of the native packages and their build-dependency closure, host units only) and
+//! answers every other crate with empty outputs, so cargo decides features, cfgs and env for the whole graph and
 //! Relax compiles the Rust. Target scripts query Relax's compiler interface even when Cargo
 //! compiles their executable; scripts feeding native host dependencies query the native rustc.
 //! Cargo's `build-script-executed` messages give the cfgs, rustc-env and
@@ -353,7 +353,8 @@ struct Plan {
 fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     let pk = |bs: &BuildScript| g.pkg[bs.krate].clone();
     // packages whose script runs for real: the native ones and the build-dependency closure of
-    // those; packages whose lib compiles for real: that closure
+    // those; packages whose lib compiles for real (its host unit: the wrapper stubs a target one):
+    // that closure
     let mut script_pkgs: Vec<String> = Vec::new();
     let mut lib_pkgs: Vec<String> = Vec::new();
     for &s in seeds {
@@ -915,9 +916,71 @@ fn run_cargo(g: &Graph, req: &Request, exe: &std::path::Path, flags: &[&String],
     run_cargo_with(&g.pkg, &script_table(g), req.workspace, req.package, req.relax_dir, req.triple, exe, flags, script_pkgs, lib_pkgs, seeds, tier)
 }
 
+/// The workspace lockfiles this process's own native builds keep: cargo brings the lock up to date,
+/// and makes one in a tree without it (module doc). Per lockfile, how many cargo runs of theirs are
+/// on it now, and its stamp (modified time, length) as the last of them left it. That lock is the
+/// run's own doing, no edit of the person's: the live watcher takes it as it is (reload.rs; a
+/// fixture's first run made its lock beside the running program, and the watcher said "1
+/// manifest(s) changed" in the program's output).
+static OWN_LOCKS: std::sync::Mutex<Vec<OwnLock>> = std::sync::Mutex::new(Vec::new());
+
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+struct OwnLock {
+    path: std::path::PathBuf,
+    running: u32,
+    left: Stamp,
+}
+
+/// What this process's own native builds did to the lockfile `path` ([`OWN_LOCKS`]).
+#[derive(Debug, PartialEq)]
+pub enum OwnLockState {
+    /// a cargo of theirs runs on it now: what the file says may still change
+    Building,
+    /// the stamp it had when the last of them returned
+    Left(Stamp),
+}
+
+/// [`OwnLockState`] of `path`; None when no native build of this process ran cargo on it.
+pub fn own_lock(path: &str) -> Option<OwnLockState> {
+    let path = std::path::Path::new(path);
+    let locks = OWN_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.iter().find(|l| l.path == path).map(|l| if l.running > 0 { OwnLockState::Building } else { OwnLockState::Left(l.left) })
+}
+
+/// One cargo run's hold on its workspace's lockfile ([`OWN_LOCKS`]): from before cargo starts to
+/// the lock's stamp once cargo has returned, whichever way the build ends.
+struct LockRun(std::path::PathBuf);
+
+impl LockRun {
+    fn start(workspace: &str) -> LockRun {
+        let path = std::path::Path::new(workspace).join("Cargo.lock");
+        let mut locks = OWN_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        match locks.iter_mut().find(|l| l.path == path) {
+            Some(l) => l.running += 1,
+            None => locks.push(OwnLock { path: path.clone(), running: 1, left: None }),
+        }
+        LockRun(path)
+    }
+}
+
+impl Drop for LockRun {
+    fn drop(&mut self) {
+        let left = std::fs::metadata(&*crate::vfs::on_disk(&self.0.to_string_lossy())).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let mut locks = OWN_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        // (a run's end in place may have cleared the list while this cargo ran)
+        match locks.iter_mut().find(|l| l.path == self.0) {
+            Some(l) => { l.running = l.running.saturating_sub(1); l.left = left; }
+            None => locks.push(OwnLock { path: self.0.clone(), running: 0, left }),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<String>)], workspace: &str, package: &str, relax_dir: &str, triple: &str, exe: &std::path::Path,
     flags: &[&String], script_pkgs: &[String], lib_pkgs: &[String], seeds: &[usize], tier: Tier) -> Result<String, String> {
+    // (cargo metadata and cargo check below may each write the lock)
+    let _lock = LockRun::start(workspace);
     // Cargo does not track the wrapper's selection environment. An empty stub
     // from another selection must never count as a fresh real library.
     let selection = selection_key(script_pkgs, lib_pkgs, c_toolchain());
@@ -1748,13 +1811,19 @@ pub fn wrapper() -> Option<i32> {
     };
     let is_print = rest.iter().any(|a| a == "--print" || a.starts_with("--print=") || a == "-vV" || a == "--version");
     let name = value("--crate-name");
+    // a unit cargo builds for the program's target (`--target`, which run_cargo_with always
+    // passes; cargo gives it no host unit): no native script runs it, so it is a stub, whatever its
+    // package. A package of the scripts' build-dependency closure that the program depends on too
+    // has one; built for real, it needed the target's own std, which a toolchain may not have
+    // (Windows: x86_64-pc-windows-gnu's beside an msvc toolchain, E0463 at the first such crate)
+    let target_unit = rest.iter().any(|a| a == "--target" || a.starts_with("--target="));
     let real = is_print || match &name {
         None => true,
         Some(n) if n == "___" => true,
         Some(n) => {
             let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
             let list = |v: &str| std::env::var(v).unwrap_or_default().split(',').any(|x| x == pkg);
-            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { list("RELAX_NATIVE_LIBS") }
+            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { !target_unit && list("RELAX_NATIVE_LIBS") }
         }
     };
     if real {
@@ -2261,6 +2330,8 @@ fn the_native_library_links_with_the_programs_c_compiler_linker() {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&STARTED, std::sync::atomic::AtomicBool::new(false));
+    // the next run snapshots its inputs anew (a cargo still running adds its lock back as it ends)
+    OWN_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // read again by the next run: the toolchain may have been updated in between
     reset(&C_TOOLCHAIN, std::sync::OnceLock::new());
 }

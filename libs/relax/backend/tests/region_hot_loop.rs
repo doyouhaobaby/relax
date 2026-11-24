@@ -11,14 +11,14 @@ use relax_backend::{exec::Code, rir::*};
 #[cfg(target_arch = "x86_64")]
 fn compile(f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
     let o = relax_session::Options::default();
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+    let env = relax_backend::x64::Env::standalone(true);
     let c = relax_backend::x64::compile_freq(&o, f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
 #[cfg(target_arch = "aarch64")]
 fn compile(f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
-    let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+    let env = relax_backend::arm64::Env::standalone(true);
     let c = relax_backend::arm64::compile_freq(&relax_session::Options::default(), f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
@@ -186,7 +186,7 @@ fn hot_path_holds_the_spilled_value() {
                 assert_eq!(run(n, seed), reference(n, seed, outer), "outer {} freq {} n {}", outer, fr.is_some(), n);
             }
         }
-        let (g, al) = allocate_split(&relax_session::Options::default(), &f, &reg_config(), true, Some(&freq));
+        let (g, al, _) = allocate_split(&relax_session::Options::default(), &f, &reg_config(), true, Some(&freq));
         let h = g.as_ref().unwrap_or(&f);
         // the hot path in the allocated function (the loop split may add and reorder blocks): the
         // body (i & 3), its predecessor (the header) and its move-only successor (the latch)

@@ -88,6 +88,8 @@ struct Inner {
     seqs: Mutex<HashMap<String, u64>>,
     caps: Mutex<Vec<String>>,
     timeout: Mutex<Option<Duration>>,
+    /// each connection's [`Conn::set_ping_limit`] (zero: none)
+    ping_limit: Mutex<Duration>,
 }
 
 #[derive(Clone)]
@@ -143,7 +145,7 @@ fn local_client_name() -> String {
 
 impl Client {
     pub fn new(target: Target, name: &str) -> Client {
-        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), failed: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
+        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), failed: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None), ping_limit: Mutex::new(Duration::ZERO) }))
     }
 
     /// Dials a local endpoint: `spec` is a socket path, a discovery file's `tcp:` socket (Windows),
@@ -266,6 +268,10 @@ impl Client {
         drop(failed);
         *self.0.caps.lock().unwrap() = ok.caps.clone();
         let conn = Conn::start(Io { reader: car.reader, writer: car.writer, shutdown: car.shutdown }, ok, true, None, Hooks::default());
+        let limit = *self.0.ping_limit.lock().unwrap();
+        if !limit.is_zero() {
+            conn.set_ping_limit(limit);
+        }
         if let Some(s) = settle {
             s();
         }
@@ -289,6 +295,15 @@ impl Client {
         }
         let (since, pause) = (f.at.elapsed(), redial_pause(f.n));
         (self.0.target.remote() && since < pause).then(|| format!("{} (its last dial failed {:.1} s ago: the next is {:.0} s after it)", f.why, since.as_secs_f32(), pause.as_secs_f32()))
+    }
+
+    /// Loses a connection whose ping goes `limit` unanswered ([`Conn::set_ping_limit`]): its open
+    /// requests fail with [`Error::LinkLost`], and the next call dials again.
+    pub fn set_ping_limit(&self, limit: Duration) {
+        *self.0.ping_limit.lock().unwrap() = limit;
+        if let Some(c) = self.0.conn.lock().unwrap().as_ref() {
+            c.set_ping_limit(limit);
+        }
     }
 
     /// True once the connection this client had has ended (its next call dials a new one): a

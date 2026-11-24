@@ -72,7 +72,7 @@ fn reference(p: &[u32], q: u64) -> u64 {
 }
 
 fn compile(f: &Func) -> Vec<u8> {
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+    let env = relax_backend::x64::Env::standalone(true);
     let c = relax_backend::x64::compile_freq(&options(), f, &env, None).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
@@ -95,7 +95,7 @@ fn r11_reloads(code: &[u8]) -> Vec<(usize, usize, i32)> {
 #[test]
 fn the_second_load_through_a_spilled_base_reads_r11_again() {
     let (f, p) = build();
-    let (g, al) = allocate_split(&options(), &f, &relax_backend::x64::reg_config(&relax_session::Options::default()), true, None);
+    let (g, al, _) = allocate_split(&options(), &f, &relax_backend::x64::reg_config(&relax_session::Options::default()), true, None);
     let _ = g;
     assert!(matches!(al.loc[p.0 as usize], Loc::Stack(_)), "the fixture needs the base spilled: {:?}", al.loc[p.0 as usize]);
     let code = compile(&f);

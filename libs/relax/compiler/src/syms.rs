@@ -19,7 +19,7 @@ use crate::program::DefId;
 use relax_backend::rir::{Mem, Sym, SymClass};
 use crate::types::{TyId, TyKind};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use relax_session::sync::Mutex;
 
@@ -65,6 +65,13 @@ pub enum SymKind {
     /// sandboxed code: the version of host entry `.0` (`c:<C name>`, `rt:<runtime entry>`) the
     /// domain's policy gives its code
     SbHost(String),
+    /// What code calls through, named by a stable string (jit.rs `RtNote`). `Func::notes`
+    /// carries it to a `RelocKind::Note`. Its value is zero and no code reads it.
+    Note(String),
+    /// the made cell of the vtable whose data symbol is `.0` (Syms::made_cell): a byte set the
+    /// first time code makes a trait object with that vtable (lower.rs note_made), so a patch
+    /// tells a trait object that was made from one only some code that never ran would make
+    Made(u32),
 }
 
 /// What the bytes of a data object hold.
@@ -104,10 +111,18 @@ pub struct Syms {
     pub vals: u64,
     /// `rir::SymClass` per id (u8): how a backend may encode the symbol (`Env::sym_class`)
     pub classes: u64,
+    /// a byte per id: the made cell of a vtable's data symbol (`SymKind::Made`, made_cell); the
+    /// program's code sets it, so a wasm32 program's are in its window (Unit::new)
+    made: u64,
     /// kind per id (append-only: read without a lock)
     kinds: crate::conc::AppendVec<SymKind>,
     inner: Mutex<SymsInner>,
     data: Mutex<DataIndex>,
+    /// Published length of the vtable index for the real-time walk.
+    vtable_count: AtomicUsize,
+    /// How many `SymKind::Thunk` symbols exist: the real-time walk scans the table for new ones
+    /// only when this grew (fn pointers held in data, matched against called signatures).
+    thunk_count: AtomicUsize,
     /// (size, align) of each `SymKind::Rw` block
     pub rw_blocks: Mutex<Vec<(u64, u64)>>,
     /// the writable blocks lowering made, by address: start -> (size, the value's type)
@@ -158,20 +173,33 @@ struct DataIndex {
 
 /// The name prefix of a vtable's data object (jit.rs Unit::vtable).
 pub const VTABLE_NAME: &str = "vtable:";
+/// Separates a vtable's dyn type and each principal key it serves.
+pub const VTABLE_KEY_SEP: char = '\u{1f}';
 
-/// The two types a vtable's data name gives (`vtable:<type>#<hash>:<dyn type>#<hash>`, stable_ty
-/// each), with their hashes.
-pub fn vtable_name_parts(name: &str) -> Option<(&str, &str)> {
+/// The concrete type, followed by the dyn type and the keys sharing its vtable.
+fn vtable_name_fields(name: &str) -> Option<(&str, std::str::Split<'_, char>)> {
     let rest = name.strip_prefix(VTABLE_NAME)?;
     let b = rest.as_bytes();
-    // (the last `#<hash>:`: the concrete type's end; the dyn type ends in its own hash)
+    // The last `#<hash>:` ends the concrete type. The dyn type and keys end in a hash or '-'.
     let cut = (0..b.len()).rev().find(|&i| b[i] == b'#' && i + 9 < b.len() && b[i + 9] == b':' && b[i + 1..i + 9].iter().all(u8::is_ascii_hexdigit))?;
-    Some((&rest[..cut + 9], &rest[cut + 10..]))
+    Some((&rest[..cut + 9], rest[cut + 10..].split(VTABLE_KEY_SEP)))
+}
+
+/// The concrete and dyn types of a vtable, with their stable_ty hashes.
+pub fn vtable_name_parts(name: &str) -> Option<(&str, &str)> {
+    let (ty, mut fields) = vtable_name_fields(name)?;
+    Some((ty, fields.next()?))
+}
+
+/// The principal keys this vtable serves, in segment order.
+pub fn vtable_name_keys(name: &str) -> impl Iterator<Item = &str> {
+    vtable_name_fields(name).into_iter().flat_map(|(_, fields)| fields.skip(1))
 }
 
 impl Syms {
-    pub fn new(vals: u64, dom0: u64) -> Syms {
-        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+    /// `made`: SYM_CAP zeroed bytes, the made cells (made_cell)
+    pub fn new(vals: u64, dom0: u64, made: u64) -> Syms {
+        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), made, kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), vtable_count: AtomicUsize::new(0), thunk_count: AtomicUsize::new(0), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
     }
 
 
@@ -192,9 +220,47 @@ impl Syms {
         s
     }
 
+    /// Vtable data symbol `vt`'s made cell: a byte code sets the first time it makes a trait
+    /// object with that vtable (lower.rs note_made), and the cache and image linkers set for a
+    /// vtable data they link points at (a constant holding a `&dyn`: its value exists, no code
+    /// made it this run). One a twin's code reaches is set when the twin is built (sandbox.rs).
+    pub fn made_cell(&self, vt: Sym) -> u64 {
+        self.made + vt.id as u64
+    }
+
+    pub fn is_made(&self, vt: Sym) -> bool {
+        unsafe { (*(self.made_cell(vt) as *const AtomicU8)).load(Ordering::Acquire) != 0 }
+    }
+
+    pub fn set_made(&self, vt: Sym) {
+        unsafe { (*(self.made_cell(vt) as *const AtomicU8)).store(1, Ordering::Release) }
+    }
+
+    /// The symbol of vtable data symbol `vt`'s made cell, as code names it.
+    pub fn made_sym(&self, vt: Sym) -> Sym {
+        self.intern(SymKind::Made(vt.id), self.made_cell(vt))
+    }
+
+    /// Whether code that makes trait objects with vtable data symbol `vt` sets its made cell
+    /// (its symbol exists: the makers lowered or linked so far name it).
+    pub fn has_made_cell(&self, vt: Sym) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&SymKind::Made(vt.id))
+    }
+
+    /// Whether symbol `s` is the start of a vtable's data object.
+    pub fn is_vtable_sym(&self, s: Sym) -> bool {
+        s.off == 0 && matches!(self.kind(s.id), Some(SymKind::Data(i)) if self.is_vtable_obj(i))
+    }
+
+    /// The symbol for a real-time call-site note.
+    pub fn note(&self, name: String) -> Sym {
+        self.intern(SymKind::Note(name), 0)
+    }
+
     fn push(&self, kind: SymKind, value: u64) -> Sym {
         // a domain symbol's table value is its offset in the domain static block (0: no storage)
         let value = if class_of(&kind) == relax_backend::rir::SymClass::Domain && value != 0 { value - self.dom0 } else { value };
+        let thunk = matches!(kind, SymKind::Thunk(_));
         let id = self.kinds.push(kind) as u32;
         if id as usize >= SYM_CAP {
             panic!("symbol table full");
@@ -202,7 +268,15 @@ impl Syms {
         unsafe { std::ptr::write((self.vals as *mut u64).add(id as usize), value) };
         let class = class_of(&self.kinds[id as usize]);
         unsafe { std::ptr::write((self.classes as *mut u8).add(id as usize), class as u8) };
+        if thunk {
+            self.thunk_count.fetch_add(1, Ordering::Release);
+        }
         Sym::new(id)
+    }
+
+    /// How many thunk symbols exist (see `thunk_count`).
+    pub fn thunk_count(&self) -> usize {
+        self.thunk_count.load(Ordering::Acquire)
     }
 
     /// The slot of a tier record symbol (`SymKind::TierRec`), without copying the kind.
@@ -249,6 +323,11 @@ impl Syms {
         self.kinds.len()
     }
 
+    /// Published symbol kinds starting at the cursor. Each index can resume a bounded scan.
+    pub fn kinds_from(&self, cursor: usize) -> impl Iterator<Item = (usize, &SymKind)> {
+        (cursor..self.len()).map(move |i| (i, &self.kinds[i]))
+    }
+
     /// Registers the data object at `start..start+len` (Unit::data); returns its symbol.
     pub fn add_data(&self, start: u64, len: u64, align: u64, kind: DataKind, mutable: bool) -> Sym {
         // one critical section: the object's index and its symbol must agree (lock order:
@@ -282,6 +361,22 @@ impl Syms {
             d.by_start.insert(*start, first + i as u32);
         }
         let vtables = d.vtables.len() > vtables;
+        if vtables { self.vtable_count.store(d.vtables.len(), Ordering::Release); }
+        // a placed object that is no vtable and points at one (a constant holding a `&dyn`): the
+        // trait object exists, though no code made it this run (made_cell)
+        let is_vt = |i: usize| d.objs.get(i).and_then(|o| o.name.as_deref()).is_some_and(|n| n.starts_with(VTABLE_NAME));
+        for i in first as usize..d.objs.len() {
+            if is_vt(i) {
+                continue;
+            }
+            if let DataKind::Relocs(r) = &d.objs[i].kind {
+                for (_, t) in r {
+                    if t.off == 0 && matches!(self.kind(t.id), Some(SymKind::Data(k)) if is_vt(k as usize)) {
+                        self.set_made(*t);
+                    }
+                }
+            }
+        }
         drop(d);
         // (the data lock released: the real-time reach's lock goes first)
         if vtables {
@@ -352,6 +447,7 @@ impl Syms {
             let Some(&i) = d.by_start.get(&start) else { return };
             if vtable && !d.objs[i as usize].name.as_deref().is_some_and(|n| n.starts_with(VTABLE_NAME)) {
                 d.vtables.push(i);
+                self.vtable_count.store(d.vtables.len(), Ordering::Release);
             }
             d.objs[i as usize].name = Some(if vtable { name.clone() } else { std::mem::take(&mut name) });
         }
@@ -364,8 +460,18 @@ impl Syms {
     /// Every vtable of this run (lowered, linked from the disk cache, placed from the startup
     /// image -- only a lowered one is in Unit::vtables): (start, name).
     pub fn vtable_objs(&self) -> Vec<(u64, String)> {
+        self.vtables_from(0).0
+    }
+
+    pub fn vtable_count(&self) -> usize {
+        self.vtable_count.load(Ordering::Acquire)
+    }
+
+    /// Vtables registered since the last scan, in registration order, and the next cursor.
+    pub fn vtables_from(&self, cursor: usize) -> (Vec<(u64, String)>, usize) {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        d.vtables.iter().filter_map(|&i| d.objs.get(i as usize)).filter_map(|o| Some((o.start, o.name.clone()?))).collect()
+        let objs = d.vtables[cursor..].iter().map(|&i| &d.objs[i as usize]);
+        (objs.filter_map(|o| Some((o.start, o.name.clone()?))).collect(), d.vtables.len())
     }
 
     /// The vtables of this run (see vtable_objs) whose dyn type `of(start, dyn type)` takes, by its
@@ -381,6 +487,12 @@ impl Syms {
             }
         }
         out
+    }
+
+    /// Whether a code reference names a vtable object.
+    pub fn is_vtable_obj(&self, idx: u32) -> bool {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        d.objs.get(idx as usize).is_some_and(|o| o.name.as_deref().is_some_and(|n| n.starts_with(VTABLE_NAME)))
     }
 
     /// Whether a vtable's data object starts at `addr`.
@@ -542,26 +654,53 @@ pub fn read_leaf(u: &Unit, s: Sym, m: Mem) -> relax_backend::passes::RoRead {
     read_obj(u, s, n)
 }
 
-/// The functions a constant data object at `addr` points at, directly or through the data
-/// objects it points at (vtables and their supertrait vtables, fn tables, constants holding fn
-/// pointers): what code reading it can call (real-time reach, jit.rs realtime).
+/// Thunks under a data address, including supertrait vtables of an explicit real-time root.
 pub(crate) fn data_thunks(u: &Unit, addr: u64, out: &mut Vec<u32>) {
-    let objs: Vec<u32> = u.syms.data_at(addr).into_iter().filter_map(|s| match u.syms.kind(s.id) { Some(SymKind::Data(i)) => Some(i), _ => None }).collect();
-    obj_thunks(u, objs, out);
+    if let Some(idx) = u.syms.data_at(addr).and_then(|s| u.syms.obj_of(s)) {
+        obj_thunks(u, vec![idx], out, true);
+    }
 }
 
-/// data_thunks for the data object of index `idx` (a code body's reference record names it so).
+/// The vtables the vtable at `addr` points at: its supertraits', which an upcast of a trait object
+/// with it reaches.
+pub(crate) fn vtable_supers(u: &Unit, addr: u64, out: &mut Vec<u64>) {
+    let Some(idx) = u.syms.data_at(addr).and_then(|s| u.syms.obj_of(s)) else { return };
+    let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { return };
+    for t in ptrs.iter().filter_map(|p| p.1) {
+        if u.syms.is_vtable_sym(t) {
+            out.push(u.syms.value(t));
+        }
+    }
+}
+
+/// The thunks reachable through non-vtable data. A vtable's callers name its words in notes.
 pub(crate) fn data_obj_thunks(u: &Unit, idx: u32, out: &mut Vec<u32>) {
-    obj_thunks(u, vec![idx], out);
+    obj_thunks(u, vec![idx], out, false);
 }
 
-fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>) {
-    let mut seen = Vec::new();
-    while let Some(idx) = todo.pop() {
-        if seen.contains(&idx) || seen.len() > 4096 {
+/// The vtable objects named by data object `idx`: itself, or reached through its non-vtable
+/// data (a constant `&dyn T`, a static's initializer holding one).
+pub(crate) fn data_obj_vtables(u: &Unit, idx: u32, out: &mut Vec<u32>) {
+    let mut seen = crate::fxhash::HashSet::default();
+    let mut todo = vec![idx];
+    while let Some(i) = todo.pop() {
+        if !seen.insert(i) { continue; }
+        if u.syms.is_vtable_obj(i) {
+            out.push(i);
             continue;
         }
-        seen.push(idx);
+        let Some((_, _, ptrs, _)) = obj_ptrs(u, i) else { continue };
+        for (_, s) in ptrs.iter() {
+            if let Some(SymKind::Data(d)) = s.and_then(|s| u.syms.kind(s.id)) { todo.push(d); }
+        }
+    }
+}
+
+fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>, include_vtables: bool) {
+    let mut seen = crate::fxhash::HashSet::default();
+    while let Some(idx) = todo.pop() {
+        if include_vtables && seen.len() > 4096 { break; }
+        if !seen.insert(idx) || (!include_vtables && u.syms.is_vtable_obj(idx)) { continue; }
         let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { continue };
         for (_, s) in ptrs.iter() {
             match s.and_then(|s| u.syms.kind(s.id)) {
@@ -571,6 +710,64 @@ fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>) {
             }
         }
     }
+}
+
+/// Indexes thunk words in the immutable initializer object or the captured initial bytes.
+/// Vtables have their own keys. Mutable storage is read from its declared initial image.
+pub(crate) fn static_initial_thunks(u: &Unit, d: DefId, initial: Option<u64>) -> Vec<u32> {
+    let root = initial.and_then(|a| u.syms.data_at(a)).or_else(|| {
+        u.statics.get(&d).and_then(|&a| u.static_sym_at(a))
+    });
+    let mut todo: Vec<_> = root.into_iter().collect();
+    let mut seen = crate::fxhash::HashSet::default();
+    let mut slots = Vec::new();
+    while let Some(sym) = todo.pop() {
+        if !seen.insert(sym.id) { continue; }
+        match u.syms.kind(sym.id) {
+            Some(SymKind::Thunk(id)) => { slots.push(id); continue; }
+            Some(SymKind::Data(i)) => {
+                if u.syms.is_vtable_obj(i) { continue; }
+                if let Some((_, _, ptrs, _)) = obj_ptrs(u, i) {
+                    todo.extend(ptrs.iter().filter_map(|(_, s)| *s));
+                    continue;
+                }
+            }
+            Some(SymKind::Static(_) | SymKind::Rw(_)) => {}
+            _ => continue,
+        }
+        let bytes = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).get(&sym.id).cloned();
+        let Some(bytes) = bytes else { continue };
+        let Some(offsets) = pointer_offsets(u, u.syms.addr(Sym::new(sym.id)), &bytes) else { continue };
+        for off in offsets {
+            if off as usize + u.ptr_bytes() as usize > bytes.len() { continue; }
+            let v = word_in(u, &bytes, off as usize);
+            if let Some(id) = u.thunk_slot(v) {
+                slots.push(id);
+            } else if let Some(child) = u.syms.containing(v).or_else(|| u.static_sym_at(v)).or_else(|| u.syms.rw_sym_at(v)) {
+                todo.push(child);
+            }
+        }
+    }
+    slots
+}
+
+/// Thunk at one pointer-sized vtable word, if that word names a function.
+pub(crate) fn vtable_word_thunk(u: &Unit, addr: u64, word: u32) -> Option<u32> {
+    let idx = u.syms.obj_of(u.syms.data_at(addr)?)?;
+    let (_, _, ptrs, _) = obj_ptrs(u, idx)?;
+    let offset = word.checked_mul(u.ptr_bytes())?;
+    let sym = ptrs.iter().find(|(off, _)| *off == offset)?.1?;
+    match u.syms.kind(sym.id)? { SymKind::Thunk(id) => Some(id), _ => None }
+}
+
+/// Thunks in the vtable itself. Stored supertrait pointers have their own vtable keys.
+pub(crate) fn vtable_thunks(u: &Unit, addr: u64) -> Vec<u32> {
+    let Some(idx) = u.syms.data_at(addr).and_then(|s| u.syms.obj_of(s)) else { return Vec::new() };
+    let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { return Vec::new() };
+    ptrs.iter().filter_map(|(_, s)| match u.syms.kind(s.as_ref()?.id)? {
+        SymKind::Thunk(id) => Some(id),
+        _ => None,
+    }).collect()
 }
 
 /// The data objects the constant data object at `addr` points at itself (a vtable's supertrait
@@ -1012,6 +1209,8 @@ pub fn describe(u: &Unit, s: Sym) -> String {
         Some(SymKind::SbTls(id)) => format!("sandbox-tls:{}", describe(u, Sym::new(id))),
         Some(SymKind::SbTable) => "sandbox-table".to_string(),
         Some(SymKind::SbHost(n)) => format!("sandbox-host:{}", n),
+        Some(SymKind::Note(n)) => format!("note:{n}"),
+        Some(SymKind::Made(v)) => format!("made:{}", describe(u, Sym::new(v))),
         Some(SymKind::Rw(k)) => {
             let b = u.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner());
             let (sz, al) = b.get(k as usize).copied().unwrap_or((0, 0));
@@ -1112,7 +1311,11 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     for rl in relocs {
         let (off, r) = (&rl.at, &rl.target);
         let o = *off as usize;
-        let w = if rl.kind == relax_backend::rir::RelocKind::Pool64 { 8 } else { 4 };
+        let w = match rl.kind {
+            relax_backend::rir::RelocKind::Note => 0,
+            relax_backend::rir::RelocKind::Pool64 => 8,
+            _ => 4,
+        };
         if o + w <= c.len() {
             c[o..o + w].fill(0);
         }
@@ -1141,7 +1344,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
         if want == "*" || name.contains(want) {
             let hex: String = c.iter().map(|b| format!("{:02x}", b)).collect();
             // the pool as compiled (values), for debugging relocations
-            let vals: Vec<String> = relocs.iter().map(|rl| {
+            let vals: Vec<String> = relocs.iter().filter(|rl| rl.kind != relax_backend::rir::RelocKind::Note).map(|rl| {
                 let (o, r) = (&rl.at, &rl.target);
                 let o = *o as usize;
                 let v = if o + 8 <= code.len() { u64::from_le_bytes(code[o..o + 8].try_into().unwrap()) } else { 0 };
@@ -1290,9 +1493,11 @@ pub fn class_of(k: &SymKind) -> relax_backend::rir::SymClass {
         SymKind::Data(_) | SymKind::Thunk(_) | SymKind::Missing(_) => SymClass::Near,
         // (the tier records are a reservation of their own, outside the code area)
         SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) | SymKind::TierRec(_) => SymClass::Far,
+        // (an address of the symbol table's own reservation)
+        SymKind::Made(_) => SymClass::Far,
         // (an offset of the sandbox's own, or an address outside the unit's code area)
         SymKind::SbThunk(_) | SymKind::SbPlace(_) | SymKind::SbTls(_) | SymKind::SbTable | SymKind::SbHost(_) => SymClass::Far,
-        SymKind::Site(_) | SymKind::ThreadLocal(_) => SymClass::Imm,
+        SymKind::Site(_) | SymKind::ThreadLocal(_) | SymKind::Note(_) => SymClass::Imm,
     }
 }
 

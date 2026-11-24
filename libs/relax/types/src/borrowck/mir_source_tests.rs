@@ -885,13 +885,20 @@ fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initiali
 }
 
 #[test]
-fn a_reference_to_a_local_returned_as_an_opaque_type_names_the_universal_region() {
-    // The argument's region is named (`'1`), so the borrow is explained by the opaque type's constraint:
-    // E0597 "opaque type requires that `y` is borrowed for `'1`" (regions/do-not-suggest-adding-bound-to-opaque-type).
+fn a_local_returned_as_an_opaque_type_is_e0515_unless_the_opaque_type_requires_static() {
+    // rustc 1.100: a borrow of a local returned as `impl Sized + '_` is blamed on the return (E0515). An
+    // opaque type that captures no lifetime requires `'static`, and that requirement is blamed on the
+    // opaque type: E0597 (regions/do-not-suggest-adding-bound-to-opaque-type.rs).
     let (errors, unchecked) = borrowck_source_in("
-        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
+        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }
+        pub trait T {}
+        pub struct S<'a>(&'a ());
+        impl<'a> T for S<'a> {}
+        pub fn foo() -> impl T { let x = (); S(&x) }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.len() == 1 && errors[0].starts_with("E0597") && errors[0].contains("opaque type requires that `y` is borrowed for `'1`"), "{errors:?}");
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors.iter().any(|e| e.starts_with("E0515 cannot return reference to local variable `y`")), "the returned borrow: {errors:?}");
+    assert!(errors.iter().any(|e| e.starts_with("E0597") && e.contains("opaque type requires that `x` is borrowed for `'static`")), "the opaque type's requirement: {errors:?}");
 }
 
 #[test]
@@ -960,6 +967,38 @@ fn a_closure_body_call_reborrowed_to_a_shared_return_type_is_checked() {
         pub fn escapes() -> &'static u8 { let mut y = 0u8; take::<&'static u8, _>(|| idl(&mut y)) }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0597") && errors[0].contains("`y`"), "{errors:?}");
+}
+
+#[test]
+fn a_unary_operand_on_a_closure_parameter_needs_its_type_where_it_stands() {
+    // expr.rs check_expr_unop: `!`, `-` and `*` resolve their operand's type structurally first, so a
+    // closure's parameter that only a later call names is E0282 there (relax took it from the call
+    // and compiled what rustc refuses). A comparison, `+` and `||` register their obligation instead
+    // and take the type from the call: rustc accepts those.
+    const SOURCE: &str = "pub struct R { pub len: u32, pub writable: bool }
+pub fn not_param(rs: &[R]) -> u64 {
+    let count = |width, write| rs.iter().filter(|r| r.len >= width && (!write || r.writable)).count() as u64;
+    count(1, false)
+}
+pub fn neg_param() -> i32 { let g = |x| -x; g(1i32) }
+pub fn deref_param() -> u32 { let g = |a| *a; g(&1u32) }
+pub fn binary_params(rs: &[R]) -> u64 {
+    let n = |width| rs.iter().filter(|r| r.len >= width).count() as u64;
+    let add = |a, b| a + b;
+    let or = |a, b| a || b;
+    n(1) + add(1u64, 2u64) + or(true, false) as u64
+}";
+    let (prog, tcx, user) = load_source(SOURCE, 2021, "repro");
+    let mut by_fn = std::collections::HashMap::new();
+    for owner in crate::borrowck::body::owners(&prog) {
+        if prog.def(owner.owner).krate != user { continue; }
+        by_fn.insert(prog.syms.str(prog.def(owner.owner).name).to_string(), tcx.typeck(&prog, owner.owner).errors.clone());
+    }
+    for f in ["not_param", "neg_param", "deref_param"] {
+        let errors = &by_fn[f];
+        assert!(errors.len() == 1 && errors[0].contains(": E0282: "), "{f}: {errors:?}");
+    }
+    assert!(by_fn["binary_params"].is_empty(), "binary_params: {:?}", by_fn["binary_params"]);
 }
 
 #[test]
@@ -1098,4 +1137,25 @@ fn an_inline_asm_body_is_unsupported_not_an_internal_failure() {
     }
     assert!(unsupported.len() == 1 && unsupported[0].ends_with("spin: inline asm"), "{unsupported:?}");
     assert!(errors.len() == 1 && errors[0].ends_with("bad E0515"), "the other bodies are checked: {errors:?}");
+}
+
+/// A trait's default method returning `impl Iterator` over borrowed data is checked with its return
+/// place typed as the method's opaque (its own RPITIT projection folded to it), so its borrow of
+/// `self` flows into the declared output, as rustc checks it; an impl that overrides it with another
+/// iterator type is checked the same way.
+#[test]
+fn a_default_method_returns_an_iterator_over_borrowed_data() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Bag {
+            fn items(&self) -> &[u32];
+            fn evens(&self) -> impl Iterator<Item = &u32> { self.items().iter().filter(|x| **x % 2 == 0) }
+        }
+        pub struct Reversed(Vec<u32>);
+        impl Bag for Reversed {
+            fn items(&self) -> &[u32] { &self.0 }
+            fn evens(&self) -> impl Iterator<Item = &u32> { self.0.iter().rev() }
+        }
+        pub fn count(b: &Reversed) -> usize { b.evens().count() }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
 }

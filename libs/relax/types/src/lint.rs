@@ -638,10 +638,12 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
 
 // ---------------------------------------------------------------- shared helpers
 
-/// Whether the code at `pos` is expanded from a macro of another crate, a built-in macro or a
-/// derive: rustc does not report lints there (`Span::in_external_macro`).
+/// Whether the code at `pos` is expanded from a macro of another crate, a built-in macro, a
+/// derive or a proc macro (the tokens it made, not the input it passed on): rustc does not
+/// report lints there (`Span::in_external_macro`).
 pub fn external(prog: &Program, file: u32, pos: u32) -> bool {
-    matches!(prog.files[file as usize].expansion_kind(pos), crate::parser::ExpnKind::ExternalRules | crate::parser::ExpnKind::Builtin)
+    let pf = &prog.files[file as usize];
+    matches!(pf.expansion_kind(pos), crate::parser::ExpnKind::ExternalRules | crate::parser::ExpnKind::Builtin) || pf.made_by_proc_macro(pos)
 }
 
 /// The attribute list's leading path (`allow`, `repr`, `doc`, `rustfmt::skip`) as bytes. An unsafe

@@ -375,6 +375,20 @@ fn a_request_sees_its_client_go() {
     conn.close("client ended");
     gone.recv_timeout(WAIT).unwrap();
     assert!(!crate::lines::client_gone(), "no request on this thread");
+    // a peer that keeps its socket open and serves nothing (a process holding a copy of it): a
+    // connection with a ping limit is lost once a ping goes that long unanswered, and its call
+    // with it; with none, the call waited for good (11-23)
+    let (mine, silent) = UnixStream::pair().unwrap();
+    let (r, w, s) = (mine.try_clone().unwrap(), mine.try_clone().unwrap(), mine);
+    let quiet = Conn::start(Io { reader: FrameReader::new(Box::new(r)), writer: Box::new(w), shutdown: Box::new(move || {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }) }, Hello::default(), true, None, Hooks::default());
+    quiet.set_ping_limit(Duration::from_millis(300));
+    let t = std::time::Instant::now();
+    let lost = quiet.open_timeout("slow", "", WAIT).map(|_| ());
+    assert!(matches!(&lost, Err((code, why)) if *code == crate::conn::CLOSE_LINK_LOST && why.contains("answered no ping")), "{lost:?}");
+    assert!(t.elapsed() < WAIT / 2 && quiet.is_closed(), "lost at its ping limit, not at the call's own wait: {:?}", t.elapsed());
+    drop(silent);
 }
 
 /// A handler that waits says so ahead of its answer, on that request's channel only.

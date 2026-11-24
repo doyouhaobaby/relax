@@ -30,6 +30,9 @@ pub struct Thread {
     pub state: &'static str,
     /// user + system CPU time
     pub cpu_ns: u64,
+    /// macOS: the scheduling priority it runs at now, which its QoS sets (31 default, 20
+    /// utility, 4 background, 37 user initiated, 47 user interactive); None elsewhere
+    pub pri: Option<i32>,
     /// the stack's [lo, hi) when known (0, 0 otherwise)
     pub stack: (u64, u64),
     /// Linux: the syscall it blocks in (`/proc/.../syscall`): number, first argument (a futex
@@ -48,6 +51,7 @@ impl Clone for Thread {
             name: self.name.clone(),
             state: self.state,
             cpu_ns: self.cpu_ns,
+            pri: self.pri,
             stack: self.stack,
             syscall: self.syscall,
             #[cfg(target_vendor = "apple")]
@@ -81,6 +85,20 @@ impl Raw {
 }
 
 pub use imp::{each_thread, list, regs_now, tid_of_handle};
+
+/// A thread's CPU time on the performance and the efficiency cores (ns), where the OS splits it
+/// (macOS on Apple silicon); None elsewhere, or once the thread ended.
+pub fn core_ns(os_id: u64) -> Option<[u64; 2]> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::core_ns(os_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = os_id;
+        None
+    }
+}
 
 /// The kernel function a thread in uninterruptible sleep waits in (Linux: its `wchan`), for the
 /// reports: its user stack ends at the system call, and only this names what it waits behind
@@ -150,6 +168,81 @@ pub fn capture(t: &Thread, raw: &mut Raw) -> Result<(), &'static str> {
 }
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use imp::{stack_hi_of_self, walk_regs_with, Slot as HoldSlot};
+
+/// The calling thread's own stack, every frame of it (host and JIT code, innermost first):
+/// return addresses, the first one into this fn's caller. std::backtrace's capture
+/// (inspect/backtrace.rs), on the running thread itself: frame records on arm64 and macOS (JIT
+/// code keeps them on every target, host code by the platform ABI), and on x86_64 Linux and
+/// Windows JIT frames by their records, host frames by their unwind tables (x64_walk). Reads stay
+/// inside the thread's stack (the program stack while it runs on one: the walk ends at its
+/// switch). Nothing where no walk exists.
+#[inline(never)]
+pub fn capture_self(out: &mut Vec<u64>) {
+    let (lo, hi) = crate::os::fault::stack_bounds_of_self();
+    #[cfg(any(target_arch = "aarch64", target_vendor = "apple"))]
+    {
+        let mut fp: u64;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp)
+        };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp)
+        };
+        // [fp] = the caller's fp, [fp + 8] = the return address (arm64e system code signs it: the
+        // pointer authentication bits go)
+        while hi != 0 && fp & 7 == 0 && fp >= lo && fp.saturating_add(16) <= hi {
+            let ret = unsafe { *((fp + 8) as *const u64) };
+            #[cfg(target_arch = "aarch64")]
+            let ret = ret & 0x0000_ffff_ffff_ffff;
+            if ret == 0 {
+                break;
+            }
+            out.push(ret);
+            let next = unsafe { *(fp as *const u64) };
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+    {
+        let (rip, rsp, rbp, rbx): (u64, u64, u64, u64);
+        let (r12, r13, r14, r15): (u64, u64, u64, u64);
+        unsafe {
+            std::arch::asm!("lea {0}, [rip]", "mov {1}, rsp", "mov {2}, rbp", "mov {3}, rbx", out(reg) rip, out(reg) rsp, out(reg) rbp, out(reg) rbx);
+            std::arch::asm!("mov {0}, r12", "mov {1}, r13", "mov {2}, r14", "mov {3}, r15", out(reg) r12, out(reg) r13, out(reg) r14, out(reg) r15);
+        }
+        // the module index, built once (a refresh leaks the index it replaces: walks may still read it)
+        if !super::cfi::covers(rip) {
+            super::cfi::refresh();
+        }
+        #[allow(unused_mut)]
+        let mut regs = super::cfi::Regs { rip, rsp, rbp: rbp.max(1), rbx, r12, r13, r14, r15, ..Default::default() };
+        #[cfg(windows)]
+        unsafe {
+            std::arch::asm!("mov {0}, rsi", "mov {1}, rdi", out(reg) regs.rsi, out(reg) regs.rdi);
+        }
+        let _ = lo;
+        // this thread's own stack: plain reads within [sp, top of stack)
+        let read = |a: u64| -> Option<u64> { (a >= rsp && a % 8 == 0 && a.saturating_add(8) <= hi).then(|| unsafe { *(a as *const u64) }) };
+        // (the first pc is this fn's own)
+        let mut first = true;
+        x64_walk::walk_each(&mut regs, &read, &mut |pc| {
+            if !first {
+                out.push(pc);
+            }
+            first = false;
+            true
+        });
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_vendor = "apple", all(target_arch = "x86_64", any(target_os = "linux", windows)))))]
+    {
+        let _ = (out, lo, hi);
+    }
+}
 
 /// Pause: holds thread `tid` in its handler until `release_hold` (Linux).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -324,9 +417,10 @@ mod imp {
             // the handle the rest of Relax names threads by comes from libpthread
             let os_id = ident(port).0;
             let handle = unsafe { pthread_from_mach_thread_np(port) } as u64;
-            let (mut name, mut state, mut cpu_ns) = (String::new(), "?", 0u64);
+            let (mut name, mut state, mut cpu_ns, mut pri) = (String::new(), "?", 0u64, None);
             if let Some(ext) = extended(port) {
                 cpu_ns = ext_cpu_ns(&ext);
+                pri = Some(ext[9] as i32);
                 state = match ext[6] {
                     1 => "running",
                     2 => "stopped",
@@ -344,7 +438,7 @@ mod imp {
             } else {
                 (0, 0)
             };
-            out.push(Thread { os_id, handle, name, state, cpu_ns, stack, syscall: None, port });
+            out.push(Thread { os_id, handle, name, state, cpu_ns, pri, stack, syscall: None, port });
         }
         unsafe { vm_deallocate(task(), ports as usize, count as usize * 4) };
         out
@@ -356,6 +450,34 @@ mod imp {
         let mut ext = [0u32; 28];
         let mut n = 28u32;
         (unsafe { thread_info(port, THREAD_EXTENDED_INFO, ext.as_mut_ptr(), &mut n) } == 0).then_some(ext)
+    }
+
+    /// A thread's CPU on the performance and the efficiency cores, ns: PROC_PIDTHREADCOUNTS gives
+    /// per performance level (0 the performance cores, then the efficiency cores) its
+    /// instructions, cycles, user and system time (mach units) and energy. None on a chip with
+    /// one level, an OS without the call, or a thread that ended.
+    #[cfg(target_os = "macos")]
+    pub fn core_ns(os_id: u64) -> Option<[u64; 2]> {
+        extern "C" {
+            fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+            fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+        }
+        const PROC_PIDTHREADCOUNTS: i32 = 34;
+        const LEVEL: usize = 40;
+        let mut tb = [0u32; 2];
+        if unsafe { mach_timebase_info(&mut tb) } != 0 || tb[1] == 0 {
+            return None;
+        }
+        let mut buf = [0u8; 8 + 4 * LEVEL];
+        let n = unsafe { proc_pidinfo(std::process::id() as i32, PROC_PIDTHREADCOUNTS, os_id, buf.as_mut_ptr(), buf.len() as i32) };
+        let levels = (u16::from_ne_bytes([buf[0], buf[1]]) as usize).min(4);
+        if n < (8 + 2 * LEVEL) as i32 || levels < 2 {
+            return None;
+        }
+        let at = |o: usize| u64::from_ne_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3], buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7]]);
+        let time = |level: usize| at(8 + level * LEVEL + 16) + at(8 + level * LEVEL + 24);
+        let ns = |t: u64| (t as u128 * tb[0] as u128 / tb[1] as u128) as u64;
+        Some([ns(time(0)), ns((1..levels).map(time).sum())])
     }
 
     fn ext_cpu_ns(ext: &[u32; 28]) -> u64 {
@@ -580,7 +702,7 @@ mod imp {
             let num = |k: usize| f.get(k).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
             let cpu_ns = (num(11) + num(12)) * tick_ns;
             let syscall = read_syscall(tid);
-            out.push(Thread { os_id: tid, handle: 0, name, state, cpu_ns, stack: (0, 0), syscall });
+            out.push(Thread { os_id: tid, handle: 0, name, state, cpu_ns, pri: None, stack: (0, 0), syscall });
         }
         out.sort_by_key(|t| t.os_id);
         out
@@ -1064,27 +1186,38 @@ mod x64_walk {
     /// CI hang's main thread, blocked in poll, read as called from the feature resolver that had
     /// run there before).
     pub fn walk_with(raw: &mut Raw, r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>) {
+        if raw.n >= MAX_FRAMES {
+            return;
+        }
+        let (pcs, n) = (&mut raw.pcs, &mut raw.n);
+        raw.stop = walk_each(r, read, &mut |pc| {
+            pcs[*n] = pc;
+            *n += 1;
+            *n < MAX_FRAMES
+        });
+    }
+
+    /// `walk_with`'s walk, each pc handed to `push` (innermost first; false: the walk ends after
+    /// that frame's step); why it ended at its last frame, when that is not the stack's outermost.
+    pub fn walk_each(r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>, push: &mut dyn FnMut(u64) -> bool) -> Option<&'static str> {
         use super::super::cfi;
         let mut top = true;
-        while raw.n < MAX_FRAMES && r.rip != 0 {
+        while r.rip != 0 {
             // the lookup pc: a return address points past its call
             let look = if top { r.rip } else { r.rip.wrapping_sub(1) };
             let own = crate::jit::in_jit_code(look);
             let jit = own || host::jit_code(look);
             if !top && !jit && !cfi::covers(look) {
-                raw.stop = Some(NOT_CODE);
-                break;
+                return Some(NOT_CODE);
             }
-            raw.pcs[raw.n] = r.rip;
-            raw.n += 1;
+            let more = push(r.rip);
             // the stack switch's frame: it runs on the thread's own stack (its sp is in the
             // switch record on the segment), its callee on the segment
             if !top && (r.rip == crate::stack::switch_return_pc() || r.rip == host::switch_return_pc()) {
                 match read(r.rsp.wrapping_add(crate::stack::SWITCH_RECORD)) {
                     Some(own) => r.rsp = own,
                     None => {
-                        raw.stop = Some("it switched to the program stack and its switch record is unreadable");
-                        break;
+                        return Some("it switched to the program stack and its switch record is unreadable");
                     }
                 }
             }
@@ -1096,28 +1229,23 @@ mod x64_walk {
                 // staged arguments (its unwind info), which need sp only
                 if r.rbp == 0 {
                     if top {
-                        raw.stop = Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
-                        break;
+                        return Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
                     }
                     if !own {
-                        raw.stop = Some(HOST_NO_FP);
-                        break;
+                        return Some(HOST_NO_FP);
                     }
                     match crate::jit::frame_pointer_at(r.rip, sp0) {
                         Ok(fp) => r.rbp = fp,
                         Err(why) => {
-                            raw.stop = Some(why);
-                            break;
+                            return Some(why);
                         }
                     }
                 }
                 if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
-                    raw.stop = Some(FP_NOT_IN_STACK);
-                    break;
+                    return Some(FP_NOT_IN_STACK);
                 }
                 let (Some(ra), Some(next)) = (read(r.rbp.wrapping_add(8)), read(r.rbp)) else {
-                    raw.stop = Some("it is JIT code and its frame record is unreadable");
-                    break;
+                    return Some("it is JIT code and its frame record is unreadable");
                 };
                 r.rsp = r.rbp + 16;
                 r.rip = ra;
@@ -1125,24 +1253,25 @@ mod x64_walk {
             } else {
                 match cfi::step(r, top, read) {
                     cfi::Step::Done => {}
-                    cfi::Step::End => break,
+                    cfi::Step::End => return None,
                     #[cfg(target_os = "linux")]
                     cfi::Step::NeedRbp => {
-                        raw.stop = Some(super::imp::BLOCKED_NO_FP);
-                        break;
+                        return Some(super::imp::BLOCKED_NO_FP);
                     }
                     cfi::Step::Fail(why) => {
-                        raw.stop = Some(why);
-                        break;
+                        return Some(why);
                     }
                 }
             }
             if r.rsp <= sp0 {
-                raw.stop = Some("its caller's frame is not above it");
-                break;
+                return Some("its caller's frame is not above it");
+            }
+            if !more {
+                return None;
             }
             top = false;
         }
+        None
     }
 }
 
@@ -1245,7 +1374,7 @@ mod imp {
                 let tid = e.th32ThreadID as u64;
                 let (name, cpu_ns) = name_and_cpu(tid);
                 // the run state is not known without NtQuerySystemInformation: "?"
-                out.push(Thread { os_id: tid, handle: tid, name, state: "?", cpu_ns, stack: (0, 0), syscall: None });
+                out.push(Thread { os_id: tid, handle: tid, name, state: "?", cpu_ns, pri: None, stack: (0, 0), syscall: None });
             }
             e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
             more = unsafe { Thread32Next(snap, &mut e) }.is_ok();

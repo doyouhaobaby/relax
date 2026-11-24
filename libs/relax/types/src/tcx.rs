@@ -1469,7 +1469,7 @@ impl Tcx {
                 // (an impl header's trait ref takes no associated item constraints)
                 if let Some(last) = prog.files[im.file as usize].ast.segs(tp.segs).last() { self.prohibit_constraints(cx, prog, im.file, last.args()); }
                 let explicit = self.lower_generic_args(cx, prog, im.file, im.module, &env, tp);
-                Some((td, self.fill_trait_defaults(cx, prog, td, st, explicit)))
+                Some((td, self.fill_trait_defaults(cx, prog, td, st, explicit, trait_regions)))
             })
         });
         let errors = cx.state.errors.replace(outer).unwrap_or_default();
@@ -2040,7 +2040,7 @@ impl Tcx {
                 // (default trait args filled: `D: OverlayEdgeData` is OverlayEdgeData<ShapeCountBoolean>,
                 // as the signature's `D::Store` projection spells it, and a binding's projection too)
                 let p = self.tys.intern(TyKind::Param(pi));
-                let targs = self.fill_trait_defaults(cx, prog, td, p, targs);
+                let targs = self.fill_trait_defaults(cx, prog, td, p, targs, RegionArgsId::EMPTY);
                 // `I: IntoIterator<Item = D>`: the binding's type is lowered for its
                 // diagnostics; the projection clause itself is native (clauses_of)
                 let bast = &prog.files[bfile as usize].ast;
@@ -2658,7 +2658,7 @@ impl Tcx {
                 decl.bounds.push((td, args));
             } else {
                 let explicit = self.lower_generic_args(cx, prog, file, module, env, path);
-                let targs = self.fill_trait_defaults(cx, prog, td, me, explicit);
+                let targs = self.fill_trait_defaults(cx, prog, td, me, explicit, RegionArgsId::EMPTY);
                 if let Some(GenericArgs::Angle(v)) = last.and_then(|l| f.ast.gargs(l.args())) {
                     for g in f.ast.list(*v) {
                         if let GenericArg::Binding(n, _, ty) = g {
@@ -2898,7 +2898,7 @@ impl Tcx {
             // 12>`); a default naming Self cannot be used in an object type, left as written
             let n = self.trait_generic_count(prog, td);
             if args.len() < n && !matches!(prog.name(td), "Fn" | "FnMut" | "FnOnce" | "AsyncFn" | "AsyncFnMut" | "AsyncFnOnce") {
-                let filled = self.fill_trait_defaults(cx, prog, td, self.tys.error, args.clone());
+                let filled = self.fill_trait_defaults(cx, prog, td, self.tys.error, args.clone(), RegionArgsId::EMPTY);
                 if filled.len() == n && filled[args.len()..].iter().all(|t| !self.tys.has_error(*t)) {
                     args = filled;
                 }
@@ -2970,7 +2970,7 @@ impl Tcx {
                         let tr = self.lower_region_args(cx.infcx, prog, file, module, env, tp);
                         let explicit = self.lower_generic_args(cx, prog, file, module, env, tp);
                         let mut args = vec![self_t];
-                        args.extend(self.fill_trait_defaults(cx, prog, td, self_t, explicit));
+                        args.extend(self.fill_trait_defaults(cx, prog, td, self_t, explicit, tr));
                         let tr = if prog.def(ad).parent == td { tr } else { RegionArgsId::EMPTY };
                         let mut own_regions = self.written_lifetimes(cx.infcx, prog, file, env, p);
                         self.infer_elided_assoc_lifetimes(cx, prog, ad, &mut own_regions, source_ty.is_none());
@@ -3998,8 +3998,11 @@ impl Tcx {
         0
     }
 
-    /// Trait args with defaults filled (`Rhs = Self` etc.).
-    pub fn fill_trait_defaults(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, td: DefId, self_t: TyId, explicit: Vec<TyId>) -> Vec<TyId> {
+    /// Trait args with defaults filled (`Rhs = Self` etc.). `regions` are the trait ref's lifetime
+    /// args, which a default may name (`trait Reborrow<'s, _Outlives = &'s Self>`: rustc
+    /// instantiates a default with every arg of the trait ref, its lifetimes too); with none
+    /// (`RegionArgsId::EMPTY`, a caller that lowers no regions) such a lifetime is erased.
+    pub fn fill_trait_defaults(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, td: DefId, self_t: TyId, explicit: Vec<TyId>, regions: RegionArgsId) -> Vec<TyId> {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
         let mut out = explicit;
@@ -4033,8 +4036,13 @@ impl Tcx {
                     env.regions.next_param += 1;
                     push_generics(prog, pd.file, &generics, &mut env);
                     env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
+                    let with_regions = !self.tys.region_args(regions).is_empty();
+                    if with_regions { env.regions = self.bound_region_env(prog, td); }
                     let lt = match (tdef, cdef) {
-                        (Some(dt), _) => self.lower_ty(cx, prog, pd.file, pd.scope, &env, dt),
+                        (Some(dt), _) => {
+                            let lt = self.lower_ty(cx, prog, pd.file, pd.scope, &env, dt);
+                            if with_regions { self.subst_decl_regions(lt, &env, regions) } else { lt }
+                        }
                         (_, Some(de)) => {
                             let GenericParamKind::Const(ty, _) = g.kind else { unreachable!() };
                             let expected = self.lower_ty(cx, prog, pd.file, pd.scope, &env, ty);
@@ -4269,7 +4277,7 @@ impl Tcx {
             };
             let explicit = self.lower_generic_args(cx, prog, pd.file, module, &env, &path);
             let explicit: Vec<TyId> = explicit.iter().map(|x| self.tys.subst(*x, &sub)).collect();
-            let args = self.fill_trait_defaults(cx, prog, d, self_t, explicit);
+            let args = self.fill_trait_defaults(cx, prog, d, self_t, explicit, RegionArgsId::EMPTY);
             for (n, t) in binds {
                 let sym = match prog.syms.get(prog.files[pd.file as usize].text(n)) {
                     Some(x) => x,
@@ -4329,7 +4337,7 @@ impl Tcx {
             let explicit: Vec<TyId> = explicit.iter().map(|x| self.tys.subst(*x, &sub)).collect();
             // rustc_type_ir/src/elaborate.rs instantiates supertrait clauses without
             // normalizing them; obligations normalize when they are registered
-            let args = self.fill_trait_defaults(cx, prog, d, self_t, explicit);
+            let args = self.fill_trait_defaults(cx, prog, d, self_t, explicit, RegionArgsId::EMPTY);
             out.push((d, args));
         }
         out
@@ -4412,7 +4420,7 @@ impl Tcx {
             };
             let explicit = self.lower_generic_args(cx, prog, d.file, module, &env, &path);
             let explicit: Vec<TyId> = explicit.iter().map(|x| self.tys.subst(*x, args)).collect();
-            let ba = self.fill_trait_defaults(cx, prog, bd, proj, explicit);
+            let ba = self.fill_trait_defaults(cx, prog, bd, proj, explicit, RegionArgsId::EMPTY);
             if let Some(GenericArgs::Angle(v)) = ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args())) {
                 for g in ast.list(*v) {
                     if let GenericArg::Binding(n, _, ty) = g {

@@ -78,6 +78,9 @@ with `RELAX_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
 - `RELAX_TRACE=typeck:<fn substring>,lower:<fn substring>`: phase starts for matching fns.
 - `RELAX_TRACE=bt`: backtraces of internal errors.
 - `--verbose` (or `RELAX_VERBOSE=1`): phase timings.
+- `RELAX_OUTLINE_WHOLE=<suffix>[,<suffix>...]`: functions whose names end with a suffix build
+  as joined bodies, a stub that privately calls the whole body as an outlined part. A stress
+  mode for the joined install, unwind and locals paths; unset, nothing changes.
 - A running program: `relax inspect <pid> help` (panics, why-hung, probes).
 
 ## Read live test results from an agent
@@ -96,6 +99,12 @@ relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted 
 ```
 
 A `testverdict` names the edited paths and the patch `group`, with counts and the failing tests.
+Each run starts from the program's initial statics, as a fresh run of the test binary does: before
+a rerun, what the earlier runs left in the statics of the program's own crates goes back (std's
+crates keep theirs), and the verdict counts those statics in `statics_reset`. When a thread an
+earlier test started still runs, or the program has its own `#[global_allocator]`, the tests restart
+into a fresh process instead (`restarted`); `statics_carried` means that restart failed and the run
+kept the earlier values.
 Its `results` field is the query for each test's outcome, `test-results group=<n>`:
 
 ```sh
@@ -132,3 +141,18 @@ stands in for one, is closed. A test that needs a built binary runs under cargo,
 - There is no GitHub CI for Relax. Maintainers run their own gates before merging, so put the
   commands you ran (the build, the tests, `relax test` on your test file) and their results in the
   PR description.
+
+## Credits
+
+A commit that ports a pull request, or fixes what a report found, credits its author with a
+`Co-Authored-By` line. Some ports went out without one; they are credited here:
+
+- kioku's relax#235 and ymote's makepad#1534, #1536, #1538, #1539, #1540, #1542 and #1543, the
+  module sandbox (2026-11-18): modules that run unmetered carry no fuel accounting; a module's
+  panic text is read from its own arena, bounded, and a host read of a module's memory faults as
+  the module's own; a twin's fn values work without code generation; O3 code over twins keeps
+  their bounds; an enum's derived discriminant reads are safe code; vectored writes take every
+  buffer; and a test filter that runs no test exits as libtest does, a test target restarted in
+  place staying one.
+- ymote's makepad#1550-#1553 (2026-11-16): the memo table walks, a sandboxed module's data image
+  pointer words, the module load's cached twins and the run-time module's definition maps.

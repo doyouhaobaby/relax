@@ -13,7 +13,7 @@ use relax_types::consts::GenericArg;
 use crate::lang_items::LangItem;
 use crate::lit::{unescape_str, unescape_bytes, strip_paren, is_assignee_pattern, parse_fmt, FmtPiece, FmtSpec};
 use crate::ast::*;
-use crate::jit::{FnKey, Unit, ShimInstance};
+use crate::jit::{rt_host_notes, rt_share_note, rt_sig_note, rt_trait_key, rt_virtual_note, FnKey, RtBoundary, RtNote, ShimInstance, Unit};
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use crate::layout::{Layout, Leaf};
 use crate::program::{DefId, DefKind, Prim};
@@ -31,6 +31,25 @@ pub const VT_DROP: u32 = 0;
 pub const VT_SIZE: u32 = 1;
 pub const VT_ALIGN: u32 = 2;
 pub const VT_METHODS: u32 = 3;
+
+/// Records a slot whose completed lowering calls indirectly without a call-site note.
+pub(crate) fn rt_check_notes(u: &Unit, id: u32, f: &Func) {
+    let indirect = f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i, Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), ..))
+    });
+    if !indirect { return; }
+    for sym in &f.notes {
+        let Some(crate::syms::SymKind::Note(name)) = u.syms.kind(sym.id) else { continue };
+        if matches!(RtNote::parse(&name),
+            Some(RtNote::Virtual(..) | RtNote::All { host: false, .. } | RtNote::Sig { host: false, .. })) {
+            return;
+        }
+    }
+    let first = crate::zone_alloc::kept_with(|| u.rt_unnoted.lock().unwrap_or_else(|e| e.into_inner()).insert(id));
+    if first && crate::jit::rt_trace() {
+        eprintln!("relax realtime: indirect call without a call-site note in #{} {}", id, f.name);
+    }
+}
 
 #[derive(Clone)]
 pub enum Val {
@@ -106,6 +125,42 @@ struct SlicePat {
     stride: u32,
     rest: Option<usize>,
     fixed: usize,
+}
+
+/// rustc_abi PointerKind: a reference or a Box an argument scalar points with (pointee_at)
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PtrKind {
+    Shared { frozen: bool },
+    Mut { unpin: bool },
+    Box { unpin: bool, global: bool },
+}
+
+/// rustc_abi PointeeInfo of an argument's pointer scalar: its kind (None: a raw pointer, or one
+/// inside a ManuallyDrop), the pointee's size (0 when unsized), and whether the scalar may be null
+/// (a niche's: `Option<&mut T>`)
+#[derive(Clone, Copy, Debug)]
+struct ArgPointee {
+    kind: Option<PtrKind>,
+    size: u32,
+    maybe_null: bool,
+}
+
+impl ArgPointee {
+    /// rustc_ty_utils abi.rs arg_attrs_for_rust_scalar's `no_alias` (`-Z box-noalias` on, its
+    /// default)
+    fn noalias(&self) -> bool {
+        match self.kind {
+            Some(PtrKind::Shared { frozen }) => frozen,
+            Some(PtrKind::Mut { unpin }) => unpin,
+            Some(PtrKind::Box { unpin, global }) => unpin && global,
+            None => false,
+        }
+    }
+
+    /// a `noalias` pointer the callee may write through (SPEC-V: alias_prone)
+    fn unique(&self) -> bool {
+        self.noalias() && !matches!(self.kind, Some(PtrKind::Shared { .. }))
+    }
 }
 
 #[derive(Clone)]
@@ -229,7 +284,8 @@ pub struct Lcx<'a> {
     /// lowering a const/static initializer: borrowed temporaries live in static memory
     /// (rustc's constant promotion), not on the initializer's stack
     const_init: bool,
-    // N:rustc_mir_build/src/builder/mod.rs:777-785: const owners always check overflow.
+    // N:rustc_mir_build/src/builder/mod.rs:777-785: const owners always check overflow; a body
+    // marked #[rustc_inherit_overflow_checks] checks as the program does (`inherited_checks`).
     overflow_checks: bool,
     /// a #[track_caller] fn: its implicit `&'static Location` parameter
     caller_loc: Option<VReg>,
@@ -808,6 +864,14 @@ impl<'a> Lcx<'a> {
         self.errors.push(prog.record_error(self.b.file, pos, "lower", msg));
     }
 
+    /// The overflow checks code that inherits them has (rustc's `#[rustc_inherit_overflow_checks]`,
+    /// `intrinsics::overflow_checks`): in a std crate the program's, which std is compiled for
+    /// (relax_overflow_checks, lib.rs std_cfg); in another crate its own profile's (KNOWN_GAPS 16:
+    /// rustc's are the instantiating crate's).
+    fn inherited_checks(&self) -> bool {
+        self.u.prog.file_crate.get(self.b.file as usize).and_then(|&k| self.u.prog.crates.get(k as usize)).is_some_and(|c| c.cfg.holds("relax_overflow_checks") || c.cfg.holds("overflow_checks"))
+    }
+
     fn ast(&self) -> &'a Ast {
         // the program outlives the lowering context; the AST is never mutated during lowering
         let p: *const Ast = &self.u.prog.files[self.b.file as usize].ast;
@@ -893,7 +957,7 @@ impl<'a> Lcx<'a> {
             // every Relax callee may unwind here: whether one was compiled (and found nounwind)
             // before this body is lowered depends on build order; the optimiser demotes the
             // invokes of the build's inline candidates found nounwind (opt::demote_invokes)
-            Callee::Fn(_) => true,
+            Callee::Part | Callee::Fn(_) => true,
             Callee::Indirect(_) => true,
             Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
             Callee::Host(a) => *a == self.u.rs.panic_site || *a == self.u.rs.panic_bounds || *a == self.u.rs.panic_impl,
@@ -2085,10 +2149,13 @@ impl<'a> Lcx<'a> {
     }
 
     pub fn lower_fn_body(&mut self, def: DefId) {
-        self.overflow_checks |= matches!(self.u.prog.def(def).kind, DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst);
-        self.scan_addr_taken();
         let ast = self.ast();
         let prog_def_item = self.u.prog.def(def).item;
+        if matches!(self.u.prog.def(def).kind, DefKind::Fn | DefKind::AssocFn) && crate::lang_items::has_attr(&self.u.prog, self.u.prog.def(def).file, ast.list(ast.item(prog_def_item).attrs), "rustc_inherit_overflow_checks") {
+            self.overflow_checks = self.inherited_checks();
+        }
+        self.overflow_checks |= matches!(self.u.prog.def(def).kind, DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst);
+        self.scan_addr_taken();
         if self.u.prog.def(def).kind == DefKind::AnonConst {
             let e = relax_types::const_eval::const_body(&self.u.prog, def).expect("anonymous const body");
             let out = self.f.vreg(Cls::I);
@@ -2298,7 +2365,15 @@ impl<'a> Lcx<'a> {
         }
         self.scan_addr_taken();
         let (params, body) = match &ast.expr(ExprId(ce)).kind {
-            ExprKind::Closure(row) => { let r = ast.row(*row); (r.params.clone(), r.body) }
+            ExprKind::Closure(row) => {
+                let r = ast.row(*row);
+                // a closure checks as the crate it is written in unless it is marked itself
+                // (rustc: the body owner's own attributes), as std's sum and product folds are
+                if r.inherit_overflow_checks {
+                    self.overflow_checks = self.inherited_checks();
+                }
+                (r.params.clone(), r.body)
+            }
             // a closure slot whose expression id names something else in this parse (a code
             // cache entry made from another numbering of the file): an error, never empty code
             _ => {
@@ -2740,7 +2815,7 @@ impl<'a> Lcx<'a> {
         self.switch(head);
         let usize_ = self.u.tcx.tys.usize_;
         let scratch0 = self.f.slots.len() as u32;
-        let r = self.emit_instance(instance, vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll);
+        let r = self.emit_instance_on(instance, vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll, Some(fut_t));
         let rp = self.val_to_place(r);
         let pending = self.f.block();
         let vi_ready = self.variant_index(out_poll, LangItem::PollReady);
@@ -2816,15 +2891,23 @@ impl<'a> Lcx<'a> {
         next
     }
 
+    fn rt_note(&mut self, name: String) {
+        let sym = self.u.syms.note(name);
+        if !self.f.notes.contains(&sym) { self.f.notes.push(sym); }
+    }
+
     /// C-family pointers use the existing C ABI classifier, including the fixed
     /// parameter count of a variadic call (rustc_ty_utils/src/abi.rs:597).
-    fn fn_ptr_callee(&mut self, f: VReg, ps: &[TyId], ret: TyId, header: crate::types::FnHeader, args: &mut Vec<(Val, TyId)>) -> Callee {
+    fn fn_ptr_callee(&mut self, f: VReg, sig: &TyKind, call_ret: TyId, args: &mut Vec<(Val, TyId)>) -> Callee {
+        let TyKind::FnPtr(ps, ret, header, _) = sig else { unreachable!("fn pointer callee") };
+        let ps = self.u.tcx.tys.list(*ps);
+        self.rt_note(rt_sig_note(self.u, ps, *ret, header.abi.is_c_like(), false));
         if header.abi == crate::types::Abi::RustCall { self.spread_tuple_argument(args); }
         if header.abi.is_c_like() {
             let fixed = if header.c_variadic { Some(ps.len()) } else { None };
             let mut params = Vec::new();
             for (_, ty) in args { params.push(*ty); }
-            let cs = crate::cabi::c_sig(self.u, &params, ret, fixed, header.abi);
+            let cs = crate::cabi::c_sig(self.u, &params, call_ret, fixed, header.abi);
             Callee::CIndirect(f, Box::new(cs))
         } else {
             Callee::Indirect(f)
@@ -2990,6 +3073,193 @@ impl<'a> Lcx<'a> {
         vals
     }
 
+    /// rustc_abi BackendRepr::Scalar / ScalarPair of a sized `t`: the byte offsets of its one or
+    /// two scalars (rustc_abi layout.rs univariant, "Try to make this a Scalar/ScalarPair"; a
+    /// niche-filling enum takes its untagged variant's when the other variant is a ZST). None:
+    /// Memory, or a repr left out here (a tagged enum, a union, SIMD, a coroutine), whose
+    /// pointers no ScalarPair attribute can name either (pointee_at finds none in them).
+    fn rust_scalars(&mut self, t: TyId, depth: usize) -> Option<Vec<u32>> {
+        let l = self.layout(t);
+        if depth > self.type_depth_limit() || l.size == 0 || l.uninhabited {
+            return None;
+        }
+        let u = self.u;
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        let (fts, offs, repr_c): (Vec<TyId>, Vec<u32>, bool) = match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::FnPtr(..) => return Some(vec![0]),
+            TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => {
+                return Some(if self.unsized_ty(inner) { vec![0, u.ptr_bytes()] } else { vec![0] });
+            }
+            TyKind::Tuple(v) => (u.tcx.tys.list(v).to_vec(), l.fields.clone(), false),
+            TyKind::Closure(file, ce, _) if !u.tcx.coroutines.contains(&(file, ce)) => (u.closure_storage(t).fields, l.fields.clone(), false),
+            TyKind::Adt(d, args, _) => {
+                let a = u.tcx.adts.get(&d)?;
+                if a.is_union() || a.is_simd() {
+                    return None;
+                }
+                let args = u.tcx.tys.list(args);
+                let variant = |vi: u32| -> Vec<TyId> { (0..a.variants[vi as usize].fields.len() as u32).map(|fi| u.tcx.field_ty(&u.prog, env, d, vi, fi, args)).collect() };
+                if !a.is_enum() {
+                    (variant(0), l.fields.clone(), a.repr_c)
+                } else {
+                    let zst = |me: &mut Self, vi: u32| variant(vi).into_iter().all(|f| me.layout(f).size == 0);
+                    match l.enc {
+                        crate::layout::TagEnc::Single(v) => (variant(v), l.variant_fields.get(v as usize)?.clone(), a.repr_c),
+                        // the other variants are ZSTs: the enum is its untagged variant's repr, the
+                        // niche in it (rustc_abi layout_of_enum, niche-filling)
+                        crate::layout::TagEnc::Niche { untagged, .. } => {
+                            if !(0..a.variants.len() as u32).all(|vi| vi == untagged || zst(self, vi)) {
+                                return None;
+                            }
+                            (variant(untagged), l.variant_fields.get(untagged as usize)?.clone(), a.repr_c)
+                        }
+                        // a fieldless enum: its tag (the tagged layouts' pairs hold no pointer)
+                        crate::layout::TagEnc::Direct if l.tag.is_some_and(|(o, _)| o == 0) && (0..a.variants.len() as u32).all(|vi| zst(self, vi)) => return Some(vec![0]),
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        };
+        let non_zst: Vec<(TyId, u32)> = fts.iter().zip(offs.iter()).filter(|(f, _)| self.layout(**f).size > 0).map(|(f, o)| (*f, *o)).collect();
+        match non_zst.as_slice() {
+            // one non-ZST field filling the value: its Scalar (not unpacked under repr(C)) or pair
+            [(f, o)] => {
+                let fl = self.layout(*f);
+                if *o != 0 || fl.align != l.align || fl.size != l.size {
+                    return None;
+                }
+                let s = self.rust_scalars(*f, depth + 1)?;
+                (s.len() == 2 || !repr_c).then_some(s)
+            }
+            // two Scalar fields in rustc's scalar_pair placement
+            [(fa, oa), (fb, ob)] => {
+                let ((fa, oa), (fb, ob)) = if oa <= ob { ((*fa, *oa), (*fb, *ob)) } else { ((*fb, *ob), (*fa, *oa)) };
+                if self.rust_scalars(fa, depth + 1)?.len() != 1 || self.rust_scalars(fb, depth + 1)?.len() != 1 {
+                    return None;
+                }
+                let (la, lb) = (self.layout(fa), self.layout(fb));
+                let b_off = la.size.next_multiple_of(lb.align);
+                let align = la.align.max(lb.align);
+                (oa == 0 && ob == b_off && l.align == align && l.size == (b_off + lb.size).next_multiple_of(align)).then(|| vec![0, b_off])
+            }
+            _ => None,
+        }
+    }
+
+    /// How deep rust_scalars and pointee_at follow by-value fields: the crate's recursion limit
+    /// (rustc's layout queries stop there), a guard only (by-value types nest finitely).
+    fn type_depth_limit(&self) -> usize {
+        self.u.prog.crates[self.u.prog.def(self.b.def).krate as usize].recursion_limit
+    }
+
+    /// rustc_middle ty/layout.rs ty_and_layout_pointee_info_at: the pointer at byte `off` of a `t`
+    /// value, when it is a reference or a Box (a raw pointer: `kind` None), reached through a
+    /// struct, tuple or closure field, a single-variant enum or a two-variant enum's null niche
+    /// (`maybe_null`); a ManuallyDrop around it takes its kind (rustc is_like_maybe_dangling).
+    fn pointee_at(&mut self, t: TyId, off: u32, depth: usize) -> Option<ArgPointee> {
+        if depth > self.type_depth_limit() {
+            return None;
+        }
+        let u = self.u;
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        let ptr = u.ptr_bytes();
+        let pointer = |me: &mut Self, inner: TyId, kind: PtrKind| {
+            let size = if me.unsized_ty(inner) { 0 } else { me.layout(inner).size };
+            Some(ArgPointee { kind: Some(kind), size, maybe_null: false })
+        };
+        let (fts, offs): (Vec<TyId>, Vec<u32>) = match self.kind(t) {
+            TyKind::Ptr(..) | TyKind::FnPtr(..) if off == 0 => return Some(ArgPointee { kind: None, size: 0, maybe_null: true }),
+            // a pointer's metadata: rustc types a `dyn` tail's vtable `&'static [usize; N]` (frozen;
+            // its [drop, size, align] header here), a slice's length is no pointer
+            TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) if off == ptr => {
+                if !self.unsized_ty(inner) {
+                    return None;
+                }
+                let tail = u.lay.struct_tail_for_codegen(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, inner);
+                return matches!(self.kind(tail), TyKind::Dyn(..)).then_some(ArgPointee { kind: Some(PtrKind::Shared { frozen: true }), size: 3 * ptr, maybe_null: false });
+            }
+            TyKind::Ref(m, inner, _) if off == 0 => {
+                let kind = if m { PtrKind::Mut { unpin: self.u.is_unpin(inner) } } else { PtrKind::Shared { frozen: u.tcx.is_freeze(&u.prog, env, inner) } };
+                return pointer(self, inner, kind);
+            }
+            TyKind::Adt(d, args, _) if off == 0 && u.tcx.adts.get(&d).is_some_and(|a| a.is_box()) => {
+                let args = u.tcx.tys.list(args);
+                let inner = *args.first()?;
+                let global = args.get(1).map_or(true, |a| crate::provided::is_global_alloc(&u.tcx, *a));
+                let unpin = self.u.is_unpin(inner);
+                return pointer(self, inner, PtrKind::Box { unpin, global });
+            }
+            TyKind::Tuple(v) => (u.tcx.tys.list(v).to_vec(), self.layout(t).fields.clone()),
+            TyKind::Closure(file, ce, _) if !u.tcx.coroutines.contains(&(file, ce)) => (u.closure_storage(t).fields, self.layout(t).fields.clone()),
+            TyKind::Adt(d, args, _) => {
+                let a = u.tcx.adts.get(&d)?;
+                if a.is_union() {
+                    return None;
+                }
+                let l = self.layout(t);
+                let args = u.tcx.tys.list(args);
+                let variant = |vi: u32| -> Vec<TyId> { (0..a.variants[vi as usize].fields.len() as u32).map(|fi| u.tcx.field_ty(&u.prog, env, d, vi, fi, args)).collect() };
+                let (fts, offs, null) = if !a.is_enum() {
+                    (variant(0), l.fields.clone(), false)
+                } else {
+                    match l.enc {
+                        crate::layout::TagEnc::Single(v) => (variant(v), l.variant_fields.get(v as usize)?.clone(), false),
+                        // only the niche scalar itself, the other variant its null
+                        crate::layout::TagEnc::Niche { untagged, start: 0, .. } if a.variants.len() == 2 && l.tag.is_some_and(|(o, _)| o == off) => {
+                            (variant(untagged), l.variant_fields.get(untagged as usize)?.clone(), true)
+                        }
+                        _ => return None,
+                    }
+                };
+                let found = self.pointee_in_fields(&fts, &offs, off, depth)?;
+                let found = ArgPointee { maybe_null: found.maybe_null || null, ..found };
+                return Some(if a.is_manually_drop() { ArgPointee { kind: None, size: 0, ..found } } else { found });
+            }
+            TyKind::Array(e, _) => {
+                let stride = self.layout(e).size;
+                if stride == 0 || off / stride >= self.layout(t).size / stride {
+                    return None;
+                }
+                return self.pointee_at(e, off % stride, depth + 1).filter(|_| off % stride + ptr <= stride);
+            }
+            _ => return None,
+        };
+        self.pointee_in_fields(&fts, &offs, off, depth)
+    }
+
+    /// pointee_at's field walk: the first field holding the whole pointer at `off`.
+    fn pointee_in_fields(&mut self, fts: &[TyId], offs: &[u32], off: u32, depth: usize) -> Option<ArgPointee> {
+        let ptr = self.u.ptr_bytes();
+        for (f, o) in fts.iter().zip(offs) {
+            if *o <= off && off + ptr <= o + self.layout(*f).size {
+                if let Some(p) = self.pointee_at(*f, off - o, depth + 1) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// The argument's pointer scalars (rustc ArgAbi::new: PassMode::Direct / Pair parts) with
+    /// the leaf each is in: (leaf index, its pointee).
+    /// RELAX_OPT=-pairnoalias: a sized reference's own pointer only (A/B).
+    fn abi_pointers(&mut self, t: TyId, leaves: &[Leaf]) -> Vec<(usize, ArgPointee)> {
+        if relax_backend::stats::opt_env_off("-pairnoalias") && !matches!(self.kind(t), TyKind::Ref(_, inner, _) if !self.unsized_ty(inner)) {
+            return Vec::new();
+        }
+        let Some(offs) = self.rust_scalars(t, 0) else { return Vec::new() };
+        let ptr = self.u.ptr_bytes() as u8;
+        let mut out = Vec::new();
+        for off in offs {
+            let Some(i) = leaves.iter().position(|lf| lf.off == off && lf.cls == Cls::I && matches!(lf.mem, Mem::Int(n, _) if n == ptr)) else { continue };
+            if let Some(p) = self.pointee_at(t, off, 0) {
+                out.push((i, p));
+            }
+        }
+        out
+    }
+
     fn abi_param(&mut self, t: TyId) -> (Vec<VReg>, bool) {
         let l = self.layout(t);
         match &l.leaves {
@@ -3003,19 +3273,32 @@ impl<'a> Lcx<'a> {
                         self.f.param_ints.push((*r, n, signed));
                     }
                 }
-                // rustc marks `&mut T` noalias only for T: Unpin (a !Unpin value, e.g. a
-                // self-referential future, may be aliased through itself)
-                if let TyKind::Ref(true, inner, _) = self.kind(t) {
-                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.is_unpin(inner) {
-                        self.f.noalias.push(regs[0]);
+                // rustc_ty_utils abi.rs arg_attrs_for_rust_scalar, for each pointer scalar of a
+                // Scalar or ScalarPair argument (a reference, a slice's data pointer, a closure's
+                // `&mut` capture, a pair's parts): `noalias` for `&mut T` with T: Unpin (a !Unpin
+                // value, e.g. a self-referential future, may be aliased through itself), `&T` with
+                // T: Freeze (nothing writes the memory during the call, so its loads are
+                // loop-invariant: quicksort's pivot under partition's stores), and a global
+                // allocator's `Box<T>` with T: Unpin
+                let parts = self.abi_pointers(t, leaves);
+                for (i, p) in &parts {
+                    if p.noalias() {
+                        self.f.noalias.push(regs[*i]);
                     }
                 }
-                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
-                // -> noalias + readonly): nothing writes the memory during the call, so its loads
-                // are loop-invariant (quicksort's pivot under partition's stores)
-                if let TyKind::Ref(false, inner, _) = self.kind(t) {
-                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
-                        self.f.noalias.push(regs[0]);
+                // a reference or Box part is never null (rustc: its scalar's valid range; a niche's
+                // part may be), and a frozen `&T`'s or Unpin `&mut T`'s pointee is dereferenceable
+                // for the call (rustc pointee_size: zero for the others, which the call may free) --
+                // a reference parameter's own pointer below
+                let own = matches!(self.kind(t), TyKind::Ref(..));
+                for (i, p) in &parts {
+                    if !(own && *i == 0) {
+                        if !p.maybe_null && p.kind.is_some() {
+                            self.f.nonnull.push(regs[*i]);
+                            if p.size > 0 && matches!(p.kind, Some(PtrKind::Shared { frozen: true } | PtrKind::Mut { unpin: true })) {
+                                self.f.deref.push((regs[*i], p.size));
+                            }
+                        }
                     }
                 }
                 // a reference's (or fat reference's data) pointer is never null (rustc `nonnull`
@@ -3973,6 +4256,37 @@ impl<'a> Lcx<'a> {
             let f = self.flag_of(li);
             self.emit(Inst::Iconst(f, 0));
         }
+    }
+
+    /// Sets the made cell of the vtable at `vt` (syms.rs made_cell) the first time this runs: a
+    /// patch then tells a trait object that was made from one that only code that never ran would
+    /// make (reload.rs MadeVtables). A load and a branch each time, the store once. The inliner
+    /// prices the body without it (`Func::guard_size`): a fn that makes a boxed closure inlines
+    /// where it did before the cells.
+    fn note_made(&mut self, vt: u64) {
+        let (cell, b, one) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I), self.f.vreg(Cls::I));
+        let vt_sym = self.u.data_sym(vt);
+        let sym = self.u.syms.made_sym(vt_sym);
+        // (a wasm32 program reaches the cell through a 32-bit offset: it must be in the window)
+        assert!(self.pb() != 4 || crate::web32::in_window(self.u.syms.made_cell(vt_sym)), "relax: a wasm32 program's made cell {:#x} is outside its window", self.u.syms.made_cell(vt_sym));
+        let check = [Inst::Addr(cell, sym), Inst::Load(Mem::Int(1, false), b, cell, 0)];
+        // (and the first time, a call that tells the live loop: rt_made_late, for a closure a patch
+        // kept that no trait object held yet)
+        let late = self.u.syms.intern(crate::syms::SymKind::Rt("made_late"), made_late_addr());
+        let store = [Inst::Iconst(one, 1), Inst::Store(Mem::Int(1, false), cell, 0, one), Inst::Call(Callee::Host(late), Vec::new(), Vec::new())];
+        self.f.guard_size.add(relax_codegen::opt::priced_out(check.iter().chain(&store), 1, 2));
+        for i in check {
+            self.emit(i);
+        }
+        let set = self.f.block();
+        let join = self.f.block();
+        self.term(Term::Branch(b, join, set));
+        self.switch(set);
+        for i in store {
+            self.emit(i);
+        }
+        self.goto(join);
+        self.switch(join);
     }
 
     fn drop_local_if_live(&mut self, li: u32) {
@@ -5374,6 +5688,7 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Dyn(..) => {
                 // a `dyn` tail: through the vtable's drop entry (0 when nothing to drop)
+                self.rt_note(rt_virtual_note(self.u, t, VT_DROP));
                 let fp = self.f.vreg(Cls::I);
                 let pm = self.pmem();
                 self.emit(Inst::Load(pm, fp, len, (VT_DROP * self.pb()) as i32));
@@ -7168,6 +7483,9 @@ impl<'a> Lcx<'a> {
                 match self.u.vtable_shared(src, dy) {
                     Ok(Some(addr)) => {
                         self.u.note_vtable_maker(addr, self.cur_fn);
+                        if crate::reload::may_hold_code(&self.u.tcx.tys, src, 0) {
+                            self.note_made(addr);
+                        }
                         self.emit(Inst::Addr(vt, self.u.data_sym(addr)))
                     }
                     // a front that goes on to note the body's other values; this lowering is dropped
@@ -7198,7 +7516,12 @@ impl<'a> Lcx<'a> {
                 // The same principal trait (`dyn Any + 'static` to `dyn Any`, an auto trait
                 // dropped) keeps its vtable (rustc codegen unsized_info): the value is unchanged,
                 // whatever holds the pointer (`Ref<'_, dyn Any>` passed on as `Ref<'_, T>`).
-                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return v };
+                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else {
+                    if rt_trait_key(self.u, dd) == "-" && rt_trait_key(self.u, sd) != "-" {
+                        self.rt_note(rt_share_note(self.u, sd));
+                    }
+                    return v;
+                };
                 // (data, vtable of Sub) -> (data, Sub's stored vtable for Super); a smart
                 // pointer's other fields stay (a Box's allocator)
                 let st = from;
@@ -7229,6 +7552,16 @@ impl<'a> Lcx<'a> {
                 let p = self.to_leaves(v, st);
                 let mut pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
                 let mut pt = inner;
+                // the steps call `DerefMut::deref_mut` only when the result is borrowed mutably
+                // (rustc convert_place_derefs_to_mutable): `&mut c as &str` calls `Deref::deref`.
+                // The adjustment's own final borrow says which: a block tail passes its own type
+                // as `target` (`let s: &str = { &mut c };` borrowed `c` mutably). Without a
+                // borrow the target's mutability decides, as before.
+                let tm = match self.b.reborrow(key) {
+                    Some(tm) => tm,
+                    None => !matches!(self.kind(target), TyKind::Ref(false, ..)),
+                };
+                let m = m && tm;
                 let saved = self.want_mut;
                 self.want_mut = m;
                 for k in 0..n {
@@ -7237,7 +7570,6 @@ impl<'a> Lcx<'a> {
                     pt = b;
                 }
                 self.want_mut = saved;
-                let _ = target;
                 if self.unsized_ty(pt) {
                     match pl {
                         Place::Regs(r) => Val::L(r),
@@ -7261,7 +7593,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::ClosureFn) => {
                 // rustc_codegen_ssa/src/mir/rvalue.rs:536-550.
                 let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
-                let id = self.u.instance_fn_id(instance);
+                let id = self.u.instance_fn_id_for(instance, from);
                 let r = self.f.vreg(Cls::I);
                 self.emit(Inst::FnAddr(r, id));
                 Val::L(vec![r])
@@ -9523,6 +9855,27 @@ impl<'a> Lcx<'a> {
                     if self.overflow_checks { self.shift_check(*op, self.int_ty(t).bits as u32, (y.0, Some(y.1))); }
                     return Val::L(vec![self.arith(*op, t, x.0, y.0, bt)]);
                 }
+                // A factor whose value fits one 64-bit word (`a as i128` of a 64-bit or narrower integer,
+                // a literal): `a as i128 * b as i128` never overflows, so it is one widening multiply
+                // (imul / smulh; mul / umulh) and no check -- rustc's, where a general 128-bit product
+                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates: a large app's
+                // slicer cross and dot products, 18% of its segment splitting under the JIT); a full
+                // 128-bit value by one word (`d as i128 * num`, `2 * n`) is four multiplies and the
+                // check of its third word (rustc's inline smulo of a sign-extended factor)
+                if *op == BinOp::Mul && self.is_wide(t) {
+                    let signed = self.wide_signed(t);
+                    let (wa, wb) = (self.fits_word(*a, signed), self.fits_word(*b, signed));
+                    if wa && wb {
+                        let lo = self.ibin(IOp::Mul, false, x.0, y.0);
+                        let hi = self.ibin(IOp::MulHi, signed, x.0, y.0);
+                        return Val::L(vec![lo, hi]);
+                    }
+                    if self.overflow_checks && (wa || wb) {
+                        let (full, word) = if wb { (x, y.0) } else { (y, x.0) };
+                        let (lo, hi) = self.checked_mul_by_word(signed, full, word);
+                        return Val::L(vec![lo, hi]);
+                    }
+                }
                 match self.checked_wide_arith(*op, t, x, y) {
                     Some((lo, hi)) => Val::L(vec![lo, hi]),
                     None => {
@@ -9862,6 +10215,70 @@ impl<'a> Lcx<'a> {
     // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:103-123,457-541.
     // Round-30 design: checked arithmetic's flag is computed with existing RIR ops.
     // N:rustc_mir_build/src/thir/cx/expr.rs:676-683 lowers -literal as a literal.
+    /// Does the value of the 128-bit operand `expr` fit one 64-bit word -- signed (i64) for a
+    /// signed type, unsigned (u64) for an unsigned one -- whatever it is at run time? Then its
+    /// high word is its low word's sign (zero). `x as T` of a narrower integer (a signed one into
+    /// a signed type, or one of fewer than 64 bits; an unsigned one into an unsigned type), an
+    /// integer literal in range, a negated literal in a signed type; parenthesized or not.
+    fn fits_word(&self, mut expr: ExprId, signed: bool) -> bool {
+        let mut negated = false;
+        loop {
+            let ex = self.ast().expr(expr);
+            match ex.kind {
+                ExprKind::Paren(inner) => expr = inner,
+                ExprKind::Unary(UnOp::Neg, inner) if signed && !negated => {
+                    negated = true;
+                    expr = inner;
+                }
+                ExprKind::Cast(inner, _) if !negated => {
+                    let xt = self.body_ty(inner);
+                    if !matches!(self.kind_ref(xt), TyKind::Int(_)) || self.is_wide(xt) {
+                        return false;
+                    }
+                    let it = self.int_ty(xt);
+                    return if signed { it.signed || it.bits < 64 } else { !it.signed };
+                }
+                ExprKind::Lit(LitKind::Int) => {
+                    let Some(v) = crate::const_fold::parse_int_lit(&self.src_text(ex.lo, ex.hi)) else { return false };
+                    return if negated { v <= 1u128 << 63 } else if signed { v <= i64::MAX as u128 } else { v <= u64::MAX as u128 };
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// `full * word` under overflow checks, `word` a 64-bit value (its high word its sign, or zero
+    /// for unsigned): full = x1 * 2^64 + x0, so the product is x0 * word (x0 unsigned) plus
+    /// x1 * word shifted up a word. Its three words: the 128-bit result and a third, which must
+    /// be the result's sign (zero) for the product to fit.
+    fn checked_mul_by_word(&mut self, signed: bool, full: (VReg, VReg), word: VReg) -> (VReg, VReg) {
+        let lo = self.ibin(IOp::Mul, false, full.0, word);
+        let mut hi0 = self.ibin(IOp::MulHi, false, full.0, word);
+        if signed {
+            // the unsigned high product counts a negative word as word + 2^64: take x0 back off
+            let k63 = self.iconst(63);
+            let mask = self.ibin(IOp::Shr, true, word, k63);
+            let over = self.ibin(IOp::And, false, full.0, mask);
+            hi0 = self.ibin(IOp::Sub, false, hi0, over);
+        }
+        let lo1 = self.ibin(IOp::Mul, false, full.1, word);
+        let hi1 = self.ibin(IOp::MulHi, signed, full.1, word);
+        let hi = self.ibin(IOp::Add, false, hi0, lo1);
+        let carry = self.icmp(Cond::Lt, false, hi, hi0);
+        let mut third = self.ibin(IOp::Add, false, hi1, carry);
+        let expected = if signed {
+            let k63 = self.iconst(63);
+            let sign0 = self.ibin(IOp::Shr, true, hi0, k63);
+            third = self.ibin(IOp::Add, false, third, sign0);
+            self.ibin(IOp::Shr, true, hi, k63)
+        } else {
+            self.iconst(0)
+        };
+        let overflow = self.icmp(Cond::Ne, false, third, expected);
+        self.overflow_assert(overflow, arithmetic_overflow_message(BinOp::Mul));
+        (lo, hi)
+    }
+
     fn negated_literal(&self, mut expr: ExprId) -> bool {
         loop {
             match self.ast().expr(expr).kind {
@@ -10004,7 +10421,7 @@ impl<'a> Lcx<'a> {
             TyKind::FnDef(d, args, _) if matches!(tk, TyKind::FnPtr(..) | TyKind::Int(_) | TyKind::Ptr(..)) => Some(Ok((*d, args.clone()))),
             TyKind::Closure(..) if matches!(tk, TyKind::FnPtr(..)) => {
                 let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
-                Some(Err(self.u.instance_fn_id(instance)))
+                Some(Err(self.u.instance_fn_id_for(instance, from)))
             },
             _ => None,
         };
@@ -11009,26 +11426,41 @@ impl<'a> Lcx<'a> {
     }
 
     /// SPEC-V: whether a call with these arguments could pass aliasing pointers to a `noalias`
-    /// parameter: a `&mut` of a sized `Unpin` type (the parameters lowered with `noalias`) and at least
-    /// one other argument that can hold a pointer. Two paths to the same bytes need two such values.
+    /// parameter: a pointer scalar the callee may write through with `noalias` (a `&mut` of an
+    /// `Unpin` type, a Box: abi_param's parts, a pair's or a closure's included) and at least one
+    /// other value that can hold a pointer, a scalar of the same pair counted. Two paths to the same
+    /// bytes need two such values.
     fn alias_prone(&mut self, args: &[(Val, TyId)]) -> bool {
         let mut muts = false;
         let mut holders = 0;
         for (_, t) in args {
-            if let TyKind::Ref(true, inner, _) = self.kind_ref(*t).clone() {
-                if !self.unsized_ty(inner) && self.u.is_unpin(inner) { muts = true; }
-            }
-            if self.may_hold_pointer(*t, 0) { holders += 1; }
+            let parts = match self.layout(*t).leaves.as_ref() {
+                Some(leaves) => self.abi_pointers(*t, leaves),
+                None => Vec::new(),
+            };
+            muts |= parts.iter().any(|(_, p)| p.unique());
+            holders += parts.len().max(self.may_hold_pointer(*t, 0) as usize);
         }
         muts && holders >= 2
     }
 
     fn may_hold_pointer(&mut self, t: TyId, depth: u32) -> bool {
         match self.kind_ref(t).clone() {
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str => false,
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str | TyKind::FnDef(..) => false,
             TyKind::Tuple(v) => {
                 let items: Vec<TyId> = self.u.tcx.tys.list(v).to_vec();
                 items.into_iter().any(|x| self.may_hold_pointer(x, depth + 1))
+            }
+            // a closure holds what it captures: a capture-less one (`|x| *x ^ 5` handed to
+            // sort_by_key) holds nothing, so a `&mut [T]` beside it is no aliasing pair. (Counted
+            // as a pointer, a slice's sort from unverified code went to its twin.) A coroutine's
+            // state is not walked here
+            TyKind::Closure(file, ce, _) if depth < 4 && !self.u.tcx.coroutines.contains(&(file, ce)) => {
+                if self.layout(t).size == 0 {
+                    return false;
+                }
+                let fields = self.u.closure_storage(t).fields.clone();
+                fields.into_iter().any(|f| self.may_hold_pointer(f, depth + 1))
             }
             TyKind::Array(e, _) => depth < 4 && self.may_hold_pointer(e, depth + 1),
             TyKind::Adt(d, args, _) if depth < 4 => {
@@ -11222,10 +11654,19 @@ impl<'a> Lcx<'a> {
 
     /// rustc_codegen_ssa/src/mir/block.rs: native instance dispatch. Closure
     /// bodies receive their environment and untupled inputs (abi.rs:61-73).
-    fn emit_instance(&mut self, instance: Instance, mut vals: Vec<(Val, TyId)>, ret: TyId) -> Val {
+    fn emit_instance(&mut self, instance: Instance, vals: Vec<(Val, TyId)>, ret: TyId) -> Val {
+        let on = vals.first().map(|v| v.1);
+        self.emit_instance_on(instance, vals, ret, on)
+    }
+
+    /// emit_instance with the type the instance was resolved for (`on`: the receiver's, which a
+    /// poll passes as an address): a closure's slot is the one its type names
+    /// (Unit::instance_fn_id_for).
+    fn emit_instance_on(&mut self, instance: Instance, mut vals: Vec<(Val, TyId)>, ret: TyId, on: Option<TyId>) -> Val {
         let args = instance.compact_args(&self.u.tcx);
         match instance.def {
             InstanceKind::Virtual(d, index) => {
+                self.rt_note(rt_virtual_note(self.u, args[0], index as u32));
                 let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
                 assert_eq!(receiver.len(), 2, "virtual receiver metadata");
                 let ptr = self.f.vreg(Cls::I);
@@ -11244,8 +11685,12 @@ impl<'a> Lcx<'a> {
                     crate::def_collector::NodeId::Closure(expr) => self.u.tcx.coroutines.contains(&(file, expr.0)),
                     _ => unreachable!(),
                 };
+                let id = match on {
+                    Some(t) => self.u.instance_fn_id_for(instance, t),
+                    None => self.u.instance_fn_id(instance),
+                };
                 // EXCEPTION(M7): Future::poll uses the existing coroutine slot ABI.
-                if coroutine { return self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret); }
+                if coroutine { return self.emit_call(Callee::Fn(id), vals, ret); }
                 assert_eq!(vals.len(), 2, "closure call receiver and tuple");
                 let tuple = vals.pop().unwrap();
                 let TyKind::Tuple(inputs) = self.kind(tuple.1) else { panic!("closure input tuple") };
@@ -11254,7 +11699,7 @@ impl<'a> Lcx<'a> {
                     let (field, ty) = self.project(&place, tuple.1, 0, i as u32);
                     vals.push((self.read_place(&field, ty), ty));
                 }
-                self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret)
+                self.emit_call(Callee::Fn(id), vals, ret)
             }
             InstanceKind::Item(d) if vals.len() == 1 && self.trivial_clone(d, ret) => {
                 // `Clone::clone` of a `TrivialClone` type is a bitwise copy by that trait's contract
@@ -11265,7 +11710,8 @@ impl<'a> Lcx<'a> {
                 self.read_place(&Place::Mem(p[0], 0), ret)
             }
             InstanceKind::Item(d) => {
-                let sig = self.u.tcx.fn_item_sig(&self.u.prog, d).expect("item signature");
+                let u = self.u;
+                let sig = u.tcx.fn_item_sig(&u.prog, d).expect("item signature");
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
                 let mut types = Vec::new();
                 for value in &vals { types.push(value.1); }
@@ -11282,6 +11728,7 @@ impl<'a> Lcx<'a> {
                         return self.dummy_val(ret);
                     };
                     let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
+                    rt_host_notes(u, &types, RtBoundary::Foreign, |name| self.rt_note(name));
                     Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi)))
                 } else if sig.header.abi.is_c_like() {
                     let cs = crate::cabi::c_sig(self.u, &types, ret, None, sig.header.abi);
@@ -11375,20 +11822,20 @@ impl<'a> Lcx<'a> {
             if let TyKind::FnDef(..) = self.kind(pt) {
                 ft = pt;
             } else {
-                return match self.kind(pt) {
-                    TyKind::FnPtr(ps, _, c, _) => {
+                return match self.kind_ref(pt) {
+                    sig @ TyKind::FnPtr(ps, ..) => {
                         let fv = self.read_place(&pl, pt);
                         let fv = self.to_leaves(fv, pt);
                         let mut vals = Vec::new();
                         let mut guards = Vec::new();
                         for (i, a) in args.iter().enumerate() {
-                            let p = self.u.tcx.tys.list(ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
+                            let p = self.u.tcx.tys.list(*ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                             let v = self.lower_expr_coerced(*a, p);
                             let v = self.guard_operand(&args[i + 1..], v, p, &mut guards);
                             vals.push((v, p));
                         }
                         self.unguard(&guards);
-                        let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(ps), t, c, &mut vals);
+                        let callee = self.fn_ptr_callee(fv[0], sig, t, &mut vals);
                         self.emit_call(callee, vals, t)
                     }
                     _ => {
@@ -11450,7 +11897,7 @@ impl<'a> Lcx<'a> {
                 self.emit_instance(instance, vals, t)
             }
 
-            TyKind::FnPtr(ps, _, c, _) => {
+            sig @ TyKind::FnPtr(ps, ..) => {
                 let fv = self.lower_expr(f);
                 let fv = self.to_leaves(fv, ft);
                 let mut vals = Vec::new();
@@ -11462,7 +11909,7 @@ impl<'a> Lcx<'a> {
                     vals.push((v, pt));
                 }
                 self.unguard(&guards);
-                let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(*ps), t, *c, &mut vals);
+                let callee = self.fn_ptr_callee(fv[0], sig, t, &mut vals);
                 self.emit_call(callee, vals, t)
             }
             _ => {
@@ -11791,6 +12238,7 @@ impl<'a> Lcx<'a> {
                 if let Some(g) = g0 {
                     if let TyKind::Dyn(..) = self.kind(g) {
                         // through the vtable's drop entry (0 when the type has no drop)
+                        self.rt_note(rt_virtual_note(self.u, g, VT_DROP));
                         let fp = self.f.vreg(Cls::I);
                         let pm = self.pmem();
                         self.emit(Inst::Load(pm, fp, p[1], (VT_DROP * self.pb()) as i32));
@@ -12171,7 +12619,23 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::Call(Callee::Host(rt), vec![slot, z, n], Vec::new()));
                 self.load_val(slot, 0, g)
             }
-            "black_box" => vals[0].0.clone(),
+            // rustc_codegen_llvm (intrinsic black_box): the value goes to the result's place and
+            // an empty asm block takes its address with a memory clobber (a ZST: the clobber
+            // alone), so no pass sees through it: the value is made, kept and read back. (As an
+            // identity it was dead after a call, which then became a sibling call: the frame
+            // that held the value was gone from the stack a live edit's landing check reads.)
+            "black_box" => {
+                let g = g0?;
+                if self.layout(g).size == 0 {
+                    self.emit(Inst::Call(Callee::Asm(Box::new(AsmBlock::opaque(Vec::new()))), Vec::new(), Vec::new()));
+                    vals[0].0.clone()
+                } else {
+                    let slot = self.new_slot_for(g);
+                    self.store_val(slot, 0, g, vals[0].0.clone());
+                    self.emit(Inst::Call(Callee::Asm(Box::new(AsmBlock::opaque(vec![relax_backend::asm::PReg::int(0)]))), vec![slot], Vec::new()));
+                    self.load_val(slot, 0, g)
+                }
+            }
             "type_name" => {
                 let s = match g0 {
                     Some(g) => crate::typeck::type_name(&self.u.prog, &self.u.tcx, g),
@@ -12917,15 +13381,16 @@ impl<'a> Lcx<'a> {
                 Some(Val::L(vec![r]))
             }
             "catch_panic" => {
-                // intrinsics_rt::catch_panic(f, data) -> bool: Rt::catch_panic runs f(data) under
-                // a recovery point on this thread (1 = panicked: reported, stack reset here)
-                if a.len() != 2 {
-                    self.err(self.pos, "intrinsic `catch_panic` takes (f: fn(*mut u8), data: *mut u8)".to_string());
+                // intrinsics_rt::catch_panic(f, data, caught) -> bool: Rt::catch_panic runs f(data)
+                // under a recovery point on this thread (1 = panicked: stack reset here); `caught`:
+                // std's catch_unwind, whose panic the program handles (no runtime report)
+                if a.len() != 3 {
+                    self.err(self.pos, "intrinsic `catch_panic` takes (f: fn(*mut u8), data: *mut u8, caught: bool)".to_string());
                     return Some(self.unit());
                 }
                 let r = self.f.vreg(Cls::I);
                 let rt = self.u.rs.catch_panic;
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], a[1]], vec![r]));
+                self.emit(Inst::Call(Callee::Host(rt), a, vec![r]));
                 let z = self.f.vreg(Cls::I);
                 self.emit(Inst::ICmpI(Cond::Ne, false, z, r, 0));
                 Some(Val::L(vec![z]))
@@ -12975,6 +13440,12 @@ impl<'a> Lcx<'a> {
                 let rt = self.u.rs.panicking;
                 self.emit(Inst::Call(Callee::Host(rt), Vec::new(), vec![r]));
                 Some(Val::L(vec![r]))
+            }
+            "overflow_checks" => {
+                // intrinsics::overflow_checks() -> bool: true in constant evaluation, as rustc's (one
+                // value there for every crate); in code, the checks its crate inherits
+                let on = self.const_init || self.inherited_checks();
+                Some(Val::L(vec![self.iconst(on as i64)]))
             }
             "rethrow" => {
                 // intrinsics_rt::rethrow(): Rt::rethrow (the next panic continues a reported one)
@@ -13510,12 +13981,16 @@ pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::S
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
     let ret = u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), s.ret);
-    Some(bridge_func_sig(u, &ps, ret, name, shim, last_panic))
+    Some(bridge_func_sig(u, u.prog.def(d).krate, &ps, ret, name, shim, last_panic))
 }
 
 /// bridge_func for an explicit signature (a derived method of an opaque type).
-pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Func {
+pub fn bridge_func_sig(u: &Unit, krate: u32, ps: &[TyId], ret: TyId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Func {
     let mut f = Func::new(name, 0);
+    rt_host_notes(u, ps, RtBoundary::Provided(krate), |name| {
+        let sym = u.syms.note(name);
+        if !f.notes.contains(&sym) { f.notes.push(sym); }
+    });
     let b = f.block();
     let rl = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, ret);
     let mut rets = Vec::new();
@@ -14391,6 +14866,21 @@ struct WideRet {
     hi: u64,
 }
 
+rt_fn! {
+/// A made cell's set block (note_made), once per vtable: after a patch that kept closures with no
+/// trait object made, the live loop looks at them (reload::made_late: atomics and a wake, no
+/// panic).
+leaf fn rt_made_late() {
+    crate::reload::made_late();
+}
+}
+
+/// The address code calls for `rt_made_late` (SymKind::Rt("made_late")).
+pub fn made_late_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_made_late;
+    f as usize as u64
+}
+
 /// The address of the 128-bit division helper (its runtime symbol is interned at unit start).
 pub fn divrem128_addr() -> u64 {
     let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128;
@@ -14420,8 +14910,10 @@ leaf fn rt_wide_f64(signed: u64, lo: u64, hi: u64) -> f64 {
 
 rt_fn! {
 /// 128-bit quotient or remainder (mode bit 0: remainder, bit 1: signed). The caller has checked a
-/// zero divisor and signed MIN / -1. (A host helper for now; candidate for an Rt entry.)
-fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
+/// zero divisor and signed MIN / -1 (wide_divrem), so it cannot panic: a leaf entry, without the
+/// panic guard each call paid (two divisions a crossing point in a large app's slicer). (A host helper
+/// for now; candidate for an Rt entry.)
+leaf fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
     let a = ((ahi as u128) << 64) | alo as u128;
     let b = ((bhi as u128) << 64) | blo as u128;
     let r: u128 = if mode & 2 != 0 {
@@ -16450,9 +16942,9 @@ pub fn shim_func(u: &Unit, shim: &ShimInstance, id: u32) -> Result<Func, String>
                 call_args.push((l.read_place(&place, ty), ty));
             }
             let callee = match l.kind(callable) {
-                TyKind::FnPtr(inputs, _, header, _) => {
+                ref sig @ TyKind::FnPtr(..) => {
                     let ptr = l.to_leaves(receiver, callable)[0];
-                    l.fn_ptr_callee(ptr, u.tcx.tys.list(inputs), ret, header, &mut call_args)
+                    l.fn_ptr_callee(ptr, sig, ret, &mut call_args)
                 }
                 TyKind::FnDef(d, args, _) => {
                     let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, u.tcx.tys.list(args)).map_err(|e| format!("shim callee: {e:?}"))?;
@@ -16526,6 +17018,7 @@ fn arithmetic_overflow_message(op: BinOp) -> &'static str {
 pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::rir::Sym> {
     let (kind, addr) = match name {
         "web_memory_base" => ("web_memory_base", crate::web::BASE),
+        "made_late" => ("made_late", made_late_addr()),
         "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
         // the loop counters' helper (a trampoline in the code area)
         "loop_hot" => return Some(crate::jit::loop_hot_sym(u)),
