@@ -779,7 +779,7 @@ pub extern "C" fn host_get_environment_variable_w(name: *const u16, buf: *mut u1
     unsafe { win::get_environment_variable_w(name, buf, size) }
 }
 
-std::thread_local! {
+thread_local! {
     /// the last `env_snapshot` of this thread (std copies it right away)
     static SNAPSHOT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }

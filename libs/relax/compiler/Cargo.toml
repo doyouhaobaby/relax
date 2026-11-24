@@ -30,6 +30,7 @@ name = "enum_tag16"
 path = "tests/enum_tag16.rs"
 
 [dependencies]
+makepad-thread-local = { path = "../../thread_local", version = "1.0.0" }
 makepad-cpu-budget = { workspace = true }
 makepad-core-util = { path = "../../core_util", version = "0.1.0" }
 # the git store's deflate/inflate (src/inflate), the manifests' TOML (src/toml) and the

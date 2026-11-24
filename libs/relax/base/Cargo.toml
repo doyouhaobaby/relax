@@ -14,6 +14,7 @@ include = ["../self_stamp.rs"]
 windows = { "lib" = "4 of 204 fail there: root resolution (2), progenv, dirs" }
 
 [dependencies]
+makepad-thread-local = { path = "../../thread_local", version = "1.0.0" }
 makepad-cpu-budget = { workspace = true }
 relax-lex = { workspace = true }
 relax-session = { workspace = true }

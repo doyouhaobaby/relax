@@ -1,3 +1,7 @@
+// thread-locals take no pthread key each on Android (libs/thread_local)
+#[macro_use(thread_local)]
+extern crate makepad_thread_local;
+
 pub mod backend;
 // The blocking client is a native socket API; wasm uses the async web backend.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]

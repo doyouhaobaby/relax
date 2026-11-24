@@ -48,3 +48,50 @@ macro_rules! __table_thread_local {
         $($crate::__table_thread_local! { $($rest)* })?
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Counted;
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    crate::thread_local! {
+        /// Attributes and visibility pass through.
+        #[allow(dead_code)]
+        pub(crate) static COUNT: Cell<u32> = const { Cell::new(0) };
+        static LOG: RefCell<Vec<u32>> = RefCell::new(vec![1]);
+        static COUNTED: RefCell<Option<Counted>> = const { RefCell::new(None) }
+    }
+    crate::thread_local!(static ONE: Cell<u8> = Cell::new(1));
+
+    /// The macro every host crate's `thread_local!` resolves to: off native Android it is std's,
+    /// with std's key type, and std's call forms (several statics, `const`, attributes, a
+    /// trailing `;` or none, the `()` form) all declare per-thread values dropped at thread exit.
+    #[test]
+    fn forwards_to_std_off_android() {
+        #[cfg(not(target_os = "android"))]
+        {
+            let _: &'static std::thread::LocalKey<Cell<u32>> = &COUNT;
+            let _: Option<std::thread::AccessError> = LOG.try_with(|_| ()).err();
+        }
+        COUNT.set(5);
+        LOG.with_borrow_mut(|l| l.push(2));
+        std::thread::spawn(|| {
+            assert_eq!(COUNT.get(), 0, "each thread starts from the initial value");
+            LOG.with_borrow(|l| assert_eq!(*l, [1], "each thread starts from the initial value"));
+            COUNTED.set(Some(Counted));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1, "a thread's value drops at its exit");
+        assert_eq!((COUNT.get(), ONE.get()), (5, 1), "this thread's values are its own");
+        LOG.with_borrow(|l| assert_eq!(*l, [1, 2]));
+    }
+}

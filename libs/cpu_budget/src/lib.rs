@@ -31,6 +31,11 @@
 //! is the class of the person's Visible work itself, and below it the kernel still runs a thread on
 //! a performance core the moment one is free for an instant, so a realtime pipeline that sleeps and
 //! wakes every round finds its core taken. Only QoS BACKGROUND keeps a thread off them.
+
+// thread-locals take no pthread key each on Android (libs/thread_local)
+#[macro_use(thread_local)]
+extern crate makepad_thread_local;
+
 use relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};

@@ -9845,7 +9845,7 @@ mod data_tests {
 
     static CACHE_UNIT: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
-    std::thread_local! {
+    thread_local! {
         // Run a nested lookup while an outer lookup owns its link guard, without
         // requiring process-global JIT execution of a static initializer.
         pub(super) static BEFORE_LINK: std::cell::RefCell<Option<Box<dyn FnOnce(&mut Unit)>>> = Default::default();

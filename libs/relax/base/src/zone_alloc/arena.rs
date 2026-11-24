@@ -1225,7 +1225,7 @@ impl Arena {
             Err(_) => std::process::abort(),
         }
     }
-    fn try_current<R>(&self, f: impl FnOnce(&Cell<[Current; CLASSES]>) -> R) -> Result<R, std::thread::AccessError> {
+    fn try_current<R>(&self, f: impl FnOnce(&Cell<[Current; CLASSES]>) -> R) -> Result<R, makepad_thread_local::AccessError> {
         if self.dynamic {
             Ok(f(&domain_tls().current))
         } else {
