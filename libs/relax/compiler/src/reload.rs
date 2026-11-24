@@ -2041,7 +2041,10 @@ fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::I
 /// include_bytes!) that were saved (`changed`): each own source file whose code includes one, with
 /// its running text (`classify` finds the items whose included content moved, and those an
 /// include! expands to read the file anew). `skip`: the source files the batch edits already.
+/// An include's path is normalized (`include_path`), so a saved path is too: a Windows spelling
+/// of the same file (`\`, the drive letter's case) matched no include.
 pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], skip: &[String]) -> Vec<Edit> {
+    let changed: Vec<String> = changed.iter().map(|p| crate::vfs::normalize_path(p)).collect();
     let mut out = Vec::new();
     for (path, file) in prog.current_source_files(|p| !skip.iter().any(|s| s == p)) {
         if !own_source_file(prog, file) { continue; }
@@ -2058,9 +2061,9 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
 }
 
 /// The saved included files (`changed`) no own source file names through text or recorded
-/// expansion sites. Which code read them is not known.
+/// expansion sites. Which code read them is not known. (Normalized, as `include_edits` reads them.)
 pub(crate) fn include_unmatched(prog: &crate::program::Program, changed: &[String]) -> Vec<String> {
-    let mut left: Vec<String> = changed.to_vec();
+    let mut left: Vec<String> = changed.iter().map(|p| crate::vfs::normalize_path(p)).collect();
     for (path, file) in prog.current_source_files(|_| true) {
         if left.is_empty() { break; }
         if !own_source_file(prog, file) { continue; }
@@ -12866,8 +12869,10 @@ mod removed_module_tests {
         std::fs::write(dir.join("leaf.rs"), "pub fn g() -> u32 { 2 }\n").unwrap();
         let session = std::sync::Arc::new(crate::Session::default());
         let (prog, _, _) = crate::load_with_std(&session, dir.join("main.rs").to_str().unwrap(), "removed_module", false).unwrap();
-        let path = |end: &str| prog.file_paths.iter().find(|p| p.ends_with(end)).cloned().unwrap();
-        let (main, zz, leaf) = (path("/main.rs"), path("/zz/mod.rs"), path("/leaf.rs"));
+        // (a path is spelled as the program has it: the root as given, `\` on Windows, its modules'
+        // joined with `/`; the lookup is by components)
+        let path = |end: &str| prog.file_paths.iter().find(|p| std::path::Path::new(p.as_str()).ends_with(end)).cloned().unwrap();
+        let (main, zz, leaf) = (path("main.rs"), path("zz/mod.rs"), path("leaf.rs"));
         let none = std::collections::HashSet::new();
         let lines = undeclared_removals(&prog, &[zz.as_str(), leaf.as_str()], &none);
         assert_eq!(lines.len(), 2, "{lines:?}");
