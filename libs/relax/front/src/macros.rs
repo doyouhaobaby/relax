@@ -2137,6 +2137,12 @@ impl MacroScope {
         })
     }
 
+    /// The proc macro `name` of `kind` that module `m` of crate `k` binds as another crate sees it:
+    /// its crate's own export at its root, or one its `pub use` imports re-export.
+    pub(crate) fn public_proc_macro(&self, k: &str, m: &str, name: &str, kind: crate::macro_reg::Kind) -> Option<crate::macro_reg::Entry> {
+        self.proc_macro_in(k, m, name, kind, true, &mut Default::default())
+    }
+
     fn proc_macro_in(&self, k: &str, m: &str, name: &str, kind: crate::macro_reg::Kind, public: bool, seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
         if !seen.insert((k.into(), m.into(), name.into())) { return None; }
         let r = Res { table: &self.table };

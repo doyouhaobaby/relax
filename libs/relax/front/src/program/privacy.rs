@@ -89,7 +89,7 @@ impl Program {
             }
             // rustc_resolve imports.rs finalize_import: an inaccessible binding is an error only when
             // no namespace resolves, and the macro namespace is one of them
-            if !visible && last && last_ns.is_none() && self.macro_binding_visible(m, name, from) {
+            if !visible && last && last_ns.is_none() && (self.macro_binding_visible(m, name, from) || self.ext_proc_macro_public(m, name)) {
                 return None;
             }
             if !visible {
@@ -101,6 +101,33 @@ impl Program {
             cur = next?;
         }
         None
+    }
+
+    /// A proc macro `name` that module `m` binds publicly, `m` being of a crate the replay of rustc's
+    /// import resolution did not cover: a registry dependency, or a checked crate whose verdict was
+    /// reused, whose names rustc reads from metadata (rsim.rs ExtTable). Its macro namespace has no
+    /// replayed binding (`macro_binding_visible`), and a `pub use` of a proc macro there makes the
+    /// name public beside a private module that has it too (relax issue 268). Only public bindings
+    /// count: a module whose macro of that name is not re-exported, or that has none, stays private.
+    fn ext_proc_macro_public(&self, m: u32, name: Sym) -> bool {
+        let md = &self.mods[m as usize];
+        if self.sim_own.get(md.krate as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        let krate = self.syms.str(self.crates[md.krate as usize].name);
+        let module = self.def_path(md.def);
+        let n = self.syms.str(name);
+        let scope = crate::macros::MacroScope::new(self.macros.clone());
+        [crate::macro_reg::Kind::Bang, crate::macro_reg::Kind::Attr, crate::macro_reg::Kind::Derive]
+            .into_iter()
+            .any(|kind| scope.public_proc_macro(krate, &module, n, kind).is_some())
+    }
+
+    /// The replay's macro namespace (rsim.rs) binds `name` in module `m` at least as widely as `vis`:
+    /// a re-export of the binding at `vis` is no E0364.
+    fn macro_binding_reexportable(&self, m: u32, name: Sym, vis: BindVis) -> bool {
+        let Some(b) = self.sim_macros.as_ref().and_then(|t| t.get(&(m, name))) else { return false };
+        (b.non_glob.is_some() && !self.vis_wider(vis, b.non_glob_vis)) || (b.glob.is_some() && !self.vis_wider(vis, b.glob_vis))
     }
 
     /// The replay's macro namespace (rsim.rs) binds `name` in module `m` where `from` can see it.
@@ -406,7 +433,10 @@ impl Program {
             self.resolve_mod_path(im.module, im.global, &segs[..segs.len() - 1], edition < 2018, true)?
         };
         let pd = self.def(parent);
-        let mut any_ok = self.lookup_macro_in_container(parent, name);
+        // a macro of that name the module binds as widely re-exports it (a proc macro re-exported
+        // beside a private module of its name, relax issue 268)
+        let mut any_ok = self.lookup_macro_in_container(parent, name)
+            || (pd.kind == DefKind::Mod && (self.macro_binding_reexportable(pd.sub, name, import_vis) || self.ext_proc_macro_public(pd.sub, name)));
         let mut failed: Option<(bool, BindVis)> = None;
         for ns in [true, false] {
             let found = match pd.kind {
