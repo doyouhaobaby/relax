@@ -909,3 +909,121 @@ fn a_constants_twins_link_from_the_disk_cache_in_the_next_run() {
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
 }
+
+/// A `global_asm!` function with its own unwind info (`.seh_*`) and no frame pointer, as
+/// rustc's would leave it: `seh_through(data, f)` calls `f(data)`. From `inside`, below it, a
+/// walk by the function tables (RtlLookupFunctionEntry / RtlVirtualUnwind, as the exception
+/// dispatcher and std's backtraces walk) goes through its frame (the code area's entry for Relax
+/// frames would take the caller's frame pointer as its own and skip the caller) to `outer` and on
+/// as `outer`'s own walk goes; an exception raised in `inside` reaches its `.seh_handler`, which
+/// resumes the raise.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const SEH: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+std::arch::global_asm!(
+    ".globl seh_through",
+    "seh_through:",
+    ".seh_proc seh_through",
+    ".seh_handler seh_through_handler, @except",
+    "push rbx",
+    ".seh_pushreg rbx",
+    "push rsi",
+    ".seh_pushreg rsi",
+    "sub rsp, 40",
+    ".seh_stackalloc 40",
+    ".seh_endprologue",
+    "call rdx",
+    "nop",
+    "add rsp, 40",
+    "pop rsi",
+    "pop rbx",
+    "ret",
+    ".seh_endproc",
+);
+extern "C" {
+    fn seh_through(data: *mut usize, f: extern "C" fn(*mut usize));
+}
+/// CONTEXT (x64): rsp and rip by their offsets
+#[repr(C, align(16))]
+struct Context([u64; 154]);
+const RSP: usize = 0x98 / 8;
+const RIP: usize = 0xf8 / 8;
+#[link(name = "kernel32")]
+extern "system" {
+    fn RtlCaptureContext(c: *mut Context);
+    fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, history: *mut u8) -> *const u8;
+    fn RtlVirtualUnwind(kind: u32, base: u64, pc: u64, f: *const u8, c: *mut Context, data: *mut *mut u8, frame: *mut u64, pointers: *mut u8) -> *mut u8;
+    fn RaiseException(code: u32, flags: u32, n: u32, args: *const usize);
+}
+const CODE: u32 = 0xE0DE_0001;
+static HANDLED: AtomicUsize = AtomicUsize::new(0);
+static OUTER: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+#[no_mangle]
+unsafe extern "system" fn seh_through_handler(record: *const u32, _frame: *mut u8, _context: *mut u8, _dispatch: *mut u8) -> u32 {
+    if *record != CODE {
+        return 1;
+    }
+    HANDLED.fetch_add(1, Ordering::Relaxed);
+    0
+}
+/// The return addresses from its caller's on (the caller's frame first), by the function tables.
+#[inline(never)]
+fn walk(t: &mut [usize; 8]) -> usize {
+    let mut c = Context([0; 154]);
+    unsafe { RtlCaptureContext(&mut c) };
+    let mut n = 0;
+    while n < t.len() {
+        let pc = c.0[RIP];
+        let mut base = 0;
+        let f = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if f.is_null() {
+            // a leaf: its return address at rsp
+            c.0[RIP] = unsafe { *(c.0[RSP] as *const u64) };
+            c.0[RSP] += 8;
+        } else {
+            let (mut data, mut frame) = (std::ptr::null_mut(), 0);
+            unsafe { RtlVirtualUnwind(0, base, pc, f, &mut c, &mut data, &mut frame, std::ptr::null_mut()) };
+        }
+        if c.0[RIP] == 0 {
+            break;
+        }
+        t[n] = c.0[RIP] as usize;
+        n += 1;
+    }
+    n
+}
+extern "C" fn inside(out: *mut usize) {
+    let mut t = [0usize; 8];
+    let n = walk(&mut t);
+    // here, seh_through, outer, then the frames outer's own walk saw after itself
+    let walked = (1..=4).filter(|&k| k + 2 < n && t[k + 2] == OUTER[k].load(Ordering::Relaxed)).count();
+    unsafe {
+        *out = walked;
+        RaiseException(CODE, 0, 0, std::ptr::null());
+        *out.add(1) = HANDLED.load(Ordering::Relaxed);
+    }
+}
+#[inline(never)]
+fn outer(out: &mut [usize; 3]) {
+    let mut t = [0usize; 8];
+    walk(&mut t);
+    for (o, a) in OUTER.iter().zip(t) {
+        o.store(a, Ordering::Relaxed);
+    }
+    unsafe { seh_through(out.as_mut_ptr(), inside) };
+}
+pub fn values(out: &mut [usize; 3]) {
+    outer(out);
+    out[2] = 7;
+}
+"#;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn an_asm_functions_own_unwind_info_walks_its_frame_and_calls_its_handler() {
+    isolated_test!(an_asm_functions_own_unwind_info_walks_its_frame_and_calls_its_handler);
+    let [walked, handled, done] = values::<3>(SEH, "seh_unwind");
+    assert_eq!(walked, 4, "a walk from below the asm frame goes on through its caller as the caller's own walk does");
+    assert_eq!(handled, 1, "an exception raised below the asm frame reaches its handler, which resumes it");
+    assert_eq!(done, 7, "the program goes on after the asm function returns");
+}

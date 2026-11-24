@@ -134,7 +134,7 @@ pub struct ProcessInformation {
 
 #[link(name = "ntdll")]
 extern "system" {
-    pub fn RtlAddFunctionTable(table: *const u32, count: u32, base: u64) -> u8;
+    pub fn RtlInstallFunctionTableCallback(table_id: u64, base: u64, length: u32, callback: unsafe extern "system" fn(u64, *mut u8) -> *mut u32, context: *mut u8, out_of_process_dll: *const u16) -> u8;
     pub fn RtlDeleteFunctionTable(table: *const u32) -> u8;
     pub fn RtlDllShutdownInProgress() -> u8;
 }
