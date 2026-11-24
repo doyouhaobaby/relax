@@ -674,6 +674,54 @@ fn an_edit_keeping_size_and_mtime_gets_a_fresh_verdict() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Generic parameters a constant may not name (rustc 1.100, the round-34 corpus case without its
+/// type error): `makepad check` prints rustc's errors, each once -- uncoded where rustc's are, no
+/// load summary repeating the checked crate's own, and nothing more where rustc resolves the path
+/// to an error (no E0425 for the name, no E0277 for `Self`, no E0080 for the discriminant).
+#[test]
+fn generic_parameters_in_constants_are_rustcs_errors_once() {
+    if std::env::var_os(CHILD).is_some() || std::env::var_os(EARLY_CHILD).is_some() { return; }
+    let lib = "#![allow(dead_code)]\nstruct A<const N: usize>;\n\
+        fn arithmetic<const N: usize>() -> [u8; N + 1] { loop {} }\n\
+        fn type_param<T>() -> [u8; std::mem::size_of::<T>()] { loop {} }\n\
+        fn nested_braces<const N: usize>() -> A<{ { N } }> { loop {} }\n\
+        fn repeat_const<const N: usize>() { let _ = [0; N + 1]; }\n\
+        struct DefaultOp<const N: usize, const M: usize = { N + 1 }>;\n\
+        struct Forward<const N: usize = M, const M: usize = 2>;\n\
+        struct ParamType<T, const N: T>(T);\n\
+        trait Tr { fn f() -> [u8; std::mem::size_of::<Self>()]; }\n\
+        enum E<const N: usize> { A = N as isize }\n\
+        const fn id<const N: usize>() -> usize { N }\n\
+        fn nested_arg<const N: usize>() -> [u8; id::<N>()] { loop {} }\n";
+    let dir = package("constparams", &[("Cargo.toml", "[package]\nname = \"early_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n"), ("lib.rs", lib)]);
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "check_reuse_tests::early_child", "--nocapture", "--test-threads=1", "--format=terse"])
+        .env(EARLY_CHILD, &dir).env("RELAX_CACHE_DIR", dir.join("cache"))
+        .env_remove("RELAX_LINT_FLAGS").env_remove("RELAX_WORKSPACE").env_remove("RELAX_CACHE"));
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+    let code = stderr.lines().find_map(|l| l.strip_prefix("early child exit ")).map(|c| c.parse::<i32>().unwrap());
+    assert!(code.is_some_and(|c| c != 0), "the check fails: {stderr}");
+    // every error line, as (line, column, message): `lib.rs:L:C: message`
+    let mut errors: Vec<(u32, u32, String)> = stderr.lines().filter(|l| !l.contains(": warning: ")).filter_map(|l| {
+        let (_, rest) = l.split_once("lib.rs:")?;
+        let mut it = rest.splitn(3, ':');
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.trim_start().to_string()))
+    }).collect();
+    errors.sort();
+    // rustc's, at rustc's positions
+    let op = "error: generic parameters may not be used in const operations";
+    let expected: Vec<(u32, u32, String)> = [
+        (3, 41, op), (4, 48, op), (5, 45, op), (6, 49, op), (7, 53, op),
+        (8, 33, "E0128: generic parameter defaults cannot reference parameters before they are declared"),
+        (9, 30, "E0770: the type of const parameters must not depend on other generic parameters"),
+        (10, 47, op), (11, 30, "error: generic parameters may not be used in enum discriminant values"),
+        (13, 46, "E0747: unresolved item provided when a constant was expected"), (13, 46, op),
+    ].iter().map(|&(l, c, m)| (l, c, m.to_string())).collect();
+    assert_eq!(errors, expected, "{stderr}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 const APP_CHILD: &str = "RELAX_CHECK_APP_CHILD";
 
 /// In a child (APP_CHILD names the workspace folder): `makepad check app_pkg` there, as the command

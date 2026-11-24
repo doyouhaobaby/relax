@@ -391,12 +391,23 @@ pub(crate) fn def_wf_errors(prog: &Program, tcx: &Tcx, d: DefId) -> ItemErrors {
     with_item_diagnostics(prog, tcx, || relax_types::wfcheck::obligations::check_def(prog, tcx, d))
 }
 
+/// The paths of the files of `crates`.
+fn crate_paths<'p>(prog: &'p Program, crates: &[u32]) -> std::collections::HashSet<&'p str> {
+    prog.file_paths.iter().zip(&prog.file_crate).filter(|(_, k)| crates.contains(k)).map(|(p, _)| p.as_str()).collect()
+}
+
 /// The loader's name resolution errors in files belonging to the selected crates.
 pub(crate) fn crate_resolve_errors(prog: &Program, crates: &[u32]) -> Vec<String> {
     if prog.errors.is_empty() { return Vec::new(); }
-    let paths: std::collections::HashSet<&str> = prog.file_paths.iter().zip(&prog.file_crate)
-        .filter(|(_, k)| crates.contains(k)).map(|(p, _)| p.as_str()).collect();
+    let paths = crate_paths(prog, crates);
     prog.errors.iter().filter(|e| paths.contains(error_position(e).0.as_str())).cloned().collect()
+}
+
+/// The loader's name resolution errors in no file of `crates` (a check's crates: it prints
+/// their errors, crate_resolve_errors, with its own).
+pub(crate) fn other_resolve_errors<'p>(prog: &'p Program, crates: &[u32]) -> Vec<&'p String> {
+    let paths = crate_paths(prog, crates);
+    prog.errors.iter().filter(|e| !paths.contains(error_position(e).0.as_str())).collect()
 }
 
 /// The item-level errors of `crates` for a failed build. Check well-formedness once all the

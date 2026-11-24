@@ -3943,6 +3943,11 @@ impl<'a> Fcx<'a> {
                 self.err(at, "E0424: expected value, found module `self`".to_string());
                 return (Res::Err, error);
             }
+            // a generic parameter a constant may not name: collection reported it (Res::Err)
+            if prog.const_param_restricted(self.b.def, self.file, path.lo) {
+                self.infcx.set_tainted_by_errors();
+                return (Res::Err, error);
+            }
             let help = import_help(prog, self.module, s, false);
             let (at, message) = prog.unresolved_name_message(self.file, self.module, path, expected);
             self.err(at, format!("E0425: {message}{help}"));
@@ -4793,8 +4798,15 @@ impl<'a> Fcx<'a> {
                 if let Ty::Infer = prog.files[self.file as usize].ast.ty(*t) {
                     return Some(self.fresh_arg(def, index));
                 }
-                let (lt, errors) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), ||
-                    self.tcx.type_or_const_arg(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, *t));
+                // a generic parameter a constant may not name (`size_of::<T>()`, `id::<N>()` in an
+                // array length): collection reported it, and rustc lowers the argument as an error
+                let restricted = match prog.files[self.file as usize].ast.ty(*t) {
+                    Ty::Path(p) => prog.const_param_restricted(self.b.def, self.file, p.lo),
+                    _ => false,
+                };
+                let (lt, errors) = if restricted { self.infcx.set_tainted_by_errors(); (self.tcx.tys.error, Vec::new()) }
+                    else { self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), ||
+                        self.tcx.type_or_const_arg(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, *t)) };
                 let clean = errors.is_empty();
                 for error in errors { if !self.b.errors.contains(&error) { self.b.errors.push(error); } }
                 // FnCtxt::lower_ty: every explicit type argument is well formed
@@ -4808,7 +4820,9 @@ impl<'a> Fcx<'a> {
                         if self.tcx.tys.has_error(lt) { "E0747: unresolved item provided when a constant was expected" }
                         else { "E0747: type provided when a constant was expected" }
                     } else { "E0747: constant provided when a type was expected" };
-                    self.err(self.last_lo, message.into());
+                    // (generics.rs generic_arg_mismatch_err: at the argument, a path's start)
+                    let at = match prog.files[self.file as usize].ast.ty(*t) { Ty::Path(p) => p.lo, _ => self.last_lo };
+                    self.err(at, message.into());
                     return Some(if expected_const { self.tcx.tys.intern(TyKind::Const(self.tcx.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tcx.tys.error });
                 }
                 Some(lt)

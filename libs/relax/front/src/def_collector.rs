@@ -22,7 +22,7 @@ pub fn collect_definitions(prog: &mut Program, owner: DefId) -> Result<(), Strin
     let file = prog.def(owner).file;
     let pf = prog.files[file as usize].clone();
     let scope = prog.def(owner).scope;
-    let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope, legacy: false, legacy_attrs: None, legacy_names: &NO_NAMES, call_names: Some(Vec::new()), const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, creates_defs_at: 0, legacy_calls: Default::default(), legacy_children: Vec::new() };
+    let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope, legacy: false, legacy_attrs: None, legacy_names: &NO_NAMES, call_names: Some(Vec::new()), const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, creates_defs_at: 0, legacy_calls: Default::default(), legacy_children: Vec::new(), restricted: Vec::new(), owner_lo: 0 };
     visitor.visit_item(owner)?;
     // an owner with a constant or generic-default rib is walked by the legacy pass (its
     // late.rs const-rib checks report there): no entry
@@ -53,6 +53,10 @@ pub struct LegacyOwner {
     pub ranges: Vec<(u32, u32)>,
     pub calls: crate::fxhash::HashMap<ExprId, LegacyConstArgs>,
     pub children: Vec<(ExprId, DefId)>,
+    /// the paths check_generic_path reported (a generic parameter a constant may not name, a
+    /// forward default, a const parameter's type), as offsets from the owner item's start: rustc
+    /// resolves each to an error (Res::Err), which reports nothing more (Program::const_param_restricted)
+    pub restricted: Vec<u32>,
 }
 
 pub fn lower_legacy_const_generics(prog: &mut Program) -> usize {
@@ -153,18 +157,19 @@ pub fn lower_legacy_const_owners(prog: &mut Program, owners: &[DefId]) -> usize 
         // definition collection over the same syntax): every lower_legacy_call returns before
         // resolving, the walk splits nothing and creates nothing -- its result is empty
         if prog.legacy_call_names.get(&owner).is_some_and(|c| !c.iter().any(|s| names.contains(s))) {
-            results.push((owner, std::sync::Arc::new(LegacyOwner { file, ranges: Vec::new(), calls: Default::default(), children: Vec::new() })));
+            results.push((owner, std::sync::Arc::new(LegacyOwner { file, ranges: Vec::new(), calls: Default::default(), children: Vec::new(), restricted: Vec::new() })));
             continue;
         }
         let pf = prog.files[file as usize].clone();
         let mut visitor = DefCollector { prog, ast: &pf.ast, file, parent_def: owner, scope,
             legacy: true, legacy_attrs: Some(&attrs), legacy_names: &names, call_names: None, const_ribs: false, bindings: Vec::new(), checking_defs: false, creates_defs: false, creates_defs_at: 0,
-            legacy_calls: Default::default(), legacy_children: Vec::new() };
+            legacy_calls: Default::default(), legacy_children: Vec::new(), restricted: Vec::new(), owner_lo: pf.ast.item(item).lo };
         if let Err(error) = visitor.visit_item(owner) { visitor.prog.errors.push(error); }
         let calls = visitor.legacy_calls;
         let children = visitor.legacy_children;
+        let restricted = visitor.restricted;
         let ranges = if calls.is_empty() { Vec::new() } else { prog.item_expr_ranges(file, item) };
-        let result = LegacyOwner { file, ranges, calls, children };
+        let result = LegacyOwner { file, ranges, calls, children, restricted };
         results.push((owner, std::sync::Arc::new(result)));
     }
     // No preemption point exists in declaration collection. The front writer
@@ -334,6 +339,9 @@ struct DefCollector<'a> {
     creates_defs_at: u32,
     legacy_calls: crate::fxhash::HashMap<ExprId, LegacyConstArgs>,
     legacy_children: Vec<(ExprId, DefId)>,
+    /// the legacy pass: LegacyOwner::restricted, and the owner item's start they are offsets from
+    restricted: Vec<u32>,
+    owner_lo: u32,
 }
 
 impl DefCollector<'_> {
@@ -438,16 +446,20 @@ impl DefCollector<'_> {
             }
         }
         if !found { return; }
+        // rustc_resolve late.rs / diagnostics.rs ResolutionError: ParamInNonTrivialAnonConst and
+        // ParamInEnumDiscriminant carry no code; the path then resolves to an error
         let message = if forward {
-            Some("E0128: generic parameter defaults cannot reference parameters before they are declared".to_string())
+            Some("E0128: generic parameter defaults cannot reference parameters before they are declared")
         } else { restriction.map(|r| match r {
-            ConstRestriction::NonTrivial => format!("generic parameters may not be used in const operations: `{name}`"),
-            ConstRestriction::Discriminant => format!("generic parameters may not be used in enum discriminant values: `{name}`"),
-            ConstRestriction::ParamTy => format!("E0770: the type of const parameters must not depend on other generic parameters: `{name}`"),
+            ConstRestriction::NonTrivial => "generic parameters may not be used in const operations",
+            ConstRestriction::Discriminant => "generic parameters may not be used in enum discriminant values",
+            ConstRestriction::ParamTy => "E0770: the type of const parameters must not depend on other generic parameters",
         }) };
         if let Some(message) = message {
-            let error = self.prog.record_error(self.file, p.lo, "resolve", message);
+            let error = if message.starts_with('E') { self.prog.record_error(self.file, p.lo, "resolve", message.into()) }
+                else { self.prog.record_uncoded_error(self.file, p.lo, "resolve", message.into()) };
             if !self.prog.errors.contains(&error) { self.prog.errors.push(error); }
+            if p.lo >= self.owner_lo && !self.restricted.contains(&(p.lo - self.owner_lo)) { self.restricted.push(p.lo - self.owner_lo); }
         }
     }
 
@@ -1127,7 +1139,7 @@ mod legacy_attribute_tests {
 crate::collected_enum!(NodeId; 0 => AnonConst(e), 1 => InlineConst(e), 2 => OpaqueTy(t), 3 => AsyncReturn(i), 4 => AsyncBody(i), 5 => Closure(e), 6 => Field(n));
 crate::collected_fields!(LegacyConstArgs, callee, positions, const_args, value_args, invalid);
 
-crate::collected_fields!(LegacyOwner, file, ranges, calls, children);
+crate::collected_fields!(LegacyOwner, file, ranges, calls, children, restricted);
 
 #[cfg(test)]
 mod round45_tests {

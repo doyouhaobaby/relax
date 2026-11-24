@@ -2079,10 +2079,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             crate::run::first_report(0, e);
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "resolve")); }
         }
-        eprintln!("relax: {} name resolution errors (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
-        for e in prog.errors.iter().take(max_err) {
-            eprintln!("  {}", e);
-        }
     }
 
     drop(mem_g);
@@ -2106,6 +2102,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let checked = if check && !boundary_options {
         crate::check::checked_crates(&prog, root, watch || root_only || session.is_some(), selftest || workspace_check, &also)
     } else { Vec::new() };
+    // the load's resolution errors, but a check's crates' own: the check prints those with its
+    // other errors, each once (as cargo check does)
+    let shown = crate::check::other_resolve_errors(&prog, &checked);
+    if !shown.is_empty() {
+        eprintln!("relax: {} name resolution errors (first {}):", shown.len(), max_err.min(shown.len()));
+        for e in shown.iter().take(max_err) {
+            eprintln!("  {}", e);
+        }
+    }
     // a one-shot check reuses the verdicts of the crates whose inputs did not change since a
     // check that passed (check_reuse.rs); when none changed, that check's diagnostics are all
     // this one prints

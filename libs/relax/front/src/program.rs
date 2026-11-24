@@ -1222,6 +1222,22 @@ impl Program {
         None
     }
 
+    /// Whether the path at `pos` of `file`, in `owner` or an item around it, names a generic
+    /// parameter where a constant may not (LegacyOwner::restricted): collection reported it, and
+    /// rustc resolves the path to an error, which reports nothing more. (Every such path has its
+    /// error in `errors`: a program without errors answers at once.)
+    pub fn const_param_restricted(&self, mut owner: DefId, file: u32, pos: u32) -> bool {
+        if self.errors.is_empty() { return false; }
+        while owner != NO_DEF {
+            if let Some(result) = self.legacy_const_args.get(&owner).filter(|r| r.file == file && !r.restricted.is_empty()) {
+                let lo = self.files[file as usize].ast.item(self.def(owner).item).lo;
+                if pos >= lo && result.restricted.contains(&(pos - lo)) { return true; }
+            }
+            owner = self.def(owner).parent;
+        }
+        false
+    }
+
     pub fn ident(&mut self, file: u32, id: Ident) -> Sym {
         let f = &self.files[file as usize];
         let s = std::str::from_utf8(f.bytes(id.lo, id.hi)).unwrap_or("?");
