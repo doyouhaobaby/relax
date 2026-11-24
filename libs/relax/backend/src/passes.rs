@@ -6124,6 +6124,17 @@ pub const SROA_COPY_CELLS: usize = 8;
 
 pub const SROA_COPY_IN_OUT_CELLS: usize = 16;
 
+/// Bytes of emitted zero stores in copies to outline records, across this run's builds.
+pub static OUTLINE_GAP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sroa_gap_piece(offset: i64, remaining: i64) -> u8 {
+    let mut n = 8u8;
+    while offset % i64::from(n) != 0 || i64::from(n) > remaining {
+        n /= 2;
+    }
+    n
+}
+
 /// A 128-bit vector cell (VLoad/VStore) in sroa's cell table (no integer access is 16 bytes)
 pub const SROA_V128: Mem = Mem::Int(16, false);
 
@@ -6304,6 +6315,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     // slot right before such a call. Nothing touches the slot after it on any path, so no
     // pointer the callee may keep can see stale cells.
     let mut esc = vec![false; ns];
+    let mut part_record = None;
     let mut touched = false;
     for &(bi, k) in &rel {
         {
@@ -6348,6 +6360,14 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 Inst::IBinI(IOp::Add, it, d, a, _) if it.bits == 64 && at(*a).0 != u32::MAX && at(*d).0 != u32::MAX => {}
                 Inst::Mov(d, a) if at(*a).0 != u32::MAX && at(*d).0 != u32::MAX => {}
                 Inst::Call(c, args, _) => {
+                    // (an exit's call to its part: its one argument is the record; the whole-body
+                    // stub's Part(None) passes the host's parameters)
+                    if let (Callee::Part(Some(_)), [record]) = (c, args.as_slice()) {
+                        let (sl, off) = at(*record);
+                        if sl != u32::MAX && off == 0 {
+                            part_record = Some(sl);
+                        }
+                    }
                     for u in args {
                         if at(*u).0 != u32::MAX {
                             esc[at(*u).0 as usize] = true;
@@ -6432,7 +6452,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     let mut gcells: Vec<Vec<SroaCell>>;
     let mut first_groups = true;
     let depth = crate::regalloc::loop_depths(f, &crate::regalloc::reachable(f));
-    loop {
+    let has_in = loop {
         fn find(p: &mut [u32], dl: &mut [i64], x: u32) -> (u32, i64) {
             // (root, delta of x relative to root)
             let mut path = Vec::new();
@@ -6637,10 +6657,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                             }
                             let end = gcells[g].get(k).map_or(hi, |c| hi.min(c.off));
                             while off < end {
-                                let mut n = 8u8;
-                                while off % n as i64 != 0 || off + n as i64 > end {
-                                    n /= 2;
-                                }
+                                let n = sroa_gap_piece(off, end - off);
                                 gaps.push(SroaCell { off, mem: Mem::Int(n, false), widened: false, lanes: false, sub: false });
                                 off += n as i64;
                             }
@@ -6719,9 +6736,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             }
         }
         if !changed {
-            break;
+            break has_in;
         }
-    }
+    };
     // escaped slots: every escaping call must be a last use (no access of the slot after it,
     // on any path, the call's own block included)
     let mut esc_slots: Vec<u32> = Vec::new();
@@ -6952,9 +6969,15 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 }
         })
         .collect();
-    // temporaries of sub-cell accesses (vregs nv0.., added after the rewrite)
+    // Integer temporaries of sub-cell accesses and record fills, added after the rewrite.
     let nv0 = f.vregs.len() as u32;
-    let mut sub_tmps: Vec<Cls> = Vec::new();
+    let mut tmps = Vec::new();
+    let mut tmp = || {
+        let r = VReg(nv0 + tmps.len() as u32);
+        tmps.push(Cls::I);
+        r
+    };
+    let mut gap_bytes = 0u64;
     for (bi, (b, _)) in f.blocks.iter_mut().zip(dirty.iter()).enumerate().filter(|x| *x.1 .1) {
         let mut out: Vec<Inst> = Vec::with_capacity(b.insts.len());
         let mut pos: Vec<u64> = Vec::with_capacity(b.pos.len());
@@ -6976,8 +6999,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         let k = (o + *off as i64 - c.off) as u32;
                         let n = mem_size(*m) as u8;
                         let t = if k == 0 { r } else {
-                            let t = VReg(sub_tmps.len() as u32 + nv0);
-                            sub_tmps.push(Cls::I);
+                            let t = tmp();
                             out.push(Inst::IBinI(IOp::Shr, IntTy { bits: 64, signed: false }, t, r, 8 * k as i64));
                             pos.push(p);
                             t
@@ -6985,8 +7007,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         match *m {
                             Mem::Int(_, signed) => out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed }), *d, t)),
                             Mem::F32 | Mem::F64 => {
-                                let u = VReg(sub_tmps.len() as u32 + nv0);
-                                sub_tmps.push(Cls::I);
+                                let u = tmp();
                                 out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: false }), u, t));
                                 pos.push(p);
                                 out.push(Inst::Conv(Conv::BitsToF(*m == Mem::F64), *d, u));
@@ -7022,7 +7043,6 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         // a part: its bits merged into the cell, the rest of the cell kept
                         let k = (o + *off as i64 - c.off) as u32;
                         let n = mem_size(*m) as u32;
-                        let mut tmp = || { let t = VReg(sub_tmps.len() as u32 + nv0); sub_tmps.push(Cls::I); t };
                         let bits = match m {
                             Mem::F32 | Mem::F64 => { let b = tmp(); out.push(Inst::Conv(Conv::FToBits(*m == Mem::F64), b, *v)); pos.push(p); b }
                             Mem::Int(..) => *v,
@@ -7076,6 +7096,36 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         });
                         pos.push(p);
                     }
+                    // With no incoming memory copy, no instruction writes the bytes between
+                    // cells. Materialise them only at a part exit, where the whole field is read.
+                    // A cell only partly inside the range is not stored above: its bytes stay
+                    // unwritten for verify_outline to refuse, never zeros in their place.
+                    let end = lo + i64::from(*n);
+                    let inside = |c: &&SroaCell| c.off >= lo && c.off + mem_size(c.mem) as i64 <= end;
+                    let straddles = gcells[g].iter().any(|c| c.off < end && c.off + mem_size(c.mem) as i64 > lo && !inside(&c));
+                    if da.is_none() && part_record == Some(at(*d).0) && !has_in[g] && !straddles {
+                        let mut zero = None;
+                        let mut cursor = lo;
+                        let cells = gcells[g].iter().filter(inside);
+                        for (start, next) in cells.map(|c| (c.off, c.off + i64::from(mem_size(c.mem))))
+                            .chain(std::iter::once((end, end))) {
+                            gap_bytes += (start - cursor) as u64;
+                            while cursor < start {
+                                let r = *zero.get_or_insert_with(|| {
+                                    let r = tmp();
+                                    out.push(Inst::Iconst(r, 0));
+                                    pos.push(p);
+                                    r
+                                });
+                                let rel = cursor - lo;
+                                let width = sroa_gap_piece(at(*d).1 + rel, start - cursor);
+                                out.push(Inst::Store(Mem::Int(width, false), *d, rel as i32, r));
+                                pos.push(p);
+                                cursor += i64::from(width);
+                            }
+                            cursor = next;
+                        }
+                    }
                 }
                 Inst::Call(_, args, _) if !esc_addr.is_empty() => {
                     // an escaped slot's last use: the slot gets its cells' values first
@@ -7117,7 +7167,10 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         b.insts = out;
         b.pos = pos;
     }
-    f.vregs.extend(sub_tmps);
+    f.vregs.extend(tmps);
+    if gap_bytes != 0 {
+        OUTLINE_GAP_BYTES.fetch_add(gap_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
     // an invoked no-capture call: its normal and unwind successors each get a block that
     // reloads the cells first (the callee may have written the slot before unwinding)
     let mut by_block: Vec<(usize, Vec<(u32, VReg)>)> = Vec::new();
@@ -8768,8 +8821,62 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
 }
 
 #[cfg(test)]
+#[path = "../tests/wasm_rt/mod.rs"]
+mod wasm_rt;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sroa_preserves_memory_bytes_copied_through_a_slot_to_a_part_record() {
+        use crate::wasm;
+        let mut f = Func::new("record_copy".into(), 0);
+        let (input, output, src, record, tag) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([input, output]);
+        let (slot, rec) = (f.slot(16, 8), f.slot(16, 16));
+        f.block();
+        f.blocks[0].insts = vec![
+            Inst::SlotAddr(src, slot), Inst::SlotAddr(record, rec), Inst::Copy(src, input, 16),
+            Inst::Load(Mem::Int(1, false), tag, src, 8), Inst::Copy(record, src, 16),
+            Inst::Call(Callee::Part(Some(0)), vec![record], vec![]),
+        ];
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        f.blocks[0].term = Term::Ret(vec![]);
+        assert!(sroa_with(&mut f, true), "the two-way group should be tiled");
+        f.verify().unwrap();
+        let b = &mut f.blocks[0];
+        assert!(!b.insts.iter().any(|i| matches!(i, Inst::Copy(..))), "both memory copies must expand");
+        for i in &b.insts {
+            if let Inst::Store(_, a, _, v) = i {
+                assert_eq!(*a, record, "the tiled stores should target the record");
+                assert!(b.insts.iter().any(|i| matches!(i, Inst::Load(_, d, p, _) if d == v && *p == input)),
+                    "each stored value must come from an input load");
+            }
+        }
+
+        // Part calls are native. At its call site, let the wasm interpreter observe the
+        // exact bytes the rewritten host passes to the part.
+        assert!(matches!(b.insts.last(), Some(Inst::Call(Callee::Part(Some(0)), ..))));
+        *b.insts.last_mut().unwrap() = Inst::Copy(output, record, 16);
+        struct NoSymbols;
+        impl wasm::Link for NoSymbols {
+            fn sym(&self, _: u32) -> u64 { unreachable!() }
+            fn host(&self, _: u32) -> wasm::HostBind { unreachable!() }
+        }
+        let mut module = wasm::Module::new(wasm::Options { stack_size: 1024, heap_pages: 1, ..Default::default() });
+        module.add_func(0, &f);
+        module.export_func(0, "copy");
+        let input = module.place(16, 8);
+        let output = module.place(16, 8);
+        let bytes: Vec<u8> = (1..=16).collect();
+        module.data_at(input, bytes.clone());
+        let image = module.finish(&relax_session::Options::default(), &NoSymbols);
+        assert!(image.stats.failed.is_empty(), "interpreter fixture failed to lower: {:?}", image.stats.failed);
+        let mut vm = wasm_rt::Instance::new(&image.bytes).unwrap();
+        vm.call_export("copy", &[input, output]).unwrap();
+        assert_eq!(&vm.mem[output as usize..output as usize + 16], bytes, "the part must receive every original byte");
+    }
 
     /// lower.rs's high word of `x as i128 * y as i128`: umulh(x, y) + x * (y >> 63) + (x >> 63) * y
     fn wide_mul_high(signed_shift: bool) -> (Func, VReg, VReg, VReg) {
@@ -8879,4 +8986,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SINCOS, relax_session::sync::Mutex::new([None, None]));
     reset(&MEM_FNS, std::sync::OnceLock::new());
     reset(&N, std::sync::atomic::AtomicU64::new(0));
+    reset(&OUTLINE_GAP_BYTES, std::sync::atomic::AtomicU64::new(0));
 }

@@ -2578,6 +2578,7 @@ mod tests {
     const SIX_FLAG: Sym = Sym { id: 10, off: 16 };
     const WORD: Sym = Sym { id: 11, off: 24 };
     const M8: Mem = Mem::Int(8, false);
+    const M1: Mem = Mem::Int(1, false);
 
     /// `fn(x) -> x + 1 + 3` (positions in its own body), patchable by `flag`
     fn leaf(name: &str, flag: Option<Sym>) -> Func {
@@ -2684,8 +2685,14 @@ mod tests {
             f.dbg.push(DbgVar { ctx: 0, local: local as u32, loc, k: vec![] });
         }
         for _ in 0..5 { f.block(); }
+        // The tuple is constructed by cells, but copied whole both into the captured
+        // slot and out to the caller. Its exit field therefore spans all 16 bytes.
+        let (builder, tuple) = (f.slot(16, 8), f.slot(16, 8));
+        let (build, pair, flag) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
         f.blocks[0].insts = vec![Inst::SlotAddr(a, shared), Inst::Store(M8, a, 0, arm),
-            Inst::SlotAddr(private, cell), Inst::IBinI(IOp::Add, U64, cell_addr, private, off.into()), Inst::Store(M8, cell_addr, 0, arm)];
+            Inst::SlotAddr(private, cell), Inst::IBinI(IOp::Add, U64, cell_addr, private, off.into()), Inst::Store(M8, cell_addr, 0, arm),
+            Inst::SlotAddr(build, builder), Inst::SlotAddr(pair, tuple), Inst::ICmpI(Cond::Eq, false, flag, arm, 1),
+            Inst::Store(M8, build, 0, arm), Inst::Store(M1, build, 8, flag), Inst::Copy(pair, build, 16)];
         f.blocks[0].term = Term::Branch(arm, 1, 2);
         f.blocks[1].insts.push(Inst::ICmpI(Cond::Eq, false, test, arm, 1));
         f.blocks[1].term = Term::Branch(test, 3, 4);
@@ -2694,6 +2701,8 @@ mod tests {
                 Inst::Call(Callee::Fn(1), vec![arm], vec![v]), Inst::IBinI(IOp::Add, U64, v, v, 10 * b as i64),
                 if indirect { Inst::AtomicLoad(M8, AtomOrd::Relaxed, seen, cell_addr) } else { Inst::Load(M8, seen, cell_addr, 0) },
                 Inst::IBin(IOp::Add, U64, v, v, seen),
+                Inst::Copy(buf, pair, 16), Inst::Load(M8, seen, buf, 0), Inst::IBin(IOp::Add, U64, v, v, seen),
+                Inst::Load(M1, seen, buf, 8), Inst::IBin(IOp::Add, U64, v, v, seen),
                 Inst::Store(M8, a, 0, v), Inst::Load(M8, seen, alias, 0)];
             f.blocks[b].term = if indirect {
                 f.blocks[b].insts.extend([Inst::Store(M8, buf, 0, seen), Inst::Store(M8, buf, 8, arm)]);
@@ -2754,12 +2763,18 @@ mod tests {
             let off = if indirect { 8 } else { 0 };
             assert!(layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Fill { offset, kind, .. } if *kind == fill && *offset == off))));
             assert_eq!(indirect, layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Register { result_buffer: true, .. }))));
-            let split = compile(&f);
+            assert!(layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Fill { kind: FillKind::Bytes(16), .. }))),
+                "each exit must carry the entire tuple");
+            let mut split = f.clone();
+            assert!(relax_backend::passes::sroa(&mut split), "scalarise the in-function split");
+            let split = compile(&split);
             let out = extract_patched_part(&mut f, layout, OutlineBody::Native).unwrap();
             assert!(matches!(out.part.dbg[0].loc, DbgLoc::Mem(v, 0) if v != DBG_NONE));
             assert!(matches!(out.part.dbg[1].loc, DbgLoc::Slot(s, o) if s != NONE && i64::from(o) == off));
             assert!(matches!(&out.part.dbg[2].loc, DbgLoc::Regs(v) if v[0] != DBG_NONE && v[0] != f.params[1]));
             assert_eq!(out.part.inl, f.inl);
+            assert!(relax_backend::passes::sroa(&mut f), "scalarise the outlined host");
+            verify_outline(&f, &out).expect("the scalarised tuple covers its exit field");
             let joined = target::join_part(compile(&f), compile(&out.part)).unwrap();
             for mut image in [split, joined] {
                 // Direct slot calls are PC-relative: put the replacement in the
@@ -2779,7 +2794,7 @@ mod tests {
                     flag.store(patched, Relaxed);
                     word.store(version, Relaxed);
                     for arm in 0..3u64 {
-                        let expected = 2 * arm + 10 * (arm + 2) + add;
+                        let expected = 3 * arm + u64::from(arm == 1) + 10 * (arm + 2) + add;
                         let mut buf = [u64::MAX; 2];
                         if indirect {
                             let call: relax_backend::host_fn_ptr!(fn(*mut u64, u64)) = unsafe { std::mem::transmute(code.ptr()) };
@@ -2816,6 +2831,66 @@ mod tests {
         let i = f.blocks[site].insts.remove(write);
         assert_eq!(verify_outline(&f, &out), Err("missing record field"));
         f.blocks[site].insts.insert(write, i);
+        let Some(Inst::Call(Callee::Part(Some(id)), args, _)) = f.blocks[site].insts.last() else { unreachable!() };
+        let record = args[0];
+        let exit = out.exits.iter().find(|e| e.id == *id).unwrap();
+        let cell = exit.fields.iter().find(|(_, v)| matches!(v, RecordValue::Fill { kind: FillKind::Cell(M8), .. })).unwrap().0;
+        let store = f.blocks[site].insts.iter().position(|i| matches!(*i, Inst::Store(M8, a, off, _) if a == record && off == cell as i32)).unwrap();
+        let Inst::Store(_, a, off, v) = f.blocks[site].insts[store] else { unreachable!() };
+        f.blocks[site].insts[store] = Inst::Store(M1, a, off, v);
+        assert_eq!(verify_outline(&f, &out), Err("missing record field"), "narrowing a word Cell must fail coverage");
+        f.blocks[site].insts[store] = Inst::Store(M8, a, off, v);
+
+        let dst = f.blocks[site].insts.iter().find_map(|i| match *i { Inst::Copy(d, _, 16) => Some(d), _ => None }).unwrap();
+        let build = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| match *i {
+            Inst::Store(M1, a, 8, _) => Some(a), _ => None,
+        }).unwrap();
+        // Keep the captured Bytes(16) layout frozen, as it is during O3. The same
+        // whole-slot copy can carry a tuple, just a variant tag, or no writes at all.
+        for defined in [9, 8, 0] {
+            let mut host = f.clone();
+            for b in &mut host.blocks {
+                for k in (0..b.insts.len()).rev() {
+                    if matches!(b.insts[k], Inst::Store(_, a, off, _) if a == build && off >= defined) {
+                        b.insts.remove(k);
+                        b.pos.remove(k);
+                    }
+                }
+            }
+            assert!(relax_backend::passes::sroa(&mut host), "promote the {defined}-byte source");
+            assert!(!host.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Copy(..))), "a whole copy survived promotion");
+            verify_outline(&host, &out).expect("every byte of the frozen field should be written");
+            let insts = &host.blocks[site].insts;
+            let zeros: Vec<_> = insts.iter().filter_map(|i| match *i { Inst::Iconst(v, 0) => Some(v), _ => None }).collect();
+            assert_eq!(zeros.len(), 1, "one exit-local zero per copy with gaps");
+            let mut filled = Vec::new();
+            for i in insts {
+                if let Inst::Store(m, a, off, v) = *i {
+                    if a == dst && (0..16).contains(&off) && v == zeros[0] {
+                        filled.extend(off..off + relax_backend::passes::mem_size(m));
+                    }
+                }
+            }
+            assert_eq!(filled, (defined..16).collect::<Vec<_>>(), "only bytes outside the {defined}-byte value are zeroed");
+            if defined == 9 {
+                for off in [8, 9] {
+                    let k = host.blocks[site].insts.iter().position(|i| matches!(*i, Inst::Store(M1, a, o, _) if a == dst && o == off)).unwrap();
+                    let i = host.blocks[site].insts.remove(k);
+                    let p = host.blocks[site].pos.remove(k);
+                    assert_eq!(verify_outline(&host, &out), Err("missing record field"), "the store at {off} is required");
+                    host.blocks[site].insts.insert(k, i);
+                    host.blocks[site].pos.insert(k, p);
+                }
+                let buf = host.params[0];
+                let writes: Vec<_> = host.blocks.iter().filter_map(|b| {
+                    let cells: Vec<_> = b.insts.iter().filter_map(|i| match *i {
+                        Inst::Store(m, a, off, _) if a == buf => Some((off, m)), _ => None,
+                    }).collect();
+                    (!cells.is_empty()).then_some(cells)
+                }).collect();
+                assert_eq!(writes, vec![vec![(0, M8), (8, M1)]; 3], "each ordinary destination gets just the two data stores");
+            }
+        }
         let Inst::SlotAddr(_, slot) = f.blocks[site].insts[0] else { panic!("record address") };
         let (a, src, vector) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::V128));
         let data = f.slot(16, 16);
