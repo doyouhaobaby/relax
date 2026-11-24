@@ -17,7 +17,7 @@
 //! producer waits out the other's backlog, and waiters stay in ticket order. With the flag down
 //! Background is one part, as before.
 //! Idle tokens are not lent to Background work beyond its part: at 16 threads they are the SMT
-//! siblings of busy cores, and filling them slowed a cold Sandbox world by 59% (the JIT's tier-ups
+//! siblings of busy cores, and filling them slowed a cold app's world load by 59% (the JIT's tier-ups
 //! on the shared cores, 11-24). A gain there comes from less build work, not from scheduling.
 //! A run whose cores are a grant on a shared box (`MAKEPAD_CPU_GRANT`: devhub's runs that are not
 //! live sessions or timed) keeps the JIT's Background builds inside its grant: they take only the
