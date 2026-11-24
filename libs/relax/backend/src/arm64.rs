@@ -2446,7 +2446,7 @@ impl<'a> Gen<'a> {
     fn tls_block_ip0(&mut self) {
         // mrs x16, <thread slot base>; and x16, x16, #~7; ldr x17, =key
         self.a.e(MRS_SLOT_BASE | IP0 as u32);
-        self.a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+        self.a.e(AND_SLOT_BASE);
         self.ldr_reloc(IP1, Reloc::TlsKey);
         let none = if TLS_TWO_LOAD {
             Some(tls_two_loads(&mut self.a))
@@ -6036,7 +6036,7 @@ pub fn thunk(slot_addr: u64) -> Vec<u8> {
 pub fn entry_thunk(id: u32, tls: u32, key: u64, slow: u64, body: u64) -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
     a.e(MRS_SLOT_BASE | IP0 as u32);
-    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(AND_SLOT_BASE);
     let none = if TLS_TWO_LOAD {
         a.mov_imm(IP1, key as i64);
         Some(tls_two_loads(&mut a))
@@ -6284,7 +6284,7 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
     // mrs x16, <slot base>; and x16, x16, #~7
     a.e(MRS_SLOT_BASE | IP0 as u32);
-    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(AND_SLOT_BASE);
     if TLS_TWO_LOAD {
         // mov x17, #key; the two loads; cbz x16, slow; ret
         a.mov_imm(IP1, key as i64);
@@ -6330,6 +6330,11 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
 /// `mrs xN, <register holding the thread's slot array>` (N or-ed in). macOS: tpidrro_el0 (the
 /// pthread TSD base; its low 3 bits carry the cpu number, masked off after). Android: tpidr_el0,
 /// bionic's thread pointer = its TLS slot array (bionic libc/platform/bionic/tls_defines.h).
+/// `and x16, x16, #~7` (mask 0xffff_ffff_ffff_fff8): the slot array's base without the low 3
+/// bits, which carry the cpu number in macOS's tpidrro_el0 (a no-op on Android, whose tpidr_el0
+/// is the slot array itself).
+const AND_SLOT_BASE: u32 = 0x927D_F000 | (IP0 as u32) << 5 | IP0 as u32;
+
 #[cfg(not(target_os = "android"))]
 const MRS_SLOT_BASE: u32 = 0xD53B_D060;
 #[cfg(target_os = "android")]
@@ -6357,7 +6362,7 @@ fn tls_two_loads(a: &mut Asm) -> usize {
 pub fn tsd_reader() -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
     a.e(MRS_SLOT_BASE | IP0 as u32);
-    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(AND_SLOT_BASE);
     // ldr x0, [x16, x0, lsl #3]
     a.e(0xF860_7800 | (IP0 as u32) << 5);
     a.ret();
@@ -6369,7 +6374,7 @@ pub fn tsd_reader() -> Vec<u8> {
 pub fn tls2_reader() -> Vec<u8> {
     let mut a = Asm { w: Vec::new(), flags: None };
     a.e(MRS_SLOT_BASE | IP0 as u32);
-    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.e(AND_SLOT_BASE);
     // add x16, x16, x0, lsr #32; ldr x16, [x16]; cbz x16, +3
     a.e(0x8B40_8000 | (IP0 as u32) << 5 | IP0 as u32);
     a.e(0xF940_0000 | (IP0 as u32) << 5 | IP0 as u32);
