@@ -17,7 +17,45 @@
 
 use super::*;
 
+type BuiltImage = (Vec<u8>, u32, Vec<u64>);
+
+/// An image build that gave way in record_manifest, kept for the next try of the same build.
+#[derive(Default)]
+pub(super) struct ImageResume {
+    work: Box<ImageWork>,
+    /// Phases before this one are done. `at` is the next iteration of the current phase.
+    phase: u8,
+    at: usize,
+    n: u32,
+    placed: Vec<u64>,
+    /// The four logged milestones and the total active time of earlier tries, in milliseconds.
+    ph: [f64; 5],
+    /// The requested slots, live-edited crate count and replacement log position at the start.
+    ids: Vec<u32>,
+    edited: usize,
+    replaced_at: usize,
+    by_bytes_filled: bool,
+    /// Chosen before add_called, for its count of transitively added slots.
+    initial_chosen: usize,
+}
+
+impl ImageResume {
+    fn matches(&self, cache: &Cache, ids: &[u32], edited: usize) -> bool {
+        if self.ids != ids || self.edited != edited { return false; }
+        if self.replaced_at == cache.replaced.len() { return true; }
+        let mut bits = Vec::new();
+        for &(id, _, _) in &self.work.chosen { set_bit(&mut bits, id); }
+        cache.replaced_in(&bits, self.replaced_at) * 100 <= self.work.chosen.len()
+    }
+}
+
 impl Cache {
+    pub(super) fn discard_image_resume(&mut self) {
+        if let Some(resume) = self.image_resume.take() {
+            crate::run::drop_later(Box::new(resume));
+        }
+    }
+
     /// The prelinked startup image of slots `ids` (the manifest's slots before the first present):
     /// each slot's code as its code entry has it -- the entry the next run's lookup would link
     /// (`image_payload`) -- with its relocations re-expressed against tables of the identities
@@ -29,169 +67,226 @@ impl Cache {
     /// no step holds the owner for more than a few ms between two asks (a refresh in the session
     /// runs while the UI thread reaches new code: each of its first calls waits for the owner).
     /// The image's bytes, its slots, and its slots as a bit per slot id (what counts as its own
-    /// when code is replaced later: image_replaced).
-    pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<Option<(Vec<u8>, u32, Vec<u64>)>, ()> {
-        // its working set (a large app's: ~600,000 allocations, ~30 ms to free) is freed by the
-        // cache writer after it gave the owner back, also when the build gave way
-        let mut work = Box::<ImageWork>::default();
-        let r = self.build_image_in(u, ids, stop, &mut work);
-        crate::run::drop_later(work);
-        r
+    /// when code is replaced later: image_replaced), with the replacement log position it began at.
+    pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<(Option<BuiltImage>, usize), ()> {
+        let edited = crate::reload::edited_crates().len();
+        if self.image_resume.as_ref().is_some_and(|r| !r.matches(self, ids, edited)) {
+            self.discard_image_resume();
+        }
+        let mut resume = self.image_resume.take().unwrap_or_else(|| ImageResume {
+            ids: ids.to_vec(), edited, replaced_at: self.replaced.len(), ..Default::default()
+        });
+        let mut pending = ImagePending::default();
+        let start = std::time::Instant::now();
+        match self.build_image_in(u, &mut resume, &mut pending, stop, start) {
+            Ok(img) => {
+                let at = resume.replaced_at;
+                // A large build has ~600,000 allocations. The writer frees them off the owner.
+                crate::run::drop_later(Box::new((resume, pending)));
+                Ok((img, at))
+            }
+            Err(()) => {
+                crate::run::drop_later(Box::new(pending));
+                resume.ph[4] += start.elapsed().as_secs_f64() * 1e3;
+                self.image_resume = Some(resume);
+                Err(())
+            }
+        }
     }
 
-    fn build_image_in(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool, work: &mut ImageWork) -> Result<Option<(Vec<u8>, u32, Vec<u64>)>, ()> {
-        let ImageWork { chosen, pend, by_bytes, in_image, tab, slots, blob, data, pend_data, pend_const, thunk_keys, key_crates } = work;
-        let t0 = std::time::Instant::now();
-        let mut ph = [0f64; 5];
-        // the entry each slot takes, decided first (slot keys need the cache mutably)
+    fn build_image_in(&mut self, u: &Unit, resume: &mut ImageResume, pending: &mut ImagePending, stop: &dyn Fn() -> bool, start: std::time::Instant) -> Result<Option<BuiltImage>, ()> {
+        let elapsed_before = resume.ph[4];
+        let elapsed = || elapsed_before + start.elapsed().as_secs_f64() * 1e3;
+        // A spill between attempts can move all of the pending entries into stores.
+        let ImagePending { code: pend, data: pend_data, constants: pend_const } = pending;
         crate::run::yield_section("image chosen");
-        chosen.reserve(ids.len());
-        *pend = self.pending_of(KIND_CODE, stop)?;
-        for (i, &id) in ids.iter().enumerate() {
-            if i % 8 == 7 && stop() { return Err(()); }
-            // interpreted slots link one by one (their code is not machine code to place); so do
-            // sandboxed twins (the image prelinks before any sandbox is set up: not_in_image)
-            if relax_codegen::interp::is_entry(u.fns[id as usize].code) || not_in_image(u, id) { continue; }
-            let Some(key0) = self.slot_key(u, id) else { continue };
-            let crates = self.slot_crates.get(&id).cloned().unwrap_or_default();
-            if let Some(k) = self.image_entry(id, key0, pend) {
-                chosen.push((id, k, crates));
-            }
-        }
-        // the fns the chosen code calls (directly, transitively) that ran this session -- as their
-        // own code, or inlined into code -- with a code entry: the image places them too. Startup
-        // code a later tier replaced (O2/O3 over the O1 code that inlined them) calls them as fns
-        // of their own; without them in the image every such call was a lazy link on the thread
-        // that made it, the UI thread's first frames after the present (a large app: ~200 back to back
-        // on the first warm start after a cold one, 50-90 ms: the JIT indicator).
-        crate::run::yield_section("image add_called");
-        self.add_called(u, chosen, pend, by_bytes, stop)?;
-        // SPEC-V: the image sends a verified-clean caller's calls to a twin to the twin's base when the
-        // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
-        // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
-        // own verdict is clean and asks for no run-time disjoint-index checks, and never from a twin
-        // (Unit::twin_caller_kept). Later warm launches then never run the cold launch's twins (the race's
-        // draw path: draw_view .. set_uniform), at no link cost (twin_link_target for the lazy path).
-        crate::run::yield_section("image twins");
-        let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
-        if stop() { return Err(()); }
-        if twinlink {
-            for (i, (id, _, _)) in chosen.iter().enumerate() {
-                if i % 256 == 255 && stop() { return Err(()); }
-                if let Some(b) = self.slot_bytes_known(*id) { in_image.insert(b); }
-            }
-        }
-        if stop() { return Err(()); }
-        // ... or when the base has a code entry outside the image (stored, or written this run):
-        // the next run's first call links it lazily, as it would the twin's. A hot twin's base
-        // never ran (nothing called it: the callers are this image's), so it is never among the
-        // slots before the first present; twin_base_build gives it the entry in the background.
-        // Without this every warm launch ran the race's draw twins and built them at O3 again.
-        if twinlink {
-            for t in 0..u.fns.len() {
-                if t % 16 == 15 && stop() { return Err(()); }
-                let crate::jit::FnKey::Plain(b) = u.fns[t].key else { continue };
-                if (b as usize) >= u.fns.len() || matches!(u.verdict_state(b), crate::jit::Verdict::Failed(_)) { continue; }
-                let Some(k) = self.slot_key(u, b) else { continue };
-                if self.entry_tier(k).is_none() && !pend.contains_key(&k) { continue; }
-                if let Some(bytes) = self.slot_bytes_known(b) {
-                    in_image.insert(bytes);
+        self.index_pending(KIND_CODE, pend, stop)?;
+        if resume.phase == 0 {
+            let chosen = &mut resume.work.chosen;
+            chosen.reserve(resume.ids.len() - resume.at);
+            for (i, &id) in resume.ids.iter().enumerate().skip(resume.at) {
+                if i % 8 == 7 && stop() { resume.at = i; return Err(()); }
+                // interpreted slots link one by one (their code is not machine code to place); so do
+                // sandboxed twins (the image prelinks before any sandbox is set up: not_in_image)
+                if relax_codegen::interp::is_entry(u.fns[id as usize].code) || not_in_image(u, id) { continue; }
+                let Some(key0) = self.slot_key(u, id) else { continue };
+                let crates = self.slot_crates.get(&id).cloned().unwrap_or_default();
+                if let Some(k) = self.image_entry(id, key0, pend) {
+                    chosen.push((id, k, crates));
                 }
             }
+            resume.initial_chosen = chosen.len();
+            resume.phase = 1;
+            resume.at = 0;
         }
-        crate::run::yield_section("image slots");
-        let mut n = 0u32;
-        let mut placed: Vec<u64> = Vec::new();
-        for (i, (id, k, crates)) in chosen.iter().enumerate() {
-            if i % 16 == 15 && stop() { return Err(()); }
-            let Some(payload) = self.image_payload(*k, pend) else { continue };
-            // which payload of the key the image's code is (a stored one's checksum is the
-            // index's, which image_payload checked it against)
-            let sum = if pend.contains_key(k) { crate::store::sum64(payload) } else { let Some(s) = self.entry_sum(*k) else { continue }; s };
-            let Some(bytes) = self.slot_bytes_known(*id) else { continue };
-            let mut cr: Vec<u32> = crates.clone();
-            // (a twin call kept counts the first failing clause: crate::jit::twin_kept_summary)
-            let caller_kept = if twinlink { u.twin_caller_kept(*id) } else { Some(crate::jit::TwinKept::Off) };
-            let retarget = |t: &[u8]| -> bool {
-                if t.first().copied().and_then(KeyKind::of) != Some(KeyKind::Twin) { return false; }
-                let why = caller_kept.or_else(|| (!in_image.contains(&t[1..])).then_some(crate::jit::TwinKept::BaseNoCode));
-                if let Some(why) = why { crate::jit::TWIN_KEPT[1][why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                why.is_none()
-            };
-            if image_slot(tab, slots, blob, *k, sum, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
-                n += 1;
-                set_bit(&mut placed, *id);
+        if resume.phase == 1 {
+            // the fns the chosen code calls (directly, transitively) that ran this session -- as their
+            // own code, or inlined into code -- with a code entry: the image places them too. Startup
+            // code a later tier replaced (O2/O3 over the O1 code that inlined them) calls them as fns
+            // of their own; without them in the image every such call was a lazy link on the thread
+            // that made it, the UI thread's first frames after the present (a large app: ~200 back to back
+            // on the first warm start after a cold one, 50-90 ms: the JIT indicator).
+            crate::run::yield_section("image add_called");
+            self.add_called(u, resume, pend, stop)?;
+            resume.phase = 2;
+            resume.at = 0;
+        }
+        let ImageWork { chosen, in_image, tab, slots, blob, data, thunk_keys, key_crates, .. } = &mut *resume.work;
+        let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
+        if resume.phase == 2 {
+            // SPEC-V: the image sends a verified-clean caller's calls to a twin to the twin's base when the
+            // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
+            // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
+            // own verdict is clean and asks for no run-time disjoint-index checks, and never from a twin
+            // (Unit::twin_caller_kept). Later warm launches then never run the cold launch's twins (the race's
+            // draw path: draw_view .. set_uniform), at no link cost (twin_link_target for the lazy path).
+            crate::run::yield_section("image twins");
+            if stop() { return Err(()); }
+            if twinlink {
+                for (i, (id, _, _)) in chosen.iter().enumerate().skip(resume.at) {
+                    if i % 256 == 255 && stop() { resume.at = i; return Err(()); }
+                    if let Some(b) = self.slot_bytes_known(*id) { in_image.insert(b); }
+                }
             }
+            resume.phase = 3;
+            resume.at = 0;
         }
-        ph[0] = t0.elapsed().as_secs_f64() * 1e3;
-        if n == 0 {
-            return Ok(None);
+        if resume.phase == 3 {
+            crate::run::yield_section("image twins");
+            if stop() { return Err(()); }
+            // ... or when the base has a code entry outside the image (stored, or written this run):
+            // the next run's first call links it lazily, as it would the twin's. A hot twin's base
+            // never ran (nothing called it: the callers are this image's), so it is never among the
+            // slots before the first present; twin_base_build gives it the entry in the background.
+            // Without this every warm launch ran the race's draw twins and built them at O3 again.
+            if twinlink {
+                for t in resume.at..u.fns.len() {
+                    if t % 16 == 15 && stop() { resume.at = t; return Err(()); }
+                    let crate::jit::FnKey::Plain(b) = u.fns[t].key else { continue };
+                    if (b as usize) >= u.fns.len() || matches!(u.verdict_state(b), crate::jit::Verdict::Failed(_)) { continue; }
+                    let Some(k) = self.slot_key(u, b) else { continue };
+                    if self.entry_tier(k).is_none() && !pend.contains_key(&k) { continue; }
+                    if let Some(bytes) = self.slot_bytes_known(b) {
+                        in_image.insert(bytes);
+                    }
+                }
+            }
+            resume.phase = 4;
+            resume.at = 0;
+        }
+        if resume.phase == 4 {
+            crate::run::yield_section("image slots");
+            for (i, (id, k, crates)) in chosen.iter().enumerate().skip(resume.at) {
+                if i % 16 == 15 && stop() { resume.at = i; return Err(()); }
+                let Some(payload) = self.image_payload(*k, pend) else { continue };
+                // which payload of the key the image's code is (a stored one's checksum is the
+                // index's, which image_payload checked it against)
+                let sum = if pend.contains_key(k) { crate::store::sum64(payload) } else { let Some(s) = self.entry_sum(*k) else { continue }; s };
+                let Some(bytes) = self.slot_bytes_known(*id) else { continue };
+                let mut cr: Vec<u32> = crates.clone();
+                // (a twin call kept counts the first failing clause: crate::jit::twin_kept_summary)
+                let caller_kept = if twinlink { u.twin_caller_kept(*id) } else { Some(crate::jit::TwinKept::Off) };
+                let retarget = |t: &[u8]| -> bool {
+                    if t.first().copied().and_then(KeyKind::of) != Some(KeyKind::Twin) { return false; }
+                    let why = caller_kept.or_else(|| (!in_image.contains(&t[1..])).then_some(crate::jit::TwinKept::BaseNoCode));
+                    if let Some(why) = why { crate::jit::TWIN_KEPT[1][why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    why.is_none()
+                };
+                if image_slot(tab, slots, blob, *k, sum, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
+                    resume.n += 1;
+                    set_bit(&mut resume.placed, *id);
+                }
+            }
+            resume.ph[0] = elapsed();
+            if resume.n == 0 {
+                return Ok(None);
+            }
+            resume.phase = 5;
+            resume.at = 0;
         }
         // the data objects the symbols name (tag 2), and the ones those name in turn: the
         // prelink places them as one block (place_data) instead of a link_data per object
         crate::run::yield_section("image data pending");
-        *pend_data = self.pending_of(KIND_DATA, stop)?;
-        *pend_const = self.pending_of(KIND_CONST, stop)?;
-        crate::run::yield_section("image data symbols");
-        let mut i = 0;
-        while i < tab.syms.list.len() {
-            if i % 8 == 7 && stop() { return Err(()); }
-            let b = &tab.syms.list[i];
-            if b.first() == Some(&2) && b.len() >= 17 {
-                let k = u128::from_le_bytes(b[1..17].try_into().unwrap());
-                let o = data.index(k);
-                data.sym.push((i as u32, o));
-            } else if b.first() == Some(&3) {
-                // a static: its cached initial value (const_value's object) goes with the data
-                let b = b.clone();
-                if let Some(o) = self.static_value_obj(u, &b, data, pend_const) {
-                    data.statics.push((i as u32, o));
+        self.index_pending(KIND_DATA, pend_data, stop)?;
+        self.index_pending(KIND_CONST, pend_const, stop)?;
+        if resume.phase == 5 {
+            crate::run::yield_section("image data symbols");
+            let mut i = resume.at;
+            // Each indexed object has either been processed or is still on the queue.
+            let mut steps = i + (data.objs.len() - data.queue.len());
+            let mut check = || { steps += 1; steps % 8 == 0 && stop() };
+            loop {
+                while !data.queue.is_empty() {
+                    if check() { resume.at = i; return Err(()); }
+                    let o = data.queue.pop().unwrap();
+                    self.image_data_obj(tab, data, o as usize, pend_data);
+                }
+                if i == tab.syms.list.len() { break; }
+                if check() { resume.at = i; return Err(()); }
+                let b = &tab.syms.list[i];
+                if b.first() == Some(&2) && b.len() >= 17 {
+                    let k = u128::from_le_bytes(b[1..17].try_into().unwrap());
+                    let o = data.index(k);
+                    data.sym.push((i as u32, o));
+                } else if b.first() == Some(&3) {
+                    // a static: its cached initial value (const_value's object) goes with the data
+                    let b = b.clone();
+                    if let Some(o) = self.static_value_obj(u, &b, data, pend_const) {
+                        data.statics.push((i as u32, o));
+                    }
+                }
+                i += 1;
+            }
+            resume.phase = 6;
+            resume.at = 0;
+        }
+        if resume.phase == 6 {
+            crate::run::yield_section("image data settle");
+            data.settle(stop).ok_or(())?;
+            resume.ph[1] = elapsed();
+            resume.phase = 7;
+            resume.at = 0;
+        }
+        if resume.phase == 7 {
+            if stop() { return Err(()); }
+            // the functions thunk symbols name (fn pointers in data: vtables, callbacks) are keys
+            // too: the prelink makes their slots with the others, so linking a thunk is a lookup by
+            // bytes instead of a fn key decode per symbol (a large app: ~18k of 22k thunks)
+            crate::run::yield_section("image thunks");
+            for i in resume.at..tab.syms.list.len() {
+                if i % 1024 == 1023 && stop() { resume.at = i; return Err(()); }
+                let b = &tab.syms.list[i];
+                if b.first() == Some(&7) && b.len() > 9 {
+                    let key = b[1..b.len() - 8].to_vec();
+                    thunk_keys.push(tab.keys.id(&key));
                 }
             }
-            i += 1;
-            // (a symbol can pull in many objects, each a store read: asked every 8 of them too)
-            let mut m = 0u32;
-            while let Some(o) = data.queue.pop() {
-                self.image_data_obj(tab, data, o as usize, pend_data);
-                m += 1;
-                if m % 8 == 0 && stop() { return Err(()); }
-            }
+            thunk_keys.sort_unstable();
+            thunk_keys.dedup();
+            resume.phase = 8;
+            resume.at = 0;
         }
-        crate::run::yield_section("image data settle");
-        data.settle(stop).ok_or(())?;
-        ph[1] = t0.elapsed().as_secs_f64() * 1e3;
-        if stop() { return Err(()); }
-        // the functions thunk symbols name (fn pointers in data: vtables, callbacks) are keys
-        // too: the prelink makes their slots with the others, so linking a thunk is a lookup by
-        // bytes instead of a fn key decode per symbol (a large app: ~18k of 22k thunks)
-        crate::run::yield_section("image thunks");
-        for i in 0..tab.syms.list.len() {
-            if i % 1024 == 1023 && stop() { return Err(()); }
-            let b = &tab.syms.list[i];
-            if b.first() == Some(&7) && b.len() > 9 {
-                let key = b[1..b.len() - 8].to_vec();
-                thunk_keys.push(tab.keys.id(&key));
+        if resume.phase == 8 {
+            // per key, the crates it names: a later run decodes a key that names a crate changed
+            // since (or one not known here) before it links any slot to it (`prelink`)
+            crate::run::yield_section("image key crates");
+            key_crates.reserve(tab.keys.list.len() - resume.at);
+            for k in resume.at..tab.keys.list.len() {
+                if k % 256 == 255 && stop() { resume.at = k; return Err(()); }
+                let b = std::mem::take(&mut tab.keys.list[k]);
+                key_crates.push(self.key_crates(u, &b));
+                tab.keys.list[k] = b;
             }
-        }
-        thunk_keys.sort_unstable();
-        thunk_keys.dedup();
-        // per key, the crates it names: a later run decodes a key that names a crate changed
-        // since (or one not known here) before it links any slot to it (`prelink`)
-        crate::run::yield_section("image key crates");
-        key_crates.reserve(tab.keys.list.len());
-        for k in 0..tab.keys.list.len() {
-            if k % 256 == 255 && stop() { return Err(()); }
-            let b = std::mem::take(&mut tab.keys.list[k]);
-            key_crates.push(self.key_crates(u, &b));
-            tab.keys.list[k] = b;
-        }
-        ph[2] = t0.elapsed().as_secs_f64() * 1e3;
-        if stop() { return Err(()); }
-        for c in key_crates.iter().flatten().flatten() {
-            let next = tab.crates.len() as u32;
-            if *tab.crate_at.entry(*c).or_insert(next) == next {
-                tab.crates.push(*c);
+            resume.ph[2] = elapsed();
+            if stop() { resume.at = tab.keys.list.len(); return Err(()); }
+            for c in key_crates.iter().flatten().flatten() {
+                let next = tab.crates.len() as u32;
+                if *tab.crate_at.entry(*c).or_insert(next) == next {
+                    tab.crates.push(*c);
+                }
             }
+            resume.phase = 9;
+            resume.at = 0;
         }
         crate::run::yield_section("image encode");
         let mut e = E::default();
@@ -267,9 +362,9 @@ impl Cache {
         if stop() { return Err(()); }
         crate::run::yield_section("image data encode");
         if data.encode(&mut e, stop).is_none() { return Err(()); }
-        ph[3] = t0.elapsed().as_secs_f64() * 1e3;
+        resume.ph[3] = elapsed();
         crate::run::yield_section("image copy");
-        e.u32(n);
+        e.u32(resume.n);
         for part in slots.0.chunks(1 << 20) {
             e.0.extend_from_slice(part);
             if stop() { return Err(()); }
@@ -280,9 +375,9 @@ impl Cache {
             if stop() { return Err(()); }
         }
         if self.verbose {
-            eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}; {} bytes written, {} reserved, capacity {}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3], e.0.len(), size, e.0.capacity());
+            eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}; {} bytes written, {} reserved, capacity {}", resume.n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, resume.ph[0], resume.ph[1], resume.ph[2], resume.ph[3], e.0.len(), size, e.0.capacity());
         }
-        Ok(Some((e.0, n, placed)))
+        Ok(Some((e.0, resume.n, std::mem::take(&mut resume.placed))))
     }
 
     /// The loaded image's slots, a bit per slot id (the first ask makes it: a replacement's
@@ -343,7 +438,7 @@ impl Cache {
         let payload = match pend.get(&key) {
             Some(&i) => Some(&self.pending[i].1.payload[..]),
             // (checksummed: a corrupt stored entry must not enter a fresh image's checksum)
-            None => match self.get_checked(key) {
+            None => match self.image_get_checked(key) {
                 Some((KIND_DATA, p)) => Some(p),
                 _ => None,
             },
@@ -422,17 +517,21 @@ impl Cache {
 
     /// build_image: appends to `chosen` the slots its code calls (call and slot-word relocations,
     /// transitively) that were called this session and have an image entry.
-    fn add_called(&mut self, u: &Unit, chosen: &mut Vec<(u32, u128, Vec<u32>)>, pend: &HashMap<u128, usize>, by_bytes: &mut HashMap<Vec<u8>, u32>, stop: &dyn Fn() -> bool) -> Result<(), ()> {
-        by_bytes.reserve(self.fnkey_bytes.len());
-        for (n, (&id, b)) in self.fnkey_bytes.iter().enumerate() {
-            if n % 1024 == 1023 && stop() { return Err(()); }
-            if let Some(b) = b { by_bytes.insert(b.clone(), id); }
-        }
-        if let Some(ids) = self.image_ids.as_ref() {
-            for id in ids.first..ids.first + ids.pending.len() as u32 {
-                if id % 1024 == 1023 && stop() { return Err(()); }
-                if let Some(b) = ids.bytes_of(id) { by_bytes.entry(b.to_vec()).or_insert(id); }
+    fn add_called(&mut self, u: &Unit, resume: &mut ImageResume, pend: &HashMap<u128, usize>, stop: &dyn Fn() -> bool) -> Result<(), ()> {
+        let ImageWork { chosen, by_bytes, .. } = &mut *resume.work;
+        if !resume.by_bytes_filled {
+            by_bytes.reserve(self.fnkey_bytes.len().saturating_sub(by_bytes.len()));
+            for (n, (&id, b)) in self.fnkey_bytes.iter().enumerate() {
+                if n % 1024 == 1023 && stop() { return Err(()); }
+                if let Some(b) = b { by_bytes.insert(b.clone(), id); }
             }
+            if let Some(ids) = self.image_ids.as_ref() {
+                for id in ids.first..ids.first + ids.pending.len() as u32 {
+                    if id % 1024 == 1023 && stop() { return Err(()); }
+                    if let Some(b) = ids.bytes_of(id) { by_bytes.entry(b.to_vec()).or_insert(id); }
+                }
+            }
+            resume.by_bytes_filled = true;
         }
         if stop() { return Err(()); }
         let mut have: HashSet<u32> = chosen.iter().map(|c| c.0).collect();
@@ -446,17 +545,12 @@ impl Cache {
             let f = &u.fns[c as usize];
             f.compiled && f.spec_state != 1 && !not_called.contains(&c)
         };
-        let mut i = 0;
-        let mut added = 0;
-        while i < chosen.len() {
+        while resume.at < chosen.len() {
             // (each slot a store read of its code and its callees' keys: asked at every one)
             if stop() { return Err(()); }
-            let k = chosen[i].1;
-            i += 1;
-            let callees: Vec<u32> = match self.image_payload(k, pend).and_then(call_targets) {
-                Some(t) => t.into_iter().filter_map(|b| by_bytes.get(b).copied()).collect(),
-                None => continue,
-            };
+            let k = chosen[resume.at].1;
+            let callees: Vec<u32> = self.image_payload(k, pend).and_then(call_targets)
+                .unwrap_or_default().into_iter().filter_map(|b| by_bytes.get(b).copied()).collect();
             for (j, c) in callees.into_iter().enumerate() {
                 if j % 16 == 15 && stop() { return Err(()); }
                 if (c as usize) >= u.fns.len() || have.contains(&c) || !ran(c) || relax_codegen::interp::is_entry(u.fns[c as usize].code) || not_in_image(u, c) { continue; }
@@ -465,10 +559,12 @@ impl Cache {
                 let crates = self.slot_crates.get(&c).cloned().unwrap_or_default();
                 if let Some(k) = self.image_entry(c, key0, pend) {
                     chosen.push((c, k, crates));
-                    added += 1;
                 }
             }
+            // A yield inside the callee loop retries this caller. `have` includes its additions.
+            resume.at += 1;
         }
+        let added = chosen.len() - resume.initial_chosen;
         if self.verbose && added > 0 {
             eprintln!("relax cache: startup image: {} slots its code calls added", added);
         }
@@ -477,26 +573,33 @@ impl Cache {
 
     /// The entries of kind `kind` recorded this run (not yet written): key to their position in
     /// `pending` (the last of a key's records).
-    fn pending_of(&self, kind: u32, stop: &dyn Fn() -> bool) -> Result<HashMap<u128, usize>, ()> {
-        let mut m = HashMap::new();
+    fn index_pending(&self, kind: u32, index: &mut HashMap<u128, usize>, stop: &dyn Fn() -> bool) -> Result<(), ()> {
         for (i, e) in self.pending.iter().enumerate() {
             if i % 4096 == 4095 && stop() { return Err(()); }
-            if e.1.kind == kind { m.insert(e.1.key, i); }
+            if e.1.kind == kind { index.insert(e.1.key, i); }
         }
-        Ok(m)
+        Ok(())
     }
 
     /// A code entry's payload: recorded this run (not yet written), or in the index.
     fn image_payload<'a>(&'a self, k: u128, pend: &HashMap<u128, usize>) -> Option<&'a [u8]> {
+        #[cfg(test)]
+        self.image_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(&i) = pend.get(&k) {
             return Some(&self.pending[i].1.payload);
         }
         // (checksummed: a corrupt stored entry must not enter a fresh image's checksum)
-        match self.get_checked(k) {
+        match self.image_get_checked(k) {
             // (empty: a rejected body's entry, reject_verdict)
             Some((KIND_CODE, p)) if !p.is_empty() => Some(p),
             _ => None,
         }
+    }
+
+    fn image_get_checked(&self, key: u128) -> Option<(u32, &[u8])> {
+        #[cfg(test)]
+        self.image_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.get_checked(key)
     }
 
     /// Whether a code entry's dependency certificate holds by its fast path (the crates it names
@@ -561,19 +664,24 @@ impl Interned {
     }
 }
 
+/// Indices into this attempt's pending entries. A spill invalidates all three.
+#[derive(Default)]
+struct ImagePending {
+    code: HashMap<u128, usize>,
+    data: HashMap<u128, usize>,
+    constants: HashMap<u128, usize>,
+}
+
 /// What an image build makes along the way (build_image): freed off the owner thread.
 #[derive(Default)]
 struct ImageWork {
     chosen: Vec<(u32, u128, Vec<u32>)>,
-    pend: HashMap<u128, usize>,
     by_bytes: HashMap<Vec<u8>, u32>,
     in_image: std::collections::HashSet<Vec<u8>>,
     tab: ImageTables,
     slots: E,
     blob: Vec<u8>,
     data: ImageData,
-    pend_data: HashMap<u128, usize>,
-    pend_const: HashMap<u128, usize>,
     thunk_keys: Vec<u32>,
     key_crates: Vec<Option<Vec<u32>>>,
 }

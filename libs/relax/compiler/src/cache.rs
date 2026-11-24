@@ -1111,6 +1111,10 @@ pub struct Cache {
     /// bytes and slots, `replaced`'s length when it was built, the crates edited live by then and
     /// its slots' bits; the retry takes it while at most 1% of its slots were replaced since
     image_kept: Option<(Vec<u8>, u32, usize, usize, Vec<u64>)>,
+    /// Work and cursor of a startup image build that gave way during record_manifest.
+    image_resume: Option<image::ImageResume>,
+    #[cfg(test)]
+    image_reads: std::sync::atomic::AtomicUsize,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -1520,6 +1524,9 @@ impl Cache {
             loaded_bits: std::sync::OnceLock::new(),
             startup_ids: std::sync::OnceLock::new(),
             image_kept: None,
+            image_resume: None,
+            #[cfg(test)]
+            image_reads: std::sync::atomic::AtomicUsize::new(0),
             rec_tier: HashMap::new(),
             manifest_root: None,
             linked_key: HashMap::new(),
@@ -5033,6 +5040,7 @@ impl Cache {
         if self.keys_moved != 0 || !self.layout_edited.is_empty() {
             self.manifest_done = true;
             self.manifest_len = order.len();
+            self.discard_image_resume();
             return true;
         }
         let t0 = std::time::Instant::now();
@@ -5050,6 +5058,7 @@ impl Cache {
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && order.len() <= self.manifest_len && !self.image_rewrite && { let (r, n) = self.image_replaced(); r * 50 <= n }) {
+            self.discard_image_resume();
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -5057,9 +5066,14 @@ impl Cache {
         // next start would prelink a few dozen slots instead of ~20,000). Slots whose entry
         // an O2/O3 build replaced since stay lazy at the next start (image.rs img_live).
         if self.manifest_done && crate::preempt::is_stopped() {
+            self.discard_image_resume();
             return true;
         }
-        let Some(key) = self.manifest_key(root) else { self.manifest_done = true; self.manifest_len = order.len(); return true };
+        let Some(key) = self.manifest_key(root) else {
+            self.manifest_done = true; self.manifest_len = order.len();
+            self.discard_image_resume();
+            return true;
+        };
         // what earlier spills of this run wrote: the image takes those entries too (mid-run, as the
         // cache writer opened their stores before this request: open_written)
         if !self.index_written(crate::preempt::is_stopped()) {
@@ -5118,6 +5132,7 @@ impl Cache {
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
             self.image_kept = None;
+            self.discard_image_resume();
             return true;
         }
         if self.verbose {
@@ -5159,20 +5174,18 @@ impl Cache {
         let kept = self.image_kept.take().filter(|(_, n, at, ed, bits)| *ed == edited && self.replaced_in(bits, *at) * 100 <= *n as usize);
         let (img, built_at) = match kept {
             Some((b, n, at, _, bits)) => {
+                self.discard_image_resume();
                 if self.verbose { eprintln!("relax cache: startup image of {} slots kept from the try that gave way ({} of them replaced since)", n, self.replaced_in(&bits, at)); }
                 (Some((b, n, bits)), at)
             }
+            None if self.mode == Mode::Verify => (None, self.replaced.len()),
             None => {
-                let at = self.replaced.len();
-                let img = if self.mode != Mode::Verify {
-                    let t = std::time::Instant::now();
-                    let built = self.build_image(u, &image_ids, stop);
-                    if self.verbose {
-                        eprintln!("relax cache: startup image of {} slots {} in {:.1} ms", image_ids.len(), if built.is_ok() { "built" } else { "gave way" }, t.elapsed().as_secs_f64() * 1e3);
-                    }
-                    match built { Err(()) => return false, Ok(img) => img }
-                } else { None };
-                (img, at)
+                let t = std::time::Instant::now();
+                let built = self.build_image(u, &image_ids, stop);
+                if self.verbose {
+                    eprintln!("relax cache: startup image of {} slots {} in {:.1} ms", image_ids.len(), if built.is_ok() { "built" } else { "gave way" }, t.elapsed().as_secs_f64() * 1e3);
+                }
+                match built { Err(()) => return false, Ok(image_and_at) => image_and_at }
             }
         };
         // at exit no key can be made any more (slot_key): slots no lookup or record keyed this
@@ -5191,6 +5204,7 @@ impl Cache {
                 eprintln!("relax cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
             }
             self.manifest_done = true; self.manifest_len = order.len();
+            self.discard_image_resume();
             return true;
         }
         // the entry first (the yield checks: nothing is queued before the last of them)
@@ -5263,6 +5277,7 @@ impl Cache {
         f.u128(if crate::reload::edited_crates().is_empty() { self.sources_fp() } else { 0 });
         self.push_pending(root, NewEntry { key: self.manifest_sources_key(key), kind: KIND_MANIFEST, payload: f.0 });
         self.image_rewrite = false;
+        self.discard_image_resume();
         true
     }
 
@@ -10248,6 +10263,92 @@ mod data_tests {
         assert!(cache.has_startup_image(), "the manifest wrote a startup image");
         check(&cache.image_digest(&u, kept).expect("the image slot's digests"), "the image");
         drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    impl Cache {
+        fn pending_manifest_payload(&self, root: u32) -> Option<&[u8]> {
+            let key = self.manifest_key(root)?;
+            let (_, entry) = self.pending.iter().rev().find(|(_, e)| e.kind == KIND_MANIFEST && e.key == key)?;
+            Some(&entry.payload)
+        }
+    }
+
+    #[test]
+    fn an_image_build_that_gave_way_resumes_where_it_stopped() {
+        isolated_test!(an_image_build_that_gave_way_resumes_where_it_stopped);
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering::Relaxed;
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-manifest-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut source = String::from("#![no_std]\n");
+        for i in 0..40 { source.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n")); }
+        let path = dir.join("a.rs");
+        std::fs::write(&path, source).unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        let root = prog.load_crate("a", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let u = Unit::new(prog, tcx, 0);
+        let ids: Vec<_> = (0..40).map(|i| {
+            let name = format!("f{i}");
+            let def = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
+            u.fn_id(FnKey::Inst(def, vec![]))
+        }).collect();
+        // Each symbol queues two objects and adds a thunk to the symbol table. The eighth
+        // step falls inside a drain and the sixteenth at the start of a symbol.
+        let relocs: Vec<_> = ids.iter().take(6).map(|&id| {
+            let entry = u.entry(id);
+            let thunk = u.syms.intern(SymKind::Thunk(id), entry);
+            let leaf = u.data(&entry.to_le_bytes(), 8, DataKind::Relocs(vec![(0, thunk)]));
+            let object = u.data(&leaf.to_le_bytes(), 8, DataKind::Relocs(vec![(0, u.data_sym(leaf))]));
+            [RelocAt { at: 0, kind: RelocKind::Pool64, target: Reloc::Sym(u.data_sym(object)) }]
+        }).collect();
+        let fresh = |name: &str| {
+            let mut cache = open_test_cache(&u, &dir.join(name));
+            for (i, &id) in ids.iter().enumerate() {
+                if let Some(reloc) = relocs.get(i) {
+                    cache.record(&u, id, &[0, 0, 0, 0, 0, 0, 0, 0, 0xc3], reloc, &[]);
+                } else {
+                    cache.record(&u, id, &[0xc3], &[], &[]);
+                }
+            }
+            cache
+        };
+        let record = |cache: &mut Cache, stop: &dyn Fn() -> bool| {
+            let before = cache.image_reads.load(Relaxed);
+            let done = cache.record_manifest(&u, root, &ids, ids.len(), stop);
+            (done, cache.image_reads.load(Relaxed) - before)
+        };
+        let calls = Cell::new(0usize);
+        let mut reference = fresh("reference");
+        let (done, reads) = record(&mut reference, &|| { calls.set(calls.get() + 1); false });
+        assert!(done && reads > 0, "the reference must build an image");
+        assert_eq!(reference.image_built.as_ref().map(|b| b.1), Some(40), "all slots were placed");
+        let payload = reference.pending_manifest_payload(root).expect("the reference manifest");
+        let mut repeat = fresh("repeat");
+        assert_eq!(record(&mut repeat, &|| false), (true, reads), "one-go reference reads");
+        assert_eq!(repeat.pending_manifest_payload(root), Some(payload), "one-go reference bytes");
+
+        for g in 1..=calls.get() {
+            let mut cache = fresh(&g.to_string());
+            let checked = Cell::new(0usize);
+            let (done, first) = record(&mut cache, &|| {
+                checked.set(checked.get() + 1);
+                checked.get() == g
+            });
+            assert!(!done, "check {g} must interrupt the first try");
+            let (done, second) = record(&mut cache, &|| false);
+            assert!(done, "the retry after check {g} must finish");
+            assert_eq!(cache.pending_manifest_payload(root), Some(payload), "manifest bytes after check {g}");
+            assert_eq!(first + second, reads, "image reads across check {g}");
+        }
+        drop(repeat);
+        drop(reference);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

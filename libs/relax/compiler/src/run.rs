@@ -5476,7 +5476,7 @@ fn mid_flush(wait: bool) -> Option<(usize, usize)> {
     let asked = Instant::now();
     let behind = (crate::owner::queued_in(crate::owner::Class::Program), crate::owner::SERVED.load(Ordering::Relaxed), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed));
     let mut passed = (0, 0);
-    let Some(Some((held, spill))) = unit_call(wait, || {
+    let Some(Some((held, elapsed, spill))) = unit_call(wait, || {
     let held = Instant::now();
     passed = (crate::owner::SERVED.load(Ordering::Relaxed).saturating_sub(behind.1 + 1), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed).saturating_sub(behind.2));
     probe.start();
@@ -5566,11 +5566,11 @@ fn mid_flush(wait: bool) -> Option<(usize, usize)> {
         s
     };
     yield_section("");
-    Some((held, spill))
+    Some((held, held.elapsed(), spill))
     }) else { yield_section(""); drop_later_now(); return None };
     drop_later_now();
     probe.report("mid write");
-    let held1 = held.elapsed().as_secs_f64() * 1e3;
+    let held1 = elapsed.as_secs_f64() * 1e3;
     let owner_wait_ms = held.saturating_duration_since(asked).as_secs_f64() * 1e3;
     let t_spill = Instant::now();
     let n = match spill {
