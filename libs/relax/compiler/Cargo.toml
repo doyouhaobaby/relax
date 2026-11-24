@@ -18,29 +18,17 @@ include = ["../build_stamp.rs", "../self_stamp.rs", "std"]
 [package.metadata.makepad]
 test-tree = "its build script runs cargo metadata on the checkout"
 
-[package.metadata.makepad.platform-gaps]
-windows = { "lib" = "16 of 468 fail there: cache and check reuse (4); platform gaps (6): native binaries (3), a 32-bit lab, WSABUF, a directory read as a file; untriaged (6)" }
-
-# a Windows box runs its unit tests after the landings that reach it (devhub's windows-tests
-# bucket), all but those still red there, by their exact names, until the relaxwin lane lands
-# their fixes: its Windows code (SEH, its memory, sockets, handles) is tested nowhere else. And
-# these corpus files under the JIT there (`makepad test <file>`), what Relax's std and runtime do
-# with the OS: no other run tests them on Windows
+# a Windows box runs all its unit tests after the landings that reach it (devhub's windows-tests
+# bucket): its Windows code (SEH, its memory, sockets, handles) is tested nowhere else. And these
+# corpus files under the JIT there (`makepad test <file>`), what Relax's std and runtime do with
+# the OS: no other run tests them on Windows
 [package.metadata.makepad.windows-tests]
 "corpus:tests/thread_name_cut.rs" = "a thread's name as Windows keeps it (its thread description)"
 "corpus:tests/thread_local_keys.rs" = "thread-local keys and their destructors as Windows threads end"
 "corpus:tests/deep_clone_stack.rs" = "a deep recursion on an 8 MB thread: Windows' stack reserve and its probes"
 "corpus:tests/fp_env.rs" = "the floating-point control register across Windows' calling convention"
 "corpus:tests/os_str_path_cow_cmp.rs" = "OsStr and Path forms compared as Windows paths"
-
-[package.metadata.makepad.windows-tests.lib]
-why = "its Windows code: SEH, its memory, sockets and handles"
-known = "the relaxwin lane"
-skip = [
-    "cache::data_tests::two_checkouts_share_only_the_code_of_their_sealed_crates",
-    "check_reuse_tests::a_copy_in_another_worktree_reuses_its_verdicts_with_its_own_paths",
-    "jit::trap_fill_tests::a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on",
-]
+"lib" = "its Windows code: SEH, its memory, sockets and handles"
 
 [lib]
 name = "relax_compiler"
