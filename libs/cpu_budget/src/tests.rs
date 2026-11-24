@@ -664,6 +664,33 @@ fn a_second_jit_job_waits_for_a_token() {
     assert_eq!(rx.recv().unwrap(), 4);
     finish(third);
     assert_eq!(b.state.lock().unwrap().running, 0);
+
+    // A run whose cores are a grant on a shared box (MAKEPAD_CPU_GRANT): the builds take only the
+    // cores its other work leaves, that of its threads that hold no token too (a test's own: a shard
+    // told 6 cores ran 6 test threads beside up to 6 builds, 11-23).
+    assert_eq!(outside_reading(1_000_000_000, 400_000_000, 100_000_000), 6000, "a span's CPU time less its rows'");
+    assert_eq!(outside_reading(100_000_000, 400_000_000, 100_000_000), 0, "rows that hold their tokens blocked read as none outside");
+    let b = Arc::new(Budget::new(4, 4).with_grant(true));
+    b.set_jit_first(true);
+    let observe = |milli| { let mut s = b.lock(); b.observe_outside(&mut s, milli); };
+    observe(3000);
+    let first = b.admit(BACKGROUND, JIT, "tier-up");
+    assert_eq!(b.state.lock().unwrap().jit_tokens, 1, "one core is left beside the 3 in use outside the table");
+    let (tx, rx) = mpsc::channel();
+    let build = worker(&b, BACKGROUND, JIT, 5, &tx);
+    until(&b, |s| s.waiters.len() == 1 || s.jit_running == 2);
+    assert!(b.state.lock().unwrap().waiters.len() == 1 && rx.try_recv().is_err(), "the grant is full: a second build waits");
+    assert!(!b.should_yield(first), "the first build fits");
+    observe(4000);
+    assert!(b.should_yield(first), "the work outside grew to the grant: the build gives its token up at its next checkpoint");
+    assert!(b.report().contains("granted: 4 cores in use outside the table"), "{}", b.report());
+    observe(0);
+    assert!(rx.try_recv().is_err(), "work that ended leaves after two spans");
+    observe(0);
+    assert_eq!(rx.recv().unwrap(), 5, "the work outside ended: the waiting build takes the core");
+    finish(build);
+    b.release(first);
+    assert_eq!(b.state.lock().unwrap().running, 0);
 }
 
 /// A waiter whose job is raised while it waits (a strand job a person's work queued behind) waits

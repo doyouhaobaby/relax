@@ -16,6 +16,12 @@
 //! JIT's builds, and the builds take the physical cores less the app's jobs that wait within it. No
 //! producer waits out the other's backlog, and waiters stay in ticket order. With the flag down
 //! Background is one part, as before.
+//! A run whose cores are a grant on a shared box (`MAKEPAD_CPU_GRANT`: devhub's runs that are not
+//! live sessions or timed) keeps the JIT's Background builds inside its grant: they take only the
+//! cores its other work leaves, that of its threads that hold no token included (a test's own
+//! threads), as the process's CPU time measures it (`Budget::observe_outside`). The person's work
+//! still never waits for them. A tests shard told 6 cores ran 6 test threads beside up to 6 tier-up
+//! builds, 12 cores on its box (11-23).
 //! On a machine with two kinds of core (Apple silicon) the budget also places Background work on
 //! them, by what it is to the program (`set_thread_work`): a build of hot code takes a performance
 //! core only where the person's work leaves one (`fast_room`: the cores less the Interactive and
@@ -143,6 +149,18 @@ struct State {
     window_area: u64,
     /// The last span's reading, in thousandths of a token.
     last_window: u64,
+    /// The rows that run, a token each or `above` (`above` counts these): what the process's CPU
+    /// time is measured against in a granted run (`Budget::observe_outside`). `rows_area` sums rows
+    /// times nanoseconds to `urgent_at`, `rows_window` is its value at `window_at`, and `cpu_window`
+    /// the process's CPU time then.
+    above: usize,
+    rows_area: u64,
+    rows_window: u64,
+    cpu_window: u64,
+    /// A granted run's cores in use outside the rows (`observe_outside`): the larger of the last two
+    /// spans', rounded; `last_outside` the last span's, in thousandths. 0 in a run with no grant.
+    outside: usize,
+    last_outside: u64,
 }
 /// The span the person's demand on the cores is averaged over (`Budget::roll`). A live run's packs
 /// start and end at its round rate (about 1.7 thousand rounds a second in a live audio simulation),
@@ -167,6 +185,9 @@ struct Budget {
     background_limit: usize,
     /// JIT_FLOOR, within a quarter of the limit: on a small machine it would leave Visible nothing.
     jit_floor: usize,
+    /// The cores are a grant on a shared box (`MAKEPAD_CPU_GRANT`): the JIT's Background builds count
+    /// the process's work outside the table too (`outside`).
+    granted: bool,
     /// The machine's physical cores within the budget's: the JIT's Background builds' ceiling while
     /// it comes first (`jit_part`). SMT siblings are left out, as for `background_limit`.
     physical: usize,
@@ -210,6 +231,7 @@ impl Budget {
             origin: monotonic_ns(), cores, limit,
             background_limit: limit.saturating_sub(2).min(physical.saturating_sub(1)).max(1),
             jit_floor: JIT_FLOOR.min(limit / 4),
+            granted: false,
             physical: physical.clamp(1, cores),
             jit_first: AtomicBool::new(false),
             jit_width: AtomicUsize::new(0),
@@ -226,6 +248,7 @@ impl Budget {
                 changes: 0,
                 watchers: 0,
                 urgent: 0, urgent_at: 0, urgent_area: 0, window_at: 0, window_area: 0, last_window: 0,
+                above: 0, rows_area: 0, rows_window: 0, cpu_window: 0, outside: 0, last_outside: 0,
             }),
             changed: Condvar::new(),
             classes: (0..ROWS).map(|_| AtomicU8::new(INTERACTIVE)).collect(),
@@ -242,11 +265,20 @@ impl Budget {
         self.fast = fast.min(self.cores);
         self
     }
+    /// The budget of a run whose cores are a grant on a shared box (`MAKEPAD_CPU_GRANT`).
+    fn with_grant(mut self, granted: bool) -> Self {
+        self.granted = granted;
+        if granted { self.state.get_mut().unwrap_or_else(|e| e.into_inner()).cpu_window = process_cpu_ns().unwrap_or(0); }
+        self
+    }
     fn now(&self) -> u64 { monotonic_ns().wrapping_sub(self.origin) }
-    /// The person's work's tokens counted up to `now`, and a new reading of `demand` once a span
-    /// passed. Two integer updates on most calls; under the lock, with the caller's clock.
+    /// The person's work's tokens and the rows that run counted up to `now`, and a new reading of
+    /// `demand` once a span passed (in a granted run also of `outside`: one read of the process's CPU
+    /// clock a span). A few integer updates on most calls; under the lock, with the caller's clock.
     fn roll(&self, s: &mut State, now: u64) {
-        s.urgent_area = s.urgent_area.saturating_add(s.urgent as u64 * now.saturating_sub(s.urgent_at));
+        let dt = now.saturating_sub(s.urgent_at);
+        s.urgent_area = s.urgent_area.saturating_add(s.urgent as u64 * dt);
+        s.rows_area = s.rows_area.saturating_add((s.running + s.above) as u64 * dt);
         s.urgent_at = s.urgent_at.max(now);
         let span = now.saturating_sub(s.window_at);
         if span < DEMAND_SPAN_NS { return; }
@@ -255,6 +287,37 @@ impl Budget {
         s.last_window = reading;
         s.window_at = now;
         s.window_area = s.urgent_area;
+        if self.granted {
+            if let Some(cpu) = process_cpu_ns() {
+                let reading = outside_reading(cpu.saturating_sub(s.cpu_window), s.rows_area - s.rows_window, span);
+                s.cpu_window = cpu;
+                self.observe_outside(s, reading);
+            }
+        }
+        s.rows_window = s.rows_area;
+    }
+    /// A granted run's span reading of its cores in use outside the rows, in thousandths: the work
+    /// of its threads that hold no token (a test's own), the JIT's waited compiles that run on them,
+    /// the process's other threads. The larger of the last two spans counts, as for `demand`: work
+    /// that starts counts within one span, work that ended leaves after two. A row that holds its
+    /// token blocked hides as much (the reading is then low: a build too many, never one too few).
+    fn observe_outside(&self, s: &mut State, reading: u64) {
+        let outside = (reading.max(s.last_outside) as usize + 500) / 1000;
+        s.last_outside = reading;
+        if outside != s.outside {
+            s.outside = outside;
+            self.refresh(s);
+        }
+    }
+    /// What `class`'s room is measured against: the tokens that run, and for the JIT's Background
+    /// builds in a granted run the cores in use outside the table too.
+    fn load(&self, s: &State, class: u8, client: u8) -> usize {
+        s.running + if class == BACKGROUND && client == JIT { s.outside } else { 0 }
+    }
+    /// The JIT's Background builds give their tokens up at their next checkpoint: the process runs
+    /// over its cores, counting a granted run's work outside the table.
+    fn builds_over(&self, s: &State) -> bool {
+        s.running + s.outside > self.cores
     }
     /// The performance cores the person's work leaves now: 0 on a machine with one kind of core.
     fn fast_room(&self) -> usize {
@@ -312,7 +375,7 @@ impl Budget {
     }
     fn room(&self, s: &State, class: u8, client: u8) -> bool {
         client == JIT && s.jit_running == 0
-            || s.running < self.class_limit(s, class, client)
+            || self.load(s, class, client) < self.class_limit(s, class, client)
     }
     fn first(&self, s: &State) -> Option<usize> {
         s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
@@ -330,7 +393,7 @@ impl Budget {
             { contended |= 1 << class; }
         }
         if s.running >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
-        let over = self.over_cores(s, BACKGROUND);
+        let over = self.builds_over(s);
         if over { bits |= JIT_BUILDS; }
         if over || s.waiting & (1 << BACKGROUND) != 0 { contended |= JIT_BUILDS; }
         self.yield_classes.store(bits, Relaxed);
@@ -399,7 +462,7 @@ impl Budget {
         job.admitted_at = now;
         job.checkpoint_at = now;
         job.thread = me();
-        job.above = job.client == JIT && s.running >= self.class_limit(&s, job.class, job.client);
+        job.above = job.client == JIT && self.load(&s, job.class, job.client) >= self.class_limit(&s, job.class, job.client);
         ADMITTED.with(|admitted| admitted.set(true));
         s.slots[index] = Some(job);
         self.roll(&mut s, now);
@@ -458,10 +521,9 @@ impl Budget {
     /// counted here it would push the JIT's own tier-ups off the performance cores at a start.
     fn urgent_row(job: &Job) -> bool { job.class != BACKGROUND && !job.above && job.client != JIT }
     fn start_counting(&self, s: &mut State, job: &Job, now: u64) {
-        if Self::urgent_row(job) {
-            self.roll(s, now);
-            s.urgent += 1;
-        }
+        self.roll(s, now);
+        s.urgent += usize::from(Self::urgent_row(job));
+        s.above += usize::from(job.above);
         s.running += usize::from(!job.above);
         s.jit_running += usize::from(job.client == JIT);
         s.background += usize::from(job.class == BACKGROUND && job.client != JIT);
@@ -470,10 +532,9 @@ impl Budget {
         s.jit_tokens += usize::from(job.class == BACKGROUND && job.client == JIT && !job.above);
     }
     fn stop_counting(&self, s: &mut State, job: &Job, now: u64) {
-        if Self::urgent_row(job) {
-            self.roll(s, now);
-            s.urgent -= 1;
-        }
+        self.roll(s, now);
+        s.urgent -= usize::from(Self::urgent_row(job));
+        s.above -= usize::from(job.above);
         s.running -= usize::from(!job.above);
         s.jit_running -= usize::from(job.client == JIT);
         s.background -= usize::from(job.class == BACKGROUND && job.client != JIT);
@@ -695,6 +756,7 @@ impl Budget {
         let worst = s.worst.iter().find(|w| now.saturating_sub(w.when) <= RECENT_NS).copied();
         let strand_worst = s.strand_worst.iter().find(|w| now.saturating_sub(w.when) <= RECENT_NS).copied();
         let parked = s.parked;
+        let outside = s.outside;
         let admitted = s.admitted;
         let runtime = s.runtime;
         let mut warnings: Vec<_> = s.warnings.iter().map(|(site, count)| (site.clone(), *count)).collect();
@@ -707,6 +769,7 @@ impl Budget {
         if above != 0 { let _ = write!(out, ", {above} JIT job above the budget"); }
         let _ = write!(out, ", jit settled: {}", if jit_settled() { "yes" } else { "no" });
         if self.jit_first.load(Relaxed) { out.push_str(", jit first"); }
+        if self.granted { let _ = write!(out, ", granted: {outside} cores in use outside the table"); }
         if self.fast > 0 {
             let _ = write!(out, ", fast room {} of {} (the person's work {:.1}, deadline threads {}, tier-ups on them {})", self.fast_room(), self.fast,
                 self.demand.load(Relaxed) as f64 / 1000.0, self.deadlines.load(Relaxed), self.fast_tier_ups.load(Relaxed));
@@ -786,6 +849,28 @@ fn monotonic_ns() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
+/// A granted run's reading of its cores in use outside the rows over a span of `span` ns, in
+/// thousandths: the process's CPU time `cpu_ns` less the rows' `rows_ns` (rows times ns).
+fn outside_reading(cpu_ns: u64, rows_ns: u64, span: u64) -> u64 {
+    cpu_ns.saturating_sub(rows_ns).saturating_mul(1000) / span.max(1)
+}
+/// The CPU time of the process, all its threads: one clock read (`observe_outside`). None where the
+/// platform gives none here: a granted run's builds then count the table alone.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn process_cpu_ns() -> Option<u64> {
+    #[repr(C)]
+    struct Timespec { sec: std::ffi::c_long, nsec: std::ffi::c_long }
+    unsafe extern "C" { fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32; }
+    #[cfg(target_vendor = "apple")]
+    const CLOCK_PROCESS_CPUTIME_ID: i32 = 12;
+    #[cfg(not(target_vendor = "apple"))]
+    const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    if unsafe { clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut ts) } != 0 { return None; }
+    Some((ts.sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.nsec as u64))
+}
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn process_cpu_ns() -> Option<u64> { None }
 #[cfg(target_arch = "wasm32")]
 fn monotonic_ns() -> u64 {
     #[link(wasm_import_module = "env")]
@@ -801,6 +886,7 @@ fn global() -> &'static Budget {
         let cores = granted_cores(thread::available_parallelism().map_or(1, usize::from), std::env::var("MAKEPAD_CPU_CORES").ok().as_deref());
         // (a machine whose topology is not known: every CPU a core)
         Budget::new(cores, match physical_cores() { 0 => cores, n => n.min(cores) }).with_fast(fast_cores())
+            .with_grant(std::env::var_os("MAKEPAD_CPU_GRANT").is_some_and(|v| v == "1"))
     })
 }
 
