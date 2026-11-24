@@ -13,7 +13,13 @@
 //! as the child's process group (unix) or job (Windows): a grandchild in neither stays.
 //!
 //! The process's own domain (0) is not recorded: it has no end before the process's.
+//!
+//! The table is keyed by what each record is (its kind and its number: an fd, a handle, a
+//! mapping's address, a TLS key), so an interposed create costs one insert and a close one
+//! remove, never a walk; a run's end walks it once. Each record carries the order it was made in,
+//! and a run's end gives back in the reverse of that.
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// What a run's end gave back (`domain::RunEnd`). The same fields on every platform; a pipe, a
 /// directory and any other kernel object count as files.
@@ -78,8 +84,8 @@ static RECORD_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 
 /// Runtime introspection, for a program to look up through its loader (dlsym; GetProcAddress on
 /// its own module): from now on the runtime records what the main program holds as it does a
-/// run's. Each of its interposed creates and closes then keeps the table as a run's do (an entry,
-/// and a scan of the table at a close); before this, the main program pays one atomic load.
+/// run's. Each of its interposed creates and closes then keeps the table as a run's do (an insert
+/// at a create, a remove at a close); before this, the main program pays one atomic load.
 pub(crate) extern "C" fn relax_track_handles() {
     RECORD_MAIN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -89,22 +95,20 @@ pub(crate) extern "C" fn relax_track_handles() {
 /// children among them. Writes up to `cap` of them to `buf` and returns how many there are; with
 /// the main program not tracked (no `relax_track_handles` yet), `usize::MAX`: the list would leave
 /// out all it holds. Only what goes through a creator the runtime interposes is recorded: what
-/// the program makes otherwise, a run's end cannot give back either.
+/// the program makes otherwise, a run's end cannot give back either. In the order they were made.
 pub(crate) extern "C" fn relax_held_handles(buf: *mut u64, cap: usize) -> usize {
     if !RECORD_MAIN.load(std::sync::atomic::Ordering::Relaxed) {
         return usize::MAX;
     }
-    with_table(|t| {
-        let mut n = 0;
-        for h in t.iter().filter_map(|o| held_handle(&o.res)) {
-            if n < cap && !buf.is_null() {
-                // SAFETY: the program passes room for `cap` values
-                unsafe { *buf.add(n) = h };
-            }
-            n += 1;
+    let mut held: Vec<(u64, u64)> = with_table(|t| t.all().filter_map(|o| held_handle(&o.res).map(|h| (o.seq, h))).collect());
+    held.sort_unstable();
+    for (i, &(_, h)) in held.iter().take(cap).enumerate() {
+        if !buf.is_null() {
+            // SAFETY: the program passes room for `cap` values
+            unsafe { *buf.add(i) = h };
         }
-        n
-    })
+    }
+    held.len()
 }
 
 /// An atfork child: the table's lock may be held for good by a thread that did not come along.
@@ -117,8 +121,9 @@ thread_local! {
 }
 
 /// Runs `f` on the table, unless this is a place that may not wait for it (nothing is recorded
-/// then: a stale entry is dropped at the end, a missing one is the one thing lost).
-fn with_table<R: Default>(f: impl FnOnce(&mut Vec<Owned>) -> R) -> R {
+/// then: a stale entry is dropped at the end, a missing one is the one thing lost). `f` is an
+/// insert, a remove or a look: no system call is made under the table's lock.
+fn with_table<R: Default>(f: impl FnOnce(&mut Table) -> R) -> R {
     if FORKED.load(std::sync::atomic::Ordering::Relaxed) || IN_TABLE.with(|t| t.replace(true)) {
         return R::default();
     }
@@ -132,16 +137,131 @@ fn with_table<R: Default>(f: impl FnOnce(&mut Vec<Owned>) -> R) -> R {
 
 fn note(res: Res) {
     if let Some(domain) = owner() {
-        with_table(|t| t.push(Owned { domain, res }));
+        // An insert can grow the map, an allocation. A program's signal handler may call an
+        // interposed create (open, socket, dup, pipe, accept are async-signal-safe): one that
+        // interrupted this thread in the table finds IN_TABLE set and records nothing, so it never
+        // inserts under the lock it interrupted. One that interrupted the allocator could wait in
+        // it here, as a Vec's push could before: an open hazard, its own item.
+        if let Some(kind) = with_table(|t| t.insert(domain, res)) {
+            replaced(kind);
+        }
     }
 }
 
+#[derive(Clone, Copy)]
 struct Owned {
     domain: u64,
+    /// the order it was made in (`Table::seq`)
+    seq: u64,
     res: Res,
 }
 
-static OWNED: Mutex<Vec<Owned>> = Mutex::new(Vec::new());
+/// A fixed hasher: the map is a static (no random keys to make), and its keys are the system's
+/// numbers, not anything a program picks to collide.
+type Fixed = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+
+/// What the runs hold. A remove from a HashMap frees nothing (it never shrinks), so a close in a
+/// signal handler (close and waitpid are async-signal-safe) does no allocator call.
+struct Table {
+    /// the last record's `Owned::seq`
+    seq: u64,
+    /// by kind and number
+    held: std::collections::HashMap<(Kind, u64), Owned, Fixed>,
+    /// the processes the runs started, by pid
+    children: std::collections::HashMap<u64, Owned, Fixed>,
+    /// unix: the mappings, by start address (an unmap takes a range, a part of one or several)
+    #[cfg(unix)]
+    maps: std::collections::BTreeMap<usize, Owned>,
+}
+
+/// Where a record goes in the table.
+enum Place {
+    Key(Kind, u64),
+    Child(u64),
+    #[cfg(unix)]
+    Map(usize),
+}
+
+impl Table {
+    const fn new() -> Table {
+        Table {
+            seq: 0,
+            held: std::collections::HashMap::with_hasher(Fixed::new()),
+            children: std::collections::HashMap::with_hasher(Fixed::new()),
+            #[cfg(unix)]
+            maps: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Records `res` for `domain`. The kind of the record it replaced under the same key, if one
+    /// was there: the system gave that number out again, so the earlier one was closed by a path
+    /// the runtime does not see.
+    fn insert(&mut self, domain: u64, res: Res) -> Option<Kind> {
+        self.seq += 1;
+        let o = Owned { domain, seq: self.seq, res };
+        match place(&res) {
+            Place::Key(kind, n) => self.held.insert((kind, n), o).map(|_| kind),
+            Place::Child(pid) => self.children.insert(pid, o).map(|_| Kind::Child),
+            #[cfg(unix)]
+            Place::Map(addr) => {
+                self.maps.insert(addr, o);
+                None
+            }
+        }
+    }
+
+    fn remove(&mut self, kind: Kind, n: u64) -> Option<Owned> {
+        self.held.remove(&(kind, n))
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Owned> {
+        let held = self.held.values().chain(self.children.values());
+        #[cfg(unix)]
+        let held = held.chain(self.maps.values());
+        held
+    }
+
+    /// Takes out every record `of` says, in no order.
+    fn take(&mut self, of: impl Fn(&Owned) -> bool) -> Vec<Owned> {
+        let mut out = Vec::new();
+        let mut keep = |o: &mut Owned| {
+            if of(o) {
+                out.push(*o);
+                false
+            } else {
+                true
+            }
+        };
+        self.held.retain(|_, o| keep(o));
+        self.children.retain(|_, o| keep(o));
+        #[cfg(unix)]
+        self.maps.retain(|_, o| keep(o));
+        out
+    }
+}
+
+static OWNED: Mutex<Table> = Mutex::new(Table::new());
+
+/// Records replaced under their key, by kind (`Kind as usize`).
+static REPLACED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The kinds whose replacement was said (a bit each).
+static REPLACED_SAID: AtomicU32 = AtomicU32::new(0);
+
+/// A record replaced: counted, and said once per kind. It names a close the runtime does not
+/// interpose (native code's own close, a call it does not bind): what to interpose next.
+fn replaced(kind: Kind) {
+    let i = kind as usize;
+    REPLACED[i].fetch_add(1, Ordering::Relaxed);
+    if REPLACED_SAID.fetch_or(1 << i, Ordering::Relaxed) & (1 << i) == 0 {
+        eprintln!("relax: a run's {} was given out again while the runtime still recorded it: it was closed by a path the runtime does not see (counted; said once per kind)", kind.name());
+    }
+}
+
+/// How many records were replaced under their key so far, all kinds.
+#[cfg(test)]
+pub(crate) fn replaced_records() -> u64 {
+    REPLACED.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+}
 
 /// The handlers a run registered with `pthread_atfork`: only its own `fork` runs them (nothing
 /// is left with libc to call its code after its end).
@@ -163,7 +283,7 @@ pub(crate) fn atfork_may_have_handlers() -> bool {
 }
 
 #[cfg(unix)]
-use unix::Res;
+use unix::{Kind, Res};
 #[cfg(unix)]
 pub(crate) use unix::*;
 #[cfg(unix)]
@@ -179,6 +299,41 @@ mod unix {
         Map { addr: usize, len: usize },
         Key(KeyT),
         Child { pid: i32, told: bool, detached: bool },
+    }
+
+    /// What a record's number is a number of (`Table::held`'s key with it).
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum Kind {
+        Fd,
+        Dir,
+        Key,
+        Child,
+    }
+
+    impl Kind {
+        pub(super) fn name(self) -> &'static str {
+            match self {
+                Kind::Fd => "file descriptor",
+                Kind::Dir => "directory stream",
+                Kind::Key => "thread-local key",
+                Kind::Child => "child process",
+            }
+        }
+    }
+
+    pub(super) fn place(res: &Res) -> Place {
+        match *res {
+            Res::Fd { fd, .. } => Place::Key(Kind::Fd, fd as u64),
+            Res::Dir(dir) => Place::Key(Kind::Dir, dir as u64),
+            Res::Key(k) => Place::Key(Kind::Key, k as u64),
+            Res::Map { addr, .. } => Place::Map(addr),
+            Res::Child { pid, .. } => Place::Child(pid as u64),
+        }
+    }
+
+    /// What would call the run's code from threads not its own (`take_back_callbacks`).
+    pub(super) fn is_callback(res: &Res) -> bool {
+        matches!(res, Res::Key(_))
     }
 
     /// The descriptor a record holds open, for `relax_held_handles`.
@@ -219,33 +374,28 @@ mod unix {
 
     fn forget_fd(fd: c_int) {
         with_table(|t| {
-            if let Some(i) = t.iter().rposition(|o| matches!(o.res, Res::Fd { fd: f, .. } if f == fd)) {
-                t.swap_remove(i);
-            }
+            t.remove(Kind::Fd, fd as u64);
         });
     }
 
-    /// The range is no longer the run's: what is left of a mapping around it stays.
+    /// The range is no longer the run's: what is left of a mapping around it stays. The run's
+    /// mappings do not overlap (a mapping over one forgets it first), so only the one that starts
+    /// below the range can reach into it; the others start in it.
     fn forget_range(addr: usize, len: usize) {
         let end = addr + len;
         with_table(|t| {
-            let mut i = 0;
-            while i < t.len() {
-                let domain = t[i].domain;
-                if let Res::Map { addr: a, len: l } = t[i].res {
-                    let e = a + l;
-                    if a < end && addr < e {
-                        t.swap_remove(i);
-                        if a < addr {
-                            t.push(Owned { domain, res: Res::Map { addr: a, len: addr - a } });
-                        }
-                        if end < e {
-                            t.push(Owned { domain, res: Res::Map { addr: end, len: e - end } });
-                        }
-                        continue;
-                    }
+            let below = t.maps.range(..addr).next_back().filter(|&(&a, o)| matches!(o.res, Res::Map { len: l, .. } if a + l > addr)).map(|(&a, _)| a);
+            let hit: Vec<usize> = below.into_iter().chain(t.maps.range(addr..end).map(|(&a, _)| a)).collect();
+            for a in hit {
+                let Some(o) = t.maps.remove(&a) else { continue };
+                let Res::Map { len: l, .. } = o.res else { continue };
+                let e = a + l;
+                if a < addr {
+                    t.maps.insert(a, Owned { res: Res::Map { addr: a, len: addr - a }, ..o });
                 }
-                i += 1;
+                if end < e {
+                    t.maps.insert(end, Owned { res: Res::Map { addr: end, len: e - end }, ..o });
+                }
             }
         });
     }
@@ -396,9 +546,7 @@ mod unix {
     }
     pub extern "C" fn closedir(d: *mut c_void) -> c_int {
         with_table(|t| {
-            if let Some(i) = t.iter().rposition(|o| matches!(o.res, Res::Dir(x) if x == d as usize)) {
-                t.swap_remove(i);
-            }
+            t.remove(Kind::Dir, d as u64);
         });
         unsafe { sys::closedir(d) }
     }
@@ -435,9 +583,7 @@ mod unix {
     }
     pub extern "C" fn pthread_key_delete(key: KeyT) -> c_int {
         with_table(|t| {
-            if let Some(i) = t.iter().rposition(|o| matches!(o.res, Res::Key(k) if k == key)) {
-                t.swap_remove(i);
-            }
+            t.remove(Kind::Key, key as u64);
         });
         unsafe { sys::pthread_key_delete(key) }
     }
@@ -465,9 +611,7 @@ mod unix {
         let r = unsafe { sys::waitpid(pid, status, options) };
         if r > 0 {
             with_table(|t| {
-                if let Some(i) = t.iter().rposition(|o| matches!(o.res, Res::Child { pid: c, .. } if c == r)) {
-                    t.swap_remove(i);
-                }
+                t.children.remove(&(r as u64));
             });
         }
         r
@@ -735,7 +879,7 @@ mod unix {
 }
 
 #[cfg(windows)]
-use windows::Res;
+use windows::{Kind, Res};
 #[cfg(windows)]
 pub(crate) use windows::*;
 #[cfg(windows)]
@@ -776,6 +920,46 @@ mod windows {
         }
     }
 
+    /// What a record's number is a number of (`Table::held`'s key with it). A socket is a kernel
+    /// handle: it shares their numbers, so it shares their kind.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum Kind {
+        Handle,
+        Find,
+        Memory,
+        View,
+        Child,
+    }
+
+    impl Kind {
+        pub(super) fn name(self) -> &'static str {
+            match self {
+                Kind::Handle => "handle",
+                Kind::Find => "find handle",
+                Kind::Memory => "reservation",
+                Kind::View => "view",
+                Kind::Child => "child process",
+            }
+        }
+    }
+
+    pub(super) fn place(res: &Res) -> Place {
+        match *res {
+            Res::Handle(h) | Res::ChildHandle { h, .. } => Place::Key(Kind::Handle, h as u64),
+            Res::Socket(s) => Place::Key(Kind::Handle, s as u64),
+            Res::Find(h) => Place::Key(Kind::Find, h as u64),
+            Res::Memory { addr, .. } => Place::Key(Kind::Memory, addr as u64),
+            Res::View { addr, .. } => Place::Key(Kind::View, addr as u64),
+            Res::Child { pid, .. } => Place::Child(pid as u64),
+        }
+    }
+
+    /// What would call the run's code from threads not its own (`take_back_callbacks`): nothing
+    /// in this table on Windows.
+    pub(super) fn is_callback(_res: &Res) -> bool {
+        false
+    }
+
     /// A handle: NULL means it failed.
     fn note_handle(h: HANDLE) -> HANDLE {
         if h != 0 && h != INVALID {
@@ -789,11 +973,9 @@ mod windows {
         }
         s
     }
-    fn forget(matches: impl Fn(&Res) -> bool) {
+    fn forget(kind: Kind, n: u64) {
         with_table(|t| {
-            if let Some(i) = t.iter().rposition(|o| matches(&o.res)) {
-                t.swap_remove(i);
-            }
+            t.remove(kind, n);
         });
     }
 
@@ -841,7 +1023,7 @@ mod windows {
     }
     extern "system" fn open_process(access: u32, inherit: i32, pid: u32) -> HANDLE {
         let h = unsafe { os::OpenProcess(access, inherit, pid) };
-        if h != 0 && with_table(|t| t.iter().any(|o| matches!(o.res, Res::Child { pid: c, .. } if c == pid))) {
+        if h != 0 && with_table(|t| t.children.contains_key(&(pid as u64))) {
             note(Res::ChildHandle { h, pid });
             return h;
         }
@@ -861,13 +1043,12 @@ mod windows {
             None
         } else {
             with_table(|table| {
-                let i = table.iter().rposition(|o| matches!(o.res, Res::Handle(x) | Res::ChildHandle { h: x, .. } if x == s))?;
-                let child = match table[i].res {
+                let child = match table.held.get(&(Kind::Handle, s as u64))?.res {
                     Res::ChildHandle { pid, .. } => Some(pid),
                     _ => None,
                 };
                 if close {
-                    table.swap_remove(i);
+                    table.remove(Kind::Handle, s as u64);
                 }
                 child
             })
@@ -894,12 +1075,9 @@ mod windows {
     }
     extern "system" fn close_handle(h: HANDLE) -> i32 {
         // (first: once it is closed, another thread can get this number)
-        let child = with_table(|t| {
-            let i = t.iter().rposition(|o| matches!(o.res, Res::Handle(x) | Res::ChildHandle { h: x, .. } if x == h))?;
-            match t.swap_remove(i).res {
-                Res::ChildHandle { pid, .. } => Some(pid),
-                _ => None,
-            }
+        let child = with_table(|t| match t.remove(Kind::Handle, h as u64)?.res {
+            Res::ChildHandle { pid, .. } => Some(pid),
+            _ => None,
         });
         let ok = unsafe { os::CloseHandle(h) };
         // A child that ended needs its record no longer: the program closing a handle to it is
@@ -929,16 +1107,34 @@ mod windows {
         ok
     }
     /// Those that are over stop holding their process's record: every child, or the one `only`.
+    /// (The looks at the processes are made outside the table's lock, and a record goes only if it
+    /// is still the one looked at: a run's end may have taken it meanwhile, and closes it then.)
     fn forget_ended_children(only: Option<u32>) {
-        with_table(|t| {
-            t.retain(|o| match o.res {
-                Res::Child { process, pid, .. } if only.is_none_or(|p| p == pid) && unsafe { os::WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 => {
-                    unsafe { os::CloseHandle(process) };
-                    false
-                }
-                _ => true,
-            })
+        let process_of = |o: &Owned| match o.res {
+            Res::Child { process, pid, .. } => Some((pid, process)),
+            _ => None,
+        };
+        let look: Vec<(u32, HANDLE)> = with_table(|t| match only {
+            Some(pid) => t.children.get(&(pid as u64)).and_then(process_of).into_iter().collect(),
+            None => t.children.values().filter_map(process_of).collect(),
         });
+        let ended: Vec<(u32, HANDLE)> = look.into_iter().filter(|&(_, process)| unsafe { os::WaitForSingleObject(process, 0) } == WAIT_OBJECT_0).collect();
+        if ended.is_empty() {
+            return;
+        }
+        let gone: Vec<HANDLE> = with_table(|t| {
+            let mut gone = Vec::new();
+            for &(pid, process) in &ended {
+                if t.children.get(&(pid as u64)).is_some_and(|o| matches!(o.res, Res::Child { process: p, .. } if p == process)) {
+                    t.children.remove(&(pid as u64));
+                    gone.push(process);
+                }
+            }
+            gone
+        });
+        for process in gone {
+            unsafe { os::CloseHandle(process) };
+        }
     }
     extern "system" fn find_first_ex(name: *const u16, level: i32, data: *mut u8, op: i32, filter: *const u8, flags: u32) -> HANDLE {
         let h = unsafe { os::FindFirstFileExW(name, level, data, op, filter, flags) };
@@ -955,7 +1151,7 @@ mod windows {
         h
     }
     extern "system" fn find_close(h: HANDLE) -> i32 {
-        forget(|r| matches!(r, Res::Find(x) if *x == h));
+        forget(Kind::Find, h as u64);
         unsafe { os::FindClose(h) }
     }
     extern "system" fn socket(af: i32, ty: i32, protocol: i32) -> usize {
@@ -968,7 +1164,7 @@ mod windows {
         note_socket(unsafe { os::accept(s, addr, len) })
     }
     extern "system" fn closesocket(s: usize) -> i32 {
-        forget(|r| matches!(r, Res::Socket(x) if *x == s));
+        forget(Kind::Handle, s as u64);
         unsafe { os::closesocket(s) }
     }
     extern "system" fn virtual_alloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8 {
@@ -981,7 +1177,7 @@ mod windows {
     }
     extern "system" fn virtual_free(addr: *mut u8, len: usize, kind: u32) -> i32 {
         if kind & MEM_RELEASE != 0 {
-            forget(|r| matches!(r, Res::Memory { addr: a, .. } if *a == addr as usize));
+            forget(Kind::Memory, addr as u64);
         }
         unsafe { os::VirtualFree(addr, len, kind) }
     }
@@ -998,7 +1194,7 @@ mod windows {
         note_view(unsafe { os::MapViewOfFileEx(h, access, hi, lo, size, base) }, size)
     }
     extern "system" fn unmap_view(addr: *mut u8) -> i32 {
-        forget(|r| matches!(r, Res::View { addr: a, .. } if *a == addr as usize));
+        forget(Kind::View, addr as u64);
         unsafe { os::UnmapViewOfFile(addr) }
     }
 
@@ -1136,47 +1332,50 @@ pub(crate) fn take_back_callbacks(bases: &[u64]) -> u32 {
         n += crate::os::progsig::give_back(bases);
     }
     crate::os::proc::forget_program_atexit(bases);
-    with_table(|t| {
-        // (last taken first)
-        for i in (0..t.len()).rev() {
-            if bases.contains(&t[i].domain) && give_back_callback(t[i].res) {
-                t.remove(i);
-                n += 1;
-            }
-        }
-    });
+    let mut taken = with_table(|t| t.take(|o| bases.contains(&o.domain) && is_callback(&o.res)));
+    // (last taken first)
+    taken.sort_unstable_by(|a, b| b.seq.cmp(&a.seq));
+    for o in taken {
+        give_back_callback(o.res);
+        n += 1;
+    }
     n
 }
 
 /// After a run's threads have left: everything of its still open. Its children may take a moment
 /// (`CHILD_GRACE`): nothing waits for this table meanwhile.
+///
+/// The order is the reverse of the order the run made them in, by design: nothing given back here
+/// depends on another record still being there (a view keeps its section alive without the
+/// section's handle; a child is ended through the runtime's own handle to it, `end_children`,
+/// not the program's; on unix a descriptor, a directory and a mapping are each on their own).
 pub(crate) fn give_back_run(bases: &[u64]) -> Released {
     let mut out = Released::default();
+    let mut taken = with_table(|t| t.take(|o| bases.contains(&o.domain) || o.domain == OUTLIVED));
+    taken.sort_unstable_by(|a, b| b.seq.cmp(&a.seq));
     let mut children = Vec::new();
+    for o in taken {
+        if is_child(&o.res) {
+            children.push(o.res);
+        } else {
+            give_back(o.res, &mut out);
+        }
+    }
+    let left = end_children(children, &mut out);
     with_table(|t| {
-        let mut i = 0;
-        while i < t.len() {
-            if bases.contains(&t[i].domain) || t[i].domain == OUTLIVED {
-                let o = t.swap_remove(i);
-                if is_child(&o.res) {
-                    children.push(o.res);
-                } else {
-                    give_back(o.res, &mut out);
-                }
-            } else {
-                i += 1;
-            }
+        for res in left {
+            t.insert(OUTLIVED, res);
         }
     });
-    let left = end_children(children, &mut out);
-    with_table(|t| t.extend(left.into_iter().map(|res| Owned { domain: OUTLIVED, res })));
     out
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
-    reset(&OWNED, Mutex::new(Vec::new()));
+    reset(&OWNED, Mutex::new(Table::new()));
+    reset(&REPLACED, [const { AtomicU64::new(0) }; 8]);
+    reset(&REPLACED_SAID, AtomicU32::new(0));
     reset(&RECORD_MAIN, std::sync::atomic::AtomicBool::new(false));
     #[cfg(unix)]
     reset(&ATFORK, Mutex::new(Vec::new()));

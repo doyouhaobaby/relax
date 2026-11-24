@@ -2192,6 +2192,80 @@ fn fixture(p: *mut u64) {
 }
 "#;
 
+/// A number the system gives out again while the runtime still records it means its earlier
+/// close went by a path the runtime does not see (here the C library's own close, inside
+/// `fclose` or `_close`): the new record replaces the old one, the replacement is counted, and
+/// the run's end closes the number once, for its new owner. With both records kept, the end
+/// closed it twice, and whatever had the number by the second close lost it.
+#[test]
+fn a_number_given_out_again_replaces_its_record() {
+    isolated_test!(a_number_given_out_again_replaces_its_record);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(GIVEN_OUT_AGAIN, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let replaced = crate::domain_res::replaced_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 1, "the number's earlier record was replaced, and counted");
+    assert_eq!(end.released.files, 1, "the number's new owner, closed once: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+const GIVEN_OUT_AGAIN: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+mod native {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    extern "C" {
+        fn fdopen(fd: i32, mode: *const u8) -> *mut u8;
+        fn fclose(f: *mut u8) -> i32;
+    }
+    pub fn number(f: &std::fs::File) -> u64 { f.as_raw_fd() as u64 }
+    /// closed the way native code closes it: the C library's own close, inside fclose
+    pub fn close(f: std::fs::File) { unsafe { fclose(fdopen(f.into_raw_fd(), b"r\0".as_ptr())) }; }
+}
+#[cfg(windows)]
+mod native {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    extern "C" {
+        fn _open_osfhandle(h: isize, flags: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+    }
+    pub fn number(f: &std::fs::File) -> u64 { f.as_raw_handle() as u64 }
+    /// closed the way native code closes it: the C runtime's own close, inside _close
+    pub fn close(f: std::fs::File) { unsafe { _close(_open_osfhandle(f.into_raw_handle() as isize, 0)) }; }
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let first = std::fs::File::open(&exe).unwrap();
+    let n = native::number(&first);
+    native::close(first);
+    // opened again until the system gives that number out (on unix the next open: the lowest free fd)
+    let mut others = Vec::new();
+    let again = loop {
+        let f = std::fs::File::open(&exe).unwrap();
+        if native::number(&f) == n { break f; }
+        others.push(f);
+    };
+    drop(others);
+    std::mem::forget(again);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" { fn strlen(s: *const u8) -> usize; }
