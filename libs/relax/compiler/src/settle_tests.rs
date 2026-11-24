@@ -652,6 +652,47 @@ fn allocator_swap_serves_background_finish() {
 }
 
 #[test]
+fn a_pause_waits_for_a_request_the_owner_picked() {
+    isolated_test!(a_pause_waits_for_a_request_the_owner_picked);
+    static PAUSE_DONE: AtomicBool = AtomicBool::new(false);
+    owner::start();
+    let (picked_tx, picked_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let requester = std::thread::spawn(move || {
+        let tid = crate::os::thread::current();
+        *owner::PICKED_TEST.lock().unwrap() = Some((tid, Box::new(move || {
+            picked_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        })));
+        owner::call(owner::Class::Program, || PAUSE_DONE.load(Ordering::SeqCst))
+    });
+    picked_rx.recv().unwrap();
+    let busy_after_pick = owner::busy_for_other(crate::os::thread::current());
+    let (looks, wake) = &PAUSE_LOOKS;
+    *looks.lock().unwrap() = 0;
+    let pauser = std::thread::spawn(move || {
+        pause_compile_jobs("test: picked", false);
+        {
+            let _looks = looks.lock().unwrap();
+            PAUSE_DONE.store(true, Ordering::SeqCst);
+            wake.notify_all();
+        }
+        resume_compile_jobs(false);
+    });
+    let done_while_picked = {
+        let _looks = wake.wait_while(looks.lock().unwrap(), |n| *n < 2 && !PAUSE_DONE.load(Ordering::SeqCst)).unwrap();
+        PAUSE_DONE.load(Ordering::SeqCst)
+    };
+    go_tx.send(()).unwrap();
+    let done_in_request = requester.join().unwrap();
+    pauser.join().unwrap();
+    assert!(busy_after_pick, "a pauser must see the owner busy once it has dequeued a request");
+    assert!(!done_while_picked, "the pause ended while the owner held a picked request");
+    assert!(!done_in_request, "the picked request body must run before the pause ends");
+    assert!(PAUSE_DONE.load(Ordering::SeqCst), "the pause must end after the request");
+}
+
+#[test]
 fn hot_o3_cache_roundtrip() {
     // Tiering is process-global: the second unit is a fresh launch, sharing only disk cache.
     const CHILD: &str = "RELAX_HOT_O3_CACHE_TEST";

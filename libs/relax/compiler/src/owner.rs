@@ -85,6 +85,8 @@ const RELEASED: u8 = 3;
 /// - the owner sleeps on `WAKE` only with `Q` held and `OWNER_ASLEEP` set, after finding the lanes
 ///   empty under `Q`; `push` adds under `Q` and then reads `OWNER_ASLEEP` (SeqCst), so a request
 ///   posted between the owner's check and its wait is either seen by the check or notifies.
+/// - the owner takes `ROLE` before checking the pause in `pick` and releases it on an empty
+///   pick before sleeping, so a pauser can drain even with held-back requests queued.
 const REQUESTER_SPIN_US: u32 = 60;
 const OWNER_SPIN_US: u32 = 60;
 /// The owner's spin after a request of the main thread: a lazy compile on the UI thread asks again
@@ -202,6 +204,17 @@ static OWNER_SERVING: AtomicBool = AtomicBool::new(false);
 
 /// os thread id of the owner thread
 static OWNER_TID: AtomicU64 = AtomicU64::new(0);
+/// The owner holds its thread id here from before pick through its drains, and across a fork
+/// park. An empty pick or the end of that work frees it. Dekker pair: the owner stores ROLE
+/// then reads BG_PAUSE in pick, the pauser stores BG_PAUSE then reads ROLE. All four are
+/// SeqCst, so one sees the other while both claims stand.
+static ROLE: AtomicU64 = AtomicU64::new(0);
+struct RoleGuard;
+impl Drop for RoleGuard {
+    fn drop(&mut self) {
+        ROLE.store(0, Ordering::SeqCst);
+    }
+}
 static OWNER_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
 /// the threads ending the process (0: none): from then on only their requests (and Job / Finish
 /// ones) are served -- other threads' requests wait until the process is gone
@@ -881,6 +894,9 @@ pub fn serving() -> (Class, u64) {
 /// (tests) work the owner runs once between two requests, beside its drains (`owner_loop`)
 #[cfg(test)]
 pub(crate) static OWN_WORK_TEST: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+/// Runs once after the owner picks this thread's request and before it serves it.
+#[cfg(test)]
+pub(crate) static PICKED_TEST: std::sync::Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>> = std::sync::Mutex::new(None);
 
 /// A request served inside an earlier request's wait, or inside a wait of the owner's own work
 /// between requests (owner only).
@@ -1651,6 +1667,7 @@ fn serve(r: usize, void: bool) {
 
 fn owner_loop() {
     calibrate();
+    let tid = me();
     let mut main_last = false;
     loop {
         // idle: a short spin catches the next request of a burst without a sleep and wake (a wait of
@@ -1663,9 +1680,15 @@ fn owner_loop() {
             std::hint::spin_loop();
         }
         drop(spin);
-        let (r, void) = {
+        let (r, void, _role) = {
             let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+            let mut role = None;
             loop {
+                role.get_or_insert_with(|| {
+                    let taken = ROLE.compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst);
+                    debug_assert!(taken.is_ok(), "only the owner takes the role");
+                    RoleGuard
+                });
                 // a fork: parked here, between two requests (no request's state half done)
                 if FORK.load(Ordering::SeqCst) == 1 {
                     drop(q);
@@ -1677,8 +1700,9 @@ fn owner_loop() {
                     continue;
                 }
                 if let Some(r) = pick(&mut q, Mode::Top) {
-                    break (r, q.void);
+                    break (r, q.void, role);
                 }
+                drop(role.take());
                 if STOP.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1693,6 +1717,16 @@ fn owner_loop() {
                 OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }
         };
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut picked = PICKED_TEST.lock().unwrap_or_else(|e| e.into_inner());
+                picked.take_if(|(tid, _)| *tid == unsafe { (*(r as *const Req)).from })
+            };
+            if let Some((_, hook)) = hook {
+                hook();
+            }
+        }
         main_last = from_main(r);
         serve(r, void);
         crate::lifeline::beat();
@@ -1970,9 +2004,10 @@ pub fn park_for_exit() -> ! {
     std::panic::resume_unwind(Box::new(ExitParked))
 }
 
-/// The owner is serving a request of another thread than `tid` now.
+/// The role is held and the owner is not known to be serving `tid`'s request. This includes
+/// the gap from pick to serve and the owner's own work between requests.
 pub fn busy_for_other(tid: u64) -> bool {
-    NOW_CLASS.load(Ordering::Acquire) != u8::MAX && NOW_FROM.load(Ordering::Acquire) != tid
+    ROLE.load(Ordering::SeqCst) != 0 && !(NOW_CLASS.load(Ordering::SeqCst) != u8::MAX && NOW_FROM.load(Ordering::SeqCst) == tid)
 }
 
 /// The allocator swap ended: the owner serves everyone again.
@@ -2016,6 +2051,8 @@ pub fn fork_parent() {
 }
 
 pub fn fork_child() {
+    // The parked owner stayed in the parent. The child serves inline and never takes its role.
+    ROLE.store(0, Ordering::SeqCst);
     CHILD.store(true, Ordering::SeqCst);
     FORKING.store(false, Ordering::SeqCst);
     IS_OWNER.with(|o| o.set(true));
@@ -2428,6 +2465,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&OWNER_ASLEEP, AtomicBool::new(false));
     reset(&OWNER_SERVING, AtomicBool::new(false));
     reset(&OWNER_TID, AtomicU64::new(0));
+    reset(&ROLE, AtomicU64::new(0));
     reset(&OWNER_THREAD, std::sync::OnceLock::new());
     reset(&EXIT_TID, AtomicU64::new(0));
     reset(&EXIT_HELPER, AtomicU64::new(0));

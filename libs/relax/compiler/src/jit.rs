@@ -28280,6 +28280,9 @@ impl Drop for JobGuard {
     }
 }
 
+#[cfg(test)]
+static PAUSE_LOOKS: (std::sync::Mutex<u32>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
 /// Holds new compile jobs at their start and waits for running ones to finish (no time limit),
 /// for `what`: an allocator swap, a plain fork (relax_fork), a unit's retirement.
 fn pause_compile_jobs(what: &str, trace: bool) {
@@ -28288,7 +28291,7 @@ fn pause_compile_jobs(what: &str, trace: bool) {
     take_pause_turn(mine);
     BG_PAUSER.store(me(), Ordering::SeqCst);
     BG_PAUSE.store(true, Ordering::SeqCst);
-    // the jobs running, and the request the owner serves now (unless it is the pauser's own)
+    // the jobs running, and the owner's work (unless it is serving the pauser's own request)
     // Every running job must reach its end before the swap goes on: a job that frees memory
     // while the zone is re-registered corrupts the heap. Waiting is the only safe answer, so a
     // long wait is logged (the jobs, what they wait for), never cut short.
@@ -28298,6 +28301,12 @@ fn pause_compile_jobs(what: &str, trace: bool) {
     // the jobs it waits for may need a token
     let _budget = crate::pool::suspend_program();
     loop {
+        #[cfg(test)]
+        {
+            let mut looks = PAUSE_LOOKS.0.lock().unwrap_or_else(|e| e.into_inner());
+            *looks += 1;
+            PAUSE_LOOKS.1.notify_all();
+        }
         if !busy() {
             // nothing runs: from here a job that comes back from waiting holds too (JobIdle),
             // and one that came back just now is seen by the second look
@@ -33574,6 +33583,7 @@ mod allocator_swap_tests {
     fn the_programs_fork_waits_for_running_jobs() {
         isolated_test!(the_programs_fork_waits_for_running_jobs);
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        owner::start();
         let addr = loader_symbol(b"fork").expect("the loader provides fork");
         assert_eq!(addr, relax_fork as *const () as usize);
         let fork: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
@@ -33590,9 +33600,19 @@ mod allocator_swap_tests {
         running_rx.recv().unwrap();
         let pid = fork();
         if pid == 0 {
-            // the child: nothing counted, nothing paused
-            let ok = BG_ACTIVE.load(Ordering::SeqCst) == 0 && !BG_PAUSE.load(Ordering::SeqCst);
-            os::thread::exit_now(if ok { 0 } else { 1 });
+            if owner::busy_for_other(os::thread::current()) {
+                os::thread::exit_now(2);
+            }
+            if BG_ACTIVE.load(Ordering::SeqCst) != 0 || BG_PAUSE.load(Ordering::SeqCst) {
+                os::thread::exit_now(1);
+            }
+            let grandchild = fork();
+            if grandchild == 0 {
+                os::thread::exit_now(0);
+            }
+            let mut status = 0;
+            let ok = grandchild > 0 && unsafe { waitpid(grandchild, &mut status, 0) } == grandchild && status == 0;
+            os::thread::exit_now(if ok { 0 } else { 3 });
         }
         assert!(pid > 0, "fork failed");
         assert!(job_over.load(Ordering::SeqCst), "the program's fork went ahead with a compile job running");
@@ -33601,7 +33621,7 @@ mod allocator_swap_tests {
         }
         let mut status = 0i32;
         assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
-        assert_eq!(status, 0, "the child saw a job counted or the jobs paused");
+        assert_eq!(status, 0, "child exit {} (1 = jobs counted or paused, 2 = parent's owner role held, 3 = second fork or grandchild failed)", status >> 8);
         job.join().unwrap();
     }
 
