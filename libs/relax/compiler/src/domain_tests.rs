@@ -2143,9 +2143,10 @@ fn fixture(p: *mut u64) {
 }
 "#;
 
-/// A handle the program closes through its copy (DuplicateHandle with DUPLICATE_CLOSE_SOURCE) is
-/// no longer the run's: the run's end closes nothing under its number. Its record stayed, and the
-/// end closed whatever had that number by then, a handle of the process's or of another run's.
+/// A handle the program closes through its copy (DuplicateHandle with DUPLICATE_CLOSE_SOURCE), or
+/// through the native API's NtClose, is no longer the run's: the run's end closes nothing under its
+/// number. Its record stayed, and the end closed whatever had that number by then, a handle of the
+/// process's or of another run's.
 #[cfg(windows)]
 #[test]
 fn a_handle_closed_through_its_copy_is_not_given_back() {
@@ -2155,6 +2156,7 @@ fn a_handle_closed_through_its_copy_is_not_given_back() {
     u.tier1 = None;
     let up = &mut *u as *mut Unit;
     let flags: [AtomicU64; 4] = Default::default();
+    let replaced = crate::domain_res::replaced_records();
     let (domain, _base, main) = launch(&mut u, entry, None, &flags);
     wait(|| {
         if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
@@ -2165,6 +2167,8 @@ fn a_handle_closed_through_its_copy_is_not_given_back() {
     main.join().unwrap();
     wait_thread_done(domain);
     assert_eq!(end.released.files, 0, "the run's end closed a handle the program had closed: {:?}", end.released);
+    // (a record left by a close the runtime did not see is replaced when the number comes back)
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 0, "a close went unseen, its record replaced");
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
@@ -2178,9 +2182,13 @@ extern "system" {
     fn GetCurrentProcess() -> isize;
     fn DuplicateHandle(sp: isize, s: isize, tp: isize, t: *mut isize, access: u32, inherit: i32, options: u32) -> i32;
     fn CloseHandle(h: isize) -> i32;
+    fn NtClose(h: isize) -> i32;
 }
 fn fixture(p: *mut u64) {
     let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    // closed through the native API
+    let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap().into_raw_handle() as isize;
+    assert!(unsafe { NtClose(file) } >= 0);
     let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap().into_raw_handle() as isize;
     let me = unsafe { GetCurrentProcess() };
     let mut copy = 0;
@@ -2188,6 +2196,132 @@ fn fixture(p: *mut u64) {
     assert!(unsafe { DuplicateHandle(me, file, me, &mut copy, 0, 0, 1 | 2) } != 0);
     assert!(unsafe { CloseHandle(copy) } != 0);
     a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// What a run opens through the native API (NtCreateFile, NtOpenFile, NtCreateNamedPipeFile) and
+/// through kernel32's other creators (CreateFile2, ReOpenFile, OpenFileById) is the run's: its end
+/// gives it back. The fixture makes a pipe as real std makes a child's, the pipe file system
+/// opened once into a static (natively once per process; under a runtime each run's statics are
+/// its own); a second run in the same process opens its own, pipes again, and gives it back too.
+#[cfg(windows)]
+#[test]
+fn a_run_gives_back_what_the_native_api_opened() {
+    isolated_test!(a_run_gives_back_what_the_native_api_opened);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    track_held();
+    for round in 0..2 {
+        let (mut u, entry, root) = fixture_of(NATIVE_API_OPENS, "fixture");
+        u.tier1 = None;
+        let up = &mut *u as *mut Unit;
+        let flags: [AtomicU64; 4] = Default::default();
+        let open_before = open_now();
+        let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+        wait(|| {
+            if let Some(DomainState::Crashed(why)) = state(domain) { panic!("round {round}: the fixture crashed: {why}"); }
+            flags[0].load(Ordering::SeqCst) == 1
+        });
+        let held = flags[1].load(Ordering::SeqCst);
+        let end = end_run(up, Duration::from_secs(10));
+        assert!(end.left.is_empty(), "left: {:?}", end.left);
+        main.join().unwrap();
+        wait_thread_done(domain);
+        assert_eq!(end.released.files as u64, held, "round {round}: the run's end gave back what it held: {:?}", end.released);
+        // (the first round's lazy compiles open what stays open for the whole process)
+        if round > 0 {
+            let recorded = held_by_the_program();
+            let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1) && recorded.as_ref().is_none_or(|h| h.contains(&f.0))).collect();
+            assert!(left.is_empty(), "round {round} left open: {left:?}");
+        }
+        domains().retain(|d| d.info.id != domain);
+        drop(u);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(windows)]
+const NATIVE_API_OPENS: &str = r#"
+use std::ptr::null;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::SeqCst};
+#[repr(C)]
+struct UnicodeString { len: u16, max: u16, buf: *const u16 }
+#[repr(C)]
+struct ObjectAttributes { len: u32, root: isize, name: *const UnicodeString, attrs: u32, sd: *const u8, qos: *const u8 }
+#[repr(C)]
+#[derive(Default)]
+struct IoStatus { status: usize, info: usize }
+/// FILE_ID_DESCRIPTOR, of FileIdType
+#[repr(C)]
+struct FileId { size: u32, kind: i32, id: [u64; 2] }
+extern "system" {
+    fn NtOpenFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, share: u32, options: u32) -> i32;
+    fn NtCreateFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> i32;
+    fn NtCreateNamedPipeFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, share: u32, disposition: u32, options: u32, pipe_type: u32, read_mode: u32, completion: u32, instances: u32, inbound: u32, outbound: u32, timeout: *const i64) -> i32;
+    fn CreateFile2(name: *const u16, access: u32, share: u32, disposition: u32, params: *const u8) -> isize;
+    fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
+    fn OpenFileById(volume: isize, id: *const FileId, access: u32, share: u32, security: *const u8, flags: u32) -> isize;
+    fn GetFileInformationByHandle(h: isize, info: *mut [u32; 13]) -> i32;
+}
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+const SHARE_ALL: u32 = 7;
+/// FILE_SYNCHRONOUS_IO_NONALERT, FILE_NON_DIRECTORY_FILE
+const SYNC_IO: u32 = 0x20;
+const NON_DIRECTORY: u32 = 0x40;
+const INVALID: isize = -1;
+/// the pipe file system, opened once into a static, as real std's child pipes keep it
+static PIPE_FS: AtomicIsize = AtomicIsize::new(0);
+fn counted(s: &[u16]) -> UnicodeString { UnicodeString { len: (s.len() * 2) as u16, max: (s.len() * 2) as u16, buf: s.as_ptr() } }
+fn attrs(root: isize, name: &UnicodeString) -> ObjectAttributes {
+    ObjectAttributes { len: std::mem::size_of::<ObjectAttributes>() as u32, root, name, attrs: 0, sd: null(), qos: null() }
+}
+fn pipe_fs() -> isize {
+    let h = PIPE_FS.load(SeqCst);
+    if h != 0 { return h; }
+    let path: Vec<u16> = r"\Device\NamedPipe\".encode_utf16().collect();
+    let (mut h, mut io) = (0, IoStatus::default());
+    let st = unsafe { NtOpenFile(&mut h, SYNCHRONIZE | GENERIC_READ, &attrs(0, &counted(&path)), &mut io, 3, SYNC_IO) };
+    assert!(st >= 0, "NtOpenFile of the pipe file system: {st:#x}");
+    PIPE_FS.store(h, SeqCst);
+    h
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = exe.to_str().unwrap();
+    let mut io = IoStatus::default();
+    // a pipe as real std makes a child's: our end under the pipe file system (FILE_CREATE, one
+    // instance, byte stream), theirs opened through ours
+    let empty = UnicodeString { len: 0, max: 0, buf: null() };
+    let timeout = -50i64 * 10_000;
+    let mut ours = 0;
+    let st = unsafe { NtCreateNamedPipeFile(&mut ours, SYNCHRONIZE | GENERIC_READ, &attrs(pipe_fs(), &empty), &mut io, 2, 2, 0, 0, 0, 0, 1, 4096, 4096, &timeout) };
+    assert!(st >= 0, "NtCreateNamedPipeFile: {st:#x}");
+    let mut theirs = 0;
+    let st = unsafe { NtOpenFile(&mut theirs, SYNCHRONIZE | GENERIC_WRITE | FILE_READ_ATTRIBUTES, &attrs(ours, &empty), &mut io, 0, NON_DIRECTORY | SYNC_IO) };
+    assert!(st >= 0, "NtOpenFile of the pipe's other end: {st:#x}");
+    // the program's own file through the native API (FILE_OPEN; an NT path: \??\ and the DOS one)
+    let nt: Vec<u16> = format!(r"\??\{}", exe.trim_start_matches(r"\\?\")).encode_utf16().collect();
+    let mut file = 0;
+    let st = unsafe { NtCreateFile(&mut file, SYNCHRONIZE | GENERIC_READ, &attrs(0, &counted(&nt)), &mut io, null(), 0, SHARE_ALL, 1, NON_DIRECTORY | SYNC_IO, null(), 0) };
+    assert!(st >= 0, "NtCreateFile: {st:#x}");
+    // and through kernel32's other creators (OPEN_EXISTING)
+    let wide: Vec<u16> = exe.encode_utf16().chain([0]).collect();
+    let second = unsafe { CreateFile2(wide.as_ptr(), GENERIC_READ, SHARE_ALL, 3, null()) };
+    assert_ne!(second, INVALID, "CreateFile2");
+    let third = unsafe { ReOpenFile(second, GENERIC_READ, SHARE_ALL, 0) };
+    assert_ne!(third, INVALID, "ReOpenFile");
+    let mut info = [0u32; 13];
+    assert!(unsafe { GetFileInformationByHandle(second, &mut info) } != 0, "the file's id");
+    let id = FileId { size: std::mem::size_of::<FileId>() as u32, kind: 0, id: [((info[11] as u64) << 32) | info[12] as u64, 0] };
+    let fourth = unsafe { OpenFileById(second, &id, GENERIC_READ, SHARE_ALL, null(), 0) };
+    assert_ne!(fourth, INVALID, "OpenFileById");
+    // held: the pipe file system, the pipe's two ends, and four of the file
+    a[1].store(7, SeqCst);
+    a[0].store(1, SeqCst);
     loop { std::thread::park(); }
 }
 "#;

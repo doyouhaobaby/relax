@@ -117,6 +117,9 @@ extern "system" {
     pub fn GetProcessHandleCount(process: HANDLE, count: *mut u32) -> i32;
     pub fn MapViewOfFile(h: HANDLE, access: u32, hi: u32, lo: u32, size: usize) -> *mut u8;
     pub fn MapViewOfFileEx(h: HANDLE, access: u32, hi: u32, lo: u32, size: usize, base: *mut u8) -> *mut u8;
+    pub fn ReOpenFile(h: HANDLE, access: u32, share: u32, flags: u32) -> HANDLE;
+    pub fn CreateFile2(name: *const u16, access: u32, share: u32, disposition: u32, params: *const u8) -> HANDLE;
+    pub fn OpenFileById(volume: HANDLE, id: *const u8, access: u32, share: u32, security: *const u8, flags: u32) -> HANDLE;
 }
 
 #[link(name = "ws2_32")]
@@ -141,6 +144,12 @@ extern "system" {
     pub fn RtlInstallFunctionTableCallback(table_id: u64, base: u64, length: u32, callback: unsafe extern "system" fn(u64, *mut u8) -> *mut u32, context: *mut u8, out_of_process_dll: *const u16) -> u8;
     pub fn RtlDeleteFunctionTable(table: *const u32) -> u8;
     pub fn RtlDllShutdownInProgress() -> u8;
+    // files and pipes through the native API (NTSTATUS: >= 0 is success; the handle comes back
+    // through the first argument); OBJECT_ATTRIBUTES and IO_STATUS_BLOCK as bytes
+    pub fn NtOpenFile(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, share: u32, options: u32) -> i32;
+    pub fn NtCreateFile(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> i32;
+    pub fn NtCreateNamedPipeFile(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, share: u32, disposition: u32, options: u32, pipe_type: u32, read_mode: u32, completion: u32, instances: u32, inbound: u32, outbound: u32, timeout: *const i64) -> i32;
+    pub fn NtClose(h: HANDLE) -> i32;
 }
 
 #[link(name = "advapi32")]

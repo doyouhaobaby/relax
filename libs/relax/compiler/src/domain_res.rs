@@ -1113,6 +1113,32 @@ mod windows {
     extern "system" fn create_file(name: *const u16, access: u32, share: u32, sa: *mut u8, disposition: u32, flags: u32, template: HANDLE) -> HANDLE {
         note_handle(unsafe { os::CreateFileW(name, access, share, sa, disposition, flags, template) })
     }
+    extern "system" fn create_file2(name: *const u16, access: u32, share: u32, disposition: u32, params: *const u8) -> HANDLE {
+        note_handle(unsafe { os::CreateFile2(name, access, share, disposition, params) })
+    }
+    extern "system" fn reopen_file(h: HANDLE, access: u32, share: u32, flags: u32) -> HANDLE {
+        note_handle(unsafe { os::ReOpenFile(h, access, share, flags) })
+    }
+    extern "system" fn open_file_by_id(volume: HANDLE, id: *const u8, access: u32, share: u32, security: *const u8, flags: u32) -> HANDLE {
+        note_handle(unsafe { os::OpenFileById(volume, id, access, share, security, flags) })
+    }
+    // The native API's creates (crates that skip kernel32 for them: a poller's \Device\Afd, a
+    // pipe made the way real std makes its child pipes): an NTSTATUS, the handle through `h`.
+    fn note_nt(status: i32, h: *mut HANDLE) -> i32 {
+        if status >= 0 {
+            note_handle(unsafe { *h });
+        }
+        status
+    }
+    extern "system" fn nt_create_file(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> i32 {
+        note_nt(unsafe { os::NtCreateFile(h, access, attrs, io_status, size, file_attrs, share, disposition, options, ea, ea_len) }, h)
+    }
+    extern "system" fn nt_open_file(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, share: u32, options: u32) -> i32 {
+        note_nt(unsafe { os::NtOpenFile(h, access, attrs, io_status, share, options) }, h)
+    }
+    extern "system" fn nt_create_named_pipe_file(h: *mut HANDLE, access: u32, attrs: *const u8, io_status: *mut u8, share: u32, disposition: u32, options: u32, pipe_type: u32, read_mode: u32, completion: u32, instances: u32, inbound: u32, outbound: u32, timeout: *const i64) -> i32 {
+        note_nt(unsafe { os::NtCreateNamedPipeFile(h, access, attrs, io_status, share, disposition, options, pipe_type, read_mode, completion, instances, inbound, outbound, timeout) }, h)
+    }
     extern "system" fn create_file_mapping(file: HANDLE, sa: *const SecurityAttributes, protect: u32, hi: u32, lo: u32, name: *const u16) -> HANDLE {
         note_handle(unsafe { os::CreateFileMappingW(file, sa, protect, hi, lo, name) })
     }
@@ -1204,19 +1230,34 @@ mod windows {
         }
         ok
     }
-    extern "system" fn close_handle(h: HANDLE) -> i32 {
-        // (first: once it is closed, another thread can get this number)
-        let child = with_table(|t| match t.remove(Kind::Handle, h as u64)?.res {
+    /// A handle the program closes: its record goes first (once it is closed, another thread can
+    /// get its number). The pid when it is a handle to a recorded child.
+    fn closing(h: HANDLE) -> Option<u32> {
+        with_table(|t| match t.remove(Kind::Handle, h as u64)?.res {
             Res::ChildHandle { pid, .. } => Some(pid),
             _ => None,
-        });
-        let ok = unsafe { os::CloseHandle(h) };
-        // A child that ended needs its record no longer: the program closing a handle to it is
-        // when to look (one wait, and only for such a handle), not its next spawn.
+        })
+    }
+    /// A child that ended needs its record no longer: the program closing a handle to it is when
+    /// to look (one wait, and only for such a handle), not its next spawn.
+    fn closed(child: Option<u32>) {
         if let Some(pid) = child {
             forget_ended_children(Some(pid));
         }
+    }
+    extern "system" fn close_handle(h: HANDLE) -> i32 {
+        let child = closing(h);
+        let ok = unsafe { os::CloseHandle(h) };
+        closed(child);
         ok
+    }
+    // (CloseHandle's own NtClose, inside the system's DLLs, is not the program's: only the
+    // program's imports bind to these, so a close prunes its record once)
+    extern "system" fn nt_close(h: HANDLE) -> i32 {
+        let child = closing(h);
+        let status = unsafe { os::NtClose(h) };
+        closed(child);
+        status
     }
     extern "system" fn create_process(app: *const u16, cmd: *mut u16, pa: *const u8, ta: *const u8, inherit: i32, flags: u32, env: *mut u8, cwd: *const u16, si: *mut u8, pi: *mut ProcessInformation) -> i32 {
         let ok = unsafe { os::CreateProcessW(app, cmd, pa, ta, inherit, flags, env, cwd, si, pi) };
@@ -1336,6 +1377,13 @@ mod windows {
         }
         match link {
             "CreateFileW" => at!(create_file),
+            "CreateFile2" => at!(create_file2),
+            "ReOpenFile" => at!(reopen_file),
+            "OpenFileById" => at!(open_file_by_id),
+            "NtCreateFile" => at!(nt_create_file),
+            "NtOpenFile" => at!(nt_open_file),
+            "NtCreateNamedPipeFile" => at!(nt_create_named_pipe_file),
+            "NtClose" => at!(nt_close),
             "CreateFileMappingW" => at!(create_file_mapping),
             "CreateEventW" => at!(create_event),
             "CreateEventExW" => at!(create_event_ex),
