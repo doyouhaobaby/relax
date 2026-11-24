@@ -990,6 +990,9 @@ pub struct Cache {
     def_maps: HashMap<u32, HashMap<u128, DefId>>,
     /// every definition by crate (built once, on the first decode)
     crate_defs: Vec<Vec<DefId>>,
+    /// `crate_defs` being made in steps (`map_crate_defs`): the lists so far, and the definition
+    /// the scan goes on from
+    crate_defs_scan: Option<(Vec<Vec<DefId>>, usize)>,
     /// a crate's definition map being built in steps (`map_crate_defs`): the crate, its
     /// definitions, how many are keyed, the map so far, and the keys found twice
     def_map_partial: Option<(u32, Vec<DefId>, usize, HashMap<u128, DefId>, HashSet<u128>)>,
@@ -1492,6 +1495,7 @@ impl Cache {
             foreign_canon: None,
             def_maps: HashMap::new(),
             crate_defs: Vec::new(),
+            crate_defs_scan: None,
             def_map_partial: None,
             #[cfg(test)]
             def_maps_appended: Vec::new(),
@@ -2247,6 +2251,7 @@ impl Cache {
         // the crates before `first` keep their lists: dec_def builds such a map on its first miss
         for v in by.iter_mut().skip(first) { *v = Vec::new(); }
         self.crate_defs = by;
+        self.crate_defs_scan = None;
     }
 
     /// A file version in an entry: its path and source hash (see file_ids).
@@ -2461,19 +2466,32 @@ impl Cache {
     /// every DEF_MAP_STEP definitions (a large crate's map took 10-35 ms in one step inside the
     /// startup image build): a stop keeps what is keyed (`def_map_partial`) for the next call, of
     /// this crate. Each call keys a step before it asks, so a stop that always says yes still
-    /// sees the map built. Ok(true): `c` has its map; Ok(false): `stop` said yes; Err: `c` has no
-    /// list.
+    /// sees the map built. The first call makes every crate's list of definitions, one scan over
+    /// the program's, in steps of DEF_SCAN_STEP the same way. Ok(true): `c` has its map;
+    /// Ok(false): `stop` said yes; Err: `c` has no list.
     pub(super) fn map_crate_defs(&mut self, u: &Unit, c: u32, stop: &dyn Fn() -> bool) -> Result<bool, ()> {
         if !self.defs_mapped(u) { self.defs_appended(u); }
         if self.def_maps.contains_key(&c) { return Ok(true); }
         let t0 = relax_session::clock::cpu_ns();
         if self.crate_defs.is_empty() {
-            let mut by = vec![Vec::new(); u.prog.crates.len()];
-            for i in 0..u.prog.defs.len() {
-                let d = DefId(i as u32);
-                if let Some(v) = by.get_mut(u.prog.def(d).krate as usize) {
-                    v.push(d);
+            // (definitions appended meanwhile are scanned too: the scan runs to the program's end)
+            let (mut by, mut i) = self.crate_defs_scan.take().unwrap_or_else(|| (vec![Vec::new(); u.prog.crates.len()], 0));
+            let start = i;
+            while i < u.prog.defs.len() {
+                if i > start && (i - start) % DEF_SCAN_STEP == 0 && stop() {
+                    self.crate_defs_scan = Some((by, i));
+                    return Ok(false);
                 }
+                let d = DefId(i as u32);
+                let k = u.prog.def(d).krate as usize;
+                if by.len() <= k {
+                    by.resize(k + 1, Vec::new());
+                }
+                by[k].push(d);
+                i += 1;
+            }
+            if by.len() < u.prog.crates.len() {
+                by.resize(u.prog.crates.len(), Vec::new());
             }
             self.crate_defs = by;
         }
@@ -6944,6 +6962,9 @@ static TRACE: relax_session::sync::Mutex<Option<String>> = relax_session::sync::
 /// Definitions a crate's map keys between two asks of `stop` (map_crate_defs); few in tests, so a
 /// small crate's map is built in steps too.
 const DEF_MAP_STEP: usize = if cfg!(test) { 4 } else { 1024 };
+/// Definitions the scan that makes the crates' lists takes between two asks of `stop`
+/// (map_crate_defs: a list push each, where a map's step makes a key each).
+const DEF_SCAN_STEP: usize = if cfg!(test) { 4 } else { 32768 };
 
 pub(crate) fn trace_on() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -11263,8 +11284,17 @@ mod data_tests {
         c.enc_def(&u, f, &mut e, &mut Vec::new());
         let mut other_e = E::default();
         c.enc_def(&u, o3, &mut other_e, &mut Vec::new());
-        // a map built in steps keeps its progress over a stop, and gives way to another crate's
-        assert_eq!(c.map_crate_defs(&u, other, &|| true), Ok(false), "a stop at the first ask leaves the other crate's map in steps");
+        // the crates' lists are made in steps, and a map built in steps keeps its progress over a
+        // stop and gives way to another crate's: under a stop that always says yes each call scans
+        // a step of the lists, and the one that ends them keys a step of the other crate's map
+        let (mut scanned, mut calls) = (0, 0);
+        while c.crate_defs.is_empty() {
+            assert_eq!(c.map_crate_defs(&u, other, &|| true), Ok(false), "a stop leaves the lists or the map in steps");
+            let now = c.crate_defs_scan.as_ref().map_or(u.prog.defs.len(), |s| s.1);
+            assert!(now > scanned, "each call scans a step of the lists before it gives way ({now} after {scanned})");
+            (scanned, calls) = (now, calls + 1);
+        }
+        assert!(calls > 1, "the lists of {} definitions are made in steps", u.prog.defs.len());
         assert!(c.def_map_partial.as_ref().is_some_and(|p| p.0 == other && p.2 > 0), "the steps so far are kept");
         assert_eq!(c.dec_def(&u, &mut D { b: &e.0, p: 0 }), Some(f), "the program definition must decode before a module loads");
         let maps = (c.crate_defs_n, c.def_maps.len());
@@ -11305,12 +11335,13 @@ mod data_tests {
         // every lookup as a cache that builds every map from the whole program finds it
         pack::ensure_private_dir(&root.join("full")).unwrap();
         let mut full = open_test_cache(&u, &root.join("full"));
-        // each call keys a step before it can give way: under a stop that always says yes the
-        // other crate's map is still built, a step a call (and decodes as one built whole)
-        let mut at = 0;
+        // each call scans or keys a step before it can give way: under a stop that always says
+        // yes the lists and the other crate's map are still made, a step a call (and the map
+        // decodes as one built whole)
+        let mut at = (0, 0);
         while full.map_crate_defs(&u, other, &|| true) == Ok(false) {
-            let now = full.def_map_partial.as_ref().map_or(0, |p| p.2);
-            assert!(now > at, "a call resumed at a step's end keys before it gives way ({now} after {at})");
+            let now = (full.crate_defs_scan.as_ref().map_or(usize::MAX, |s| s.1), full.def_map_partial.as_ref().map_or(0, |p| p.2));
+            assert!(now > at, "a call resumed at a step's end scans or keys before it gives way ({now:?} after {at:?})");
             at = now;
         }
         assert!(full.def_maps.contains_key(&other), "the map in steps is built under a stop that always says yes");
