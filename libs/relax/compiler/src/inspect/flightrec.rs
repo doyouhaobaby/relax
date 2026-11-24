@@ -403,15 +403,6 @@ pub fn hitch(ns: u64, typical_ns: u64) {
     }
 }
 
-/// The first frame waited for the app check. Record the wait and save a long one.
-pub fn gate_wait(ns: u64) {
-    if !on() { return; }
-    event("gate", &format!("the first frame waited {:.0} ms for the app check", ns as f64 / 1e6), ns, 0);
-    if ns / 1_000_000 >= DUMP_MS.load(Relaxed) {
-        request_dump(Why::Gate);
-    }
-}
-
 /// Every inspect event (panic, hang, hitch, script error, ...) also goes to the recorder.
 pub fn inspect_event(kind: &str, key: &str) {
     if kind == "hitch" {
@@ -493,7 +484,6 @@ pub enum Why {
     /// the JIT code window went lean (`Unit::code_lean`): the recent compiles and installs say
     /// which loop filled it
     Lean,
-    Gate,
 }
 
 /// The category of makepad-platform's first-draw event (`first_draw::CAT`): a run that started
@@ -510,7 +500,6 @@ impl Why {
             Why::Asked => "asked",
             Why::NoDraw => "nodraw",
             Why::Lean => "lean",
-            Why::Gate => "gate",
         }
     }
 }
@@ -564,14 +553,13 @@ fn watch() {
                 3 => Why::Fault,
                 5 => Why::NoDraw,
                 6 => Why::Lean,
-                7 => Why::Gate,
                 _ => Why::Asked,
             };
             let now = crate::clock::wall_ns();
             let last = LAST_AUTO.load(Relaxed);
             // (a run's one no-draw event is never left out for an earlier recording: a restart's
             // hitch just before it would have been)
-            let gap = match why { Why::Panic => DUMP_GAP_NS / 3, Why::NoDraw | Why::Lean | Why::Gate => 0, _ => DUMP_GAP_NS };
+            let gap = match why { Why::Panic => DUMP_GAP_NS / 3, Why::NoDraw | Why::Lean => 0, _ => DUMP_GAP_NS };
             if last == 0 || now.saturating_sub(last) >= gap {
                 LAST_AUTO.store(now, Relaxed);
                 match save(if why == Why::Hitch { HITCH_LAST_NS } else { DUMP_LAST_NS }, why, None, true) {

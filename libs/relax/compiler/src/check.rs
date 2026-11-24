@@ -624,7 +624,6 @@ pub fn prepare_check(up: *mut Unit, crates: &[u32], check_items: bool) -> Option
     use std::sync::atomic::Ordering::Relaxed;
     let u = unsafe { &*up };
     let t0 = jit::wall_ns();
-    APP_CHECK_ASKED.store(true, Relaxed);
     RUN_CHECK[7].store(0, Relaxed);
     let mut keys = Vec::new();
     let mut todo = Vec::new();
@@ -971,7 +970,7 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
 /// A batch of a check beside the running program (the app's own crates, a test's dependencies) on
 /// the JIT's queue (jit_queue `Job::Check`): no threads of its own. Its jobs run last in Visible
 /// during a UI app's boot check, otherwise last in Background. They yield to higher-priority
-/// waiters between items. Once the app's first window frame or the run's exit waits, they go
+/// waiters between items. Once a test or the run's exit waits, they go
 /// first in the waiter's class (`waited`). Each job takes the next item until its slice is used, then queues itself again: its
 /// worker goes back to the queue's order every few milliseconds. (On threads of its own a test's
 /// dependency check took every core beside a large app's cold start, first frame 27.5 s; on two of them
@@ -993,7 +992,7 @@ pub(crate) struct CheckBatch {
 static CHECK_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Something waits for the check beside the program (`waited`).
 static CHECK_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// CPU time (ns) of the app check's jobs for the first frame's line (`first_frame_gate`).
+/// CPU time (ns) of the app check's jobs for its verdict line.
 static APP_CHECK_CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The check jobs beside the program: running now, most at once while something waited, slices
 /// the OS raised to the waiter's class, raises refused, and the slices' total queue time (ns)
@@ -1029,7 +1028,7 @@ fn check_width() -> usize {
     width.max(1) as usize
 }
 
-/// The app's first window frame or the run's exit waits for the check beside the program.
+/// A test or the run's exit waits for the check beside the program.
 fn waited() {
     if !CHECK_WAITED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         CHECK_WAITED_AT.store(crate::clock::wall_ns(), std::sync::atomic::Ordering::Release);
@@ -1037,7 +1036,7 @@ fn waited() {
     }
 }
 
-/// An empty boot batch for the isolated queue test, with the same promotion as a first-frame wait.
+/// An empty boot batch for the isolated queue test, with the same promotion as a verdict wait.
 #[cfg(test)]
 pub(crate) fn with_early_batch_for_test(front: std::sync::Arc<jit::FrontShared>, test: impl FnOnce(std::sync::Arc<CheckBatch>, fn())) {
     use std::sync::{Arc, atomic::Ordering::Relaxed};
@@ -1097,7 +1096,7 @@ pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     }
     let now = CHECK_SLICES[0].fetch_add(1, Ordering::Relaxed) + 1;
     let _running = Running;
-    // something waits for the check (the first frame, the run's exit): the queue admits its jobs
+    // something waits for the check (a test or the run's exit): the queue admits its jobs
     // in the Interactive class (promote_checks), and the worker runs it at that class at the OS
     // too. A Linux thread without CAP_SYS_NICE that ran Background work cannot be raised: counted.
     if check_waited() {
@@ -1256,85 +1255,32 @@ pub fn finish_test_deps(code: i32) -> i32 {
     if *failed { 101 } else { code }
 }
 
+/// At process exit, let the app check finish before choosing the exit code. As for test
+/// dependencies, an exit inside an owner request must go on with its own code: the check
+/// can need that owner to finish.
+pub(crate) fn finish_app_check(code: i32) -> i32 {
+    if crate::run::exit_caller_holds_owner() {
+        if app_check_running() {
+            eprintln!("relax: exiting with code {code} while the app check runs: the exiting thread holds the owner");
+        }
+        return code;
+    }
+    if wait_app_check() { 101 } else { code }
+}
+
 /// The app check beside the program (start_app_check): 0 none, 1 running, 2 done clean, 3 found
-/// errors (the run ends in place: run_end::check_failed).
+/// errors.
 static BESIDE: (relax_session::sync::Mutex<u8>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new());
 static APP_CHECK_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FIRST_FRAME_WAITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn first_frame_waits() -> bool {
-    FIRST_FRAME_WAITS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-enum FrameHold {
-    None,
-    Waiting {
-        wake: Option<(Option<crate::domain::Callback>, extern "C" fn())>,
-        start: std::time::Instant,
-        cpu_start: u64,
-        ui: crate::preempt::UiWaits,
-        main: jit::MainHeld,
-    },
-    Finished { wall_ns: u64, cpu_ns: u64 },
-}
-static FRAME_HOLD: relax_session::sync::Mutex<FrameHold> = relax_session::sync::Mutex::new(FrameHold::None);
-
-/// Register the event-loop wake under the check's state lock, so completion cannot miss it.
-pub(crate) fn first_frame_ready(wake: usize) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    if *state != 1 { return true; }
-    let wake = (wake != 0).then(|| (crate::domain::callback(), unsafe {
-        std::mem::transmute::<usize, extern "C" fn()>(wake)
-    }));
-    let mut hold = FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner());
-    if let FrameHold::Waiting { wake: registered, .. } = &mut *hold {
-        *registered = wake;
-        return false;
-    }
-    waited();
-    *hold = FrameHold::Waiting {
-        wake, start: std::time::Instant::now(), cpu_start: APP_CHECK_CPU.load(Relaxed),
-        ui: crate::preempt::UiWaits::new(), main: jit::MainHeld::new(),
-    };
-    FIRST_FRAME_WAITS.store(true, Relaxed);
-    drop((hold, state));
-    // (a cold start's window stays empty until the gate line: this says why, and when it began)
-    eprintln!("relax: the first frame waits for the app check (the window answers meanwhile)");
-    false
-}
-
-fn finish_app_check(verdict: u8) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hold = FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner());
-    let waiting = std::mem::replace(&mut *hold, FrameHold::None);
-    *state = verdict;
+fn app_check_done(verdict: u8) {
+    *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = verdict;
     BESIDE.1.notify_all();
-    drop(state);
-    if let FrameHold::Waiting { wake, start, cpu_start, ui, main } = waiting {
-        drop((ui, main));
-        FIRST_FRAME_WAITS.store(false, Relaxed);
-        let wall_ns = start.elapsed().as_nanos() as u64;
-        let cpu_ns = APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu_start);
-        // A submit that already sees the verdict reads the complete timing under this lock.
-        *hold = FrameHold::Finished { wall_ns, cpu_ns };
-        drop(hold);
-        crate::inspect::flightrec::gate_wait(wall_ns);
-        if let Some((scope, wake)) = wake {
-            match scope {
-                Some(scope) => { let _ = scope.call(|| wake()); }
-                None => wake(),
-            }
-        }
-    }
 }
 
 /// makepad run of an app that presents frames: its app check runs beside main instead of before
 /// it. Every body is still checked before it first runs (a lazy compile checks its body; a body
-/// with errors is a compile error, which ends the run). The first frame waits for the check
-/// (wait_app_check, from the platform's first window frame); an error ends the run before it,
-/// reported as a build's errors are (`stop`). A live session's hosted run ends in place, as a
+/// with errors is a compile error, which ends the run). The app presents as soon as it can.
+/// The check reports its errors as a build does (`stop`). A live session's hosted run ends in place, as a
 /// restart's end does, and its host waits with no run for the next save or relaunch
 /// (run_end::check_failed); any other run exits 101 (the program's exit: os::proc::exit).
 pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::RuntimeOptions, stop: Box<dyn Fn(&[String]) + Send>) {
@@ -1350,8 +1296,8 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
         {
             let _state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
             APP_CHECK_THREAD.store(crate::waits::me(), Relaxed);
-            // A frame that arrived before this thread started can now name its holder.
-            if first_frame_waits() { BESIDE.1.notify_all(); }
+            // An exit already waiting can now name the check thread.
+            BESIDE.1.notify_all();
         }
         let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
@@ -1365,16 +1311,22 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
             CHECK_EARLY.store(!jit::past_startup_headless(), std::sync::atomic::Ordering::Release);
             check_prepared(upn as *mut Unit, p, Some(&runtime), CheckMode::Typeck)
         }.strings();
-        if crate::run::VERBOSE.load(Relaxed) {
-            eprintln!("relax: app check beside main: {} crates, {} body owners, {} item defs, {} errors, {:.0} ms",
-                RUN_CHECK[0].load(Relaxed), RUN_CHECK[1].load(Relaxed), RUN_CHECK[7].load(Relaxed), errors.len(), RUN_CHECK[2].load(Relaxed) as f64 / 1e6);
-        }
+        let n = |i: usize| RUN_CHECK[i].load(Relaxed);
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let present = jit::FIRST_PRESENT_NS.load(std::sync::atomic::Ordering::Acquire);
+        let when = if present == 0 {
+            "before the first present".to_string()
+        } else {
+            format!("{:.0} ms after the first present", ms(jit::wall_ns().saturating_sub(present)))
+        };
+        let verdict = if errors.is_empty() { "clean".to_string() } else { format!("{} errors", errors.len()) };
+        eprintln!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu); verdict: {verdict}, {when}",
+            n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)));
         if !errors.is_empty() {
             stop(&errors);
             // a live session: the process never ends for a compile error. The run's end is the
             // restart's (the program's threads, the run's, the unit, the statics), from its own
-            // thread, never from under the program's threads here; the first frame's gate lets
-            // the app's thread go to it (wait_app_check)
+            // thread, never from under the program's threads here.
             if crate::run::live_session() && crate::run::hosted_run() {
                 // the app crates' folders: the held host watches them for the fix's save, which can
                 // be in any of them, not only in the package's own folder
@@ -1387,17 +1339,17 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
                 let dirs: Vec<_> = sources.iter().map(|s| crate::unitgraph::manifest_dir_of(s))
                     .filter(|dir| !dir.is_empty()).map(std::path::PathBuf::from).collect();
                 if crate::run_end::check_failed(&errors, &dirs).is_ok() {
-                    finish_app_check(3);
+                    app_check_done(3);
                     return;
                 }
             }
             // as the program's own exit ends (os::proc::exit): without the C library's exit
             // handlers, which a native library registered (a GPU driver's teardown, from the
             // window's load) and which run while the program's threads go on in that library
-            // Keep the frame held through the exit. There is no surviving event loop to wake.
+            app_check_done(3);
             crate::os::proc::exit(101);
         }
-        finish_app_check(2);
+        app_check_done(2);
     }).expect("app check thread");
 }
 
@@ -1406,80 +1358,26 @@ pub(crate) fn app_check_running() -> bool {
     *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) == 1
 }
 
-/// The first frame's gate (the platform asks before it submits its first window frame): waits
-/// for the app check beside main. An error it finds ends the run instead (start_app_check): the
-/// program's thread here leaves it, with no frame presented and no wait for the end's grace.
-/// The quit hook (run.rs) still waits here for the verdict of an app that quits before its first frame
-/// (a failed check ends that run with the check's exit code).
-pub fn wait_app_check() {
-    use std::sync::atomic::Ordering::Relaxed;
-    struct GateWait;
-    impl Drop for GateWait {
-        fn drop(&mut self) { FIRST_FRAME_WAITS.store(false, Relaxed); }
-    }
+/// Wait for the verdict at the run's end. True if the check reported errors.
+fn wait_app_check() -> bool {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
     let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    if state == 3 { crate::run_end::leave(); }
-    if state != 1 { return; }
-    waited();
-    let t0 = std::time::Instant::now();
-    let mut g = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    let waited_ns = if *g == 1 {
-        let _ui = crate::preempt::UiWaits::new();
-        let _held = crate::jit::MainHeld::new();
-        FIRST_FRAME_WAITS.store(true, Relaxed);
-        let _gate = GateWait;
-        while *g == 1 {
-            let holder = APP_CHECK_THREAD.load(Relaxed);
-            let _wait = crate::waits::begin(crate::waits::Kind::Check, 0, holder, "first frame");
-            g = BESIDE.1.wait_while(g, |state| *state == 1 && APP_CHECK_THREAD.load(Relaxed) == holder)
-                .unwrap_or_else(|e| e.into_inner());
-        }
-        Some(t0.elapsed().as_nanos() as u64)
-    } else { None };
-    let failed = *g == 3;
-    drop(g);
-    if let Some(ns) = waited_ns { crate::inspect::flightrec::gate_wait(ns); }
-    if failed { crate::run_end::leave(); }
-    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("relax: the first frame waited {:.0} ms for the app check", t0.elapsed().as_secs_f64() * 1e3);
-    }
-}
+    if state != 1 { return state == 3; }
 
-/// Before the first window frame, wait for the app's body and item verdicts and report the
-/// wait time, body count and unique item definition count once per run.
-pub fn first_frame_gate() {
-    use std::sync::atomic::Ordering::Relaxed;
-    let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    let (cpu0, t0) = (APP_CHECK_CPU.load(Relaxed), std::time::Instant::now());
-    wait_app_check();
-    let blocking_ns = t0.elapsed().as_nanos() as u64;
-    // (a run whose app has no check, as a test's window, says nothing)
-    if !APP_CHECK_ASKED.load(Relaxed) || GATE_SAID.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
-    let n = |i: usize| RUN_CHECK[i].load(Relaxed);
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let held = match *FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner()) {
-        FrameHold::Finished { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
-        _ => None,
-    };
-    let line = match state {
-        // no check beside main: every app crate's clean verdict was stored (prepare_check)
-        0 => "relax: app check: none needed (its crates' clean verdicts stored); the first frame waited 0 ms".to_string(),
-        2 if held.is_none() => format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu), done before the first frame (it waited 0 ms)",
-            n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed))),
-        _ => {
-            let (wall_ns, cpu_ns) = held.unwrap_or_else(|| (blocking_ns, APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0)));
-            format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu); the first frame waited {:.0} ms for it, \
-                its checks {:.0} ms cpu meanwhile (at most {} jobs at once, CPU limit {}; {} slices raised to the frame's class at the OS, {} refused; its slices waited {:.0} ms for a worker)",
-                n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)), ms(wall_ns), ms(cpu_ns),
-                CHECK_SLICES[1].load(Relaxed), makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed), ms(CHECK_SLICES[4].load(Relaxed)))
-        }
-    };
-    eprintln!("{line}");
+    waited();
+    let _ui = crate::preempt::UiWaits::new();
+    let _held = jit::MainHeld::new();
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *state == 1 {
+        let holder = APP_CHECK_THREAD.load(Relaxed);
+        let _wait = crate::waits::begin(crate::waits::Kind::Check, 0, holder, "the run's end");
+        state = BESIDE.1.wait_while(state, |s| *s == 1 && APP_CHECK_THREAD.load(Relaxed) == holder)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    CHECK_WAITED_AT.store(0, Release);
+    CHECK_WAITED.store(false, Release);
+    *state == 3
 }
-/// The first frame's line was said (`first_frame_gate`).
-static GATE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// This run looked for its app crates' stored verdicts (prepare_check): it has an app check.
-static APP_CHECK_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The last run_check_crates: crates checked, their body owners, wall ns, of it the stored verdicts'
 /// lookup and the skipped files' load, body verdicts found by their dependencies' interfaces,
@@ -3159,14 +3057,10 @@ pub(crate) unsafe fn reset_statics() {
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&CHECK_WAITED_AT, std::sync::atomic::AtomicU64::new(0));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
-    reset(&FRAME_HOLD, relax_session::sync::Mutex::new(FrameHold::None));
     reset(&APP_CHECK_THREAD, std::sync::atomic::AtomicU64::new(0));
-    reset(&FIRST_FRAME_WAITS, std::sync::atomic::AtomicBool::new(false));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 8]);
     reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
     reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
-    reset(&GATE_SAID, std::sync::atomic::AtomicBool::new(false));
-    reset(&APP_CHECK_ASKED, std::sync::atomic::AtomicBool::new(false));
 }
 
 #[cfg(test)]
@@ -3174,62 +3068,69 @@ mod def_work_tests {
     use super::{def_work, DefWork};
 
     #[test]
-    fn first_frame_waits_for_the_app_check() {
-        use super::{finish_app_check, first_frame_ready, first_frame_waits, wait_app_check, FrameHold,
-            APP_CHECK_CPU, APP_CHECK_THREAD, BESIDE, CHECK_WAITED, FRAME_HOLD};
-        use std::sync::atomic::AtomicUsize;
+    fn finish_app_check_waits_for_the_verdict_unless_the_exit_holds_the_owner() {
+        use super::{app_check_done, check_waited, finish_app_check, APP_CHECK_THREAD, BESIDE};
         use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        static WAKES: AtomicUsize = AtomicUsize::new(0);
-        extern "C" fn wake() { WAKES.fetch_add(1, Relaxed); }
+        // Isolate the run's globals and capture what the owner-held exit actually reported.
+        const NAME: &str = "check::def_work_tests::finish_app_check_waits_for_the_verdict_unless_the_exit_holds_the_owner";
+        if std::env::var("RELAX_TEST_CHILD").as_deref() != Ok(NAME) {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--test-threads=1", "--nocapture"]).env("RELAX_TEST_CHILD", NAME));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+            let exits: Vec<_> = stderr.lines().filter(|l| l.contains("the exiting thread holds the owner")).collect();
+            assert_eq!(exits, ["relax: exiting with code 7 while the app check runs: the exiting thread holds the owner"]);
+            return;
+        }
 
         let holder = crate::waits::me();
-        let old_holder = APP_CHECK_THREAD.swap(holder, Relaxed);
-        let old_state = std::mem::replace(&mut *BESIDE.0.lock().unwrap(), 1);
-        // The test holds the check itself. Its waiter has no jobs to promote on the shared queue.
-        let old_waited = CHECK_WAITED.swap(true, Relaxed);
-
-        // Register a wake on the existing hold. Its CPU measurement includes work before registration.
-        let old_hold = std::mem::replace(&mut *FRAME_HOLD.lock().unwrap(), FrameHold::None);
-        assert!(!first_frame_ready(0));
-        assert!(first_frame_waits() && crate::preempt::ui_waits(), "the held draw gives the check priority");
-        assert_eq!(super::check_width(), makepad_cpu_budget::cores().max(1) as usize, "a waited check's batches take every core");
-        let cpu_start = APP_CHECK_CPU.fetch_add(7, Relaxed);
-        assert!(!first_frame_ready(wake as *const () as usize));
-        finish_app_check(2);
-        assert!(!first_frame_waits() && !crate::preempt::ui_waits(), "release drops both hold guards");
-        assert!(first_frame_ready(wake as *const () as usize));
-        assert_eq!(WAKES.swap(0, Relaxed), 1, "only completion calls the registered wake");
-        assert!(matches!(*FRAME_HOLD.lock().unwrap(), FrameHold::Finished { cpu_ns: 7, .. }),
-            "a second query must preserve the original hold interval");
-        APP_CHECK_CPU.store(cpu_start, Relaxed);
-        *FRAME_HOLD.lock().unwrap() = old_hold;
-
-        // A caller that goes straight to the submit gate still parks until the verdict.
+        APP_CHECK_THREAD.store(holder, Relaxed);
         *BESIDE.0.lock().unwrap() = 1;
-        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(crate::owner::queued_note().contains("\"check\":1"));
+        assert!(!check_waited(), "observing the check must not promote it");
+
+        let (owner_tx, owner_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || crate::owner::call(crate::owner::Class::Program, || {
+            assert!(crate::run::exit_caller_holds_owner());
+            owner_tx.send(finish_app_check(7)).unwrap();
+        }));
+        let own_code = owner_rx.recv_timeout(Duration::from_secs(5));
+
+        let (tx, rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let id = crate::waits::me();
             tx.send(id).unwrap();
-            wait_app_check();
-            crate::waits::of(id).is_none()
+            let code = finish_app_check(0);
+            (code, crate::waits::of(id).is_none())
         });
         let id = rx.recv().unwrap();
         let start = Instant::now();
         let registered = loop {
-            if crate::waits::of(id).is_some_and(|w| w.kind == crate::waits::Kind::Check && w.holder == holder && w.label == "first frame")
-                && first_frame_waits() && crate::preempt::ui_waits() && crate::owner::queued_note().contains("\"gate\":1") {
+            if crate::waits::of(id).is_some_and(|w| w.kind == crate::waits::Kind::Check && w.holder == holder && w.label == "the run's end")
+                && check_waited() && crate::preempt::ui_waits() {
                 break true;
             }
             if start.elapsed() >= Duration::from_millis(500) { break false; }
             std::thread::sleep(Duration::from_millis(1));
         };
-        *BESIDE.0.lock().unwrap() = 2;
-        BESIDE.1.notify_all();
-        let cleared = waiter.join();
-        *BESIDE.0.lock().unwrap() = old_state;
-        APP_CHECK_THREAD.store(old_holder, Relaxed);
+        let width = super::check_width();
+        app_check_done(3);
+        let (error_code, cleared) = waiter.join().unwrap();
+        owner.join().unwrap();
+        assert_eq!(own_code.unwrap(), 7, "the owner-held exit keeps its code before the failing verdict");
+        assert!(registered, "the parked exit must name the check thread and promote the check");
+        assert_eq!(width, makepad_cpu_budget::cores().max(1) as usize, "a waited check's batches take every core");
+        assert_eq!(error_code, 101, "the non-owner exit takes the failing verdict");
+        assert!(cleared && !check_waited() && !crate::preempt::ui_waits(), "the row and promotion must clear");
+        assert!(crate::owner::queued_note().contains("\"check\":0"));
+        app_check_done(2);
+        assert_eq!(finish_app_check(8), 8, "a clean verdict preserves the exit code");
+        crate::owner::call(crate::owner::Class::Program, || assert_eq!(finish_app_check(9), 9));
+
         // A slice queued before the wait began counts from the wait's start.
         let counted0 = super::CHECK_SLICES[4].load(Relaxed);
         let old_at = super::CHECK_WAITED_AT.swap(crate::clock::wall_ns(), Relaxed);
@@ -3237,12 +3138,6 @@ mod def_work_tests {
         let counted = super::CHECK_SLICES[4].load(Relaxed) - counted0;
         super::CHECK_WAITED_AT.store(old_at, Relaxed);
         assert!(counted < 1_000_000_000, "a slice's queue time before the wait began was counted: {counted} ns");
-        CHECK_WAITED.store(old_waited, Relaxed);
-
-        assert!(registered, "the parked frame must name the check thread and report the JIT gate");
-        assert!(cleared.unwrap(), "the wait row must clear before the waiter thread exits");
-        assert!(!first_frame_waits(), "the gate must clear when the check finishes");
-        assert!(!crate::preempt::ui_waits(), "background work must resume when the gate clears");
     }
 
     fn ice(said: &str) -> String {

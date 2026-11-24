@@ -409,6 +409,7 @@ fn run_ended(code: i32, json: bool, args: &[String], start: Instant) -> i32 {
         crate::hot_failure::restart_failed(&format!("the replacement test harness ended before it started (exit {code})"));
         crate::hot_failure::pump();
     }
+    let code = crate::check::finish_app_check(code);
     let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     if let Some(exit) = EXIT_SUMMARY.get() {
@@ -2620,8 +2621,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     } else if !harness && !exports_mode && hal_window_pending() {
         // an app the HAL hosts: its own crates are type-checked whole beside main (the lookups and
-        // the skipped files' loads here); its first window frame waits for that check and an error
-        // ends the run before it (check.rs start_app_check). Every body is still checked before it
+        // the skipped files' loads here). An error ends the run (check.rs start_app_check).
+        // Every body is still checked before it
         // first runs: a lazy compile checks its body, and a compile error ends the run.
         let t_check = Instant::now();
         let app = crate::check::app_crates(&u.prog, root);
@@ -2848,7 +2849,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 report("error", e);
                 eprintln!("{}", e);
             }
-            eprintln!("error: could not compile `{}` due to {} previous error{}: stopped before its first frame (`{tool} run` checks the app's own crates whole beside main, as cargo builds them)",
+            eprintln!("error: could not compile `{}` due to {} previous error{} (`{tool} run` checks the app's own crates whole beside main, as cargo builds them)",
                 name, errors.len(), if errors.len() == 1 { "" } else { "s" }, tool = crate::tool_name());
         }));
     }
@@ -4988,9 +4989,6 @@ pub(crate) extern "C" fn relax_quit_started() {
     if crate::domain::current_app_domain().and_then(crate::domain::info).is_some_and(|i| i.parent.is_some()) {
         return;
     }
-    // an app quitting before its first frame still has its app check's verdict: an error it finds
-    // ends the run as a compile error (check.rs start_app_check)
-    crate::check::wait_app_check();
     quit_mark();
 }
 
