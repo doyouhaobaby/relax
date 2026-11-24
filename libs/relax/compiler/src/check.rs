@@ -1375,9 +1375,21 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
             // restart's (the program's threads, the run's, the unit, the statics), from its own
             // thread, never from under the program's threads here; the first frame's gate lets
             // the app's thread go to it (wait_app_check)
-            if crate::run::live_session() && crate::run::hosted_run() && crate::run_end::check_failed(&errors).is_ok() {
-                finish_app_check(3);
-                return;
+            if crate::run::live_session() && crate::run::hosted_run() {
+                // the app crates' folders: the held host watches them for the fix's save, which can
+                // be in any of them, not only in the package's own folder
+                let sources: Vec<_> = {
+                    let read = jit::front_read("app check watch roots");
+                    let (prog, _) = read.unit(upn as *const Unit);
+                    app_crates(prog, crate::layout::root_crate()).into_iter()
+                        .map(|k| prog.crates[k as usize].root_path().to_owned()).collect()
+                };
+                let dirs: Vec<_> = sources.iter().map(|s| crate::unitgraph::manifest_dir_of(s))
+                    .filter(|dir| !dir.is_empty()).map(std::path::PathBuf::from).collect();
+                if crate::run_end::check_failed(&errors, &dirs).is_ok() {
+                    finish_app_check(3);
+                    return;
+                }
             }
             // as the program's own exit ends (os::proc::exit): without the C library's exit
             // handlers, which a native library registered (a GPU driver's teardown, from the
