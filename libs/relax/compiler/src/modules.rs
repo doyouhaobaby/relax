@@ -357,10 +357,8 @@ pub(crate) struct NewCrate {
 /// What a new crate depends on.
 #[derive(Clone, Copy)]
 pub(crate) enum Dep {
-    /// a crate of the program (std crates included)
+    /// a crate of the program (std crates included, and the crates a domain load added before)
     Existing(u32),
-    /// a crate of the same batch (an earlier one)
-    New(usize),
 }
 
 /// What `add_crates` put in the program.
@@ -403,10 +401,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
                 Some(done as u64), Some(new.len() as u64), &nc.name); }
             let mut dep_list = Vec::new();
             for (n, d) in &nc.deps {
-                let k = match d {
-                    Dep::Existing(k) => *k,
-                    Dep::New(i) => crates[*i],
-                };
+                let Dep::Existing(k) = *d;
                 dep_list.push((u.prog.syms.intern(n), k));
             }
             let first = u.prog.crates.len();

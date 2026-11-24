@@ -1,4 +1,5 @@
 use super::*;
+use super::load_step_gate::{hold_load_steps, release_load_step, wait_for_loaders, wait_load_step_held, STEPS_BEGUN};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -369,6 +370,291 @@ fn cancel_during_compile_never_enters_main() {
         assert_eq!(dead.arena_committed, 0);
         domains().retain(|d| d.info.id != id);
     }
+}
+
+struct LoadFixture {
+    dir: std::path::PathBuf,
+    unit: Box<Unit>,
+    cfg: crate::cfg::CfgSet,
+}
+
+impl LoadFixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("relax-domain-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::dirs::set_relax_dir(dir.join("run"));
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let session = std::sync::Arc::new(session);
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let mut prog = crate::program::Program::new(&session);
+        // Domain graphs start after the boot's std crates. Empty one-file versions suffice
+        // for these no_std libraries, whose only function takes and returns a primitive.
+        let std = crate::std_pre_crates(&session, prog.std_simd, prog.std_overflow_checks);
+        for name in std.into_iter().map(|c| c.name).chain(std::iter::once("host".into())) {
+            let path = dir.join(format!("{name}.rs"));
+            std::fs::write(&path, "#![no_std]\n").unwrap();
+            prog.load_crate(&name, path.to_str().unwrap(), 2021, cfg.clone(), vec![]).unwrap();
+        }
+        prog.resolve_imports();
+        assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+        Self { dir, unit: Unit::new(prog, tcx, 0), cfg }
+    }
+
+    fn chain(&self, names: &[&str]) -> TestLoad {
+        self.chain_with(names, "")
+    }
+
+    /// `chain`, with `first` added to the first crate's source.
+    fn chain_with(&self, names: &[&str], first: &str) -> TestLoad {
+        let mut crates = Vec::new();
+        let mut pkg = Vec::new();
+        for (i, &name) in names.iter().enumerate() {
+            let path = self.dir.join(format!("{name}.rs"));
+            let mut deps = Vec::new();
+            let value = if i == 0 {
+                "x".to_owned()
+            } else {
+                let dep = names[i - 1];
+                deps.push((i - 1, dep.to_owned()));
+                format!("{dep}::value(x)")
+            };
+            let extra = if i == 0 { first } else { "" };
+            std::fs::write(&path, format!("#![no_std]\n{extra}pub fn value(x: u32) -> u32 {{ {value} }}\n")).unwrap();
+            crates.push(crate::crates::CrateUnit {
+                name: name.into(), src_path: path.to_str().unwrap().into(), edition: 2021,
+                deps, features: vec![], host: None, proc_macro: false, bin: false, harness: false,
+                build_script: false, version: "0.1.0".into(), registry: false, host_only: false,
+            });
+            pkg.push((self.dir.to_str().unwrap().into(), name.into(), "0.1.0".into()));
+        }
+        let n = names.len();
+        let graph = crate::unitgraph::Graph {
+            crates, root: n - 1, build_scripts: vec![], pkg, cfgs: vec![vec![]; n],
+            env: vec![vec![]; n], link_libs: vec![], native: None, raw: vec![], bins: vec![],
+        };
+        let order = crate::crates::topo_order(&graph.crates);
+        let cfgs = vec![self.cfg.clone(); n];
+        let idents = identities(&graph, &cfgs, &order);
+        let id = prepare(&AppSpec { package: names[n - 1].into(), ..Default::default() }).unwrap();
+        TestLoad { graph, order, cfgs, idents, id }
+    }
+
+    fn address(&mut self) -> usize { &mut *self.unit as *mut Unit as usize }
+}
+
+impl Drop for LoadFixture {
+    fn drop(&mut self) {
+        LOADED.lock().unwrap().retain(|r| !std::path::Path::new(&r.4).starts_with(&self.dir));
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+}
+
+struct TestLoad {
+    graph: crate::unitgraph::Graph,
+    order: Vec<usize>,
+    cfgs: Vec<crate::cfg::CfgSet>,
+    idents: Vec<u64>,
+    id: DomainId,
+}
+
+impl TestLoad {
+    fn run(&self, up: usize) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
+        unsafe { load_graph(up as *mut Unit, &self.graph, &self.order, &self.cfgs, &self.idents, self.id, true) }
+    }
+}
+
+impl Drop for TestLoad {
+    fn drop(&mut self) {
+        drop(Loading(self.id));
+        domains().retain(|d| d.info.id != self.id);
+    }
+}
+
+// Drop inside the thread scope, so a failed assertion also releases the loaders before join.
+struct HoldSteps;
+impl HoldSteps {
+    fn new() -> Self { hold_load_steps(true); Self }
+}
+impl Drop for HoldSteps {
+    fn drop(&mut self) { hold_load_steps(false); }
+}
+
+fn hold_after_first_crate() {
+    assert_eq!(wait_load_step_held(), 0);
+    release_load_step();
+    assert_eq!(wait_load_step_held(), 1);
+}
+
+fn value_def(u: &Unit, krate: u32) -> Option<crate::program::DefId> {
+    u.prog.defs.iter().enumerate().find_map(|(i, d)| {
+        (d.krate == krate && u.prog.syms.str(d.name) == "value").then_some(crate::program::DefId(i as u32))
+    })
+}
+
+fn shared_dependency(u: &Unit, root: u32) -> u32 {
+    u.prog.crates[root as usize].deps.iter().find(|(name, _)| u.prog.syms.str(*name) == "a").unwrap().1
+}
+
+fn records_for(ident: u64) -> usize {
+    LOADED.lock().unwrap().iter().filter(|r| r.0 == ident).count()
+}
+
+#[test]
+fn a_waiting_request_is_served_between_load_steps() {
+    isolated_test!(a_waiting_request_is_served_between_load_steps);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    std::thread::scope(|s| {
+        let _hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        for k in 0..graph.order.len() {
+            assert_eq!(wait_load_step_held(), k);
+            let (tx, rx) = std::sync::mpsc::channel();
+            // This thread's request is queued before the loader is free to post its next one.
+            crate::owner::post(crate::owner::Class::Program, move || tx.send(STEPS_BEGUN.load(Ordering::SeqCst)).unwrap());
+            release_load_step();
+            assert_eq!(rx.recv().unwrap(), k, "a waiting request was overtaken at step {k}");
+        }
+        let (_, reused, new, _) = loader.join().unwrap().unwrap();
+        assert_eq!((reused, new.len()), (0, 3));
+        assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 3);
+    });
+}
+
+#[test]
+fn a_load_cancelled_between_steps_keeps_only_whole_crates() {
+    isolated_test!(a_load_cancelled_between_steps_keeps_only_whole_crates);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    let err = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        hold_after_first_crate();
+        retire(graph.id).unwrap();
+        drop(hold);
+        loader.join().unwrap().unwrap_err()
+    });
+    assert_eq!(err, ["domain compilation cancelled"]);
+    let a = lookup_loaded(graph.idents[0]).expect("the completed crate is recorded");
+    assert!(value_def(&f.unit, a).is_some(), "the completed crate has its definitions");
+    assert_eq!(lookup_loaded(graph.idents[1]), None, "b started after cancellation");
+    assert_eq!(lookup_loaded(graph.idents[2]), None, "c started after cancellation");
+}
+
+#[test]
+fn a_parse_error_keeps_the_crates_before_it() {
+    isolated_test!(a_parse_error_keeps_the_crates_before_it);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let bad = f.chain(&["a", "b", "c"]);
+    std::fs::write(&bad.graph.crates[1].src_path, "#![no_std]\npub fn broken(\n").unwrap();
+    let up = f.address();
+    let err = std::thread::scope(|s| s.spawn(|| bad.run(up)).join().unwrap().unwrap_err());
+    assert!(err.iter().any(|e| e.contains("b.rs")), "expected a parse error in b: {err:?}");
+    let a = lookup_loaded(bad.idents[0]).expect("a was recorded before b failed");
+    assert_eq!(lookup_loaded(bad.idents[1]), None, "the failing crate was recorded");
+    assert_eq!(lookup_loaded(bad.idents[2]), None, "the load continued past the failing crate");
+
+    let good = f.chain(&["a", "e"]);
+    let (root, reused, _, _) = std::thread::scope(|s| s.spawn(|| good.run(up)).join().unwrap().unwrap());
+    assert_eq!(reused, 1);
+    assert_eq!(shared_dependency(&f.unit, root), a, "e must depend on the first load's a");
+    assert_eq!(lookup_loaded(good.idents[0]), Some(a));
+    assert_eq!(records_for(good.idents[0]), 1);
+}
+
+#[test]
+fn a_recorded_crate_with_extern_crate_aliases_is_reused() {
+    isolated_test!(a_recorded_crate_with_extern_crate_aliases_is_reused);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    // the alias adds an entry to a's dependency list beside the std crates
+    let alias = "extern crate core as __core;\n";
+    let ab = f.chain_with(&["a", "b"], alias);
+    let up = f.address();
+    std::thread::scope(|s| s.spawn(|| ab.run(up)).join().unwrap().unwrap());
+    let a = lookup_loaded(ab.idents[0]).expect("a was recorded");
+    let ad = f.chain_with(&["a", "d"], alias);
+    let (root, reused, new, _) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
+    assert_eq!((reused, new.len()), (1, 1), "a was loaded again: {new:?}");
+    assert_eq!(shared_dependency(&f.unit, root), a);
+    assert_eq!(records_for(ab.idents[0]), 1);
+}
+
+#[test]
+fn two_loads_of_a_shared_crate_load_it_once() {
+    isolated_test!(two_loads_of_a_shared_crate_load_it_once);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let ab = f.chain(&["a", "b"]);
+    let ad = f.chain(&["a", "d"]);
+    for load in [&ab, &ad] {
+        use std::io::Write;
+        let root = &load.graph.crates[load.graph.root];
+        let mut file = std::fs::OpenOptions::new().append(true).open(&root.src_path).unwrap();
+        writeln!(file, "#[link(name = \"step_{}\")] extern \"C\" {{}}", root.name).unwrap();
+    }
+    let up = f.address();
+    let (b, d) = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let first = s.spawn(|| ab.run(up));
+        assert_eq!(wait_load_step_held(), 0);
+        let second = s.spawn(|| ad.run(up));
+        // Both have examined the empty registry. Run the two steps for a before either root.
+        assert_eq!(wait_for_loaders(2), 0);
+        release_load_step();
+        assert_eq!(wait_for_loaders(2), 0);
+        release_load_step();
+        assert_eq!(wait_for_loaders(2), 1);
+        drop(hold);
+        (first.join().unwrap().unwrap(), second.join().unwrap().unwrap())
+    });
+    let a = lookup_loaded(ab.idents[0]).expect("the shared crate was recorded");
+    assert_eq!((b.1, d.1), (0, 1), "the second load reused a");
+    assert_eq!(records_for(ab.idents[0]), 1);
+    assert_eq!(shared_dependency(&f.unit, b.0), a);
+    assert_eq!(shared_dependency(&f.unit, d.0), a);
+    assert_eq!(b.3, d.3, "both file ranges include both roots");
+    for (root, lib) in [(b.0, "step_b"), (d.0, "step_d")] {
+        let selected = HashSet::from([a, root]);
+        let libs = crate::run::link_attr_libs(&f.unit.prog, b.3, Some(&selected));
+        assert_eq!(libs, [(lib.to_owned(), false)], "a domain links only its own root's library");
+    }
+}
+
+#[test]
+fn a_crate_loaded_by_an_earlier_step_compiles_before_the_load_ends() {
+    isolated_test!(a_crate_loaded_by_an_earlier_step_compiles_before_the_load_ends);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        hold_after_first_crate();
+        let a = lookup_loaded(graph.idents[0]).expect("a is already recorded");
+        let installed = crate::owner::call(crate::owner::Class::Program, || unsafe {
+            let up = up as *mut Unit;
+            let def = value_def(&*up, a).expect("a's definition is visible");
+            let slot = (*up).fn_id(crate::jit::FnKey::Inst(def, vec![]));
+            let (code, map, relocs) = crate::jit::compile_fn(up, slot)?;
+            (*up).install(slot, &code, &relocs, map, 0)
+        }).unwrap();
+        assert_ne!(installed, 0);
+        assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 1, "the install finished before b began");
+        drop(hold);
+        let (_, _, new, _) = loader.join().unwrap().unwrap();
+        assert_eq!(new.len(), 3);
+    });
 }
 
 /// A domain loader holds its compile job for the whole load, build scripts included: it waits

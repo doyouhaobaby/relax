@@ -3384,7 +3384,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
     // with #[link] (frameworks register their Objective-C classes and protocols on load, and
     // the program looks those up by name at run time)
     let mut n_link = link_libs.len();
-    for (name, fw) in link_attr_libs(prog, first_file) {
+    for (name, fw) in link_attr_libs(prog, first_file, crates) {
         if link_libs.iter().any(|l| l.0 == name && l.1 == fw) || provided_static(&name) {
             continue;
         }
@@ -3592,11 +3592,13 @@ fn link_trace() -> bool {
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
 /// are active (got definitions), or an empty link-only block without a cfg; files from
-/// `first_file` on.
-pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize) -> Vec<(String, bool)> {
+/// `first_file` on that belong to the selected crates (all crates at boot).
+pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for (fi, f) in prog.files.iter().enumerate().skip(first_file) {
-        let Some(cfg) = prog.file_crate.get(fi).and_then(|&k| prog.crates.get(k as usize)).map(|c| &c.cfg) else { continue };
+        let Some(&k) = prog.file_crate.get(fi) else { continue };
+        if crates.is_some_and(|selected| !selected.contains(&k)) { continue; }
+        let Some(cfg) = prog.crates.get(k as usize).map(|c| &c.cfg) else { continue };
         let src = f.src_view();
         // Every item of the file's arena, as before: it also holds the items of macro expansions
         // the collector dropped (libc's cfg_if! branches for other targets carry no #[cfg] of

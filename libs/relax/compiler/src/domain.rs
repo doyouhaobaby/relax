@@ -1601,8 +1601,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let idents = identities(&g, &cfgs, &order);
     let t1 = std::time::Instant::now();
     let upn = up as usize;
-    // the owner thread: the program's tables change there
-    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id, !from_boot) });
+    let loaded = unsafe { load_graph(up, &g, &order, &cfgs, &idents, id, !from_boot) };
     let (root, n_reused, new_names, first_file) = match loaded {
         Ok(x) => x,
         Err(e) => return fail(id, e),
@@ -1614,8 +1613,9 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let t2 = std::time::Instant::now();
     // the libraries the new crates link; the native library's callbacks are the fns of the
     // domain's crates (its root and what that depends on)
-    let crates = {
-        let prog = unsafe { &(*up).prog };
+    let linked = {
+        let read = crate::jit::front_read("domain link");
+        let (prog, _) = read.unit(up);
         let mut seen = std::collections::HashSet::from([root]);
         let mut todo = vec![root];
         while let Some(k) = todo.pop() {
@@ -1623,9 +1623,9 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
                 if seen.insert(d) { todo.push(d); }
             }
         }
-        seen
+        crate::run::link_libraries(prog, &g.link_libs, g.native.as_ref(), first_file, Some(&seen))
     };
-    let (_, missing, callbacks) = match crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file, Some(&crates)) {
+    let (_, missing, callbacks) = match linked {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("relax domain: {error}");
@@ -1862,106 +1862,167 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
     start(up, spec)
 }
 
-/// On the owner thread: gets the crates of `g` into the program (shared ones are reused) and
-/// returns (root crate, crates reused, names of the crates loaded, first file index of the load).
+#[cfg(test)]
+mod load_step_gate {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::thread::ThreadId;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    pub(super) static STEPS_BEGUN: AtomicUsize = AtomicUsize::new(0);
+    // A loader occupies one place in arrival order until the test releases it.
+    static HELD: Mutex<VecDeque<(ThreadId, usize)>> = Mutex::new(VecDeque::new());
+    static CHANGED: Condvar = Condvar::new();
+
+    pub(super) fn hold_load_steps(on: bool) {
+        let mut held = HELD.lock().unwrap();
+        if on { STEPS_BEGUN.store(0, Ordering::SeqCst); }
+        ON.store(on, Ordering::Relaxed);
+        if !on { held.clear(); }
+        CHANGED.notify_all();
+    }
+
+    pub(super) fn before_step(k: usize) {
+        if !ON.load(Ordering::Relaxed) { return; }
+        let mut held = HELD.lock().unwrap();
+        if !ON.load(Ordering::Relaxed) { return; }
+        let loader = std::thread::current().id();
+        held.push_back((loader, k));
+        CHANGED.notify_all();
+        drop(CHANGED.wait_while(held, |q| q.iter().any(|h| h.0 == loader)).unwrap());
+    }
+
+    pub(super) fn wait_for_loaders(n: usize) -> usize {
+        let held = CHANGED.wait_while(HELD.lock().unwrap(), |q| q.len() < n).unwrap();
+        held[0].1
+    }
+
+    pub(super) fn wait_load_step_held() -> usize { wait_for_loaders(1) }
+
+    pub(super) fn release_load_step() {
+        HELD.lock().unwrap().pop_front().expect("a loader at the gate");
+        CHANGED.notify_all();
+    }
+}
+
+/// Compare the current revision of each shared crate with disk. A changed crate and the
+/// dependants built against its old revision must load again. Called on the owner.
+unsafe fn reread_loaded(up: *mut Unit, idents: &[u64], changed: &mut HashSet<u32>) {
+    let prog = &(*up).prog;
+    let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
+    let mut current = std::collections::BTreeMap::new();
+    for module in &prog.mods {
+        let file = module.file as usize;
+        let Some(&krate) = prog.file_crate.get(file) else { continue };
+        if candidates.contains(&krate) {
+            if let Some(path) = prog.file_paths.get(file) { current.insert((krate, path), file); }
+        }
+    }
+    // every changed file, with the bytes on disk now: the program's source registry keeps the
+    // first snapshot of a path for good (source ids name paths across revisions), so the new
+    // revision reads these through an overlay -- without it a second relaunch after an edit
+    // loaded the first relaunch's text again
+    let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
+    for ((krate, path), file) in current {
+        if path.is_empty() { continue; }
+        let pf = &prog.files[file];
+        match crate::vfs::read(path) {
+            Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
+            Ok(src) => {
+                changed.insert(krate);
+                if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
+            }
+            Err(_) => { changed.insert(krate); }
+        }
+    }
+    if !fresh.is_empty() {
+        let _fw = crate::jit::front_write();
+        let sources = &mut (*up).prog.sources;
+        for (path, src) in fresh {
+            *sources = std::sync::Arc::new(sources.overlay(&path, src.into()));
+        }
+    }
+}
+
+/// The loader asks the owner for one complete crate at a time. Between requests the crate
+/// indices belong to the loader and the program can serve other domains.
 unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
-    let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd, u.prog.std_overflow_checks).len();
-    let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
-    let mut crate_of = vec![u32::MAX; g.crates.len()];
-    let mut batch_of = vec![usize::MAX; g.crates.len()];
-    let mut batch: Vec<NewCrate> = Vec::new();
-    let mut batch_ci: Vec<usize> = Vec::new();
-    let mut reused = 0;
-    let mut why_new: Vec<String> = Vec::new();
-    // A layout/signature edit cannot reuse the old compiled crate just because its package
-    // identity stayed the same. Keep unchanged code shared; load changed crates and their
-    // dependants as a new revision. Other domains can still finish using their old revision.
-    // A domain that resolved its own package compares every loaded file of a shared crate with the
-    // disk. The app's first start takes the boot's graph, whose files this process read a moment
-    // ago: nothing to compare (a save after that is the live watcher's, which stamped them before
-    // the load).
+    use crate::owner::{call, Class::Program};
+    let epochs = || (crate::reload::program_edits(), crate::jit::patch_epoch());
     let mut changed = HashSet::new();
-    if reread {
-        let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
-        let mut current = std::collections::BTreeMap::new();
-        for module in &u.prog.mods {
-            let file = module.file as usize;
-            let Some(&krate) = u.prog.file_crate.get(file) else { continue };
-            if candidates.contains(&krate) {
-                if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
-            }
-        }
-        // every changed file, with the bytes on disk now: the program's source registry keeps the
-        // first snapshot of a path for good (source ids name paths across revisions), so the new
-        // revision reads these through an overlay -- without it a second relaunch after an edit
-        // loaded the first relaunch's text again
-        let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
-        for ((krate, path), file) in current {
-            if path.is_empty() { continue; }
-            let pf = &u.prog.files[file];
-            match crate::vfs::read(path) {
-                Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
-                Ok(src) => {
-                    changed.insert(krate);
-                    if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
-                }
-                Err(_) => { changed.insert(krate); }
-            }
-        }
-        for (path, src) in fresh {
-            u.prog.sources = std::sync::Arc::new(u.prog.sources.overlay(&path, src.into()));
-        }
-    }
+    let (first_file, std_deps, mut checked) = call(Program, || {
+        let checked = epochs();
+        // The boot graph was just read. A later edit invalidates that shortcut too.
+        if reread { reread_loaded(up, idents, &mut changed); }
+        let prog = &(*up).prog;
+        let std_count = crate::std_pre_crates(&prog.session, prog.std_simd, prog.std_overflow_checks).len();
+        let deps: Vec<_> = (0..std_count).map(|k| (prog.syms.str(prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
+        (prog.files.len(), deps, checked)
+    });
+    let mut crate_of = vec![u32::MAX; g.crates.len()];
+    let mut reused = 0;
+    let mut why_new = Vec::new();
+    let mut errs = Vec::new();
     for &ci in order {
-        let dependency_changed = g.crates[ci].deps.iter().any(|(d, _)| batch_of[*d] != usize::MAX);
-        if let Some(k) = lookup_loaded(idents[ci]).filter(|k| !dependency_changed && !changed.contains(k)) {
-            crate_of[ci] = k;
-            reused += 1;
-            continue;
-        }
-        let c = &g.crates[ci];
-        why_new.push(namesake_diff(c, &cfgs[ci]).unwrap_or_else(|| c.name.clone()));
-        let mut deps = std_deps.clone();
-        for (d, ext) in &c.deps {
-            if crate_of[*d] != u32::MAX {
-                deps.push((ext.clone(), Dep::Existing(crate_of[*d])));
-            } else if batch_of[*d] != usize::MAX {
-                deps.push((ext.clone(), Dep::New(batch_of[*d])));
+        #[cfg(test)]
+        load_step_gate::before_step(reused + why_new.len());
+        call(Program, || {
+            #[cfg(test)]
+            load_step_gate::STEPS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if cancelled(id) { return Err(vec!["domain compilation cancelled".to_string()]); }
+            let now = epochs();
+            if now != checked {
+                reread_loaded(up, idents, &mut changed);
+                checked = now;
             }
-        }
-        batch_of[ci] = batch.len();
-        batch_ci.push(ci);
-        batch.push(NewCrate { name: c.name.clone(), path: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps, proc_macro: c.proc_macro });
-        // (env!() looks a crate up by name: a second crate of a name replaces the first one's
-        // environment, which differs here by definition of a new identity)
-        crate::crates::set_crate_env(&c.name, g.env[ci].clone());
+
+            let c = &g.crates[ci];
+            let graph_deps = c.deps.iter().filter(|(d, _)| crate_of[*d] != u32::MAX);
+            if let Some(k) = lookup_loaded(idents[ci]) {
+                // A concurrent loader may have published either this crate or its dependencies.
+                // The identity names the package graph; the indices name the actual revisions:
+                // the record is reused when it was built against every crate this load selected
+                // for its dependencies. Its list holds more than those (the std crates, and an
+                // entry per `extern crate .. as ..` alias, ahead of them), so membership, not
+                // position, decides.
+                let prog = &(*up).prog;
+                let deps = &prog.crates[k as usize].deps;
+                let dependency_changed = graph_deps.clone().any(|(d, _)| !deps.iter().any(|&(_, dep)| dep == crate_of[*d]));
+                if !dependency_changed && !changed.contains(&k) {
+                    crate_of[ci] = k;
+                    reused += 1;
+                    return Ok(());
+                }
+            }
+
+            if why_new.is_empty() { compile_phase(id, "load").map_err(|e| vec![e])?; }
+            why_new.push(namesake_diff(c, &cfgs[ci]).unwrap_or_else(|| c.name.clone()));
+            let mut deps = std_deps.clone();
+            deps.extend(graph_deps.map(|(d, ext)| (ext.clone(), Dep::Existing(crate_of[*d]))));
+            let nc = NewCrate { name: c.name.clone(), path: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps, proc_macro: c.proc_macro };
+            crate::crates::set_crate_env(&c.name, g.env[ci].clone());
+            let added = crate::modules::add_crates(up, &[nc], true, Some(id))?;
+            // Even when stop arrived during collection, publish the completed crate.
+            crate_of[ci] = added.crates[0];
+            {
+                let _fw = crate::jit::front_write();
+                record_loaded(idents[ci], added.crates[0], c, &cfgs[ci]);
+                (*up).bind_added_provided(&added.crates);
+            }
+            errs.extend(added.errs);
+            Ok(())
+        })?;
     }
-    let first_file = u.prog.files.len();
-    if !batch.is_empty() {
-        compile_phase(id, "load").map_err(|e| vec![e])?;
-        let added = crate::modules::add_crates(up, &batch, true, Some(id))?;
-        // Loaded crates remain reusable even when stop arrived during collection.
-        // As for a boot: unresolved imports and signature errors are reported, the load goes on
-        // (only a crate that does not parse is refused).
-        if !added.errs.is_empty() {
-            if crate::run_state::observed() {
-                for e in &added.errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
-            }
-            let max: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-            eprintln!("relax domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
-            for e in added.errs.iter().take(max) {
-                eprintln!("  {}", e);
-            }
+    // As for boot, unresolved imports and signature errors are reported and the load goes on.
+    if !errs.is_empty() {
+        if crate::run_state::observed() {
+            for e in &errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
         }
-        for (b, &ci) in batch_ci.iter().enumerate() {
-            crate_of[ci] = added.crates[b];
-            record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
-        }
-        // provided crates (rustc-built into the loader) that only this app brings, like the
-        // compute crate for an app, bind their ops now, as the booted program's do
-        { let _fw = crate::jit::front_write(); u.bind_added_provided(&added.crates); }
+        let max: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        eprintln!("relax domain: {} diagnostics in the loaded crates (first {}):", errs.len(), max.min(errs.len()));
+        for e in errs.iter().take(max) { eprintln!("  {}", e); }
     }
     if cancelled(id) { return Err(vec!["domain compilation cancelled".into()]); }
     let root = crate_of[g.root];
