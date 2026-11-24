@@ -26286,6 +26286,7 @@ pub extern "C" fn relax_first_present() {
         crate::domain::first_present();
         if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
             FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+            queue::mark_present();
             crate::first_frame::presented();
             if EXEC_CHECK.load(Ordering::Relaxed) {
                 exec_check_now("first frame");

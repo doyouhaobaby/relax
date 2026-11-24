@@ -4719,6 +4719,7 @@ fn finish_run(why: &'static str, code: Option<i32>) {
     jit::exec_check();
     let Some(exit) = EXIT_SUMMARY.get() else { crate::borrowck::lazy::stop(); return };
     if DONE.swap(true, Ordering::AcqRel) { crate::borrowck::lazy::stop(); return; }
+    verbose!("{}", jit::Stats::drains_line());
     // ending on the owner thread itself (an initializer's process::exit): it cannot serve the
     // exit worker while it waits for it
     EXIT_CALLER_HOLDS.store(crate::owner::is_owner(), Ordering::SeqCst);

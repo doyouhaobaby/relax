@@ -678,6 +678,8 @@ impl Budget {
     /// A run of the app ended in place (`makepad run`): the threads of the app's and the JIT's rows
     /// are gone and never release them. The HAL's stay, its threads with them.
     fn end_run(&self) {
+        for count in CLASS_REFUSALS.iter().flatten() { count.store(0, Relaxed); }
+        REFUSALS_MARKED.store(false, Relaxed);
         let mut s = self.lock();
         let now = self.now();
         for i in 0..s.slots.len() {
@@ -1514,6 +1516,13 @@ fn background_class() -> u8 {
 #[cfg(not(target_os = "macos"))]
 fn background_class() -> u8 { BACKGROUND }
 
+static CLASS_REFUSALS: [[AtomicU64; 7]; 2] = [const { [const { AtomicU64::new(0) }; 7] }; 2];
+static REFUSALS_MARKED: AtomicBool = AtomicBool::new(false);
+/// Split this run's refused OS class changes at the calling event.
+pub fn mark_class_refusals() { REFUSALS_MARKED.store(true, Relaxed); }
+/// Counts by requested OS class, before and after the mark. Without a mark all are before.
+pub fn class_refusals() -> [[u64; 7]; 2] { CLASS_REFUSALS.each_ref().map(|row| row.each_ref().map(|n| n.load(Relaxed))) }
+
 fn apply_thread_class(class: u8) -> bool {
     THREAD_CLASS.with(|current| {
         // Background work on a thread at the idle policy: it stays there, below Background (a
@@ -1522,6 +1531,7 @@ fn apply_thread_class(class: u8) -> bool {
         let class = if class == BACKGROUND { background_class() } else { class };
         if current.get() == Some(class) { return true; }
         let applied = os_class(class);
+        if !applied { CLASS_REFUSALS[REFUSALS_MARKED.load(Relaxed) as usize][class as usize].fetch_add(1, Relaxed); }
         // A failed call may have partially changed the OS state.
         current.set(if applied { Some(class) } else { None });
         // the tier-ups that hold a performance core: counted while this thread's class is theirs

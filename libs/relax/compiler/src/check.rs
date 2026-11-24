@@ -1080,10 +1080,12 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
         out: relax_session::sync::Mutex::new(Vec::with_capacity(n)), done: (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new()),
     });
     jit::queue_check(&batch, jobs);
+    if !ctx.strict { coordinator().active(false); }
     {
         let mut g = batch.done.0.lock().unwrap_or_else(|e| e.into_inner());
         while batch.left.load(Ordering::Acquire) != 0 { g = batch.done.1.wait(g).unwrap_or_else(|e| e.into_inner()); }
     }
+    if !ctx.strict { coordinator().active(true); }
     let mut out = std::mem::take(&mut *batch.out.lock().unwrap_or_else(|e| e.into_inner()));
     out.sort_unstable_by_key(|(i, _)| *i);
     out.into_iter().map(|(_, r)| r).collect()
@@ -1283,7 +1285,27 @@ pub(crate) fn finish_app_check(code: i32) -> i32 {
 /// errors.
 static BESIDE: (relax_session::sync::Mutex<u8>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new());
 static APP_CHECK_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[derive(Clone, Copy)]
+struct Coordinator { tid: u64, final_cpu: Option<u64>, busy: u64, since: Option<u64> }
+const NEW_COORDINATOR: Coordinator = Coordinator { tid: 0, final_cpu: Some(0), busy: 0, since: None };
+static COORDINATOR: relax_session::sync::Mutex<Coordinator> = relax_session::sync::Mutex::new(NEW_COORDINATOR);
+fn coordinator() -> relax_session::sync::MutexGuard<'static, Coordinator> { COORDINATOR.lock().unwrap_or_else(|e| e.into_inner()) }
+impl Coordinator {
+    fn wall(&self) -> u64 { self.busy + self.since.map_or(0, |t| jit::wall_ns() - t) }
+    fn active(&mut self, on: bool) { self.busy = self.wall(); self.since = on.then(jit::wall_ns); }
+    fn cpu(&self) -> Option<u64> {
+        if self.tid == 0 { return self.final_cpu; }
+        #[cfg(unix)]
+        if self.tid == crate::inspect::threads::self_os_id() { return Some(relax_session::clock::cpu_ns()); }
+        let mut ns = None;
+        crate::inspect::threads::each_thread(|id, _, cpu| if id == self.tid { ns = cpu() });
+        ns
+    }
+}
 fn app_check_done(verdict: u8) {
+    let clock = *coordinator();
+    let cpu = clock.cpu();
+    { let mut c = coordinator(); c.active(false); c.final_cpu = cpu; c.tid = 0; }
     *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = verdict;
     BESIDE.1.notify_all();
 }
@@ -1306,6 +1328,9 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
         let _thread = CheckThread;
         {
             let _state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = coordinator();
+            c.tid = crate::inspect::threads::self_os_id();
+            c.active(true);
             APP_CHECK_THREAD.store(crate::waits::me(), Relaxed);
             // An exit already waiting can now name the check thread.
             BESIDE.1.notify_all();
@@ -1375,6 +1400,9 @@ fn wait_app_check() -> bool {
     let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     if state != 1 { return state == 3; }
 
+    let (t0, cpu0) = (std::time::Instant::now(), APP_CHECK_CPU.load(Relaxed));
+    let clock = *coordinator();
+    let (coord_wall, coord_cpu) = (clock.wall(), clock.cpu());
     waited();
     let _ui = crate::preempt::UiWaits::new();
     let _held = jit::MainHeld::new();
@@ -1387,7 +1415,20 @@ fn wait_app_check() -> bool {
     }
     CHECK_WAITED_AT.store(0, Release);
     CHECK_WAITED.store(false, Release);
-    *state == 3
+    let failed = *state == 3;
+    drop(state);
+    // what the exit waited and what the check got meanwhile: on a loaded Linux box a waited
+    // check's slices on a worker that ran Background work cannot be raised to the waiter's class
+    // (no CAP_SYS_NICE): counted here
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let c = *coordinator();
+    let cpu = c.final_cpu.zip(coord_cpu).map_or_else(|| "-".into(), |(end, start)| format!("{:.0}", ms(end.saturating_sub(start))));
+    let busy = ms(c.wall().saturating_sub(coord_wall));
+    eprintln!("relax: the run's end waited {:.0} ms for the app check; its checks {:.0} ms cpu meanwhile (at most {} jobs at once, \
+        CPU limit {}; {} slices raised to the waiter's class at the OS, {} refused; its slices waited {:.0} ms for a worker; run-app-check {cpu} ms cpu, {busy:.0} ms busy wall)",
+        t0.elapsed().as_secs_f64() * 1e3, ms(APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0)), CHECK_SLICES[1].load(Relaxed),
+        makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed), ms(CHECK_SLICES[4].load(Relaxed)));
+    failed
 }
 
 /// The last run_check_crates: crates checked, their body owners, wall ns, of it the stored verdicts'
@@ -3069,6 +3110,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&CHECK_WAITED_AT, std::sync::atomic::AtomicU64::new(0));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
     reset(&APP_CHECK_THREAD, std::sync::atomic::AtomicU64::new(0));
+    reset(&COORDINATOR, relax_session::sync::Mutex::new(NEW_COORDINATOR));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 8]);
     reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
     reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);

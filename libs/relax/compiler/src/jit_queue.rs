@@ -569,7 +569,42 @@ static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = re
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
 /// `idle`: the worker runs at the OS's idle policy (idle_tiers): it takes tier-ups only.
-struct Sleeper { thread: OnceLock<budget::Wake>, waiting: AtomicBool, idle: AtomicBool }
+#[derive(Default)]
+struct Sleeper {
+    thread: OnceLock<budget::Wake>, waiting: AtomicBool, idle: AtomicBool,
+    os_id: AtomicU64, jobs: [AtomicU64; 3], present_nice: OnceLock<Option<i32>>,
+}
+impl Sleeper {
+    fn nice(&self) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        if let tid @ 1.. = self.os_id.load(Ordering::Relaxed) {
+            extern "C" { fn getpriority(which: i32, who: u32) -> i32; }
+            let _errno = os::proc::KeepLastError::new();
+            os::proc::set_last_error(0);
+            let nice = unsafe { getpriority(0, tid as u32) };
+            return (nice != -1 || os::proc::last_error() == 0).then_some(nice);
+        }
+        None
+    }
+}
+pub(super) fn mark_present() {
+    budget::mark_class_refusals();
+    if crate::run::VERBOSE.load(Ordering::Relaxed) {
+        for w in THREADS.get().into_iter().flatten() { let _ = w.present_nice.set(w.nice()); }
+    }
+}
+impl super::Stats {
+    pub(crate) fn drains_line() -> String {
+        let threads = THREADS.get().map_or(&[][..], Vec::as_slice);
+        let show = |n: Option<i32>| n.map_or_else(|| "-".into(), |n| n.to_string());
+        let rows: Vec<_> = threads.iter().take(DRAINS.count.load(Ordering::Relaxed)).enumerate().map(|(i, w)| {
+            let [a, v, b] = w.jobs.each_ref().map(|n| n.load(Ordering::Relaxed));
+            format!("#{i} nice {} {a}/{v}/{b} jobs (first present {})", show(w.nice()), show(w.present_nice.get().copied().flatten()))
+        }).collect();
+        let [before, after] = budget::class_refusals();
+        format!("relax: {} drains, {} slots (I/V/B): {}; OS class refusals before first present {before:?}, after {after:?}", DRAINS.count.load(Ordering::Relaxed), threads.len(), rows.join(", "))
+    }
+}
 /// While a real-time thread is live (jit::rt_live; Linux and Android, whose kernels have an idle
 /// policy) the tier-ups run on workers at the idle policy, below every other thread of the machine:
 /// a real-time thread sharing a core with one gets it back at once (6 copies of the rt_lock case on
@@ -704,7 +739,7 @@ pub(super) fn start() {
     let want = budget::cores() as usize;
     let init = || {
         crate::pool::thread_start(ensure_altstack);
-        THREADS.get_or_init(|| (0..want).map(|_| Sleeper { thread: OnceLock::new(), waiting: AtomicBool::new(false), idle: AtomicBool::new(false) }).collect());
+        THREADS.get_or_init(|| (0..want).map(|_| Sleeper::default()).collect());
     };
     match DRAINS.start(want, init, || crate::pool::drain(&SOURCE)) {
         Ok(Started::Already | Started::All) => {}
@@ -1091,6 +1126,7 @@ impl Source for CompilerSource {
 }
 fn worker_loop(index: usize) {
         let worker = &THREADS.get().unwrap()[index];
+        worker.os_id.store(crate::inspect::threads::self_os_id(), Ordering::Relaxed);
         worker.thread.set(budget::Wake::current()).ok();
         let mut admission = budget::Admission::default();
         // the job this worker ran last, (serial, tier): it leaves `running` under the lock that
@@ -1188,6 +1224,7 @@ fn worker_loop(index: usize) {
             };
             match next {
                 Ok((entry, permit, more, go_idle, work)) => {
+                    worker.jobs[entry.class as usize].fetch_add(1, Ordering::Relaxed);
                     worker.waiting.store(false, Ordering::SeqCst);
                     crate::lifeline::beat();
                     if go_idle {
