@@ -2143,6 +2143,55 @@ fn fixture(p: *mut u64) {
 }
 "#;
 
+/// A handle the program closes through its copy (DuplicateHandle with DUPLICATE_CLOSE_SOURCE) is
+/// no longer the run's: the run's end closes nothing under its number. Its record stayed, and the
+/// end closed whatever had that number by then, a handle of the process's or of another run's.
+#[cfg(windows)]
+#[test]
+fn a_handle_closed_through_its_copy_is_not_given_back() {
+    isolated_test!(a_handle_closed_through_its_copy_is_not_given_back);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(CLOSED_THROUGH_ITS_COPY, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files, 0, "the run's end closed a handle the program had closed: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+const CLOSED_THROUGH_ITS_COPY: &str = r#"
+use std::os::windows::io::IntoRawHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn DuplicateHandle(sp: isize, s: isize, tp: isize, t: *mut isize, access: u32, inherit: i32, options: u32) -> i32;
+    fn CloseHandle(h: isize) -> i32;
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap().into_raw_handle() as isize;
+    let me = unsafe { GetCurrentProcess() };
+    let mut copy = 0;
+    // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS: the copy, and the file's first handle closed
+    assert!(unsafe { DuplicateHandle(me, file, me, &mut copy, 0, 0, 1 | 2) } != 0);
+    assert!(unsafe { CloseHandle(copy) } != 0);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" { fn strlen(s: *const u8) -> usize; }

@@ -746,6 +746,7 @@ mod windows {
 
     const INVALID: HANDLE = -1;
     const WAIT_OBJECT_0: u32 = 0;
+    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
     const DUPLICATE_SAME_ACCESS: u32 = 2;
     const DETACHED_PROCESS: u32 = 0x8;
     const MEM_RESERVE: u32 = 0x2000;
@@ -850,18 +851,44 @@ mod windows {
         note_handle(unsafe { os::OpenThread(access, inherit, id) })
     }
     extern "system" fn duplicate_handle(sp: HANDLE, s: HANDLE, tp: HANDLE, t: *mut HANDLE, access: u32, inherit: i32, options: u32) -> i32 {
-        let ok = unsafe { os::DuplicateHandle(sp, s, tp, t, access, inherit, options) };
         let me = unsafe { os::GetCurrentProcess() };
+        // DUPLICATE_CLOSE_SOURCE closes the source, whether or not the copy is made: its record
+        // goes first, as in close_handle (once it is closed, another thread can get its number,
+        // and the run's end would close whatever has that number then).
+        let close = sp == me && options & DUPLICATE_CLOSE_SOURCE != 0;
+        // (a copy of a handle to a recorded child is one too)
+        let child = if sp != me {
+            None
+        } else {
+            with_table(|table| {
+                let i = table.iter().rposition(|o| matches!(o.res, Res::Handle(x) | Res::ChildHandle { h: x, .. } if x == s))?;
+                let child = match table[i].res {
+                    Res::ChildHandle { pid, .. } => Some(pid),
+                    _ => None,
+                };
+                if close {
+                    table.swap_remove(i);
+                }
+                child
+            })
+        };
+        let ok = unsafe { os::DuplicateHandle(sp, s, tp, t, access, inherit, options) };
+        let mut copied = false;
         if ok != 0 && !t.is_null() && tp == me {
             let h = unsafe { *t };
-            // (a copy of a handle to a recorded child is one too)
-            let child = if sp == me { with_table(|t| t.iter().find_map(|o| match o.res { Res::ChildHandle { h: x, pid } if x == s => Some(pid), _ => None })) } else { None };
             match child {
-                Some(pid) if h != 0 => note(Res::ChildHandle { h, pid }),
+                Some(pid) if h != 0 => {
+                    note(Res::ChildHandle { h, pid });
+                    copied = true;
+                }
                 _ => {
                     note_handle(h);
                 }
             }
+        }
+        // (the program's handle to a child closed and no copy of it here: as in close_handle)
+        if let (true, Some(pid), false) = (close, child, copied) {
+            forget_ended_children(Some(pid));
         }
         ok
     }
