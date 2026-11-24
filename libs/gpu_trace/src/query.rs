@@ -1044,7 +1044,15 @@ fn ablate(rec: &Recording) -> Answer {
             let f = &rec.frames[st.idx];
             let near: Vec<&Stat> = an.stats[i.saturating_sub(6)..(i + 7).min(an.stats.len())].iter().filter(|s| !rec.frames[s.idx].special()).collect();
             busy_n.extend(near.iter().map(|s| s.busy));
+            // A name a frame gives several passes (one per bloom level, one per shadow face) is
+            // one time on both sides: the sum of those passes.
+            let owned = |s: &Stat, name: u32| -> u64 {
+                rec.frames[s.idx].passes.iter().enumerate().filter(|(_, q)| q.name == name).map(|(k, _)| s.owned[k]).sum()
+            };
             for (pi, p) in f.passes.iter().enumerate() {
+                if f.passes[..pi].iter().any(|q| q.name == p.name) {
+                    continue;
+                }
                 let e = match per.iter_mut().position(|x| x.0 == p.name) {
                     Some(k) => &mut per[k],
                     None => {
@@ -1052,12 +1060,8 @@ fn ablate(rec: &Recording) -> Answer {
                         per.last_mut().unwrap()
                     }
                 };
-                e.1.push(st.owned[pi]);
-                for n in &near {
-                    let g = &rec.frames[n.idx];
-                    let t: u64 = g.passes.iter().enumerate().filter(|(_, q)| q.name == p.name).map(|(k, _)| n.owned[k]).sum();
-                    e.2.push(t);
-                }
+                e.1.push(owned(st, p.name));
+                e.2.extend(near.iter().map(|n| owned(*n, p.name)));
             }
         }
         let med = |mut v: Vec<u64>| {
@@ -1504,9 +1508,20 @@ mod tests {
                 f.passes[1].end -= 2 * MS;
             }
         }
+        // A name repeated within a frame (one pass per bloom level), the same in every frame:
+        // no saving, on either side.
+        let bloom = rec.strings.len() as u32;
+        rec.strings.push("bloom down".into());
+        for f in rec.frames.iter_mut() {
+            let at = f.passes[1].end;
+            for (from, to) in [(0, 8), (8, 10)] {
+                f.passes.push(Pass { name: bloom, w: 960, h: 540, start: at + from * MS / 10, end: at + to * MS / 10, ..Default::default() });
+            }
+        }
         let a = run_q(&rec, "ablate");
         assert!(a.lines[0].contains("\"shader\":\"feedback#4\""), "{:?}", a.lines);
         assert!(a.lines[0].contains("\"saved_ms\":\"2.00\"") || a.lines[0].contains("\"saved_ms\":2.00"), "{:?}", a.lines);
+        assert!(!a.lines.iter().any(|l| l.contains("bloom down")), "a repeated pass is no saving: {:?}", a.lines);
         // ablation frames are not frame-time samples
         let f = run_q(&rec, "top by=pass");
         assert!(f.findings[0].starts_with("4"), "{:?}", f.findings);
