@@ -5343,9 +5343,21 @@ fn rt_compile_global(g: u64) -> u64 {
 }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAZY_COMPILE_HOOK: std::cell::Cell<Option<(u32, fn())>> = const { std::cell::Cell::new(None) };
+}
+
 /// rt_compile for the unit at `up`.
 fn rt_compile_in(up: usize, slot: u64) -> u64 {
     let _keep = os::proc::KeepLastError::new();
+    #[cfg(test)]
+    let _ = LAZY_COMPILE_HOOK.try_with(|hook| {
+        if let Some((_, capture)) = hook.get().filter(|(id, _)| u64::from(*id) == slot) {
+            hook.set(None);
+            capture();
+        }
+    });
     // JIT code made a lazy call inside a compile with no call_jit_in between: only an interruption
     // (a signal handler the trampoline did not run) gets there, and it would wait for itself
     if CompileInnermost::get() {

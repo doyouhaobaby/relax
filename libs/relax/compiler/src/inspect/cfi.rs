@@ -530,6 +530,27 @@ fn call_reaches(ret: u64, lo: u64, hi: u64, read: &dyn Fn(u64) -> Option<u64>) -
             Some(t) => t,
             None => return false,
         }
+    } else if b[6] == 0xff && (0xd0..=0xd7).contains(&b[7]) {
+        let extended = b[5] == 0x41;
+        let call = ret.wrapping_sub(if extended { 3 } else { 2 });
+        let rex = if extended { 0x4c } else { 0x48 };
+        let modrm = ((b[7] & 7) << 3) | 5;
+        // 32 bytes leaves room around the observed 13-byte sequence for argument setup.
+        // A pattern inside another instruction is accepted only if its target names this very function.
+        let load = (7..=32).find_map(|back| {
+            let at = call.wrapping_sub(back);
+            let w = read(at)?.to_le_bytes();
+            if w[0] != rex || !matches!(w[1], 0x8b | 0x8d) || w[2] != modrm {
+                return None;
+            }
+            let disp = i32::from_le_bytes([w[3], w[4], w[5], w[6]]);
+            Some((w[1], at.wrapping_add(7).wrapping_add_signed(i64::from(disp))))
+        });
+        match load {
+            Some((0x8b, slot)) => match read(slot) { Some(t) => t, None => return false },
+            Some((_, addr)) => addr,
+            None => return false,
+        }
     } else {
         return false;
     };
@@ -772,11 +793,26 @@ mod frame_of_its_call_tests {
         code.extend_from_slice(&0x40i32.to_le_bytes());
         let read = memory(&[stack(&[0xa000, ret, 0]), (ret - 8, code), (ret + 0x40, 0x5030u64.to_le_bytes().to_vec())]);
         assert_eq!(rbp_of_its_call(FUNC.0, FUNC.1, SP, 8, &read), Some(SP));
+
+        let mut code = vec![0x48, 0x8b, 0x05, 0x39, 0, 0, 0]; // mov rax, [rip + 0x39] (slot at +0x40)
+        code.extend_from_slice(&[0x89, 0xdf, 0x89, 0xde, 0xff, 0xd0]); // mov edi, ebx; mov esi, ebx; call rax
+        let rax_ret = ret + code.len() as u64;
+        code.extend_from_slice(&[0x4c, 0x8d, 0x1d]); // lea r11, [rip + disp]
+        let lea_end = ret + code.len() as u64 + 4;
+        code.extend_from_slice(&(FUNC.0.wrapping_sub(lea_end) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xff, 0xd3]);
+        let r11_ret = ret + code.len() as u64;
+        code.extend_from_slice(&[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xff, 0xd0]); // lea rax, [rip]; call rax
+        let other_ret = ret + code.len() as u64;
+        let read = memory(&[(ret, code), (ret + 0x40, FUNC.0.to_le_bytes().to_vec())]);
+        assert!(call_reaches(rax_ret, FUNC.0, FUNC.1, &read), "mov from slot into rax across two instructions");
+        assert!(call_reaches(r11_ret, FUNC.0, FUNC.1, &read), "lea into r11 with a backward displacement");
+        assert!(!call_reaches(other_ret, FUNC.0, FUNC.1, &read), "the nearer load into rax names another function");
     }
 
     #[test]
     fn nothing_proven_is_not_a_frame_pointer() {
-        // a call through a register says nothing of where it went, and words that are no code
+        // a call through a register with no known target, and words that are no code
         let ret = 0x7000u64;
         let read = memory(&[stack(&[0xa000, ret, 5, 6]), (ret - 8, vec![0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xff, 0xd0])]);
         assert_eq!(rbp_of_its_call(FUNC.0, FUNC.1, SP, 8, &read), None);

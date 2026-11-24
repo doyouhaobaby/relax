@@ -1659,6 +1659,109 @@ mod tests {
     }
 }
 
+#[cfg(all(test, any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+mod lazy_compile_tests {
+    use super::{capture, capture_self, list, self_os_id, Raw};
+    use crate::jit::{call_jit, FnKey, Unit, LAZY_COMPILE_HOOK};
+    use crate::owner::{self, Class};
+    use crate::program::{DefId, Program};
+    use std::sync::{Arc, OnceLock};
+
+    static OWN: OnceLock<Vec<u64>> = OnceLock::new();
+    static WAITING: OnceLock<Result<Raw, &'static str>> = OnceLock::new();
+
+    // When the test harness itself runs under Relax, its rt_compile belongs to the outer JIT.
+    #[cfg(relax)]
+    fn name_hosted_frames(frames: &mut [crate::inspect::Frame]) {
+        extern "C" {
+            fn relax_backtrace_resolve(pcs: *const u64, n: usize, out: *mut u8, cap: usize) -> usize;
+        }
+        let pcs: Vec<_> = frames.iter().map(|f| f.pc).collect();
+        let resolve = |buf: &mut [u8]| unsafe { relax_backtrace_resolve(pcs.as_ptr(), pcs.len(), buf.as_mut_ptr(), buf.len()) };
+        let mut buf = vec![0; pcs.len() * 128];
+        let symbols = loop {
+            let n = resolve(&mut buf);
+            if n <= buf.len() { break std::str::from_utf8(&buf[..n]).unwrap(); }
+            buf.resize(n, 0);
+        };
+        for line in symbols.lines() {
+            let mut fields = line.split('\t');
+            let frame = &mut frames[fields.next().unwrap().parse::<usize>().unwrap()];
+            if frame.module == "?" { frame.name = fields.next().unwrap().to_owned(); }
+        }
+    }
+
+    fn inside_lazy_compile() {
+        let mut pcs = Vec::new();
+        capture_self(&mut pcs);
+        OWN.set(pcs).unwrap();
+        let (tid, handle) = (self_os_id(), crate::waits::me());
+        // Queue the capture ahead of the compile's next Program request. The owner keeps
+        // that request pending until it has captured the parked caller.
+        owner::post(Class::Program, move || {
+            let start = std::time::Instant::now();
+            let result = loop {
+                if crate::waits::of(handle).is_some_and(|w| w.kind == crate::waits::Kind::Owner && w.object == Class::Program as u64) {
+                    if let Some(thread) = list().into_iter().find(|t| t.os_id == tid && t.state == "waiting") {
+                        let mut raw = Raw::new();
+                        break capture(&thread, &mut raw).map(|()| raw);
+                    }
+                }
+                if start.elapsed().as_secs() >= 5 {
+                    break Err("the lazy compile did not park on its owner request");
+                }
+                std::thread::yield_now();
+            };
+            let _ = WAITING.set(result);
+        });
+    }
+
+    #[test]
+    fn lazy_compile_stack_reaches_app_caller() {
+        isolated_test!(lazy_compile_stack_reaches_app_caller);
+        crate::borrowck::lazy::disable_gandalf();
+        let path = std::env::temp_dir().join(format!("relax-lazy-stack-{}.rs", std::process::id()));
+        std::fs::write(&path, "#![no_std]\n#[inline(never)] fn cold(x: u64) -> u64 { x ^ 7 }\npub fn app_caller(out: &mut u64) { *out = cold(*out) ^ 1; }").unwrap();
+        let session = Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate("stack_test", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let (entry, cold) = owner::call(Class::Program, || {
+            let slot = |name| {
+                let def = (0..u.prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| u.prog.name(d) == name).unwrap();
+                u.fn_id(FnKey::Inst(def, vec![]))
+            };
+            (u.entry(slot("app_caller")), slot("cold"))
+        });
+        LAZY_COMPILE_HOOK.set(Some((cold, inside_lazy_compile)));
+        let mut value = 11u64;
+        let result = unsafe { call_jit(&mut *u, entry, &mut value as *mut u64 as u64) }.map_err(|p| p.message);
+        std::fs::remove_file(path).unwrap();
+        result.unwrap();
+        assert_eq!(value, 13);
+
+        let own = OWN.get().expect("the first call of cold entered rt_compile");
+        let waiting = WAITING.get().expect("the owner sampled the requester").as_ref().unwrap();
+        let mut partial = Vec::new();
+        let mut stacks = crate::inspect::symbolise(&[own.clone(), waiting.frames().to_vec()], &mut partial);
+        let mut reached = Vec::new();
+        for (label, frames) in ["self", "owner wait"].into_iter().zip(&mut stacks) {
+            #[cfg(relax)]
+            name_hosted_frames(frames);
+            eprintln!("{label} stack:");
+            for f in frames.iter() {
+                eprintln!("  {:#x} {}", f.pc, f.name);
+            }
+            let compile = frames.iter().position(|f| f.name.ends_with("::rt_compile"));
+            let app = frames.iter().position(|f| f.name == "stack_test::app_caller");
+            reached.push(compile.is_some() && app > compile);
+        }
+        assert_eq!(reached, [true, true], "app_caller below rt_compile (self, owner wait); wait stop {:?}, {partial:?}", waiting.stop);
+    }
+}
+
 /// A program thread's walk crosses the program stack's switch (relax_base::stack): a thread
 /// parked on a program stack shows the function that switched to it, which runs on the thread's
 /// own stack. Host frames only (no JIT here): the module's unwind tables, both sides. So only in a
