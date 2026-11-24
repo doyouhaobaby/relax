@@ -1189,8 +1189,7 @@ const TLS_CAP: usize = 1 << 20;
 const TLS_COVERAGE_DISABLED: u32 = 16;
 const TLS_FIRST_FREE: u32 = 32;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
-/// Bytes of a thread-local block any unit placed variables in (`Unit::tls_alloc`; the most of
-/// every unit's): no thread writes a block beyond it.
+/// Bytes of a thread-local block reserved by `tls_block_alloc`: no thread writes a block beyond it.
 static TLS_USED: AtomicU32 = AtomicU32::new(TLS_FIRST_FREE);
 /// The next free byte of every thread's block, for every unit of the run: one block per thread
 /// holds the variables of all of them (the program's, a macro world's), so no two share bytes. Each
@@ -1213,6 +1212,53 @@ fn tls_block_done(p: u64) {
     unsafe { std::ptr::write_bytes(p as *mut u8, 0, TLS_USED.load(Ordering::Acquire) as usize) };
     if let Some(p) = SPARE_TLS_BLOCKS.keep(p) {
         os::mem::free(p, TLS_CAP);
+    }
+}
+
+/// Reserves `size` bytes of every thread's thread-local block, bytes no other variable has
+/// (TLS_NEXT, TLS_USED); returns their offset.
+fn tls_block_alloc(size: u32, align: u32) -> u32 {
+    let a = align.max(1);
+    let mut cur = TLS_NEXT.load(Ordering::Relaxed);
+    let at = loop {
+        let at = (cur + a - 1) / a * a;
+        if (at + size) as usize > TLS_CAP {
+            panic!("thread-local block full");
+        }
+        match TLS_NEXT.compare_exchange(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => break at,
+            Err(c) => cur = c,
+        }
+    };
+    TLS_USED.fetch_max(at + size, Ordering::Release);
+    at
+}
+
+/// `__relax_tls_cell` (os/tls.rs, Linux x86-64): a runtime this process runs under Relax, at
+/// any depth, keeps its thread's block pointer in a word of the outermost runtime's (this
+/// native one's) thread-local block, which the JIT code it compiles reads with two loads
+/// (relax_backend x64::TLS_TWO_LOAD). `key` 0: a new word, returned as its key (os::tls::cell_key);
+/// else the address of word `key` on the calling thread (its block made when it has none). A
+/// runtime itself under Relax forwards both to the runtime that runs it. 0 off Linux x86-64.
+pub extern "C" fn relax_tls_cell(key: u64) -> u64 {
+    #[cfg(relax)]
+    {
+        extern "C" {
+            fn __relax_tls_cell(key: u64) -> u64;
+        }
+        unsafe { __relax_tls_cell(key) }
+    }
+    #[cfg(all(not(relax), target_os = "linux", target_arch = "x86_64"))]
+    {
+        if key == 0 {
+            return os::tls::cell_key(tls_block_alloc(8, 8));
+        }
+        tls_block() + key as u32 as u64
+    }
+    #[cfg(all(not(relax), not(all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        let _ = key;
+        0
     }
 }
 
@@ -1858,7 +1904,9 @@ fn rt_tls_block() -> u64 {
     window_tls_block();
     let b = os::tls::get(tls_key());
     if !b.is_null() {
-        TLS_BLOCK_COPY.with(|c| c.set(b as u64));
+        // Under Relax a callback scope or a new outer block can leave the word JIT code reads
+        // empty while the key still has the block. Publish it again or every access takes this path.
+        set_tls_block(b);
         return b as u64;
     }
     // the wasm32 program's thread-local blocks are in its window (`&THREAD_LOCAL` is an offset)
@@ -7215,20 +7263,8 @@ impl Unit {
     /// first use), bytes no other unit's variable has (TLS_NEXT); returns the offset for
     /// `Inst::TlsAddr`.
     pub fn tls_alloc(&mut self, size: u32, align: u32) -> u32 {
-        let a = align.max(1);
-        let mut cur = TLS_NEXT.load(Ordering::Relaxed);
-        let at = loop {
-            let at = (cur + a - 1) / a * a;
-            if (at + size) as usize > TLS_CAP {
-                panic!("thread-local block full");
-            }
-            match TLS_NEXT.compare_exchange(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => break at,
-                Err(c) => cur = c,
-            }
-        };
+        let at = tls_block_alloc(size, align);
         self.tls_next = self.tls_next.max(at + size);
-        TLS_USED.fetch_max(at + size, Ordering::Release);
         at
     }
 
@@ -28451,7 +28487,8 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_test_inherit" => Some(crate::harness::reach::inherit as *const () as usize),
         b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
         b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),
-        b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
+        // a runtime under Relax keeps its block pointer in a word of the outermost runtime's block
+        b"__relax_tls_cell" => Some(relax_tls_cell as *const () as usize),
         b"__relax_host_jit_code" => Some(relax_host_jit_code as *const () as usize),
         b"__relax_host_switch_return_pc" => Some(relax_host_switch_return_pc as *const () as usize),
         // a loader run as the program: the run's parent this runner took (restart_parent.rs)

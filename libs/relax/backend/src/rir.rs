@@ -857,7 +857,7 @@ pub enum Reloc {
     /// code (a direct branch the runtime keeps in step with the table word)
     Call(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
-    /// x64 Windows: `x64::win_tls_key`)
+    /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`)
     TlsKey,
     /// `Env::tls_slow`
     TlsSlow,
