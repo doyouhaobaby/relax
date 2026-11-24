@@ -28106,6 +28106,7 @@ fn job_gate() -> JobGuard {
         // escape here turned a slow machine into a crash). The thread that began the swap
         // passes above (a callback into its own swap code), so the swap can finish. The loop
         // counts the job again and re-checks: a pause that began meanwhile holds it too.
+        let _w = crate::waits::begin(crate::waits::Kind::Futex, &BG_CV as *const _ as u64, 0, "job gate");
         let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
         while BG_PAUSE.load(Ordering::SeqCst) {
             g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
@@ -30681,6 +30682,9 @@ pub fn front_read(site: &'static str) -> FrontRead {
         Err(std::sync::TryLockError::WouldBlock) => {
             // behind a writer, the owner: what it waits for may need the token
             let _budget = crate::pool::suspend_program();
+            // a wait the registry names (inspect `waits`, a hitch's waits, the timeline): a UI
+            // thread's check ahead behind a graph load's or a live edit's front write
+            let _w = crate::waits::begin(crate::waits::Kind::Futex, &FRONT_RW as *const _ as u64, 0, "front read");
             FRONT_RW.read().unwrap_or_else(|e| e.into_inner())
         }
     };
