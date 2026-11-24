@@ -364,6 +364,12 @@ mod trace {
     /// the definition being checked, by which check, since when
     static NOW: relax_session::sync::Mutex<Option<(DefId, &'static str, Instant)>> = relax_session::sync::Mutex::new(None);
 
+    /// A run that ends in place leaves no definition being checked (`NOW`; `on`'s flag is the
+    /// environment's, read once: process_statics.tsv).
+    pub(super) unsafe fn reset_statics() {
+        relax_session::reset_static(&NOW, relax_session::sync::Mutex::new(None));
+    }
+
     fn resident_mb() -> u64 {
         crate::memstat::resident() >> 20
     }
@@ -842,6 +848,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&STATS, [const { AtomicU64::new(0) }; 7]);
     reset(&RUNNING, AtomicBool::new(false));
     reset(&STORED_FINDINGS, relax_session::sync::Mutex::new(Vec::new()));
+    trace::reset_statics();
 }
 
 #[cfg(test)]
