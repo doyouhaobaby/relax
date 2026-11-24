@@ -2266,6 +2266,255 @@ fn fixture(p: *mut u64) {
 }
 "#;
 
+/// A program's signal handler that opens and closes (both async-signal-safe) while the main flow
+/// holds many records, the table growing under it: its opens take the table's spare room (an
+/// insert in a handler never grows a map, which could wait on the allocator the handler
+/// interrupted), none is left out, and the run's end gives back what each side still holds.
+#[cfg(unix)]
+#[test]
+fn opens_in_a_signal_handler_are_recorded_and_given_back() {
+    isolated_test!(opens_in_a_signal_handler_are_recorded_and_given_back);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(HANDLER_OPENS, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (made, left_out) = crate::domain_res::handler_records();
+    let replaced = crate::domain_res::replaced_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let (held, opens) = (flags[1].load(Ordering::SeqCst), flags[2].load(Ordering::SeqCst));
+    let (made_now, left_out_now) = crate::domain_res::handler_records();
+    assert!(held >= 100 && opens >= 50, "the main flow held {held}, the handler opened {opens}");
+    assert_eq!(made_now - made, opens, "every open in the handler was made in it (its thread marked)");
+    assert_eq!(left_out_now - left_out, 0, "an open in the handler found no spare room");
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 0, "a close in the handler was not seen");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files as u64, held + 1, "what the main flow held and the handler's last open: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+const HANDLER_OPENS: &str = r#"
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
+extern "C" {
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    fn close(fd: i32) -> i32;
+    fn signal(sig: i32, h: usize) -> usize;
+    fn raise(sig: i32) -> i32;
+    fn getrlimit(r: i32, l: *mut [u64; 2]) -> i32;
+    fn setrlimit(r: i32, l: *const [u64; 2]) -> i32;
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOFILE: i32 = 7;
+#[cfg(target_vendor = "apple")]
+const NOFILE: i32 = 8;
+/// `want` descriptors, or what the soft limit has room for (raised toward the hard one first)
+fn room(want: u64) -> u64 {
+    let mut l = [0u64; 2];
+    unsafe {
+        getrlimit(NOFILE, &mut l);
+        let up = [l[1].min(want + 256), l[1]];
+        if up[0] > l[0] { setrlimit(NOFILE, &up); }
+        getrlimit(NOFILE, &mut l);
+    }
+    want.min(l[0].saturating_sub(64))
+}
+static PATH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static LAST: AtomicI32 = AtomicI32::new(-1);
+static OPENS: AtomicU64 = AtomicU64::new(0);
+/// the program's handler: opens the file again and closes what its last run opened
+extern "C" fn on_usr1(_: i32) {
+    let fd = unsafe { open(PATH.load(Ordering::SeqCst), 0) };
+    if fd < 0 { return; }
+    OPENS.fetch_add(1, Ordering::SeqCst);
+    let last = LAST.swap(fd, Ordering::SeqCst);
+    if last >= 0 { unsafe { close(last) }; }
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(exe.as_os_str())).unwrap();
+    PATH.store(exe.into_raw() as *mut u8, Ordering::SeqCst);
+    unsafe { signal(SIGUSR1, on_usr1 as *const () as usize) };
+    let many = room(1000);
+    let mut held = Vec::new();
+    for i in 0..many {
+        let fd = unsafe { open(PATH.load(Ordering::SeqCst), 0) };
+        assert!(fd >= 0, "open {i} of {many}");
+        held.push(fd);
+        if i % 2 == 0 { unsafe { raise(SIGUSR1) }; }
+    }
+    a[1].store(held.len() as u64, Ordering::SeqCst);
+    a[2].store(OPENS.load(Ordering::SeqCst), Ordering::SeqCst);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A program's handler left by siglongjmp, once on the thread's own stack and once on an
+/// alternate stack (SA_ONSTACK, as std's own guard handler is) mapped above the thread's, where a
+/// plain stack-pointer compare would never clear the handler's mark: its open is made in a handler,
+/// and the opens after the jump are the main flow's, the mark cleared.
+#[cfg(unix)]
+#[test]
+fn a_handler_left_by_siglongjmp_leaves_its_thread_outside_handlers() {
+    isolated_test!(a_handler_left_by_siglongjmp_leaves_its_thread_outside_handlers);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(LEFT_BY_JUMP, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (made, left_out) = crate::domain_res::handler_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let (on_alt, after) = (flags[1].load(Ordering::SeqCst), flags[2].load(Ordering::SeqCst));
+    let (made_now, left_out_now) = crate::domain_res::handler_records();
+    assert_eq!(on_alt, 0b10, "the first handler ran on the thread's own stack, the second on the alternate one");
+    assert_eq!(made_now - made, 2, "each handler's own open was made in it, and none of the {after} opens after its jump");
+    assert_eq!(left_out_now - left_out, 0, "an open found no spare room");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files as u64, 2 + after, "the handlers' opens and the main flow's: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+const LEFT_BY_JUMP: &str = r#"
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering::SeqCst};
+use std::ptr::{null, null_mut};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct SigAction { handler: usize, mask: [u64; 16], flags: i32, pad: i32, restorer: usize }
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct SigAction { handler: usize, mask: u32, flags: i32 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct StackT { sp: *mut u8, flags: i32, pad: i32, size: usize }
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct StackT { sp: *mut u8, size: usize, flags: i32 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SA_ONSTACK: i32 = 0x0800_0000;
+#[cfg(target_vendor = "apple")]
+const SA_ONSTACK: i32 = 0x1;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAP_PRIVATE_ANON: i32 = 0x22;
+#[cfg(target_vendor = "apple")]
+const MAP_PRIVATE_ANON: i32 = 0x1002;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;
+const SS_ONSTACK: i32 = 1;
+const STACK: usize = 1 << 18;
+extern "C" {
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+    fn raise(sig: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    #[cfg_attr(target_os = "linux", link_name = "__sigsetjmp")]
+    fn sigsetjmp(env: *mut u8, savemask: i32) -> i32;
+    fn siglongjmp(env: *mut u8, val: i32) -> !;
+}
+#[repr(C, align(16))]
+struct Jmp([u8; 1024]);
+static mut JMP: Jmp = Jmp([0; 1024]);
+static PATH: AtomicPtr<u8> = AtomicPtr::new(null_mut());
+static PHASE: AtomicU64 = AtomicU64::new(0);
+static ON_ALT: AtomicU64 = AtomicU64::new(0);
+static OPENED: AtomicI32 = AtomicI32::new(-1);
+fn jmp() -> *mut u8 { unsafe { std::ptr::addr_of_mut!(JMP.0).cast() } }
+/// the program's handler: notes the stack it runs on, opens the file, and leaves by siglongjmp
+extern "C" fn leave(_: i32) {
+    let mut ss: StackT = unsafe { std::mem::zeroed() };
+    unsafe { sigaltstack(null(), &mut ss) };
+    if ss.flags & SS_ONSTACK != 0 { ON_ALT.fetch_or(1 << PHASE.load(SeqCst), SeqCst); }
+    OPENED.store(unsafe { open(PATH.load(SeqCst), 0) }, SeqCst);
+    unsafe { siglongjmp(jmp(), 1) }
+}
+/// raises SIGUSR1: true once its handler jumped back here
+#[inline(never)]
+fn left_by_jump() -> bool {
+    if unsafe { sigsetjmp(jmp(), 1) } != 0 { return true; }
+    unsafe { raise(SIGUSR1) };
+    false
+}
+/// a stack mapped above the calling thread's
+fn stack_above() -> *mut u8 {
+    let mark = 0u8;
+    let here = &mark as *const u8 as usize;
+    for shift in 28..40 {
+        let hint = (here + (1usize << shift)) & !(STACK - 1);
+        let p = unsafe { mmap(hint as *mut u8, STACK, 3, MAP_PRIVATE_ANON, -1, 0) };
+        if p as isize == -1 { continue; }
+        if p as usize > here { return p; }
+        unsafe { munmap(p, STACK) };
+    }
+    panic!("no stack could be mapped above the thread's");
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(exe.as_os_str())).unwrap();
+    PATH.store(exe.into_raw() as *mut u8, SeqCst);
+    let mut after = 0u64;
+    for phase in 0..2u64 {
+        PHASE.store(phase, SeqCst);
+        let mut act: SigAction = unsafe { std::mem::zeroed() };
+        act.handler = leave as *const () as usize;
+        act.flags = if phase == 1 { SA_ONSTACK } else { 0 };
+        assert_eq!(unsafe { sigaction(SIGUSR1, &act, null_mut()) }, 0, "the handler's installation");
+        let mut old: StackT = unsafe { std::mem::zeroed() };
+        let mut alt = null_mut();
+        if phase == 1 {
+            alt = stack_above();
+            let mut ss: StackT = unsafe { std::mem::zeroed() };
+            ss.sp = alt;
+            ss.size = STACK;
+            assert_eq!(unsafe { sigaltstack(&ss, &mut old) }, 0, "the alternate stack");
+        }
+        assert!(left_by_jump(), "the handler left by siglongjmp");
+        assert!(OPENED.load(SeqCst) >= 0, "the handler's open");
+        // the main flow's opens, after the jump
+        for _ in 0..4 {
+            assert!(unsafe { open(PATH.load(SeqCst), 0) } >= 0, "an open after the jump");
+            after += 1;
+        }
+        if phase == 1 {
+            assert_eq!(unsafe { sigaltstack(&old, null_mut()) }, 0, "the thread's alternate stack back");
+            unsafe { munmap(alt, STACK) };
+        }
+    }
+    a[1].store(ON_ALT.load(SeqCst), SeqCst);
+    a[2].store(after, SeqCst);
+    a[0].store(1, SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" { fn strlen(s: *const u8) -> usize; }

@@ -587,6 +587,8 @@ pub fn create(u: &Unit) -> u64 {
         let _kept = crate::zone_alloc::kept();
         BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((base, u.syms.dom0()));
     }
+    // (a program's signal handler then finds room in the resource table from its first create)
+    crate::domain_res::make_room();
     base
 }
 

@@ -87,6 +87,7 @@ static RECORD_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// run's. Each of its interposed creates and closes then keeps the table as a run's do (an insert
 /// at a create, a remove at a close); before this, the main program pays one atomic load.
 pub(crate) extern "C" fn relax_track_handles() {
+    make_room();
     RECORD_MAIN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -137,15 +138,81 @@ fn with_table<R: Default>(f: impl FnOnce(&mut Table) -> R) -> R {
 
 fn note(res: Res) {
     if let Some(domain) = owner() {
-        // An insert can grow the map, an allocation. A program's signal handler may call an
-        // interposed create (open, socket, dup, pipe, accept are async-signal-safe): one that
-        // interrupted this thread in the table finds IN_TABLE set and records nothing, so it never
-        // inserts under the lock it interrupted. One that interrupted the allocator could wait in
-        // it here, as a Vec's push could before: an open hazard, its own item.
-        if let Some(kind) = with_table(|t| t.insert(domain, res)) {
-            replaced(kind);
+        // A program's signal handler may call an interposed create (open, socket, dup, pipe,
+        // accept, fork are async-signal-safe). One that interrupted this thread in the table finds
+        // IN_TABLE set and records nothing, so it never inserts under the lock it interrupted. One
+        // that interrupted the allocator would wait in it if its insert grew a map: inside a
+        // handler an insert only takes the map's spare room, which the inserts outside handlers
+        // keep topped up (`SPARE`), and a record that finds none is left out and counted.
+        #[cfg(unix)]
+        let in_handler = crate::os::progsig::in_program_handler();
+        #[cfg(not(unix))]
+        let in_handler = false;
+        if in_handler {
+            HANDLER_RECORDS.fetch_add(1, Ordering::Relaxed);
+        }
+        match with_table(|t| t.insert(domain, res, in_handler)) {
+            Inserted::New => {}
+            Inserted::Replaced(kind) => replaced(kind),
+            Inserted::LeftOut(kind) => left_out(kind),
+            // a handler that interrupted its thread inside the table (a fork's child records
+            // nothing, by design)
+            Inserted::NotReached => {
+                if in_handler && !FORKED.load(Ordering::Relaxed) {
+                    left_out(kind_of(&res));
+                }
+            }
         }
     }
+}
+
+/// What an insert did.
+#[derive(Default)]
+enum Inserted {
+    /// (`with_table` did not reach the table)
+    #[default]
+    NotReached,
+    New,
+    /// it replaced a record under the same key (`replaced`)
+    Replaced(Kind),
+    /// a program's signal handler made it, and the map had no spare room for it (`left_out`)
+    LeftOut(Kind),
+}
+
+/// The room the inserts outside handlers keep free in each HashMap for the inserts a program's
+/// signal handler makes, which never grow a map: when an insert leaves less than this, it
+/// reserves twice this more (one rehash per this many inserts at the least, amortized as growth
+/// is). A handler that finds none leaves its record out (`left_out`): the open still succeeds.
+const SPARE: usize = 64;
+
+fn kind_of(res: &Res) -> Kind {
+    match place(res) {
+        Place::Key(kind, _) => kind,
+        Place::Child(_) => Kind::Child,
+        #[cfg(unix)]
+        Place::Map(_) => Kind::Map,
+    }
+}
+
+/// May `map` take `key` without growing (an insert of a new key with no room left grows it)?
+fn has_room<K: std::hash::Hash + Eq, V>(map: &std::collections::HashMap<K, V, Fixed>, key: &K) -> bool {
+    map.len() < map.capacity() || map.contains_key(key)
+}
+
+/// Outside handlers: keeps `SPARE` free in `map`.
+fn top_up<K: std::hash::Hash + Eq, V>(map: &mut std::collections::HashMap<K, V, Fixed>) {
+    if map.capacity() - map.len() < SPARE {
+        map.reserve(2 * SPARE);
+    }
+}
+
+/// Before a run's code starts (`domain::create`; the main program's, at `relax_track_handles`):
+/// the maps get their spare room, so a create in a handler before any create outside one finds it.
+pub(crate) fn make_room() {
+    with_table(|t| {
+        top_up(&mut t.held);
+        top_up(&mut t.children);
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -193,21 +260,45 @@ impl Table {
         }
     }
 
-    /// Records `res` for `domain`. The kind of the record it replaced under the same key, if one
-    /// was there: the system gave that number out again, so the earlier one was closed by a path
-    /// the runtime does not see.
-    fn insert(&mut self, domain: u64, res: Res) -> Option<Kind> {
-        self.seq += 1;
-        let o = Owned { domain, seq: self.seq, res };
-        match place(&res) {
-            Place::Key(kind, n) => self.held.insert((kind, n), o).map(|_| kind),
-            Place::Child(pid) => self.children.insert(pid, o).map(|_| Kind::Child),
+    /// Records `res` for `domain`. Replaced: a record was there under the same key, so the system
+    /// gave that number out again and the earlier one was closed by a path the runtime does not
+    /// see. `in_handler` (a program's signal handler made it): the insert allocates nothing, it
+    /// takes the map's spare room or is left out; a mapping always is (a BTreeMap insert may
+    /// allocate a node; mmap is not async-signal-safe).
+    fn insert(&mut self, domain: u64, res: Res, in_handler: bool) -> Inserted {
+        let o = Owned { domain, seq: self.seq + 1, res };
+        let replaced = match place(&res) {
+            Place::Key(kind, n) => {
+                if in_handler && !has_room(&self.held, &(kind, n)) {
+                    return Inserted::LeftOut(kind);
+                }
+                let old = self.held.insert((kind, n), o).map(|_| kind);
+                if !in_handler {
+                    top_up(&mut self.held);
+                }
+                old
+            }
+            Place::Child(pid) => {
+                if in_handler && !has_room(&self.children, &pid) {
+                    return Inserted::LeftOut(Kind::Child);
+                }
+                let old = self.children.insert(pid, o).map(|_| Kind::Child);
+                if !in_handler {
+                    top_up(&mut self.children);
+                }
+                old
+            }
             #[cfg(unix)]
             Place::Map(addr) => {
+                if in_handler {
+                    return Inserted::LeftOut(Kind::Map);
+                }
                 self.maps.insert(addr, o);
                 None
             }
-        }
+        };
+        self.seq += 1;
+        replaced.map_or(Inserted::New, Inserted::Replaced)
     }
 
     fn remove(&mut self, kind: Kind, n: u64) -> Option<Owned> {
@@ -253,8 +344,45 @@ fn replaced(kind: Kind) {
     let i = kind as usize;
     REPLACED[i].fetch_add(1, Ordering::Relaxed);
     if REPLACED_SAID.fetch_or(1 << i, Ordering::Relaxed) & (1 << i) == 0 {
-        eprintln!("relax: a run's {} was given out again while the runtime still recorded it: it was closed by a path the runtime does not see (counted; said once per kind)", kind.name());
+        say(&["relax: a run's ", kind.name(), " was given out again while the runtime still recorded it: it was closed by a path the runtime does not see (counted; said once per kind)\n"]);
     }
+}
+
+/// Records a program's signal handlers made that found no spare room (`SPARE`), all kinds.
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+static LEFT_OUT_SAID: AtomicU32 = AtomicU32::new(0);
+/// Records a program's signal handlers made, left out or not.
+static HANDLER_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+/// A record a program's signal handler made, left out: counted, and said once. The run's end does
+/// not give that resource back; the create itself succeeded.
+fn left_out(kind: Kind) {
+    LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+    if LEFT_OUT_SAID.swap(1, Ordering::Relaxed) == 0 {
+        say(&["relax: a program's signal handler made a ", kind.name(), " while the runs' resource table had no spare room, so it is not recorded: the run's end does not give it back (counted; said once)\n"]);
+    }
+}
+
+/// How many records a program's signal handlers made, and how many of them were left out.
+#[cfg(all(test, unix))]
+pub(crate) fn handler_records() -> (u64, u64) {
+    (HANDLER_RECORDS.load(Ordering::Relaxed), LEFT_OUT.load(Ordering::Relaxed))
+}
+
+/// A line to stderr from anywhere, a program's signal handler included: on unix written straight
+/// to fd 2 (std's stderr takes a lock and a RefCell a handler may have interrupted).
+fn say(parts: &[&str]) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+        }
+        for p in parts {
+            unsafe { write(2, p.as_ptr().cast(), p.len()) };
+        }
+    }
+    #[cfg(not(unix))]
+    eprint!("{}", parts.concat());
 }
 
 /// How many records were replaced under their key so far, all kinds.
@@ -308,6 +436,8 @@ mod unix {
         Dir,
         Key,
         Child,
+        /// (`Table::maps`, keyed by address: named here only, for what a record was)
+        Map,
     }
 
     impl Kind {
@@ -317,6 +447,7 @@ mod unix {
                 Kind::Dir => "directory stream",
                 Kind::Key => "thread-local key",
                 Kind::Child => "child process",
+                Kind::Map => "mapping",
             }
         }
     }
@@ -1364,7 +1495,7 @@ pub(crate) fn give_back_run(bases: &[u64]) -> Released {
     let left = end_children(children, &mut out);
     with_table(|t| {
         for res in left {
-            t.insert(OUTLIVED, res);
+            t.insert(OUTLIVED, res, false);
         }
     });
     out
@@ -1376,6 +1507,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&OWNED, Mutex::new(Table::new()));
     reset(&REPLACED, [const { AtomicU64::new(0) }; 8]);
     reset(&REPLACED_SAID, AtomicU32::new(0));
+    reset(&LEFT_OUT, AtomicU64::new(0));
+    reset(&LEFT_OUT_SAID, AtomicU32::new(0));
+    reset(&HANDLER_RECORDS, AtomicU64::new(0));
     reset(&RECORD_MAIN, std::sync::atomic::AtomicBool::new(false));
     #[cfg(unix)]
     reset(&ATFORK, Mutex::new(Vec::new()));
