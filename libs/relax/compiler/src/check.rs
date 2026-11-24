@@ -608,6 +608,8 @@ pub struct AppCheck {
     owners: Vec<crate::program::DefId>,
     audited: Vec<(u32, u128)>,
     items: HashMap<u32, ItemKeys>,
+    /// The crates of the run's item check (empty without one): the crate-level checks' scope
+    scope: Vec<u32>,
 }
 
 /// The app check's lookups and loads (the cache is read here: before main, on the boot thread).
@@ -699,7 +701,7 @@ pub fn prepare_check(up: *mut Unit, crates: &[u32], check_items: bool) -> Option
     let u = unsafe { &*up };
     let owners = if todo.is_empty() { Vec::new() } else { body_owners(&u.prog, &todo) };
     RUN_CHECK[1].store(owners.len() as u64, Relaxed);
-    Some(AppCheck { t0, todo, keys, owners, audited, items })
+    Some(AppCheck { t0, todo, keys, owners, audited, items, scope: if check_items { crates.to_vec() } else { Vec::new() } })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -823,7 +825,7 @@ impl BodyCheck {
 /// Checks the prepared bodies and, for the app, its definitions. Beside a running program each
 /// job holds a front read, yields to writers and retries. Test dependencies use the body error pipeline.
 fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::RuntimeOptions>, mode: CheckMode) -> PreparedErrors {
-    let AppCheck { t0, todo, mut keys, owners, audited, mut items } = p;
+    let AppCheck { t0, todo, mut keys, owners, audited, mut items, scope } = p;
     let strict = mode == CheckMode::Errors;
     let front = unsafe { (*up).front.clone() };
     let mut audit = audit_dir().map(CheckAudit::new);
@@ -841,6 +843,14 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
     let skipped_left = || {
         let r = beside.map(|_| jit::front_read("app check skipped"));
         !r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0).skipped_files.is_empty()
+    };
+    // the crates of the run's item check that are checked here (by their items or their bodies)
+    let checked: Vec<bool> = if scope.is_empty() { Vec::new() } else {
+        let r = beside.map(|_| jit::front_read("app check crates"));
+        let prog = r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0);
+        let mut checked = vec![false; prog.crates.len()];
+        for &k in items.keys().chain(&todo).filter(|k| scope.contains(k)) { checked[k as usize] = true; }
+        checked
     };
     let mut item_errors = Vec::new();
     if mode == CheckMode::Typeck && !items.is_empty() {
@@ -873,17 +883,6 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
             }
             if kind == CheckKind::Items { defs.retain(|(k, _)| items.contains_key(k)); }
         }
-        // the crates' `use` declarations: no def's check sees them, and rustc's resolve refuses
-        // one through something private (E0603), as a check does (check_crate_impl import_privacy)
-        let refused: Vec<(u32, String)> = {
-            let r = beside.map(|_| jit::front_read("app check imports"));
-            let prog = r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0);
-            let mut own = vec![false; prog.crates.len()];
-            for &k in items.keys() { own[k as usize] = true; }
-            prog.import_privacy_errors(&own).into_iter().map(|(k, _, e)| (k, e)).collect()
-        };
-        for (k, _) in &refused { items.remove(k); }
-        item_errors.extend(refused);
         if crate::run_threads::run_ending() { return run_ended(); }
     }
     // Impl soundness once per crate, in parallel before its bodies. Dependencies are checked
@@ -924,6 +923,34 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
     }
     failed.extend(bodies);
     if crate::run_threads::run_ending() { return run_ended(); }
+    // The crate-level checks (crate_level_errors, a check's own): no def's check makes them, and
+    // what they find, rustc refuses. The crates whose items or bodies are checked here: an edit
+    // to a body can bring what they look for (an attribute, a nested item). After the bodies: a
+    // run parses a file's skipped bodies on their first need, and the gated syntax in them is
+    // known once they are parsed.
+    if mode == CheckMode::Typeck && !checked.is_empty() {
+        let mut st = StepTimes::new("app check crate level");
+        let root = crate::layout::root_crate();
+        let refused = {
+            let r = beside.map(|_| jit::front_read("app check crate level"));
+            let u = unsafe { &*up };
+            let (prog, tcx) = r.as_ref().map_or((&u.prog, &u.tcx), |r| r.of(&front));
+            let mut all = vec![false; prog.crates.len()];
+            for &k in &scope { all[k as usize] = true; }
+            let binaries: Vec<u32> = scope.iter().copied().filter(|&k| prog.crates[k as usize].is_bin).collect();
+            let entry = prog.crates.get(root as usize).is_some_and(|c| c.is_bin && !c.harness && all[root as usize]);
+            // the imports rustc never binds (a check's are before its signatures: check_crate_impl)
+            let strict = prog.strict_import_errors(&checked).into_iter().map(|(_, e)| e);
+            strict.chain(crate_level_errors(prog, tcx, &checked, &all, &binaries, entry.then_some(root), &mut st).0.into_iter().map(|(_, e)| e)).collect::<Vec<String>>()
+        };
+        if !refused.is_empty() {
+            // the crates' errors together: none of the crates checked here gets a clean verdict
+            items.retain(|&k, _| !checked[k as usize]);
+            keys.retain(|&(k, _)| !checked[k as usize]);
+            item_errors.extend(refused.into_iter().map(|e| (root, e)));
+        }
+        if crate::run_threads::run_ending() { return run_ended(); }
+    }
     let mut errors: Vec<(u32, String)> = {
         let r = beside.map(|_| jit::front_read("app check verdicts"));
         let prog = r.as_ref().map_or(unsafe { &(*up).prog }, |r| r.of(&front).0);
@@ -1215,7 +1242,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         } else {
             unsafe { jit::load_skipped_of(up, &todo) };
             let owners = { let r = jit::front_read("test dependency owners"); body_owners(r.of(&front).0, &todo) };
-            (owners.len(), check_prepared(up, AppCheck { t0, todo, keys, owners, audited: Vec::new(), items: HashMap::new() }, Some(&runtime), CheckMode::Errors))
+            (owners.len(), check_prepared(up, AppCheck { t0, todo, keys, owners, audited: Vec::new(), items: HashMap::new(), scope: Vec::new() }, Some(&runtime), CheckMode::Errors))
         };
         TestDepsResult {
             errors: crate::zone_alloc::kept_clone(&checked.errors), names,
@@ -1890,6 +1917,45 @@ pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, 
     LiveCheck { lints, owners, borrows }
 }
 
+/// The crate-level checks of the crates `own`: rustc's resolve, early, attribute and AST
+/// validation passes, which no definition's check makes. `all` holds the whole check's crates, for
+/// the checks across crates (the symbols, the global allocators, the entry symbol); `entry` is the
+/// root crate when it is a program's entry. Each error with where rustc reports it
+/// (check_order.rs), and the erroneous imports (each counts as used). A check's
+/// (check_crate_impl) and a run's app check (check_prepared): what rustc refuses here, a run
+/// refuses too.
+fn crate_level_errors(prog: &Program, tcx: &Tcx, own: &[bool], all: &[bool], binaries: &[u32], entry: Option<u32>, st: &mut StepTimes) -> (Vec<(crate::check_order::Stage, String)>, Vec<usize>) {
+    use crate::check_order::{Phase, Stage, LATE_PRIVATE_IN_PUBLIC};
+    use relax_types::item_checks as ic;
+    let mut errors = Vec::new();
+    let mut add = |stage: Stage, found: Vec<String>, step: &str| {
+        errors.extend(staged(stage, found));
+        st.mark(step);
+    };
+    add(Stage::new(Phase::Resolve, 0), ic::duplicate_items(prog, own), "duplicate_items");
+    add(Stage::new(Phase::Resolve, 0), ic::duplicate_exported_macros(prog, own), "duplicate_exported_macros");
+    add(Stage::new(Phase::Resolve, 3), ic::super_paths(prog, own), "super_paths");
+    add(Stage::new(Phase::Late, LATE_PRIVATE_IN_PUBLIC), ic::impl_trait_path_privacy(prog, tcx, own), "impl_trait_path_privacy");
+    add(Stage::new(Phase::Late, LATE_PRIVATE_IN_PUBLIC), ic::private_assoc_types(prog, tcx, own), "private_assoc_types");
+    add(Stage::new(Phase::Early, 1), ic::gated_syntax(prog, own), "gated_syntax");
+    add(Stage::new(Phase::Attrs, 0), ic::node_attribute_targets(prog, own), "node_attribute_targets");
+    add(Stage::new(Phase::Early, 0), ic::param_attributes(prog, own), "param_attributes");
+    add(Stage::new(Phase::Early, 0), ic::foreign_blocks(prog, own), "foreign_blocks");
+    add(Stage::new(Phase::Attrs, 0), ic::duplicate_symbols(prog, all), "duplicate_symbols");
+    add(Stage::new(Phase::Attrs, 0), ic::global_allocators_and_lang_items(prog, all, binaries), "global_allocators_and_lang_items");
+    add(Stage::new(Phase::Early, 0), relax_types::proc_macro_harness::check(prog, tcx, own), "proc_macro_harness");
+    if let Some(root) = entry {
+        add(Stage::new(Phase::Attrs, 0), ic::entry_point(prog, root), "entry_point");
+        add(Stage::new(Phase::Attrs, 0), ic::entry_symbol_conflict(prog, all, root), "entry_symbol_conflict");
+    }
+    let privacy = prog.import_privacy_errors(own);
+    let refused_imports = privacy.iter().filter_map(|(_, i, _)| *i).collect();
+    add(Stage::new(Phase::Resolve, 6), privacy.into_iter().map(|(_, _, e)| e).collect(), "import_privacy");
+    add(Stage::new(Phase::Attrs, 0), prog.attribute_errors(own), "attribute_errors");
+    add(Stage::new(Phase::Early, 0), prog.ast_validation_errors(own), "ast_validation");
+    (errors, refused_imports)
+}
+
 fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>, emit: bool, compile: bool, mut reuse: Option<&mut crate::check_reuse::Reuse>) -> (i32, Vec<crate::diag::Diagnostic>, Vec<(String, usize)>) {
     use crate::check_order::{Phase, Stage};
     let t_check = std::time::Instant::now();
@@ -1956,32 +2022,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     let d_sigs = t_sigs0.elapsed();
     let t_items0 = std::time::Instant::now();
     let mut st = StepTimes::new("item_checks");
-    errors.extend(staged(Stage::new(Phase::Resolve, 0), relax_types::item_checks::duplicate_items(&u.prog, &own))); st.mark("duplicate_items");
-    errors.extend(staged(Stage::new(Phase::Resolve, 0), relax_types::item_checks::duplicate_exported_macros(&u.prog, &own))); st.mark("duplicate_exported_macros");
-    errors.extend(staged(Stage::new(Phase::Resolve, 3), relax_types::item_checks::super_paths(&u.prog, &own))); st.mark("super_paths");
-    errors.extend(staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVATE_IN_PUBLIC), relax_types::item_checks::impl_trait_path_privacy(&u.prog, &u.tcx, &own))); st.mark("impl_trait_path_privacy");
-    errors.extend(staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVATE_IN_PUBLIC), relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own))); st.mark("private_assoc_types");
-    errors.extend(staged(Stage::new(Phase::Early, 1), relax_types::item_checks::gated_syntax(&u.prog, &own))); st.mark("gated_syntax");
-    errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::node_attribute_targets(&u.prog, &own))); st.mark("node_attribute_targets");
-    errors.extend(staged(Stage::new(Phase::Early, 0), relax_types::item_checks::param_attributes(&u.prog, &own))); st.mark("param_attributes");
-    errors.extend(staged(Stage::new(Phase::Early, 0), relax_types::item_checks::foreign_blocks(&u.prog, &own))); st.mark("foreign_blocks");
-    errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::duplicate_symbols(&u.prog, &own_all))); st.mark("duplicate_symbols");
     // the compiled binaries: `makepad test`'s subjects are each a test binary (cargo builds every
     // target separately); a check's are its bin crates
     let binaries: Vec<u32> = crates.iter().copied().filter(|&k| subjects_mode() != 0 || u.prog.crates[k as usize].is_bin).collect();
-    errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own_all, &binaries))); st.mark("global_allocators_and_lang_items");
-    errors.extend(staged(Stage::new(Phase::Early, 0), relax_types::proc_macro_harness::check(&u.prog, &u.tcx, &own))); st.mark("proc_macro_harness");
     let entry = u.prog.crates[root as usize].is_bin && !u.prog.crates[root as usize].harness && subjects_mode() != 2;
-    if entry { errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::entry_point(&u.prog, root))); }
-    if entry { errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::entry_symbol_conflict(&u.prog, &own_all, root))); }
-    st.mark("entry");
+    let (crate_level, refused_imports) = crate_level_errors(&u.prog, &u.tcx, own, &own_all, &binaries, entry.then_some(root), &mut st);
+    errors.extend(crate_level);
+    erroneous_imports.extend(refused_imports);
     errors.extend(staged(Stage::new(Phase::Early, 2), relax_types::lint_levels::check(&u.prog, &own))); st.mark("lint_levels");
     relax_types::lint_dead::reset();
-    let privacy = u.prog.import_privacy_errors(&own);
-    erroneous_imports.extend(privacy.iter().filter_map(|(_, i, _)| *i));
-    errors.extend(staged(Stage::new(Phase::Resolve, 6), privacy.into_iter().map(|(_, _, e)| e))); st.mark("import_privacy");
-    errors.extend(staged(Stage::new(Phase::Attrs, 0), u.prog.attribute_errors(&own))); st.mark("attribute_errors");
-    errors.extend(staged(Stage::new(Phase::Early, 0), u.prog.ast_validation_errors(&own))); st.mark("ast_validation");
     let d_items = t_items0.elapsed();
     let t_wf0 = std::time::Instant::now();
     // item well-formedness (rustc wfcheck): after the signatures, and only when they are sound -- an

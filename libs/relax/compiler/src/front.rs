@@ -87,11 +87,7 @@ pub fn image(pf: &ParsedFile) -> Writer<'_> {
     }
     ast_arrays!(put);
     let _ = k;
-    let gated: Vec<u32> = a.gated_syntax.iter().flat_map(|&(f, pos)| {
-        let i = crate::ast::GATED_SYNTAX.iter().position(|g| *g == f).expect("a gated syntax feature of GATED_SYNTAX");
-        [i as u32, pos]
-    }).collect();
-    w.add_owned(S_GATED, &gated);
+    w.add_owned(S_GATED, &gated_words(a));
     w.add(S_PM_EDITIONS, pf.pm_editions.bytes());
     let n = pf.numbering();
     w.add_owned(S_NUMBERING, &[n as u64, (n >> 64) as u64]);
@@ -203,6 +199,8 @@ const P_SOURCES: u32 = 207;
 const P_RULES_EXP: u32 = 208;
 const P_BODY_ORIGIN: u32 = 209;
 const P_PM_EDITIONS: u32 = 210;
+/// `Ast::gated_syntax` of the part's bodies (S_GATED's pairs), after the editions
+const P_GATED: u32 = 211;
 const P_AST: u32 = 300;
 
 pub static PARTS_MAPPED: AtomicU64 = AtomicU64::new(0);
@@ -252,7 +250,22 @@ pub fn part_image<'a>(pf: &'a ParsedFile, fp: &'a crate::parser::FilePart, a: &'
     w.add(P_RULES_EXP, fp.rules_exp.bytes());
     w.add(P_BODY_ORIGIN, fp.body_origin.bytes());
     w.add(P_PM_EDITIONS, fp.pm_editions.bytes());
+    // the gated syntax in its bodies, which a check and a run's app check report (E0658)
+    w.add_owned(P_GATED, &gated_words(a));
     Some(w)
+}
+
+/// `Ast::gated_syntax` as (index in `GATED_SYNTAX`, position) pairs (S_GATED, P_GATED).
+fn gated_words(a: &crate::ast::Ast) -> Vec<u32> {
+    a.gated_syntax.iter().flat_map(|&(f, pos)| {
+        let i = crate::ast::GATED_SYNTAX.iter().position(|g| *g == f).expect("a gated syntax feature of GATED_SYNTAX");
+        [i as u32, pos]
+    }).collect()
+}
+
+/// The gated syntax `gated_words` wrote.
+fn gated_syntax(words: &[u32]) -> Option<Vec<(&'static str, u32)>> {
+    words.chunks_exact(2).map(|p| Some((*crate::ast::GATED_SYNTAX.get(p[0] as usize)?, p[1]))).collect()
 }
 
 /// A part read from its image, continuing a file whose arrays end at `ends` (AST ids) and
@@ -291,6 +304,8 @@ fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rule
         mismatch(path, "part.rules");
         return None;
     };
+    let Some(gated) = r.slice::<u32>(11 + k, P_GATED).and_then(gated_syntax) else { mismatch(path, "part.gated"); return None; };
+    a.gated_syntax = gated;
     let fp = crate::parser::FilePart {
         src_base: src as u32, tok_base: toks as u32, rules_base: rules as u32,
         rules_exp, body_origin, pm_editions, next: Default::default(),
@@ -309,7 +324,7 @@ fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rule
 /// length, and verifying, every array's contents.
 fn same_part(a: &crate::parser::FilePart, aa: &crate::ast::Ast, b: &crate::parser::FilePart, ba: &crate::ast::Ast) -> bool {
     let v = verify();
-    let mut s = aa.base == ba.base && a.bodies.iter().eq(b.bodies.iter()) && a.ext.len() == b.ext.len() && a.toks.len() == b.toks.len()
+    let mut s = aa.base == ba.base && aa.gated_syntax == ba.gated_syntax && a.bodies.iter().eq(b.bodies.iter()) && a.ext.len() == b.ext.len() && a.toks.len() == b.toks.len()
         && a.exp_map.len() == b.exp_map.len() && a.tok_origin.len() == b.tok_origin.len() && a.token_origins.len() == b.token_origins.len()
         && a.rules_exp.len() == b.rules_exp.len() && a.body_origin.len() == b.body_origin.len() && a.pm_editions.len() == b.pm_editions.len();
     if v {
@@ -540,8 +555,7 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
     macro_rules! get { ($($f:ident: $t:ident),*) => { $(ast.$f=Arena::Mapped(r.slice::<$t>(8+k,S_AST+k as u32)?);k+=1;)* }; }
     ast_arrays!(get);
     // the gated syntax, which `makepad check` reports (E0658) from the restored tree too
-    let gated = r.slice::<u32>(8 + k, S_GATED)?;
-    ast.gated_syntax = gated.chunks_exact(2).map(|p| Some((*crate::ast::GATED_SYNTAX.get(p[0] as usize)?, p[1]))).collect::<Option<_>>()?;
+    ast.gated_syntax = gated_syntax(r.slice::<u32>(8 + k, S_GATED)?)?;
     let mut sources = None;
     let origins = restore_origins(r.slice(6, S_TOKEN_ORIGINS)?, r.slice(7, S_SOURCES)?, &mut sources, certified)?;
     if meta.token_input {
@@ -771,7 +785,7 @@ mod tests {
         let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", "test.rs", "test", &cfg));
         let table = std::sync::Arc::new(crate::macros::MacroTable::default());
         let (mut f, _) = crate::parser::parse_owned_ctx(sess,
-            b"pub fn f(x: u32) -> u32 { let y = x + 3; y * 2 }".to_vec(), None, 2021,
+            b"pub fn f(x: u32) -> u32 { let y = #[allow(unused)] 3; (x + y) * 2 }".to_vec(), None, 2021,
             Some(crate::macros::MacroScope::new(table)), "test", Some(ctx), true,
         ).unwrap();
         crate::program::prepare_file(&mut f, &cfg);
@@ -806,15 +820,20 @@ mod tests {
         let (mut fp, mut a) = crate::parser::parse_part(&f, &cfg);
         let part = part_bytes(&f, &fp, &a);
         assert!(a.exprs.heap_bytes() > 0);
+        let gated = a.gated_syntax.clone();
+        assert_eq!(gated.iter().map(|g| g.0).collect::<Vec<_>>(), ["stmt_expr_attributes"]);
         assert!(map_part("test.rs", &f, &mut fp, &mut a, part));
         assert_eq!(a.exprs.heap_bytes(), 0);
         assert_eq!(fp.toks.heap_bytes(), 0);
+        // the gated syntax in the bodies (a run's app check reports it, E0658) is the parse's
+        assert_eq!(a.gated_syntax, gated, "the mapped part's gated syntax");
         // The warm path reads the same image to exactly the same ids and body ranges.
         let (mut warm, _) = lazy_file(sess);
         assert!(apply("test.rs", &mut warm, main));
         assert!(apply_part("test.rs", &mut warm, part, &cfg, false));
         assert_eq!(format!("{:?}", fp.bodies), format!("{:?}", warm.part.get().unwrap().bodies));
         assert_eq!(format!("{:?}", a.exprs), format!("{:?}", warm.ast.part.get().unwrap().exprs));
+        assert_eq!(warm.ast.part.get().unwrap().gated_syntax, gated, "the restored part's gated syntax");
     }
 
     #[test]
