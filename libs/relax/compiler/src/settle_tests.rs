@@ -1621,6 +1621,8 @@ fn live_o3_split_keeps_the_saved_host_current() {
     let end = saved + u64::from(host.code_len);
     {
         let tables = u.code.read().unwrap();
+        assert!(crate::invalid::group_of(&u, caller, 0, &[]).is_none(), "the fresh host uses the hot code chunk");
+        assert_eq!(tables.version_of(saved).map(|(v, n, _)| (v, n)), Some((2, 2)), "one baseline and one hot install");
         let part = tables.function_base(saved, end - 1);
         if tokens == "+outline" {
             assert!(part > saved && part < end, "the joined continuation has its own function base");

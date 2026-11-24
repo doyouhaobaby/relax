@@ -377,12 +377,18 @@ fn a_split_keeps_a_branch_whose_body_ends_in_an_empty_guarded_copy() {
     assert!(unsafe { compile_tier1(up, ids[3]) }, "O3 build of lane_read");
     assert!(unsafe { compile_tier1(up, caller) }, "O3 build of caller");
     crate::owner::call(crate::owner::Class::Program, || {
-        let mut pat = false;
-        u.fns[caller as usize].pc_map.each(|o, p| {
-            pat |= o != u32::MAX && relax_backend::rir::pos_patched(p);
+        let f = &u.fns[caller as usize];
+        let mut pat = None;
+        f.pc_map.each(|o, p| {
+            if o < f.code_len && relax_backend::rir::pos_patched(p) {
+                pat = Some(f.code + u64::from(o));
+                return false;
+            }
             true
         });
-        assert!(pat, "caller's O3 code has a patched path: {}", u.fns[caller as usize].rir.as_ref().map(|r| r.dump()).unwrap_or_default());
+        let pc = pat.unwrap_or_else(|| panic!("caller's O3 code has a patched path: {}", f.rir.as_ref().map(|r| r.dump()).unwrap_or_default()));
+        assert!(codever::describe_pc(&u, &mut codever::Resolver::new(), pc).unwrap().patched);
+        assert!(codever::in_patched_path(&u, caller, f.code, pc));
     });
     assert_eq!(unsafe { run(up, caller) }, 1980309814, "the split O3 build's fast half keeps the branch and both stores");
     unsafe { UNIT = std::ptr::null_mut() };
@@ -392,11 +398,8 @@ fn a_split_keeps_a_branch_whose_body_ends_in_an_empty_guarded_copy() {
 #[test]
 fn a_frame_in_a_patched_path_is_named() {
     isolated_test!(a_frame_in_a_patched_path_is_named);
-    // A live session's O3 build of `caller` splits (relax_codegen::patched): its loop runs leaf's
-    // copy unguarded behind an exit, the patched path keeps the guard. A pc in the patched path is
-    // named so (its pc-map positions carry POS_PATCHED), a fast one is not; a patch flag of leaf
-    // moves caller's copy version, and the loop then leaves for its patched path and computes the
-    // same.
+    // Both machine functions belong to one install. An old frame keeps that install's
+    // source and inline context when the slot moves to another patch generation.
     crate::borrowck::lazy::disable_gandalf();
     if std::env::var_os("RELAX_STD").is_none() {
         std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
@@ -407,12 +410,15 @@ fn a_frame_in_a_patched_path_is_named() {
     std::fs::write(&path, SOURCE).unwrap();
     let mut session = crate::Session::default();
     session.options.live = true;
+    session.options.opt = vec!["+outline".into()];
+    std::env::remove_var("RELAX_OUTLINE_WHOLE");
     let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(session), path.to_str().unwrap(), "patched_path", false).unwrap();
     let def = |prog: &Program, n: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
         (d.krate == krate && prog.name(id) == n).then_some(id)
     }).unwrap();
     let (leaf_d, caller_d) = (def(&prog, "leaf"), def(&prog, "caller"));
+    let file = prog.def(leaf_d).file;
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
@@ -428,33 +434,83 @@ fn a_frame_in_a_patched_path_is_named() {
         }
         (ids[0], ids[1])
     });
+    // A slot compiled from an edited file tiers into that generation's code group.
+    crate::owner::call(crate::owner::Class::Program, || {
+        u.file_gen.insert(file, 1);
+        assert!(crate::invalid::group_of(&u, caller, 0, &[]).is_some());
+    });
     assert!(unsafe { compile_tier1(up, caller) }, "O3 build of caller");
     let ver = |u: &Unit| unsafe { (*tier_rec(&u.slots, caller).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) };
-    crate::owner::call(crate::owner::Class::Program, || {
-        let code = u.fns[caller as usize].code;
-        let (mut fast, mut pat) = (None, None);
+    let code = u.fns[caller as usize].code;
+    let part = joined_install(&u, caller, 2);
+    let (pc, location) = crate::owner::call(crate::owner::Class::Program, || {
+        let mut pc = None;
+        let lines = codever::target_lines(&u, &[(leaf, None)]);
         u.fns[caller as usize].pc_map.each(|o, p| {
-            if o != u32::MAX {
-                if relax_backend::rir::pos_patched(p) { pat.get_or_insert(o); } else { fast.get_or_insert(o); }
+            let at = code + u64::from(o);
+            if (part..code + u64::from(u.fns[caller as usize].code_len)).contains(&at)
+                && relax_backend::rir::pos_ctx(p) != 0 && lines.iter().any(|l| l.holds(&u, p)) {
+                pc = Some((at, u.pos_str(relax_backend::rir::pos_file(p), p as u32)));
+                return false;
             }
             true
         });
-        let pat = pat.unwrap_or_else(|| panic!("caller's O3 code has a patched path: {}", u.fns[caller as usize].rir.as_ref().map(|r| r.dump()).unwrap_or_default()));
+        pc.expect("an inlined instruction of leaf in P")
+    });
+    let check = |u: &Unit, state: &str| {
         let mut r = codever::Resolver::new();
-        let d = codever::describe_pc(&u, &mut r, code + pat as u64).unwrap();
-        let (_, _, module, json) = codever::frame_fields(&u, &d);
-        assert!(d.patched && module.contains("patched path of") && json.contains("\"patched_path\""), "a pc in the patched path is named so: {} {}", module, json);
-        assert!(codever::in_patched_path(&u, caller, code, code + pat as u64), "the held-frame report sees it too");
-        let d = codever::describe_pc(&u, &mut r, code + fast.unwrap() as u64).unwrap();
-        assert!(!d.patched && !codever::frame_fields(&u, &d).2.contains("patched path"), "a fast pc is not");
+        let d = codever::describe_pc(u, &mut r, pc).unwrap();
+        assert_eq!((d.slot, d.start, d.state), (caller, code, state));
+        let (name, at, module, json) = codever::frame_fields(u, &d);
+        assert_eq!(name, "patched_path::leaf");
+        assert_eq!(at, location, "the saved instruction's file, line and column");
+        assert!(module.contains("patched path of patched_path::caller") && module.contains("inlined at"), "{module}");
+        assert!(json.contains("\"patched_path\"") && json.contains("\"inlined_into\":\"patched_path::caller\"")
+            && json.contains("\"inline_stack\":[{\"fn\":\"patched_path::leaf\""), "{json}");
+        assert!(d.patched && codever::in_patched_path(u, caller, code, pc));
+        assert!(codever::describe_pc(u, &mut r, part).unwrap().patched, "P's entry before its first source line");
+        assert!(codever::in_patched_path(u, caller, code, part));
+        let fast = codever::describe_pc(u, &mut r, code).unwrap();
+        assert!(!fast.patched && !codever::frame_fields(u, &fast).2.contains("patched path"));
+        assert!(!codever::in_patched_path(u, caller, code, code + u64::from(d.len)), "past this install");
+    };
+    crate::owner::call(crate::owner::Class::Program, || {
+        check(&u, "installed");
         assert_eq!(ver(&u), 0);
     });
-    assert_eq!(unsafe { run(up, caller) }, 9984);
-    crate::owner::call(crate::owner::Class::Program, || set_patched(&u, leaf));
-    assert_ne!(ver(&u), 0, "a patch flag of leaf moves the copy version caller's exits read");
-    assert_eq!(unsafe { run(up, caller) }, 9984, "the patched path computes what the fast half did");
+    let run_saved = || {
+        let mut result = 0u32;
+        unsafe { call_jit(up, code, &mut result as *mut u32 as u64) }.map_err(|p| p.message).unwrap();
+        result
+    };
+    assert_eq!(run_saved(), 9984);
+    let change = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
+        file, path: path.to_string_lossy().into_owned(), src: SOURCE.replace("z ^ 7", "(z ^ 7) + 1").replacen("*out = s;", "*out = s + 2;", 1).into_bytes(),
+    }]) };
+    assert_eq!(change.rung, crate::reload::Rung::Patch, "{:?}", change.lines);
+    assert_ne!(ver(&u), 0, "the changed leaf moves the copy version the saved host reads");
+    assert_eq!(run_saved(), 10084, "the original entry runs the changed leaf through P");
+    assert_eq!(unsafe { run(up, caller) }, 10086, "the replacement also adds two");
+    crate::owner::call(crate::owner::Class::Program, || {
+        check(&u, "replaced");
+        u.restore_before(caller, change.group);
+        check(&u, "installed");
+    });
     unsafe { UNIT = std::ptr::null_mut() };
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn joined_install(u: &Unit, slot: u32, version: u32) -> u64 {
+    let f = &u.fns[slot as usize];
+    let start = f.code;
+    let t = u.code.read().unwrap();
+    assert_eq!(t.version_of(start).map(|(v, n, _)| (v, n)), Some((version, version)), "one version per install");
+    assert_eq!(t.kind_of(start), CodeKind::new(tier::O3, origin::FRESH));
+    let part = t.function_base(start, start + u64::from(f.code_len) - 1);
+    assert!(part > start, "P has its own function base");
+    assert_eq!(t.function_base(start, part - 1), start);
+    assert_eq!(t.entry_at(part), Some((start, f.code_len, slot)));
+    part
 }
 
 #[test]
@@ -615,47 +671,10 @@ pub fn panicking(out: &mut [u32; 2]) {
         frames.sort_unstable();
         frames
     }
-    fn parked_leaf(u: &Unit, leaf_start: u64, regs: &[u64]) -> Result<[u32; 2], String> {
-        use crate::inspect::vars;
-        let stop = vars::Stop::from_block(u, regs).ok_or("short parked register block")?;
-        let frame = {
-            let tables = u.code.read().unwrap();
-            stop.frames.iter().position(|&(pc, _)| tables.entry_at(pc).is_some_and(|(start, _, _)| start == leaf_start && tables.function_base(start, pc) != start))
-        }.ok_or("parked stack has no frame in outlined_leaf's part")?;
-        let levels = vars::levels(u, &stop, Some(frame));
-        let level = levels.iter().flat_map(|(_, levels)| levels).find(|l| l.inlined_into.is_none() && l.name.ends_with("outlined_leaf"))
-            .ok_or("no root level for outlined_leaf's part")?;
-        let read = |name| {
-            let local = level.locals.iter().find(|l| l.name == name).ok_or_else(|| format!("missing {name}"))?;
-            match &local.got {
-                vars::Got::Bytes(b, _) => b.as_slice().try_into().map(u32::from_le_bytes).map_err(|_| format!("{name}: expected u32")),
-                vars::Got::No(why) => Err(format!("{name}: {why}")),
-            }
-        };
-        Ok([read("seen")?, read("n")?])
-    }
-    let (done, finished) = std::sync::mpsc::channel::<()>();
-    let addr = up as usize;
     crate::inspect::start("joined_body");
-    let watcher = std::thread::spawn(move || {
-        use crate::inspect::events;
-        let mut seen = Vec::new();
-        loop {
-            for (id, _, _, message, _) in events::parked_now() {
-                if seen.iter().any(|(k, _, _)| *k == id) { continue; }
-                let values = events::parked_regs(Some(id)).ok_or("missing parked registers".to_string()).and_then(|(_, regs)| {
-                    crate::owner::call(crate::owner::Class::Program, || parked_leaf(unsafe { &*(addr as *const Unit) }, starts[0], &regs))
-                });
-                seen.push((id, message, values));
-                events::quit_releases();
-            }
-            if finished.recv_timeout(std::time::Duration::from_millis(2)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) { break; }
-        }
-        seen
+    let (ran, seen) = watch_part(up, starts[0], "outlined_leaf", ["seen", "n"], || {}, || {
+        unsafe { call_jit(up, panicking, out.as_mut_ptr() as u64) }
     });
-    let ran = unsafe { call_jit(up, panicking, out.as_mut_ptr() as u64) };
-    drop(done);
-    let seen = watcher.join().unwrap();
     assert_eq!(seen.len(), 1, "{phase}: one park: {seen:?}");
     assert!(seen[0].1.contains("outlined_leaf panics"), "{phase}: {seen:?}");
     assert_eq!(seen[0].2, Ok([22, 7]), "{phase}: seen and n in the leaf's part");
@@ -665,4 +684,146 @@ pub fn panicking(out: &mut [u32; 2]) {
         crate::owner::call(crate::owner::Class::Program, || u.cache.as_mut().unwrap().flush().unwrap());
     }
     std::mem::forget(u);
+}
+
+fn watch_part<T>(up: *mut Unit, start: u64, host: &str, locals: [&str; 2], mut on_wait: impl FnMut() + Send, run: impl FnOnce() -> T)
+    -> (T, Vec<(u64, String, Result<[u32; 2], String>)>) {
+    fn parked_locals(u: &Unit, start: u64, regs: &[u64], host: &str, locals: [&str; 2]) -> Result<[u32; 2], String> {
+        use crate::inspect::vars;
+        let stop = vars::Stop::from_block(u, regs).ok_or("short parked register block")?;
+        let frame = {
+            let tables = u.code.read().unwrap();
+            stop.frames.iter().position(|&(pc, _)| tables.entry_at(pc).is_some_and(|(owner, _, _)| owner == start && tables.function_base(owner, pc) != owner))
+        }.ok_or_else(|| format!("parked stack has no frame in {host}'s part"))?;
+        let levels = vars::levels(u, &stop, Some(frame));
+        let level = levels.iter().flat_map(|(_, levels)| levels).find(|l| l.inlined_into.is_none() && l.name.ends_with(host))
+            .ok_or_else(|| format!("no root level for {host}'s part"))?;
+        let read = |name| {
+            let local = level.locals.iter().find(|l| l.name == name).ok_or_else(|| format!("missing {name}"))?;
+            match &local.got {
+                vars::Got::Bytes(b, _) => b.as_slice().try_into().map(u32::from_le_bytes).map_err(|_| format!("{name}: expected u32")),
+                vars::Got::No(why) => Err(format!("{name}: {why}")),
+            }
+        };
+        Ok([read(locals[0])?, read(locals[1])?])
+    }
+    let addr = up as usize;
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(move || {
+            use crate::inspect::events;
+            let mut seen = Vec::new();
+            loop {
+                on_wait();
+                for (id, _, _, message, _) in events::parked_now() {
+                    if seen.iter().any(|(k, _, _)| *k == id) { continue; }
+                    let values = events::parked_regs(Some(id)).ok_or("missing parked registers".to_string()).and_then(|(_, regs)| {
+                        crate::owner::call(crate::owner::Class::Program, || parked_locals(unsafe { &*(addr as *const Unit) }, start, &regs, host, locals))
+                    });
+                    seen.push((id, message, values));
+                    events::quit_releases();
+                }
+                if finished.recv_timeout(std::time::Duration::from_millis(2)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) { break; }
+            }
+            seen
+        });
+        let ran = run();
+        drop(done);
+        (ran, watcher.join().unwrap())
+    })
+}
+
+#[test]
+fn a_live_exit_unwinds_and_shows_the_hosts_locals_in_the_part() {
+    isolated_test!(a_live_exit_unwinds_and_shows_the_hosts_locals_in_the_part);
+    const PROGRAM: &str = r#"
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
+static ADDRESS: AtomicUsize = AtomicUsize::new(0);
+struct D<F: Fn()>(F);
+impl<F: Fn()> Drop for D<F> { fn drop(&mut self) { (self.0)(); } }
+#[inline]
+fn leaf(n: u32) -> u32 { n + 1 }
+#[inline(never)]
+fn escape(shared: *mut u32, gate: &AtomicU32) {
+    ADDRESS.store(shared as usize, SeqCst);
+    gate.store(1, SeqCst);
+    while gate.load(SeqCst) == 1 { std::thread::yield_now(); }
+}
+#[inline(never)]
+pub fn host(state: &[AtomicU32; 4]) {
+    let mut shared = 7u32;
+    let _before = D(|| { state[1].fetch_add(1, SeqCst); });
+    escape(&raw mut shared, &state[0]);
+    let seen = leaf(shared);
+    shared = seen + 1;
+    let _after = D(|| {
+        state[3].store(shared * 100 + seen, SeqCst);
+        state[2].fetch_add(1, SeqCst);
+    });
+    let alias = ADDRESS.load(SeqCst) as *const u32;
+    if unsafe { *alias } == 11 && shared == 11 { panic!("patched host panics") }
+}
+pub fn drive(addr: usize) {
+    let result = std::thread::spawn(move || host(unsafe { &*(addr as *const [AtomicU32; 4]) })).join();
+    let state = unsafe { &*(addr as *const [AtomicU32; 4]) };
+    if result.is_err() { state[0].store(3, SeqCst); }
+}
+"#;
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::remove_var("RELAX_OUTLINE_WHOLE");
+    std::env::remove_var("RELAX_INSPECT");
+    std::env::set_var("RELAX_PANIC_PARK", "600");
+    std::env::set_var("RELAX_EXPECTED_CRASH", "inspect the panic in the host's patched path");
+    let dir = std::env::temp_dir().join(format!("relax-live-part-panic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, PROGRAM).unwrap();
+    let mut session = crate::Session::default();
+    session.options.live = true;
+    session.options.opt = vec!["+outline".into()];
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(session), path.to_str().unwrap(), "live_part", false).unwrap();
+    let [leaf, host, driver] = ["leaf", "host", "drive"].map(|name|
+        (0..prog.defs.len() as u32).map(DefId).find(|&d| prog.def(d).krate == krate && prog.name(d) == name).unwrap());
+    let file = prog.def(leaf).file;
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    let (start, drive) = crate::owner::call(crate::owner::Class::Program, || {
+        let [leaf, host, driver] = [leaf, host, driver].map(|d| u.fn_id(FnKey::Inst(d, vec![])));
+        let (body, map, relocs) = unsafe { compile_fn(up, leaf) }.unwrap();
+        u.install(leaf, &body, &relocs, map, 0).unwrap();
+        let start = unsafe { compile_o3_always(up, host) }
+            .unwrap_or_else(|| panic!("the host's first install is fresh O3: {:?}", u.stats.tier1_drop_why));
+        joined_install(&u, host, 1);
+        (start, u.entry(driver))
+    });
+    let state = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+    let mut change = None;
+    let addr = up as usize;
+    crate::inspect::start("live_part");
+    let (ran, seen) = watch_part(up, start, "live_part::host", ["shared", "seen"], || {
+        if state[0].load(Ordering::Acquire) == 1 {
+            let outcome = unsafe { crate::reload::apply(addr as *mut Unit, vec![crate::reload::Edit {
+                file, path: path.to_string_lossy().into_owned(), src: PROGRAM.replace("{ n + 1 }", "{ n + 3 }").into_bytes(),
+            }]) };
+            change = Some((outcome.rung, outcome.lines));
+            state[0].store(2, Ordering::Release);
+        }
+    }, || unsafe { call_jit(up, drive, state.as_ptr() as u64) });
+    let (rung, lines) = change.expect("the fast half escaped its slot before the edit");
+    assert_eq!(rung, crate::reload::Rung::Patch, "{lines:?}");
+    assert_eq!(seen.len(), 1, "one panic park: {seen:?}");
+    assert!(seen[0].1.contains("patched host panics"), "{seen:?}");
+    assert_eq!(seen[0].2, Ok([11, 10]), "the shared slot and the patched leaf's result at the park");
+    ran.map_err(|p| p.message).unwrap();
+    assert_eq!(state[0].load(Ordering::Acquire), 3, "the JIT thread unwound to its join");
+    assert_eq!(state[1].load(Ordering::Acquire), 1, "the guard created before the exit dropped once");
+    assert_eq!(state[2].load(Ordering::Acquire), 1, "the guard created in P dropped once");
+    assert_eq!(state[3].load(Ordering::Acquire), 1110, "the cleanup read both locals from their live homes");
+    unsafe { UNIT = std::ptr::null_mut() };
+    std::fs::remove_dir_all(dir).unwrap();
 }

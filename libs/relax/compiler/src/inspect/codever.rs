@@ -307,20 +307,12 @@ impl Resolver {
     }
 
     fn file_fns(&mut self, u: &Unit, file: u32) -> &[(u32, u32, crate::program::DefId)] {
-        self.by_file.entry(file).or_insert_with(|| {
-            // every fn item of the file (a fn that only runs inlined into code from the disk
-            // cache has no slot of its own)
-            let mut v = Vec::new();
-            for &d in u.prog.defs_in_file(file) {
-                let d = crate::program::DefId(d);
-                if matches!(u.prog.def(d).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
-                    if let Some((_, lo, hi)) = def_lines(u, d) {
-                        v.push((lo, hi, d));
-                    }
-                }
-            }
-            v
-        })
+        if !self.by_file.contains_key(&file) {
+            let spans = u.prog.files.get(file as usize).map(|f| self.file_fn_bytes(u, file).iter()
+                .map(|&(lo, hi, d)| (f.line_col(lo).0 as u32, f.line_col(hi).0 as u32, d)).collect()).unwrap_or_default();
+            self.by_file.insert(file, spans);
+        }
+        &self.by_file[&file]
     }
 
     /// Every fn item of a file by its byte span (expansions included: their bytes follow the source).
@@ -337,6 +329,19 @@ impl Resolver {
                     let item = f.ast.item(def.item);
                     if matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
                         v.push((item.lo, item.hi, d));
+                    }
+                }
+            }
+            // An edit retargets a surviving def to the new file. Its old AST and item_defs
+            // entry still identify the exact function at a byte of that version.
+            if !u.prog.is_current_version(file) {
+                if let Some(f) = u.prog.files.get(file as usize) {
+                    for (i, item) in f.ast.items.iter().enumerate() {
+                        if matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
+                            if let Some(&d) = u.prog.item_defs.get(&(file, i as u32)) {
+                                if u.prog.def(d).file != file { v.push((item.lo, item.hi, d)); }
+                            }
+                        }
                     }
                 }
             }
@@ -526,8 +531,11 @@ impl Resolver {
 
 /// What JIT pc `pc` is in (on the owner or with the unit otherwise stable: reads slots).
 pub(crate) fn describe_pc(u: &Unit, r: &mut Resolver, pc: u64) -> Option<PcCode> {
-    let (start, len, id) = u.code.read().unwrap_or_else(|e| e.into_inner()).entry_at(pc)?;
-    let kind = kind_at(u, start);
+    let (start, len, id, kind, part) = {
+        let t = u.code.read().unwrap_or_else(|e| e.into_inner());
+        let (start, len, id) = t.entry_at(pc)?;
+        (start, len, id, t.kind_of(start), t.function_base(start, pc) != start)
+    };
     let all = bodies(u, id);
     let b = all.iter().find(|b| b.start == start);
     let (state, gen, map) = match b {
@@ -541,12 +549,17 @@ pub(crate) fn describe_pc(u: &Unit, r: &mut Resolver, pc: u64) -> Option<PcCode>
     };
     // the line table's inline stack, else (older code) the fn whose span holds the position
     let inlined = pos.and_then(|p| map.and_then(|m| r.inline_stack(u, id, start, m, p)).or_else(|| r.inlined_fn(u, id, start, p)));
-    let patched = pos.is_some_and(relax_backend::rir::pos_patched);
+    let patched = part || pos.is_some_and(relax_backend::rir::pos_patched);
     Some(PcCode { slot: id, start, len, kind, state, gen, at, inlined, patched })
 }
 
 /// Whether pc `pc` of slot `id`'s code body at `start` lies in a split body's patched path.
 pub(crate) fn in_patched_path(u: &Unit, id: u32, start: u64, pc: u64) -> bool {
+    {
+        let t = u.code.read().unwrap_or_else(|e| e.into_inner());
+        if !t.entry_at(pc).is_some_and(|(s, _, slot)| s == start && slot == id) { return false; }
+        if t.function_base(start, pc) != start { return true; }
+    }
     bodies(u, id).iter().find(|b| b.start == start).and_then(|b| b.map.lookup((pc - start) as u32)).is_some_and(relax_backend::rir::pos_patched)
 }
 

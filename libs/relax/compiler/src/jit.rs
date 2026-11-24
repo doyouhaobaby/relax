@@ -964,7 +964,7 @@ impl CodeTables {
     }
 
     /// The function whose frame holds `pc` in the body at `start`.
-    fn function_base(&self, start: u64, pc: u64) -> u64 {
+    pub(crate) fn function_base(&self, start: u64, pc: u64) -> u64 {
         if let Ok(k) = self.parts.binary_search_by_key(&start, |p| p.0) {
             let base = start + self.parts[k].1 as u64;
             if pc >= base { return base; }
