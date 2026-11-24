@@ -303,8 +303,8 @@ mod imp {
     pub use super::unix::{get, key_create};
 
     /// bionic TLS_SLOT_APP: word 2 of the slot array tpidr_el0 points at, "available for use by
-    /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; our minSdk is
-    /// 30). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
+    /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; the run host's
+    /// minSdk is 29, cargo-makepad android HOST_MIN_SDK). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
     /// stays for its thread-exit destructor; JIT code reads the slot (codegen arm64 tls_addr).
     const TLS_SLOT_APP: u64 = 2;
 
