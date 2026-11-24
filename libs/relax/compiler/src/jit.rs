@@ -922,8 +922,8 @@ pub struct CodeTables {
     image_unwind: Vec<(u64, u64, u32)>,
     image_keep: Option<std::sync::Arc<PcFiles>>,
     /// glue that calls out with a frame record (lazy and hot entries, `enter`, the TLS slow path,
-    /// register-block trampolines): (start, len, fp - sp at its call), for walks from sp alone
-    glue: Vec<(u64, u32, u32)>,
+    /// register-block trampolines): (start, len, fp - sp at its call, name)
+    glue: Vec<(u64, u32, u32, &'static str)>,
     /// the code starts of twins' bodies (a sandboxed module's code, `FnKey::Sandbox`): an unwind
     /// cut at a module's edge walks past their landings (unwind_walk)
     twins: std::collections::HashSet<u64>,
@@ -1125,11 +1125,10 @@ impl CodeTables {
         self.glue.get(k.wrapping_sub(1)).filter(|g| pc < g.0 + g.1 as u64).map(|g| (g.0, g.0 + g.1 as u64))
     }
 
-    /// The start of the glue code (`Unit::emit_glue`: the runtime's entries and trampolines)
-    /// holding `pc`.
-    pub(crate) fn glue_at(&self, pc: u64) -> Option<u64> {
+    /// Frame size and name of the runtime entry or trampoline holding `pc`.
+    pub(crate) fn glue_at(&self, pc: u64) -> Option<(u32, &'static str)> {
         let k = self.glue.partition_point(|g| g.0 <= pc);
-        self.glue.get(k.wrapping_sub(1)).filter(|g| pc < g.0 + g.1 as u64).map(|g| g.0)
+        self.glue.get(k.wrapping_sub(1)).filter(|g| pc < g.0 + g.1 as u64).map(|g| (g.2, g.3))
     }
 
     /// The frame pointer of the JIT frame whose call returns to `ret`, from the stack pointer
@@ -1146,11 +1145,7 @@ impl CodeTables {
             };
             return Ok(info);
         }
-        let k = self.glue.partition_point(|g| g.0 <= pc);
-        match self.glue.get(k.wrapping_sub(1)) {
-            Some(&(at, len, frame)) if pc < at + len as u64 => Ok(sp + frame as u64),
-            _ => Err("its code has no frame size (glue without a frame record)"),
-        }
+        self.glue_at(pc).map(|(frame, _)| sp + frame as u64).ok_or("its code has no frame size (glue without a frame record)")
     }
 
     fn saved_regs_at(&self, pc: u64) -> Option<(u64, Vec<u32>)> {
@@ -3001,6 +2996,7 @@ pub(crate) fn install_ice_hook() {
             // RELAX_ICE_BT=1: the compiler's own backtrace of a build's internal error
             if std::env::var_os("RELAX_ICE_BT").is_some() {
                 eprintln!("relax ICE in build: {}\n{}", info, std::backtrace::Backtrace::force_capture());
+                eprintln!("{}", crate::inspect::report_stack());
             }
             return;
         }
@@ -3012,6 +3008,7 @@ pub(crate) fn install_ice_hook() {
             // RELAX_ICE_BT=1: the compiler's own backtrace of an internal error
             if std::env::var_os("RELAX_ICE_BT").is_some() {
                 eprintln!("relax ICE: {}\n{}", info, std::backtrace::Backtrace::force_capture());
+                eprintln!("{}", crate::inspect::report_stack());
             }
             return;
         }
@@ -5498,6 +5495,10 @@ pub(crate) fn in_jit_code(pc: u64) -> bool {
 /// waits on the tables' lock (the thread walked may be the one writing them): a writer that
 /// stays past a short spin ends the step, saying so.
 pub fn frame_pointer_at(ret: u64, sp: u64) -> Result<u64, &'static str> {
+    frame_pointer_at_with(ret, sp, false)
+}
+
+pub(crate) fn frame_pointer_at_with(ret: u64, sp: u64, nowait: bool) -> Result<u64, &'static str> {
     let u = cur_unit();
     if u.is_null() {
         return Err("there is no JIT unit");
@@ -5506,6 +5507,7 @@ pub fn frame_pointer_at(ret: u64, sp: u64) -> Result<u64, &'static str> {
         match unsafe { &*u }.code.try_read() {
             Ok(t) => return t.frame_pointer_at(ret, sp),
             Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner().frame_pointer_at(ret, sp),
+            Err(std::sync::TryLockError::WouldBlock) if nowait => break,
             Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
         }
     }
@@ -6939,11 +6941,11 @@ impl Unit {
 
     /// Glue that calls out with a frame record `frame` bytes above its sp at the call: emitted
     /// and registered for walks from sp alone (CodeTables::frame_pointer_at).
-    fn emit_glue(&self, b: &[u8], what: &str, frame: u32) -> u64 {
+    fn emit_glue(&self, b: &[u8], what: &'static str, frame: u32) -> u64 {
         let at = self.emit_code(b, what);
         let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
         let _k = crate::zone_alloc::kept();
-        let e = (at, b.len() as u32, frame);
+        let e = (at, b.len() as u32, frame, what);
         let k = t.glue.partition_point(|g| g.0 < at);
         t.glue.insert(k, e);
         at

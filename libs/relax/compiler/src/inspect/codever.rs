@@ -637,10 +637,23 @@ pub(crate) fn frame_fields_no_owner(u: &Unit, pc: u64) -> Option<(String, String
     ))
 }
 
-/// JIT code that is no fn body: a slot's thunk (what calls branch to), its lazy stub, or a veneer
+/// A report uses the slot's stored diagnostic name; resolving its display name needs the owner.
+pub(super) fn report_name(u: &Unit, pc: u64) -> Option<String> {
+    let t = u.code.try_read().ok()?;
+    let Some((start, _, id)) = t.entry_at(pc) else {
+        return t.glue_at(pc).map(|(_, name)| name.to_string());
+    };
+    let name = crate::jit::slot_name(id)?;
+    Some(format!("{name} (slot#{id}+{:#x})", pc - start))
+}
+
+/// JIT code that is no fn body: a shared runtime entry, a slot's thunk, its lazy stub, or a veneer
 /// (a branch to a host function or a far target): (name, module label). A profile sample on one
 /// is the cost of reaching the callee (a fetch of a thunk line that is not in the i-cache).
 pub(crate) fn glue_name(u: &Unit, pc: u64) -> Option<(String, &'static str)> {
+    if let Some((_, name)) = u.code.read().unwrap_or_else(|e| e.into_inner()).glue_at(pc) {
+        return Some((name.to_string(), "jit/glue"));
+    }
     for (kind, what, module) in [(0usize, "thunk of", "jit/glue thunk"), (1, "lazy stub of", "jit/glue stub")] {
         if let Some((id, _)) = u.slots.find(kind, pc).filter(|(id, _)| (*id as usize) < u.fns.len()) {
             return Some((format!("[{} {}]", what, super::display_name(u, id, 0)), module));

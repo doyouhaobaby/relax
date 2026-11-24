@@ -176,8 +176,13 @@ pub use imp::{stack_hi_of_self, walk_regs_with, Slot as HoldSlot};
 /// Windows JIT frames by their records, host frames by their unwind tables (x64_walk). Reads stay
 /// inside the thread's stack (the program stack while it runs on one: the walk ends at its
 /// switch). Nothing where no walk exists.
-#[inline(never)]
+#[inline(always)]
 pub fn capture_self(out: &mut Vec<u64>) {
+    capture_self_with(out, false);
+}
+
+#[inline(never)]
+pub(super) fn capture_self_with(out: &mut Vec<u64>, _nowait: bool) -> Option<&'static str> {
     let (lo, hi) = crate::os::fault::stack_bounds_of_self();
     #[cfg(any(target_arch = "aarch64", target_vendor = "apple"))]
     {
@@ -206,6 +211,7 @@ pub fn capture_self(out: &mut Vec<u64>) {
             }
             fp = next;
         }
+        None
     }
     #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
     {
@@ -217,7 +223,7 @@ pub fn capture_self(out: &mut Vec<u64>) {
         }
         // the module index, built once (a refresh leaks the index it replaces: walks may still read it)
         if !super::cfi::covers(rip) {
-            super::cfi::refresh();
+            if _nowait { super::cfi::refresh_nowait(); } else { super::cfi::refresh(); }
         }
         #[allow(unused_mut)]
         let mut regs = super::cfi::Regs { rip, rsp, rbp: rbp.max(1), rbx, r12, r13, r14, r15, ..Default::default() };
@@ -230,17 +236,18 @@ pub fn capture_self(out: &mut Vec<u64>) {
         let read = |a: u64| -> Option<u64> { (a >= rsp && a % 8 == 0 && a.saturating_add(8) <= hi).then(|| unsafe { *(a as *const u64) }) };
         // (the first pc is this fn's own)
         let mut first = true;
-        x64_walk::walk_each(&mut regs, &read, &mut |pc| {
+        x64_walk::walk_each(&mut regs, &read, _nowait, &mut |pc| {
             if !first {
                 out.push(pc);
             }
             first = false;
             true
-        });
+        })
     }
     #[cfg(not(any(target_arch = "aarch64", target_vendor = "apple", all(target_arch = "x86_64", any(target_os = "linux", windows)))))]
     {
         let _ = (out, lo, hi);
+        Some("no stack walk on this target")
     }
 }
 
@@ -1210,7 +1217,7 @@ mod x64_walk {
             return;
         }
         let (pcs, n) = (&mut raw.pcs, &mut raw.n);
-        raw.stop = walk_each(r, read, &mut |pc| {
+        raw.stop = walk_each(r, read, false, &mut |pc| {
             pcs[*n] = pc;
             *n += 1;
             *n < MAX_FRAMES
@@ -1219,7 +1226,7 @@ mod x64_walk {
 
     /// `walk_with`'s walk, each pc handed to `push` (innermost first; false: the walk ends after
     /// that frame's step); why it ended at its last frame, when that is not the stack's outermost.
-    pub fn walk_each(r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>, push: &mut dyn FnMut(u64) -> bool) -> Option<&'static str> {
+    pub fn walk_each(r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>, nowait: bool, push: &mut dyn FnMut(u64) -> bool) -> Option<&'static str> {
         use super::super::cfi;
         let mut top = true;
         while r.rip != 0 {
@@ -1252,7 +1259,7 @@ mod x64_walk {
                         return Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
                     }
                     if own {
-                        match crate::jit::frame_pointer_at(r.rip, sp0) {
+                        match crate::jit::frame_pointer_at_with(r.rip, sp0, nowait) {
                             Ok(fp) => r.rbp = fp,
                             Err(why) => {
                                 return Some(why);
@@ -1700,6 +1707,7 @@ mod lazy_compile_tests {
     use std::sync::{Arc, OnceLock};
 
     static OWN: OnceLock<Vec<u64>> = OnceLock::new();
+    static REPORT: OnceLock<String> = OnceLock::new();
     static WAITING: OnceLock<Result<Raw, &'static str>> = OnceLock::new();
 
     // When the test harness itself runs under Relax, its rt_compile belongs to the outer JIT.
@@ -1723,10 +1731,18 @@ mod lazy_compile_tests {
         }
     }
 
+    #[cfg(relax)]
+    fn hosted_name(pc: u64) -> String {
+        let mut frame = [crate::inspect::Frame { pc, name: String::new(), at: String::new(), module: "?".into(), code: String::new(), slot: None, levels: Vec::new() }];
+        name_hosted_frames(&mut frame);
+        std::mem::take(&mut frame[0].name)
+    }
+
     fn inside_lazy_compile() {
         let mut pcs = Vec::new();
         capture_self(&mut pcs);
         OWN.set(pcs).unwrap();
+        REPORT.set(crate::inspect::report_stack()).unwrap();
         let (tid, handle) = (self_os_id(), crate::waits::me());
         // Queue the capture ahead of the compile's next Program request. The owner keeps
         // that request pending until it has captured the parked caller.
@@ -1774,6 +1790,28 @@ mod lazy_compile_tests {
         result.unwrap();
         assert_eq!(value, 13);
 
+        let report = REPORT.get().expect("the first call produced a Relax stack report");
+        eprintln!("{report}");
+        // each frame's name; hosted (this harness under Relax), the outer JIT's frames print as
+        // raw pcs (their names need its owner, which a report never waits for): named here
+        let names: Vec<String> = report.lines().skip(1).map(|line| {
+            let mut words = line.split_whitespace();
+            let _pc = words.next().and_then(|pc| u64::from_str_radix(pc.trim_start_matches("0x"), 16).ok());
+            match words.next() {
+                Some(name) => name.to_string(),
+                #[cfg(relax)]
+                None => _pc.map(hosted_name).unwrap_or_default(),
+                #[cfg(not(relax))]
+                None => String::new(),
+            }
+        }).collect();
+        let compile = names.iter().position(|n| n.ends_with("::rt_compile"));
+        let glue = names.iter().position(|n| n == "relax::lazy_entry");
+        let app = names.iter().position(|n| n == "stack_test::app_caller");
+        assert!(compile.is_some(), "the report names rt_compile: {report}");
+        assert!(compile < glue, "the report names lazy_entry below rt_compile: {report}");
+        assert!(glue < app, "the report names app_caller below lazy_entry: {report}");
+
         let own = OWN.get().expect("the first call of cold entered rt_compile");
         let waiting = WAITING.get().expect("the owner sampled the requester").as_ref().unwrap();
         let mut partial = Vec::new();
@@ -1789,6 +1827,10 @@ mod lazy_compile_tests {
             let compile = frames.iter().position(|f| f.name.ends_with("::rt_compile"));
             let app = frames.iter().position(|f| f.name == "stack_test::app_caller");
             reached.push(compile.is_some() && app > compile);
+            if label == "owner wait" {
+                let glue = frames.iter().position(|f| f.name == "relax::lazy_entry");
+                assert!(compile.is_some() && compile < glue && glue < app, "owner wait did not name lazy_entry between rt_compile and app_caller: {glue:?}, {partial:?}");
+            }
         }
         assert_eq!(reached, [true, true], "app_caller below rt_compile (self, owner wait); wait stop {:?}, {partial:?}", waiting.stop);
     }

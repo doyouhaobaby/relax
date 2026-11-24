@@ -947,6 +947,29 @@ pub struct Frame {
     pub levels: Vec<(String, String)>,
 }
 
+/// The ICE and bail reports already take the loader lock and read symbol files in std's native
+/// backtrace. This walk may do the same; it only tries Relax's locks and never calls the owner.
+pub(crate) fn report_stack() -> String {
+    use std::fmt::Write;
+    let _kept = crate::zone_alloc::kept();
+    let mut pcs = Vec::new();
+    let stop = threads::capture_self_with(&mut pcs, true);
+    let mut text = String::from("the program's stack (Relax's walk, through JIT code):");
+    for pc in pcs {
+        let look = pc.wrapping_sub(1); // capture_self returns only return addresses
+        write!(text, "\n  {pc:#x}").unwrap();
+        if crate::jit::in_jit_code(look) {
+            if let Some(name) = codever::report_name(unsafe { &*crate::jit::cur_unit() }, look) {
+                write!(text, " {name}").unwrap();
+            }
+        } else if let Some((name, image, _)) = symbols::host_symbol_nowait(look) {
+            write!(text, " {name} ({image})").unwrap();
+        }
+    }
+    if let Some(why) = stop { write!(text, "\n  walk stopped: {why}").unwrap(); }
+    text
+}
+
 /// Names for raw pcs: JIT frames by the unit (one owner Job request; on timeout `slot#id+off`),
 /// host frames by the images' symbol tables. `lookup` pcs are return addresses except the first.
 pub fn symbolise(frames: &[Vec<u64>], partial: &mut Vec<String>) -> Vec<Vec<Frame>> {

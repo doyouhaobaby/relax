@@ -43,6 +43,14 @@ static REFRESH: Mutex<()> = Mutex::new(());
 /// Rebuilds the module index. Allocates and takes the loader lock: only while no thread is held.
 pub fn refresh() {
     let _g = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+    refresh_index();
+}
+
+pub(super) fn refresh_nowait() {
+    if let Ok(_g) = REFRESH.try_lock() { refresh_index(); }
+}
+
+fn refresh_index() {
     use super::symbols::{dl_iterate_phdr, PhdrInfo};
     extern "C" fn cb(info: *const PhdrInfo, _size: usize, data: *mut u8) -> i32 {
         unsafe {

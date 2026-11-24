@@ -717,6 +717,7 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *TRACE.get_or_init(|| std::env::var_os("RELAX_BAIL_TRACE").is_some()) {
                 eprintln!("relax bail: {} (slot {}) at\n{}", what, slot, std::backtrace::Backtrace::force_capture());
+                eprintln!("{}", crate::inspect::report_stack());
             }
             // (a wait's slot is the one in flight: no front of it helps)
             let (slots, flight) = match slot {
