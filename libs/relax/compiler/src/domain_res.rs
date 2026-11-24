@@ -65,10 +65,46 @@ fn pages(len: usize) -> usize {
     (len + p - 1) & !(p - 1)
 }
 
-/// The domain the calling thread's resources belong to.
+/// The domain the calling thread's resources belong to: a run's, or the main program's once it
+/// asked for that (`relax_track_handles`).
 fn owner() -> Option<u64> {
     let base = crate::domain::current();
-    (base != 0 && base != crate::domain::default_base()).then_some(base)
+    (base != 0 && (base != crate::domain::default_base() || RECORD_MAIN.load(std::sync::atomic::Ordering::Relaxed))).then_some(base)
+}
+
+/// The main program's resources are recorded too (a run's always are): from its
+/// `relax_track_handles` on. No run's end gives them back; its own closes forget them.
+static RECORD_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Runtime introspection, for a program to look up through its loader (dlsym; GetProcAddress on
+/// its own module): from now on the runtime records what the main program holds as it does a
+/// run's. Each of its interposed creates and closes then keeps the table as a run's do (an entry,
+/// and a scan of the table at a close); before this, the main program pays one atomic load.
+pub(crate) extern "C" fn relax_track_handles() {
+    RECORD_MAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Runtime introspection, looked up as `relax_track_handles` is: the handles (Windows) or
+/// descriptors (unix) the runtime records the program holding, its own handles to the program's
+/// children among them. Writes up to `cap` of them to `buf` and returns how many there are; with
+/// the main program not tracked (no `relax_track_handles` yet), `usize::MAX`: the list would leave
+/// out all it holds. Only what goes through a creator the runtime interposes is recorded: what
+/// the program makes otherwise, a run's end cannot give back either.
+pub(crate) extern "C" fn relax_held_handles(buf: *mut u64, cap: usize) -> usize {
+    if !RECORD_MAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        return usize::MAX;
+    }
+    with_table(|t| {
+        let mut n = 0;
+        for h in t.iter().filter_map(|o| held_handle(&o.res)) {
+            if n < cap && !buf.is_null() {
+                // SAFETY: the program passes room for `cap` values
+                unsafe { *buf.add(n) = h };
+            }
+            n += 1;
+        }
+        n
+    })
 }
 
 /// An atfork child: the table's lock may be held for good by a thread that did not come along.
@@ -143,6 +179,18 @@ mod unix {
         Map { addr: usize, len: usize },
         Key(KeyT),
         Child { pid: i32, told: bool, detached: bool },
+    }
+
+    /// The descriptor a record holds open, for `relax_held_handles`.
+    pub(super) fn held_handle(res: &Res) -> Option<u64> {
+        match *res {
+            Res::Fd { fd, .. } => Some(fd as u64),
+            Res::Dir(dir) => {
+                let fd = unsafe { sys::dirfd(dir as *mut c_void) };
+                (fd >= 0).then_some(fd as u64)
+            }
+            Res::Map { .. } | Res::Key(_) | Res::Child { .. } => None,
+        }
     }
 
     /// pthread_key_t
@@ -220,6 +268,7 @@ mod unix {
             pub fn opendir(path: *const c_char) -> *mut c_void;
             pub fn fdopendir(fd: c_int) -> *mut c_void;
             pub fn closedir(dir: *mut c_void) -> c_int;
+            pub fn dirfd(dir: *mut c_void) -> c_int;
             pub fn mmap(addr: *mut u8, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut u8;
             pub fn munmap(addr: *mut u8, len: usize) -> c_int;
             pub fn pthread_key_create(key: *mut usize, dtor: Option<extern "C" fn(*mut u8)>) -> c_int;
@@ -705,11 +754,25 @@ mod windows {
     #[derive(Clone, Copy)]
     pub(super) enum Res {
         Handle(HANDLE),
+        /// The program's handle to a child this table records (`Child`): when it closes on a
+        /// child that ended, that record goes too.
+        ChildHandle { h: HANDLE, pid: u32 },
         Find(HANDLE),
         Socket(usize),
         Memory { addr: usize, len: usize },
         View { addr: usize, len: usize },
-        Child { process: HANDLE, detached: bool },
+        /// The runtime's own handle to a child the run started, to end it with the run.
+        Child { process: HANDLE, pid: u32, detached: bool },
+    }
+
+    /// The handle a record holds open, for `relax_held_handles` (a socket is one; a find handle
+    /// is the system's context for the search, not the directory's handle).
+    pub(super) fn held_handle(res: &Res) -> Option<u64> {
+        match *res {
+            Res::Handle(h) | Res::ChildHandle { h, .. } | Res::Child { process: h, .. } => Some(h as u64),
+            Res::Socket(s) => Some(s as u64),
+            Res::Find(_) | Res::Memory { .. } | Res::View { .. } => None,
+        }
     }
 
     /// A handle: NULL means it failed.
@@ -776,45 +839,73 @@ mod windows {
         note_handle(unsafe { os::CreateJobObjectW(sa, name) })
     }
     extern "system" fn open_process(access: u32, inherit: i32, pid: u32) -> HANDLE {
-        note_handle(unsafe { os::OpenProcess(access, inherit, pid) })
+        let h = unsafe { os::OpenProcess(access, inherit, pid) };
+        if h != 0 && with_table(|t| t.iter().any(|o| matches!(o.res, Res::Child { pid: c, .. } if c == pid))) {
+            note(Res::ChildHandle { h, pid });
+            return h;
+        }
+        note_handle(h)
     }
     extern "system" fn open_thread(access: u32, inherit: i32, id: u32) -> HANDLE {
         note_handle(unsafe { os::OpenThread(access, inherit, id) })
     }
     extern "system" fn duplicate_handle(sp: HANDLE, s: HANDLE, tp: HANDLE, t: *mut HANDLE, access: u32, inherit: i32, options: u32) -> i32 {
         let ok = unsafe { os::DuplicateHandle(sp, s, tp, t, access, inherit, options) };
-        if ok != 0 && !t.is_null() && tp == unsafe { os::GetCurrentProcess() } {
-            note_handle(unsafe { *t });
+        let me = unsafe { os::GetCurrentProcess() };
+        if ok != 0 && !t.is_null() && tp == me {
+            let h = unsafe { *t };
+            // (a copy of a handle to a recorded child is one too)
+            let child = if sp == me { with_table(|t| t.iter().find_map(|o| match o.res { Res::ChildHandle { h: x, pid } if x == s => Some(pid), _ => None })) } else { None };
+            match child {
+                Some(pid) if h != 0 => note(Res::ChildHandle { h, pid }),
+                _ => {
+                    note_handle(h);
+                }
+            }
         }
         ok
     }
     extern "system" fn close_handle(h: HANDLE) -> i32 {
         // (first: once it is closed, another thread can get this number)
-        forget(|r| matches!(r, Res::Handle(x) if *x == h));
-        unsafe { os::CloseHandle(h) }
+        let child = with_table(|t| {
+            let i = t.iter().rposition(|o| matches!(o.res, Res::Handle(x) | Res::ChildHandle { h: x, .. } if x == h))?;
+            match t.swap_remove(i).res {
+                Res::ChildHandle { pid, .. } => Some(pid),
+                _ => None,
+            }
+        });
+        let ok = unsafe { os::CloseHandle(h) };
+        // A child that ended needs its record no longer: the program closing a handle to it is
+        // when to look (one wait, and only for such a handle), not its next spawn.
+        if let Some(pid) = child {
+            forget_ended_children(Some(pid));
+        }
+        ok
     }
     extern "system" fn create_process(app: *const u16, cmd: *mut u16, pa: *const u8, ta: *const u8, inherit: i32, flags: u32, env: *mut u8, cwd: *const u16, si: *mut u8, pi: *mut ProcessInformation) -> i32 {
         let ok = unsafe { os::CreateProcessW(app, cmd, pa, ta, inherit, flags, env, cwd, si, pi) };
         if ok != 0 {
             let pi = unsafe { &*pi };
-            note_handle(pi.process);
-            note_handle(pi.thread);
             // (the run's own handle may be closed long before the process ends; with no run to
             // record the child, no copy: nothing would ever close it)
             let me = unsafe { os::GetCurrentProcess() };
             let mut process = 0;
             if owner().is_some() && unsafe { os::DuplicateHandle(me, pi.process, me, &mut process, 0, 0, DUPLICATE_SAME_ACCESS) } != 0 {
-                forget_ended_children();
-                note(Res::Child { process, detached: flags & DETACHED_PROCESS != 0 });
+                forget_ended_children(None);
+                note(Res::Child { process, pid: pi.pid, detached: flags & DETACHED_PROCESS != 0 });
+                note(Res::ChildHandle { h: pi.process, pid: pi.pid });
+            } else {
+                note_handle(pi.process);
             }
+            note_handle(pi.thread);
         }
         ok
     }
-    /// Those that are over stop holding their process's record.
-    fn forget_ended_children() {
+    /// Those that are over stop holding their process's record: every child, or the one `only`.
+    fn forget_ended_children(only: Option<u32>) {
         with_table(|t| {
             t.retain(|o| match o.res {
-                Res::Child { process, .. } if unsafe { os::WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 => {
+                Res::Child { process, pid, .. } if only.is_none_or(|p| p == pid) && unsafe { os::WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 => {
                     unsafe { os::CloseHandle(process) };
                     false
                 }
@@ -934,7 +1025,7 @@ mod windows {
     pub(super) fn give_back(res: Res, out: &mut Released) {
         unsafe {
             match res {
-                Res::Handle(h) => {
+                Res::Handle(h) | Res::ChildHandle { h, .. } => {
                     os::CloseHandle(h);
                     out.files += 1;
                 }
@@ -967,7 +1058,7 @@ mod windows {
     pub(super) fn end_children(list: Vec<Res>, out: &mut Released) -> Vec<Res> {
         let mut ending = Vec::new();
         for res in list {
-            let Res::Child { process, detached } = res else { continue };
+            let Res::Child { process, pid, detached } = res else { continue };
             if detached {
                 unsafe { os::CloseHandle(process) };
                 out.children_detached += 1;
@@ -975,15 +1066,15 @@ mod windows {
                 unsafe { os::CloseHandle(process) };
             } else {
                 unsafe { os::TerminateProcess(process, 1) };
-                ending.push(process);
+                ending.push((process, pid));
             }
         }
         let start = std::time::Instant::now();
         while !ending.is_empty() && start.elapsed() < CHILD_GRACE + CHILD_KILL_GRACE {
-            ending.retain(|h| {
-                let gone = unsafe { os::WaitForSingleObject(*h, 0) } == WAIT_OBJECT_0;
+            ending.retain(|&(h, _)| {
+                let gone = unsafe { os::WaitForSingleObject(h, 0) } == WAIT_OBJECT_0;
                 if gone {
-                    unsafe { os::CloseHandle(*h) };
+                    unsafe { os::CloseHandle(h) };
                     out.children_ended += 1;
                 }
                 !gone
@@ -993,7 +1084,7 @@ mod windows {
             }
         }
         out.children_left += ending.len() as u32;
-        ending.into_iter().map(|process| Res::Child { process, detached: false }).collect()
+        ending.into_iter().map(|(process, pid)| Res::Child { process, pid, detached: false }).collect()
     }
 
     pub(super) fn is_child(res: &Res) -> bool {
@@ -1059,6 +1150,7 @@ pub(crate) fn give_back_run(bases: &[u64]) -> Released {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&OWNED, Mutex::new(Vec::new()));
+    reset(&RECORD_MAIN, std::sync::atomic::AtomicBool::new(false));
     #[cfg(unix)]
     reset(&ATFORK, Mutex::new(Vec::new()));
     #[cfg(unix)]

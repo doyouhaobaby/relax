@@ -1855,14 +1855,69 @@ fn end_process(pid: u32) {
         }
         unsafe { kill(pid as i32, 9) };
     }
+    // (and waits for its end: a handle closed on a child that ended is when the runtime lets go
+    // of its own)
     #[cfg(windows)]
     {
-        use crate::os::win32::{CloseHandle, OpenProcess, TerminateProcess};
+        use crate::os::win32::{CloseHandle, OpenProcess, TerminateProcess, WaitForSingleObject};
         unsafe {
-            let h = OpenProcess(0x0001, 0, pid);
+            let h = OpenProcess(0x0001 | 0x0010_0000, 0, pid);
             TerminateProcess(h, 1);
+            WaitForSingleObject(h, u32::MAX);
             CloseHandle(h);
         }
+    }
+}
+
+/// A function the runtime this test runs under provides, found as a program finds it (through its
+/// loader); None in a native run.
+fn runtime_fn(name: &std::ffi::CStr) -> Option<usize> {
+    #[cfg(unix)]
+    let f = {
+        // (as os/proc.rs declares it)
+        extern "C" {
+            fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
+        }
+        #[cfg(target_vendor = "apple")]
+        let default = -2isize as *mut u8;
+        #[cfg(not(target_vendor = "apple"))]
+        let default = std::ptr::null_mut();
+        unsafe { dlsym(default, name.as_ptr() as *const u8) as usize }
+    };
+    #[cfg(windows)]
+    let f = {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetProcAddress(module: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe { GetProcAddress(GetModuleHandleW(std::ptr::null()), name.as_ptr()) as usize }
+    };
+    (f != 0).then_some(f)
+}
+
+/// Under a runtime: from now on it records what this program holds (`relax_track_handles`).
+fn track_held() {
+    if let Some(f) = runtime_fn(c"relax_track_handles") {
+        let track: extern "C" fn() = unsafe { std::mem::transmute(f) };
+        track();
+    }
+}
+
+/// What the runtime this test runs under records the program holding (`relax_held_handles`);
+/// None with no runtime under the test.
+fn held_by_the_program() -> Option<Vec<u64>> {
+    let f = runtime_fn(c"relax_held_handles")?;
+    let held: extern "C" fn(*mut u64, usize) -> usize = unsafe { std::mem::transmute(f) };
+    let mut out = Vec::new();
+    loop {
+        let n = held(out.as_mut_ptr(), out.len());
+        assert_ne!(n, usize::MAX, "the runtime tracks no handles of this program's");
+        if n <= out.len() {
+            out.truncate(n);
+            return Some(out);
+        }
+        out.resize(n, 0);
     }
 }
 
@@ -1999,6 +2054,7 @@ fn a_run_ends_with_what_it_held_given_back() {
     isolated_test!(a_run_ends_with_what_it_held_given_back);
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (mut counts, mut lefts) = (Vec::new(), Vec::new());
+    track_held();
     for _ in 0..3 {
         let (mut u, entry, root) = fixture_of(HOLDS, "fixture");
         u.tier1 = None;
@@ -2042,8 +2098,12 @@ fn a_run_ends_with_what_it_held_given_back() {
             }
             assert_eq!(unsafe { signal(SIGUSR2, 0) }, 0, "the run's handler stayed");
         }
-        // what the round left open, by what it names: not a count of the whole process
-        let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1)).collect();
+        // what the round left open, by what it names: not a count of the whole process. Under a
+        // runtime (`makepad run` running this test), of that what the runtime records the program
+        // holding: its own threads at work (a sleep's timer, a look at the process's threads)
+        // hold handles for moments, and they are no one's leak. Natively nothing else runs here.
+        let held = held_by_the_program();
+        let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1) && held.as_ref().is_none_or(|h| h.contains(&f.0))).collect();
         counts.push(left.len());
         lefts.push(left);
         domains().retain(|d| d.info.id != domain);
