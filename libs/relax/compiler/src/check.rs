@@ -969,11 +969,10 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
 }
 
 /// A batch of a check beside the running program (the app's own crates, a test's dependencies) on
-/// the JIT's queue (jit_queue `Job::Check`): no threads of its own. Its jobs run in the Background
-/// class behind every build of the queue, on what the budget gives Background beside the program,
-/// the JIT and the app's pools (it yields to their waiters between items), and go first in the
-/// waiter's class once something waits for them (`waited`: the app's first window frame, the run's
-/// exit). Each job takes the next item until its slice is used, then queues itself again: its
+/// the JIT's queue (jit_queue `Job::Check`): no threads of its own. Its jobs run last in Visible
+/// during a UI app's boot check, otherwise last in Background. They yield to higher-priority
+/// waiters between items. Once the app's first window frame or the run's exit waits, they go
+/// first in the waiter's class (`waited`). Each job takes the next item until its slice is used, then queues itself again: its
 /// worker goes back to the queue's order every few milliseconds. (On threads of its own a test's
 /// dependency check took every core beside a large app's cold start, first frame 27.5 s; on two of them
 /// the start drew at 14.8 s, but the check ended 66 s after the tests.)
@@ -990,6 +989,8 @@ pub(crate) struct CheckBatch {
     done: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar),
 }
 
+/// The boot check started for a program expected to present a frame.
+static CHECK_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Something waits for the check beside the program (`waited`).
 static CHECK_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// CPU time (ns) of the app check's jobs for the first frame's line (`first_frame_gate`).
@@ -1001,6 +1002,10 @@ static CHECK_SLICES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::ato
 /// A job's slice: past it, the job gives its worker back to the queue after the item it is on.
 const CHECK_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
+pub(crate) fn check_early() -> bool {
+    CHECK_EARLY.load(std::sync::atomic::Ordering::Acquire) && !jit::past_startup_headless()
+}
+
 /// Something waits for the check beside the program: its jobs run first in the Interactive class.
 pub(crate) fn check_waited() -> bool {
     CHECK_WAITED.load(std::sync::atomic::Ordering::Acquire)
@@ -1009,8 +1014,7 @@ pub(crate) fn check_waited() -> bool {
 /// When something began to wait for the check (wall ns; 0: nothing has).
 static CHECK_WAITED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A slice queued at `since` (wall ns) starts now: its queue time while something waited. Before
-/// the wait its job was a Background one behind every build, which is no wait for a worker.
+/// A slice queued at `since` (wall ns) starts now: count only the time during the wait.
 pub(crate) fn slice_queued(since: u64) {
     let waited_at = CHECK_WAITED_AT.load(std::sync::atomic::Ordering::Acquire);
     if waited_at == 0 { return; }
@@ -1031,6 +1035,27 @@ fn waited() {
         CHECK_WAITED_AT.store(crate::clock::wall_ns(), std::sync::atomic::Ordering::Release);
         jit::promote_checks();
     }
+}
+
+/// An empty boot batch for the isolated queue test, with the same promotion as a first-frame wait.
+#[cfg(test)]
+pub(crate) fn with_early_batch_for_test(front: std::sync::Arc<jit::FrontShared>, test: impl FnOnce(std::sync::Arc<CheckBatch>, fn())) {
+    use std::sync::{Arc, atomic::Ordering::Relaxed};
+    let batch = Arc::new(CheckBatch {
+        ctx: Arc::new(BodyCheck {
+            upn: 0, front, strict: false, beside: true, cpu: Default::default(),
+            audit_reads: None, item_diagnostics: Default::default(),
+        }),
+        items: Vec::new(), kind: CheckKind::Body, next: Default::default(), left: Default::default(),
+        jobs: Default::default(), out: Default::default(), done: Default::default(),
+    });
+    let old_early = CHECK_EARLY.swap(true, Relaxed);
+    let old_waited = CHECK_WAITED.swap(false, Relaxed);
+    let old_at = CHECK_WAITED_AT.load(Relaxed);
+    test(batch, waited);
+    CHECK_WAITED_AT.store(old_at, Relaxed);
+    CHECK_WAITED.store(old_waited, Relaxed);
+    CHECK_EARLY.store(old_early, Relaxed);
 }
 
 /// `items` checked by jobs of the JIT's queue, results in order.
@@ -1332,6 +1357,12 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let errors = {
             let _span = crate::inspect::timeline::span("app check");
+            struct EarlyCheck;
+            impl Drop for EarlyCheck {
+                fn drop(&mut self) { CHECK_EARLY.store(false, std::sync::atomic::Ordering::Release); }
+            }
+            let _early = EarlyCheck;
+            CHECK_EARLY.store(!jit::past_startup_headless(), std::sync::atomic::Ordering::Release);
             check_prepared(upn as *mut Unit, p, Some(&runtime), CheckMode::Typeck)
         }.strings();
         if crate::run::VERBOSE.load(Relaxed) {
@@ -3105,6 +3136,7 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&BOOT_SKIPPED, std::sync::OnceLock::new());
     reset(&AUDIT_DIR, std::sync::OnceLock::new());
+    reset(&CHECK_EARLY, std::sync::atomic::AtomicBool::new(false));
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&CHECK_WAITED_AT, std::sync::atomic::AtomicU64::new(0));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
@@ -3179,8 +3211,7 @@ mod def_work_tests {
         let cleared = waiter.join();
         *BESIDE.0.lock().unwrap() = old_state;
         APP_CHECK_THREAD.store(old_holder, Relaxed);
-        // a slice queued before the wait began counts from the wait's start (before it, its job
-        // was a Background one behind every build: no wait for a worker)
+        // A slice queued before the wait began counts from the wait's start.
         let counted0 = super::CHECK_SLICES[4].load(Relaxed);
         let old_at = super::CHECK_WAITED_AT.swap(crate::clock::wall_ns(), Relaxed);
         super::slice_queued(crate::clock::wall_ns().saturating_sub(5_000_000_000));

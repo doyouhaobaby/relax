@@ -29,8 +29,7 @@ pub(super) enum Job {
     /// (REACH_KEY)
     Reach(usize, u32, bool),
     Tick,
-    /// a slice of a check beside the program (check.rs CheckBatch): below every build until
-    /// something waits for it
+    /// a slice of a check beside the program (check.rs CheckBatch)
     Check(Arc<crate::check::CheckBatch>),
 }
 impl Job {
@@ -470,11 +469,12 @@ fn work_kind(job: &Job, now: &HeatNow) -> u8 {
 /// ahead of the main thread's lazy compiles serve the startup and the UI's bursts; a tier-up (O2,
 /// O3) or a speculative build only speeds code up, so it runs in the background class, below the
 /// app's visible work, however hot its slot (its heat orders it among the background builds).
-/// A check beside the program runs in the background class until something waits for it.
+/// A check is Visible during a UI app's boot check, Background otherwise, and Interactive once waited for.
 fn job_class(job: &Job, _now: &HeatNow) -> u8 {
     match job {
         Job::Ahead(..) if startup_phase() || ui_burst() => budget::INTERACTIVE,
         Job::Check(..) if crate::check::check_waited() => budget::INTERACTIVE,
+        Job::Check(..) if crate::check::check_early() => budget::VISIBLE,
         Job::Reach(_, _, true) => budget::INTERACTIVE,
         _ => budget::BACKGROUND,
     }
@@ -1325,6 +1325,7 @@ mod tests {
 
     #[test]
     fn admission_order_and_waiter_promotion() {
+        isolated_test!(admission_order_and_waiter_promotion);
         let mut order = [
             (budget::BACKGROUND, heat_key(1024, false, 0), 0),
             (budget::VISIBLE, heat_key(2, false, 0), 1),
@@ -1381,7 +1382,7 @@ mod tests {
         let front = Arc::new(FrontShared::new(&Arc::new(crate::Session::default())));
         front.alive.store(true, Ordering::Release);
         q.push(Job::Spec(1, 12), 1);
-        q.push(Job::Ahead(front, AheadWork::Slot(13)), 100);
+        q.push(Job::Ahead(front.clone(), AheadWork::Slot(13)), 100);
         q.set_ahead_class(budget::BACKGROUND);
         assert_eq!(q.entries[q.ordered(1)[0].0].job.tier(), 3, "older cold work leads outside a UI burst");
         q.set_ahead_class(budget::INTERACTIVE);
@@ -1390,6 +1391,24 @@ mod tests {
         assert_eq!(q.remove(first).class, budget::INTERACTIVE, "admission uses the bucket's current class");
         q.remove(0);
         assert_eq!(q.ahead_len, 0, "removals balance bucket accounting");
+
+        crate::check::with_early_batch_for_test(front, |batch, wait| {
+            let check = Job::Check(batch.clone());
+            let old_headless = HEADLESS.swap(true, Ordering::Relaxed);
+            let headless_class = job_class(&check, &now);
+            HEADLESS.store(false, Ordering::Relaxed);
+            // Insert directly so no worker drains the entry before the frame waits.
+            lock().push(Job::Check(batch), 1);
+            let early = { let q = lock(); (q.entries[0].class, q.entries[0].key) };
+            wait();
+            let promoted = lock().remove(0);
+            let waited_class = job_class(&check, &now);
+            HEADLESS.store(old_headless, Ordering::Relaxed);
+            assert_eq!(headless_class, budget::BACKGROUND, "a headless boot check runs in Background");
+            assert_eq!(early, (budget::VISIBLE, i64::MIN), "an early UI check runs last in Visible");
+            assert_eq!((promoted.class, promoted.key), (budget::INTERACTIVE, CHECK_WAITED_KEY), "the wait promotes the queued Visible check");
+            assert_eq!(waited_class, budget::INTERACTIVE, "new check slices are Interactive after the wait");
+        });
     }
 
     /// A drain the OS refuses a thread (a memory limit on the process: a tests/ui check under the
