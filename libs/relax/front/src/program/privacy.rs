@@ -290,8 +290,8 @@ impl Program {
                 // (it binds nothing: rustc reports it unused as well)
                 out.push((None, self.record_error(im.file, im.pos, "resolve", "E0432: unresolved import -- cannot glob-import a module into itself".to_string())));
             } else if !im.glob && im.is_pub && !im.ext {
-                if let Some(msg) = self.cannot_reexport(im, segs, edition) {
-                    out.push((None, self.record_error(im.file, im.pos, "resolve", msg)));
+                if let Some((pos, msg)) = self.cannot_reexport(im, segs, edition) {
+                    out.push((None, self.record_error(im.file, pos, "resolve", msg)));
                 }
             }
         }
@@ -332,12 +332,42 @@ impl Program {
     }
 
     /// E0364 / E0365 (rustc_resolve imports.rs finalize_import): a `pub use` whose every
-    /// resolved binding is less visible than the import itself.
-    fn cannot_reexport(&self, im: &Import, segs: &[(SegKind, Sym)], edition: u16) -> Option<String> {
-        let (kind, name) = *segs.last()?;
-        // the import's nominal visibility: the `use` item's
+    /// resolved binding is less visible than the import itself, at the import's use tree.
+    fn cannot_reexport(&self, im: &Import, segs: &[(SegKind, Sym)], edition: u16) -> Option<(u32, String)> {
         let f = self.files.get(im.file as usize)?;
         let item = f.ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, ItemKind::Use(_)))?;
+        let ItemKind::Use(u) = item.kind else { return None };
+        let pos = self.import_tree_pos(f, &f.ast.row(u).tree, None, 0, im).unwrap_or(im.pos);
+        self.cannot_reexport_message(im, item, segs, edition).map(|m| (pos, m))
+    }
+
+    /// rustc's span for import `im` in `use` tree `tree` (finalize_import's `import.span`): the tree
+    /// that binds it -- the whole tree, or its own one inside a `{..}` group -- from its first
+    /// segment. `start`: where the tree being walked started; `depth`: the segments matched so far.
+    fn import_tree_pos(&self, f: &ParsedFile, tree: &UseTree, start: Option<u32>, depth: usize, im: &Import) -> Option<u32> {
+        let seg_is = |seg: &PathSeg, i: usize| im.segs.get(i).is_some_and(|&(k, s)| f.text(seg.name) == match k {
+            SegKind::Super => "super", SegKind::Crate => "crate", SegKind::SelfValue => "self", SegKind::SelfType => "Self", SegKind::Ident => self.syms.str(s),
+        });
+        match *tree {
+            UseTree::Path(seg, next) => {
+                if !seg_is(&seg, depth) { return None; }
+                self.import_tree_pos(f, f.ast.use_tree(next), start.or(Some(seg.name.lo)), depth + 1, im)
+            }
+            UseTree::Name(seg, rename) => {
+                let own = f.text(seg.name);
+                // the last segment, or a `self` that names the path so far (`a::{self as m}`)
+                let leaf = if depth == im.segs.len() { own == "self" } else { depth + 1 == im.segs.len() && seg_is(&seg, depth) };
+                let bind = im.bind.map(|b| self.syms.str(b));
+                let binds = match (rename.get(), bind) { (Some(r), Some(b)) => f.text(r) == b, (None, Some(b)) => own == b || own == "self", _ => true };
+                (leaf && binds).then_some(start.unwrap_or(seg.name.lo))
+            }
+            UseTree::Glob => None,
+            UseTree::Group(list) => f.ast.list(list).iter().find_map(|t| self.import_tree_pos(f, t, None, depth, im)),
+        }
+    }
+
+    fn cannot_reexport_message(&self, im: &Import, item: &Item, segs: &[(SegKind, Sym)], edition: u16) -> Option<String> {
+        let (kind, name) = *segs.last()?;
         let import_vis = self.vis_module(im.file, im.module, &item.vis);
         let krate_root = self.crates[self.mods[im.module as usize].krate as usize].root_mod;
         let message = |code: &str, n: &str, bv: BindVis| {
