@@ -1215,6 +1215,8 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
 }
 
 // flags[0]: the thread to hold runs
+// (no thread hold on Windows or Android yet: inspect/instrument.rs pause_imp is a stub there)
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 const HELD_RUN: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
@@ -1231,6 +1233,8 @@ fn fixture(p: *mut u64) {
 /// A thread held for good (a frame of it in code a layout patch replaced: stale.rs `park_held`)
 /// leaves with its run: once the run's code is gone the end lets it go, and it ends as every other
 /// thread of the run does, its domain's memory back.
+// (no thread hold on Windows or Android yet: inspect/instrument.rs pause_imp is a stub there)
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn a_thread_held_for_good_leaves_with_its_run() {
     isolated_test!(a_thread_held_for_good_leaves_with_its_run);
