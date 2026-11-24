@@ -768,8 +768,9 @@ impl<'a> Gates<'a> {
         }
         if let Some(root) = relax_internal(&names) {
             // (no module of rustc's library: its resolve error for the path)
+            // (at the segment that does not resolve, rustc's span)
             if !self.feats.has(RELAX_INTERNALS) {
-                self.errors.push(self.prog.record_error(self.file, p.lo, "typeck", format!("E0433: cannot find `intrinsics_mem` in `{root}`")));
+                self.errors.push(self.prog.record_error(self.file, segs[1].name.lo, "typeck", format!("E0433: cannot find `intrinsics_mem` in `{root}`")));
             }
             return;
         }
@@ -1307,7 +1308,7 @@ fn check_imports(prog: &Program, krate: u32, imports: &[usize]) -> Vec<String> {
         if let Some(root) = relax_internal(&names) {
             // (no module of rustc's library: rustc's unresolved import)
             if !feats.has(RELAX_INTERNALS) {
-                out.push(prog.record_error(imp.file, imp.pos, "typeck", format!("E0432: unresolved import `{root}::intrinsics_mem`")));
+                out.push(prog.record_error(imp.file, import_segment_pos(prog, imp, "intrinsics_mem"), "typeck", format!("E0432: unresolved import `{root}::intrinsics_mem`")));
             }
             continue;
         }
@@ -1318,6 +1319,19 @@ fn check_imports(prog: &Program, krate: u32, imports: &[usize]) -> Vec<String> {
         }
     }
     out
+}
+
+/// rustc's span for segment `name` of import `imp`, the one that does not resolve: where that word
+/// first stands in the import's text up to its `;` (as resolve places an unresolved import's name;
+/// the import keeps no segment positions), else the import's start.
+fn import_segment_pos(prog: &Program, imp: &crate::program::Import, name: &str) -> u32 {
+    let pf = &*prog.files[imp.file as usize];
+    let src = &pf.src[..(pf.src_len as usize).min(pf.src.len())];
+    let lo = pf.diagnostic_pos(imp.pos) as usize;
+    if lo >= src.len() { return imp.pos; }
+    let text = &src[lo..];
+    let end = text.iter().position(|&c| c == b';').unwrap_or(text.len());
+    text[..end].windows(name.len()).position(|w| w == name.as_bytes()).map_or(imp.pos, |n| (lo + n) as u32)
 }
 
 fn unstable_in_attrs(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {

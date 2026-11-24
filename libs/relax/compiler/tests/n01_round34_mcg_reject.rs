@@ -4,6 +4,7 @@
 // rejects: E0128
 // rejects: generic parameters may not be used in const operations
 // rejects: generic parameters may not be used in enum discriminant values
+// rejects-at: 23:46 E0747
 // (rustc: E0747 "unresolved item provided when a constant was expected" at `id::<N>()`, the N of a
 // const operation resolving to an error; E0308 at the default "bad" of a u8 const parameter, whose
 // anonymous constant is type-checked as a body owner. A failed discriminant (`E`) stops neither.)
