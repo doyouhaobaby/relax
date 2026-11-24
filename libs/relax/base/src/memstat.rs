@@ -89,14 +89,17 @@ pub enum Tag {
     Patterns,
     /// building and transforming a body's MIR for the borrow checker
     Mir,
+    /// `makepad run`'s background check of the crates' items (typeck_bg.rs ItemPass): its own
+    /// blocks; what the phases under it tag (sigs, typeck, ..) stays theirs
+    ItemPass,
 }
 
-pub const N_TAGS: usize = 39;
+pub const N_TAGS: usize = 40;
 pub const TAG_NAMES: [&str; N_TAGS] = [
     "other", "boot", "parse", "parse-body", "derive", "macro_rules", "fmt", "mac-other", "load", "resolve", "syms", "sigs", "types",
     "typeck", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
     "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output", "planner",
-    "body-lints", "patterns", "mir",
+    "body-lints", "patterns", "mir", "item-pass",
 ];
 
 /// 0 undecided, 1 off, 2 on (decided at the first allocation, never changed)
