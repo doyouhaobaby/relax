@@ -10830,9 +10830,18 @@ mod data_tests {
         assert_eq!((hit, other.stats.shared_hits), ([false, false, true, true, true, true, true, true], 0), "under another std the sealed slots miss, a's own code hits");
         drop(other);
         // `a` moved to a2, its run dirs with it: the shared code hits; a's own code is keyed by
-        // the checkout and misses; nothing that holds a path was recorded to hit
+        // the checkout and misses; nothing that holds a path was recorded to hit. (Copied, not
+        // renamed: this process holds its build and pass locks in a's store folders until it
+        // exits (store.rs HELD, PASSES), and Windows renames no folder holding an open file.)
+        fn copy(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap() {
+                let (e, to) = { let e = e.unwrap(); let to = to.join(e.file_name()); (e, to) };
+                if e.file_type().unwrap().is_dir() { copy(&e.path(), &to) } else { std::fs::copy(e.path(), to).unwrap(); }
+            }
+        }
         std::fs::remove_dir_all(&a2).unwrap();
-        std::fs::rename(&a, &a2).unwrap();
+        copy(&a, &a2);
         assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), (first, [6, 0, 0, 1, 1]), "the moved checkout links only the shared code");
         // short of room on its volume, prune evicts the shared store (used by no running pass, nor
         // by a run of this process now): the next run compiles that code again and shares it, a
