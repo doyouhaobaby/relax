@@ -1198,7 +1198,7 @@ fn worker_loop(index: usize) {
                     let (serial, tier) = (entry.serial, entry.job.tier());
                     let queued_ns = wall_ns().saturating_sub(entry.since);
                     if matches!(entry.job, Job::Check(..)) && crate::check::check_waited() {
-                        crate::check::slice_queued(queued_ns);
+                        crate::check::slice_queued(entry.since);
                     }
                     crate::zone_alloc::kept_with(|| budget::waited(entry.class, budget::JIT, queued_ns, entry.job.label()));
                     let active = if let Job::O3(tier) = &entry.job {
