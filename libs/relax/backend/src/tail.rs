@@ -342,3 +342,23 @@ pub fn tail_shaped(f: &Func, reach: &[bool]) -> Vec<usize> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tail_shaped_part_call_keeps_its_record_frame() {
+        let mut f = Func::new("host".into(), 0);
+        let slot = f.slot(16, 16);
+        let (record, id, result) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.rets.push(Cls::I);
+        f.block();
+        f.blocks[0].insts = vec![Inst::SlotAddr(record, slot), Inst::Iconst(id, 2), Inst::Call(Callee::Part, vec![record, id], vec![result])];
+        f.blocks[0].term = Term::Ret(vec![result]);
+        assert!(returns_results(&f, 0, 3, &[result]));
+        for arch in [Arch::X64, Arch::Arm64] {
+            assert!(sibling_calls(&relax_session::Options::default(), &f, &[true], arch).is_empty());
+        }
+    }
+}
