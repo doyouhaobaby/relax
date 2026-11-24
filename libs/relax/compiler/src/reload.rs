@@ -11266,6 +11266,127 @@ fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
     }
 }
 
+/// Whether a save of `paths` is whole only at the edits ledger, however still its files are:
+/// each a mounted store's file the program never wrote. Such a file changes only through the
+/// edits folder, and devhub's ship-done renames a ship's files in, then the ledger last
+/// ([`committed_by_ledger`]). The program's own write puts its ledger record before its content,
+/// so it and a disk save settle at the quiet window; so does an edits folder without a ledger.
+fn awaits_ledger<'a>(paths: impl Iterator<Item = &'a str>) -> bool {
+    #[cfg(unix)]
+    {
+        if !crate::vfs::edits_record().is_some_and(|p| p.is_file()) { return false; }
+        let mut any = false;
+        let all = { paths }.all(|p| {
+            any = true;
+            crate::vfs::in_store(p) && crate::vfs::edit_rel(p).is_some_and(|rel| !crate::vfs::program_edited(&rel))
+        });
+        any && all
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        false
+    }
+}
+
+/// What a save's settle ([`settle_save`]) ended with: every watched file's stamp then, the git
+/// identities then, whether anything moved while it waited, how many stamps it read, and whether
+/// it waited on the live watch.
+struct Settled {
+    stamps: Vec<Option<(std::time::SystemTime, u64)>>,
+    git: git::Snapshot,
+    moved: bool,
+    scanned: usize,
+    waited: bool,
+}
+
+/// Lets a save settle across the whole watch set. A native notification is a wakeup, not proof
+/// that a checkout has finished: index.lock must be gone and HEAD, its ref and every changed file
+/// must stay still for a full quiet window. Never give up waiting on a slow writer: a save of a
+/// mounted store's files ends at its ledger, however long the writer takes between two of them
+/// ([`awaits_ledger`]). `changed` takes every file that moved meanwhile, and `files` the sources
+/// new in a changed source folder.
+#[allow(clippy::too_many_arguments)]
+fn settle_save(files: &mut Vec<(String, u32, Option<(std::time::SystemTime, u64)>)>, virt: &Virtual, changed: &mut Vec<usize>, events: &mut Option<LiveWatch>,
+    inputs: &mut Inputs, repositories: &mut git::Repositories, settled_git: &git::Snapshot, wait: &mut SettleWait) -> Settled {
+    let look = Look::new();
+    let mut last: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(virt, k, &f.0)).collect();
+    let mut git_state = repositories.snapshot();
+    let mut still_since = Instant::now();
+    let (mut any_moved, mut scanned) = (false, 0);
+    // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
+    // every overlay edit's save -> frame)
+    let mut committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
+    let mut waited = false;
+    loop {
+        if !committed {
+            // the rest of the quiet window, or for an overlay edit until the watch hears a file
+            // or the ledger: one seen between its file's rename and ship-done's last write, the
+            // ledger's, goes on at that rename (a third of overlay edits waited out the whole
+            // window, 11-03). Every file is looked at below, so an event is only a wakeup; a
+            // disk save waits out the window without a look per event (a checkout's files).
+            let left = LIVE_QUIET.saturating_sub(still_since.elapsed());
+            // (past the window, a save that waits for its ledger looks again a window at a time)
+            let left = if left.is_zero() && awaits_ledger(changed.iter().map(|&k| files[k].0.as_str())) { LIVE_QUIET } else { left };
+            let overlay = cfg!(unix) && changed.iter().all(|&k| crate::vfs::in_store(&files[k].0));
+            let rewatch = match events.as_mut().filter(|_| overlay) {
+                Some(w) => {
+                    waited = true;
+                    // whole milliseconds, rounded up: a wait that ends short of the window
+                    // would look again at once
+                    w.wait(Some(std::time::Duration::from_millis(left.as_micros().div_ceil(1000) as u64)));
+                    w.changed().is_none()
+                }
+                None => {
+                    std::thread::sleep(left);
+                    false
+                }
+            };
+            // events lost, or a new edit recorded (it may have made a folder): watched anew
+            if rewatch { *events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+            committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
+        }
+        let additions = inputs.discover_sources(files.iter().map(|f| f.0.as_str()));
+        if !additions.is_empty() {
+            let known: std::collections::HashSet<_> = files.iter().map(|f| f.0.clone()).collect();
+            for path in additions {
+                if !known.contains(&path) { files.push((path, u32::MAX, None)); }
+            }
+            repositories.include(files.iter().map(|f| f.0.as_str()));
+            *events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
+        }
+        let look = Look::new();
+        let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(virt, k, &f.0)).collect();
+        scanned += files.len();
+        for (k, f) in files.iter().enumerate() {
+            if now[k] != f.2 { changed.push(k); }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        let next_git = repositories.snapshot();
+        let moved = moved_file(files, &now, &last)
+            .or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display())))
+            .or_else(|| next_git.holding(wait.save, settled_git).map(|p| format!("{} is there", p.display())));
+        last = now;
+        git_state = next_git;
+        if let Some(what) = moved {
+            wait.moved(&what, || wait_name(&changed[..], &files[..]));
+            any_moved = true;
+            still_since = Instant::now();
+        } else if committed {
+            break;
+        } else if still_since.elapsed() >= LIVE_QUIET {
+            if !awaits_ledger(changed.iter().map(|&k| files[k].0.as_str())) { break; }
+            // still, and its ledger not in: its writer is between two of its files. A busy box
+            // spaced one ship's two files 300 ms apart; the window took the first alone, and a
+            // struct's new field the second added was refused E0560 on the first's patch (11-24).
+            wait.moved("its edits ledger", || wait_name(&changed[..], &files[..]));
+        }
+        committed = false;
+    }
+    Settled { stamps: last, git: git_state, moved: any_moved, scanned, waited }
+}
+
 /// Whether a changed watched path that no running file has is one a round answers for (a live
 /// test session reruns its tests: a data file they may read): a file, never a folder. A folder is
 /// a directory identity: its stamp moves whenever an entry in it is made, renamed or removed, a
@@ -11951,81 +12072,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 hot.push(k);
             }
         }
-        // Let the save settle across the whole watch set. A native notification
-        // is a wakeup, not proof that a checkout has finished: index.lock must
-        // be gone and HEAD, its ref and every changed file must stay still for
-        // a full quiet window. Never give up waiting on a slow writer.
-        let look = Look::new();
-        let mut last: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
-        let mut git_state = repositories.snapshot();
-        let mut still_since = Instant::now();
-        // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
-        // every overlay edit's save -> frame)
-        let mut committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
-        let mut waited = false;
-        loop {
-            if !committed {
-                // the rest of the quiet window, or for an overlay edit until the watch hears a file
-                // or the ledger: one seen between its file's rename and ship-done's last write, the
-                // ledger's, goes on at that rename (a third of overlay edits waited out the whole
-                // window, 11-03). Every file is looked at below, so an event is only a wakeup; a
-                // disk save waits out the window without a look per event (a checkout's files).
-                let left = LIVE_QUIET.saturating_sub(still_since.elapsed());
-                let overlay = cfg!(unix) && changed.iter().all(|&k| crate::vfs::in_store(&files[k].0));
-                let rewatch = match events.as_mut().filter(|_| overlay) {
-                    Some(w) => {
-                        waited = true;
-                        // whole milliseconds, rounded up: a wait that ends short of the window
-                        // would look again at once
-                        w.wait(Some(std::time::Duration::from_millis(left.as_micros().div_ceil(1000) as u64)));
-                        w.changed().is_none()
-                    }
-                    None => {
-                        std::thread::sleep(left);
-                        false
-                    }
-                };
-                // events lost, or a new edit recorded (it may have made a folder): watched anew
-                if rewatch { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
-                committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
-            }
-            let additions = inputs.discover_sources(files.iter().map(|f| f.0.as_str()));
-            if !additions.is_empty() {
-                let known: std::collections::HashSet<_> = files.iter().map(|f| f.0.clone()).collect();
-                for path in additions {
-                    if !known.contains(&path) { files.push((path, u32::MAX, None)); }
-                }
-                repositories.include(files.iter().map(|f| f.0.as_str()));
-                events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
-            }
-            let look = Look::new();
-            let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
-            scanned += files.len();
-            for (k, f) in files.iter().enumerate() {
-                if now[k] != f.2 { changed.push(k); }
-            }
-            changed.sort_unstable();
-            changed.dedup();
-            let next_git = repositories.snapshot();
-            let moved = moved_file(&files, &now, &last)
-                .or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display())))
-                .or_else(|| next_git.holding(wait.save, &settled_git).map(|p| format!("{} is there", p.display())));
-            last = now;
-            git_state = next_git;
-            if let Some(what) = moved {
-                wait.moved(&what, || wait_name(&changed, &files));
-                quiet_retry = false;
-                still_since = Instant::now();
-            } else if committed || still_since.elapsed() >= LIVE_QUIET {
-                break;
-            }
-            committed = false;
-        }
-        settled_git = git_state.clone();
-        // a wait above may have taken a wakeup meant for the loop's own (a streamed edit, a
+        let settled = settle_save(&mut files, &virt, &mut changed, &mut events, &mut inputs, &mut repositories, &settled_git, &mut wait);
+        scanned += settled.scanned;
+        if settled.moved { quiet_retry = false; }
+        settled_git = settled.git;
+        // a wait in it may have taken a wakeup meant for the loop's own (a streamed edit, a
         // retry, a domain's inputs): one more round sees what it was for
-        if waited { watch_events::kick(); }
-        let settled_stamps = last;
+        if settled.waited { watch_events::kick(); }
+        let settled_stamps = settled.stamps;
         // (what settled may be a held landing's: it waits, the rest applies)
         changed.retain(|&k| !held_back(&files[k].0, true));
         // The lockfile as the run's own native build left it is no edit (cargo brought it up to
@@ -12327,7 +12381,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let look = Look::new();
         let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
         let next_git = repositories.snapshot();
-        if let Some(what) = moved_file(&files, &now, &settled_stamps).or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display()))) {
+        if let Some(what) = moved_file(&files, &now, &settled_stamps).or_else(|| next_git.moved_from(&settled_git).map(|p| format!("{} moved", p.display()))) {
             wait.moved(&what, || wait_name(&changed, &files));
             settle_wait = Some(wait);
             again = true;
@@ -12366,7 +12420,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // recovers now, the edit's own errors wait for the tree's next change. A tree that
             // moved while this compiled has that move's events queued: their round retries it.
             let look = Look::new();
-            let unchanged = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
+            let unchanged = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == settled_git;
             if unchanged {
                 if let Some(failure) = failure {
                     drop(_reloading);
@@ -13845,6 +13899,69 @@ mod commit_tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "woken by the ledger's rename, not a timeout ({:?})", start.elapsed());
         crate::vfs::set_edits(None);
         let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A ship's files settle as one save however far apart its writer renames them in: a save of
+    /// a mounted store's files is whole at the ledger ship-done renames last, never at a quiet
+    /// window. A busy box spaced one ship's two files 300 ms apart; the first was patched alone,
+    /// refused E0560 on the new field of a struct the second changed, and cargo built the ship
+    /// (11-24). A disk save, a store file the program wrote itself (its ledger record comes before
+    /// its content) and an edits folder without a ledger still settle at the window.
+    #[test]
+    fn a_ships_files_settle_as_one_save_however_far_apart() {
+        isolated_test!(a_ships_files_settle_as_one_save_however_far_apart);
+        let fixture = vfs_store::Fixture::new(&[("app/a.rs", b"a"), ("app/b.rs", b"b"), ("app/c.rs", b"c")]);
+        let root = "/relax-live-apart/vfs/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-live-apart-{}", std::process::id()));
+        std::fs::create_dir_all(edits.join("app")).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        let put = |rel: &str, text: &str| {
+            let tmp = edits.join(format!("{rel}.part"));
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, edits.join(rel)).unwrap();
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(20));
+        let disk = edits.with_extension("disk.rs").to_string_lossy().into_owned();
+        std::fs::write(&disk, "d").unwrap();
+        put(".makepad-run-edits", "");
+        tick();
+        let (a, b, c) = (format!("{root}/app/a.rs"), format!("{root}/app/b.rs"), format!("{root}/app/c.rs"));
+        let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = [&a, &b, &c, &disk].iter().map(|p| (p.to_string(), 0, None)).collect();
+        let virt = super::Virtual::of(&files);
+        let look = super::Look::new();
+        for k in 0..files.len() { files[k].2 = look.stamp(&virt, k, &files[k].0); }
+        let mut events = super::LiveWatch::new(files.iter().map(|f| f.0.as_str()));
+        let (mut inputs, mut repositories) = (super::Inputs::default(), super::git::Repositories::default());
+        let settled_git = repositories.snapshot();
+        // ship-done: a.rs, b.rs 250 ms after it, then the ledger; the round saw a.rs
+        put("app/a.rs", "a2");
+        let mut changed = vec![0];
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                put("app/b.rs", "b2");
+                tick();
+                put(".makepad-run-edits", "app/a.rs\tnew\napp/b.rs\tnew\n");
+            });
+            let mut wait = super::SettleWait::new(String::new());
+            super::settle_save(&mut files, &virt, &mut changed, &mut events, &mut inputs, &mut repositories, &settled_git, &mut wait);
+        });
+        assert_eq!(changed, [0, 1], "the ship's second file, in 250 ms after its first, settles with it");
+        assert!(super::committed_by_ledger([a.as_str(), b.as_str()].into_iter()), "and the save ends at its ledger");
+        let awaits = |p: &str| super::awaits_ledger(std::iter::once(p));
+        assert!(!awaits(&disk), "a disk save settles at the window");
+        let (mut out, mut len) = (std::ptr::null(), 0usize);
+        let id = crate::vfs::relax_vfs_edit(c.as_ptr(), c.len(), 2, &mut out, &mut len);
+        assert_ne!(id, 0, "the program can write c.rs");
+        crate::vfs::relax_vfs_release(id);
+        assert!(!awaits(&c), "a store file the program wrote itself settles at the window");
+        assert!(awaits(&b), "a store file only a ship writes waits for its ledger");
+        std::fs::remove_file(edits.join(".makepad-run-edits")).unwrap();
+        assert!(!awaits(&b), "an edits folder without a ledger has none to wait for");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
+        let _ = std::fs::remove_file(&disk);
     }
 }
 
