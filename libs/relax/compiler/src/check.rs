@@ -1021,6 +1021,12 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
 /// used, then the job queues itself again while items are left.
 pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     use std::sync::atomic::Ordering;
+    let _span = crate::inspect::timeline::span(match batch.kind {
+        CheckKind::Items => "check items",
+        CheckKind::Wf => "check wf",
+        CheckKind::Impl => "check impl",
+        CheckKind::Body => "check body",
+    });
     let start = std::time::Instant::now();
     struct Running;
     impl Drop for Running {
@@ -1175,6 +1181,12 @@ pub fn finish_test_deps(code: i32) -> i32 {
 /// The app check beside the program (start_app_check): 0 none, 1 running, 2 done clean, 3 found
 /// errors (the run ends in place: run_end::check_failed).
 static BESIDE: (relax_session::sync::Mutex<u8>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new());
+static APP_CHECK_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FIRST_FRAME_WAITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn first_frame_waits() -> bool {
+    FIRST_FRAME_WAITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// makepad run of an app that presents frames: its app check runs beside main instead of before
 /// it. Every body is still checked before it first runs (a lazy compile checks its body; a body
@@ -1187,11 +1199,25 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
     *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 1;
     let upn = up as usize;
     crate::run_threads::spawn_sized("run-app-check", 256 << 20, move || {
+        use std::sync::atomic::Ordering::Relaxed;
+        struct CheckThread;
+        impl Drop for CheckThread {
+            fn drop(&mut self) { APP_CHECK_THREAD.store(0, Relaxed); }
+        }
+        let _thread = CheckThread;
+        {
+            let _state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+            APP_CHECK_THREAD.store(crate::waits::me(), Relaxed);
+            // A frame that arrived before this thread started can now name its holder.
+            if first_frame_waits() { BESIDE.1.notify_all(); }
+        }
         let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-        let errors = check_prepared(upn as *mut Unit, p, Some(&runtime), CheckMode::Typeck).strings();
-        if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-            use std::sync::atomic::Ordering::Relaxed;
+        let errors = {
+            let _span = crate::inspect::timeline::span("app check");
+            check_prepared(upn as *mut Unit, p, Some(&runtime), CheckMode::Typeck)
+        }.strings();
+        if crate::run::VERBOSE.load(Relaxed) {
             eprintln!("relax: app check beside main: {} crates, {} body owners, {} item defs, {} errors, {:.0} ms",
                 RUN_CHECK[0].load(Relaxed), RUN_CHECK[1].load(Relaxed), RUN_CHECK[7].load(Relaxed), errors.len(), RUN_CHECK[2].load(Relaxed) as f64 / 1e6);
         }
@@ -1225,14 +1251,26 @@ pub(crate) fn app_check_running() -> bool {
 /// for the app check beside main. An error it finds ends the run instead (start_app_check): the
 /// program's thread here leaves it, with no frame presented and no wait for the end's grace.
 pub fn wait_app_check() {
+    use std::sync::atomic::Ordering::Relaxed;
+    struct GateWait;
+    impl Drop for GateWait {
+        fn drop(&mut self) { FIRST_FRAME_WAITS.store(false, Relaxed); }
+    }
     let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     if state == 3 { crate::run_end::leave(); }
     if state != 1 { return; }
     waited();
     let t0 = std::time::Instant::now();
     let mut g = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *g == 1 {
-        g = BESIDE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+    if *g == 1 {
+        FIRST_FRAME_WAITS.store(true, Relaxed);
+        let _gate = GateWait;
+        while *g == 1 {
+            let holder = APP_CHECK_THREAD.load(Relaxed);
+            let _wait = crate::waits::begin(crate::waits::Kind::Check, 0, holder, "first frame");
+            g = BESIDE.1.wait_while(g, |state| *state == 1 && APP_CHECK_THREAD.load(Relaxed) == holder)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
     let failed = *g == 3;
     drop(g);
@@ -2943,6 +2981,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&AUDIT_DIR, std::sync::OnceLock::new());
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
+    reset(&APP_CHECK_THREAD, std::sync::atomic::AtomicU64::new(0));
+    reset(&FIRST_FRAME_WAITS, std::sync::atomic::AtomicBool::new(false));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 8]);
     reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
     reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
@@ -2953,6 +2993,46 @@ pub(crate) unsafe fn reset_statics() {
 #[cfg(test)]
 mod def_work_tests {
     use super::{def_work, DefWork};
+
+    #[test]
+    fn first_frame_waits_for_the_app_check() {
+        use super::{first_frame_waits, wait_app_check, APP_CHECK_THREAD, BESIDE, CHECK_WAITED};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::time::{Duration, Instant};
+
+        let holder = crate::waits::me();
+        let old_holder = APP_CHECK_THREAD.swap(holder, Relaxed);
+        let old_state = std::mem::replace(&mut *BESIDE.0.lock().unwrap(), 1);
+        // The test holds the check itself. Its waiter has no jobs to promote on the shared queue.
+        let old_waited = CHECK_WAITED.swap(true, Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let id = crate::waits::me();
+            tx.send(id).unwrap();
+            wait_app_check();
+            crate::waits::of(id).is_none()
+        });
+        let id = rx.recv().unwrap();
+        let start = Instant::now();
+        let registered = loop {
+            if crate::waits::of(id).is_some_and(|w| w.kind == crate::waits::Kind::Check && w.holder == holder && w.label == "first frame")
+                && first_frame_waits() && crate::owner::queued_note().contains("\"gate\":1") {
+                break true;
+            }
+            if start.elapsed() >= Duration::from_millis(500) { break false; }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        *BESIDE.0.lock().unwrap() = 2;
+        BESIDE.1.notify_all();
+        let cleared = waiter.join();
+        *BESIDE.0.lock().unwrap() = old_state;
+        APP_CHECK_THREAD.store(old_holder, Relaxed);
+        CHECK_WAITED.store(old_waited, Relaxed);
+
+        assert!(registered, "the parked frame must name the check thread and report the JIT gate");
+        assert!(cleared.unwrap(), "the wait row must clear before the waiter thread exits");
+        assert!(!first_frame_waits(), "the gate must clear when the check finishes");
+    }
 
     fn ice(said: &str) -> String {
         format!("ice: {said}")

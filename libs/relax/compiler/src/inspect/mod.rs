@@ -1310,6 +1310,7 @@ pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
         crate::waits::Kind::Owner => format!("owner ({} request) for {}; owner serves {}", w.label, ms, crate::owner::serving_note()),
         crate::waits::Kind::Build => format!("build #{} {} held by {} for {}", w.object, w.label, thread_label(w.holder, list), ms),
         crate::waits::Kind::Token => format!("a {} CPU token for {}", w.label, ms),
+        crate::waits::Kind::Check => format!("the app check beside main ({}) held by {} for {}", w.label, thread_label(w.holder, list), ms),
         _ => format!("{} held by {} for {}", kind, thread_label(w.holder, list), ms),
     }
 }

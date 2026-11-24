@@ -951,14 +951,16 @@ pub fn serving_detail() -> String {
 /// the program is inside a demand compile (a first call's lazy compile, from its first request
 /// until it runs the code). A queued request is only part of that wait: once the owner served it,
 /// the thread still waits on its compile until it runs again, and an app whose threads
-/// wait so is not idle (makepad_test's idle rule reads it).
+/// wait so is not idle (makepad_test's idle rule reads it). `gate` is 1 while the first frame
+/// waits on the app check, which is JIT work, so the app is not idle.
 pub fn queued_note() -> String {
     format!(
-        "{{\"total\":{},\"foreground\":{},\"main\":{},\"demand\":{}}}",
+        "{{\"total\":{},\"foreground\":{},\"main\":{},\"demand\":{},\"gate\":{}}}",
         QUEUED_N.load(Ordering::Relaxed),
         FOREGROUND.load(Ordering::Relaxed),
         MAIN_QUEUED.load(Ordering::Relaxed),
-        u8::from(crate::jit::demand_compile_age().0)
+        u8::from(crate::jit::demand_compile_age().0),
+        u8::from(crate::check::first_frame_waits())
     )
 }
 
