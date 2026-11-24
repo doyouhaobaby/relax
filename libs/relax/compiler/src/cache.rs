@@ -2432,9 +2432,21 @@ impl Cache {
     /// collected record reuses them up to `crate_defs_n`).
     fn defs_appended(&mut self, u: &Unit) {
         let n = u.prog.defs.len();
-        let mut touched: Vec<u32> = (self.crate_defs_n.min(n)..n).map(|i| u.prog.def(DefId(i as u32)).krate).filter(|&k| (k as usize) < self.crate_ident.len()).collect();
-        touched.sort_unstable();
-        touched.dedup();
+        // the crates the cache names that have new definitions, a flag per crate (no sort over the
+        // definitions); none while nothing is listed or mapped, as at the first map, whose
+        // definitions are all new (it runs inside the startup image build, with no yield check)
+        let mut touched: Vec<u32> = Vec::new();
+        if !self.crate_defs.is_empty() || !self.def_maps.is_empty() {
+            let mut seen = vec![false; self.crate_ident.len()];
+            for i in self.crate_defs_n.min(n)..n {
+                let k = u.prog.def(DefId(i as u32)).krate as usize;
+                if k < seen.len() && !seen[k] {
+                    seen[k] = true;
+                    touched.push(k as u32);
+                }
+            }
+            touched.sort_unstable();
+        }
         // a map built in steps: its definitions back to its crate's list (taken anew below if
         // its crate is one of these)
         if let Some((pc, defs, ..)) = self.def_map_partial.take() {
@@ -11312,10 +11324,11 @@ mod data_tests {
         c.enc_def(&u, g, &mut module_e, &mut Vec::new());
         assert_eq!(c.dec_def(&u, &mut D { b: &module_e.0, p: 0 }), None, "a run-time module's definition must not decode from a cache key");
 
+        // the first map found nothing listed to take anew (it scans no definitions for that), and
+        // a run-time module's definitions belong to no crate the cache names
+        assert!(c.def_maps_appended.is_empty(), "the first map and a run-time module's load drop no map: {:?}", c.def_maps_appended);
         // A live edit adds definitions to a crate the cache can name: one under a new name, and a
-        // copy of f. (The first map took every crate's definitions as added: only what this
-        // append drops counts.)
-        c.def_maps_appended.clear();
+        // copy of f.
         let mut renamed = *u.prog.def(f);
         renamed.name = u.prog.syms.intern("h");
         u.prog.defs.push(renamed);
