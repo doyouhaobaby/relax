@@ -203,6 +203,29 @@ static REC: [Rec; RECS] = [const {
 static WAKE_W: AtomicI32 = AtomicI32::new(-1);
 #[cfg(unix)]
 static WAKE_R: AtomicI32 = AtomicI32::new(-1);
+/// The watcher's wake-up event (Windows, auto-reset); 0 before it runs.
+#[cfg(windows)]
+static WAKE: AtomicUsize = AtomicUsize::new(0);
+
+/// Wakes the watcher. Signal-safe: write(2) on unix; on Windows SetEvent, a system call that takes
+/// no lock of this process's (a vectored exception handler may call it).
+fn wake(why: &'static [u8; 1]) {
+    #[cfg(unix)]
+    {
+        let w = WAKE_W.load(Ordering::Acquire);
+        if w >= 0 {
+            let _ = unsafe { write(w, why.as_ptr().cast(), 1) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = why;
+        let e = WAKE.load(Ordering::Acquire);
+        if e != 0 {
+            unsafe { crate::os::win32::SetEvent(e as crate::os::win32::HANDLE) };
+        }
+    }
+}
 
 #[cfg(unix)]
 extern "C" {
@@ -241,13 +264,7 @@ pub unsafe fn on_fault(f: &crate::os::fault::Fault, r: &'static Range, walk: imp
         rec.state.store(2, Ordering::Release);
     }
     first_line(f, r);
-    #[cfg(unix)]
-    {
-        let w = WAKE_W.load(Ordering::Acquire);
-        if w >= 0 {
-            let _ = write(w, b"s".as_ptr().cast(), 1);
-        }
-    }
+    wake(b"s");
     leave_when(crate::domain::current_is_ending);
 }
 
@@ -302,6 +319,18 @@ fn start_watcher() {
             if pipe(fds.as_mut_ptr()) == 0 {
                 WAKE_R.store(fds[0], Ordering::Release);
                 WAKE_W.store(fds[1], Ordering::Release);
+            } else {
+                eprintln!("relax: the stale-access watcher has no wake-up pipe ({}): it looks every 250 ms instead", std::io::Error::last_os_error());
+            }
+        }
+        // (auto-reset: a wake-up wakes the one waiter once)
+        #[cfg(windows)]
+        {
+            let e = unsafe { crate::os::win32::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if e != 0 {
+                WAKE.store(e as usize, Ordering::Release);
+            } else {
+                eprintln!("relax: the stale-access watcher has no wake-up event ({}): it looks every 250 ms instead", std::io::Error::last_os_error());
             }
         }
         let _k = crate::zone_alloc::kept();
@@ -327,6 +356,7 @@ fn start_watcher() {
     });
 }
 
+/// Until a wake-up; every 250 ms only when the watcher could make no way to be woken.
 fn wait() {
     #[cfg(unix)]
     {
@@ -334,6 +364,15 @@ fn wait() {
         if r >= 0 {
             let mut b = [0u8; 16];
             unsafe { read(r, b.as_mut_ptr().cast(), b.len()) };
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        const INFINITE: u32 = u32::MAX;
+        let e = WAKE.load(Ordering::Acquire);
+        if e != 0 {
+            unsafe { crate::os::win32::WaitForSingleObject(e as crate::os::win32::HANDLE, INFINITE) };
             return;
         }
     }
@@ -378,13 +417,7 @@ pub fn park_held(os_id: u64, frames: Vec<u64>, at: usize, what: String, reason: 
     start_watcher();
     crate::inspect::flightrec::event("stale.held", &format!("tid {}: frame in {}: {}", os_id, what, reason), os_id, frames.get(at).copied().unwrap_or(0));
     crate::zone_alloc::kept_with(|| HELD.lock().unwrap_or_else(|e| e.into_inner()).push(Held { os_id, frames, at, what, reason, held }));
-    #[cfg(unix)]
-    {
-        let w = WAKE_W.load(Ordering::Acquire);
-        if w >= 0 {
-            let _ = unsafe { write(w, b"h".as_ptr().cast(), 1) };
-        }
-    }
+    wake(b"h");
 }
 
 fn handle_held(h: Held) {
