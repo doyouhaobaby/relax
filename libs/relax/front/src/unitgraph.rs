@@ -2197,7 +2197,7 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
     }
     if !any {
         // cargo: a script that names no inputs reruns when any file of its package changes
-        match (shared_content(shared, pkg_dir, true, follow), crate::vfs::identity(pkg_dir)) {
+        match (shared_content(shared, pkg_dir, true, follow), crate::vfs::package_identity(pkg_dir)) {
             (Some(c), _) => key.push_str(&format!("p c{:032x} {}\n", c, pkg_dir)),
             (None, Some(id)) => key.push_str(&format!("p {} {}\n", id, pkg_dir)),
             (None, None) => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir), follow), pkg_dir)),
@@ -3141,6 +3141,62 @@ mod shared_script_tests {
         let use_file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(held.join("relax-use")).unwrap();
         assert!(use_file.try_lock().is_err(), "a build dir made again is use-locked again");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "../../base/tests/support/vfs_store.rs"]
+mod vfs_store;
+
+#[cfg(test)]
+mod overlay_rerun_tests {
+    use super::*;
+
+    /// An overlay edit reruns a build script: one that names no input at each edit, whiteout or
+    /// take-back of a file of its package (cargo's rule), one that names a file at each edit of
+    /// that file. A mounted store's package folder was keyed by its commit alone, which no edit
+    /// moves, so the script kept its output from before the edit; a named file's edits were keyed
+    /// by a disk time the store's paths have none of, the same at every edit after the first.
+    #[test]
+    fn an_overlay_edit_reruns_a_build_script() {
+        let fixture = super::vfs_store::Fixture::new(&[("pkg/build.rs", b"fn main() {}"), ("pkg/src/lib.rs", b"pub fn f() {}"), ("pkg/proto/a.proto", b"a")]);
+        let root = "/relax-unitgraph-overlay/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-unitgraph-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&edits);
+        std::fs::create_dir_all(&edits).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        let put = |rel: &str, text: &str| {
+            let p = edits.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        let pkg = format!("{root}/pkg");
+        let unnamed = || rerun_key("cargo:rustc-cfg=x\n", &pkg, "env", None, None).unwrap();
+        let named = || rerun_key("cargo:rerun-if-changed=proto/a.proto\ncargo:rustc-cfg=x\n", &pkg, "env", None, None).unwrap();
+        let (unnamed0, named0) = (unnamed(), named());
+        assert_eq!((unnamed(), named()), (unnamed0.clone(), named0.clone()), "the store's own files: one key");
+        put("pkg/src/lib.rs", "pub fn f() -> u8 { 1 }");
+        let unnamed1 = unnamed();
+        assert_ne!(unnamed1, unnamed0, "an edit of a file of its package reruns a script that names nothing");
+        assert_eq!(named(), named0, "one that names another file keeps its output");
+        put("pkg/proto/a.proto", "bb");
+        let named1 = named();
+        assert_ne!(named1, named0, "an edit of the file it names reruns it");
+        put("pkg/proto/a.proto", "ccc");
+        assert_ne!(named(), named1, "and so does each edit after it");
+        let unnamed2 = unnamed();
+        assert_ne!(unnamed2, unnamed1, "an edit of another file of the package reruns the one that names nothing again");
+        put("pkg/target/debug/out", "x");
+        put("pkg/.hidden", "x");
+        assert_eq!(unnamed(), unnamed2, "its target folder and hidden entries are not its files (cargo's rule)");
+        std::fs::write(edits.join(".makepad-run-deleted"), "pkg/build.rs\n").unwrap();
+        assert_ne!(unnamed(), unnamed2, "a file of the package taken away reruns it");
+        std::fs::remove_file(edits.join(".makepad-run-deleted")).unwrap();
+        std::fs::remove_dir_all(edits.join("pkg")).unwrap();
+        assert_eq!((unnamed(), named()), (unnamed0, named0), "every edit taken back: the store's own files again");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
     }
 }
 
