@@ -3775,8 +3775,13 @@ impl KeptRig {
     /// O3 code for every instance of fn `name` that has code (one for a fn that is not generic;
     /// tiering is otherwise off: no count reaches the threshold): their slots.
     fn tier_up(&mut self, name: &str) -> Vec<u32> {
+        self.tier_up_with(name, |_| {})
+    }
+
+    /// tier_up, with the O3 tier's config set by `set` (a no-inline set of the lower tiers only)
+    fn tier_up_with(&mut self, name: &str, set: impl FnOnce(&mut crate::jit::Tier1Cfg)) -> Vec<u32> {
         let session = unsafe { crate::jit::unit_session(self.up) };
-        self.unit.tier1 = crate::jit::Tier1Cfg::from_options(&session.options).map(|mut t| { t.threshold = u64::MAX; t });
+        self.unit.tier1 = crate::jit::Tier1Cfg::from_options(&session.options).map(|mut t| { t.threshold = u64::MAX; set(&mut t); t });
         let u = &self.unit;
         let slots: Vec<u32> = (0..u.fns.len() as u32).filter(|&s| u.fns[s as usize].compiled && matches!(&u.fns[s as usize].key, crate::jit::FnKey::Inst(d, _) if u.prog.name(*d) == name)).collect();
         for &s in &slots {
@@ -3945,7 +3950,7 @@ pub fn start(p: *mut u64) {
 /// held for a restart only once the old code makes that box (`late_held`, the live loop's look),
 /// and the box runs the old text, its inner closures included. (O1 inlines nothing
 /// into `pump` and no closure anywhere, so its first code calls the closure; O3 inlines as a
-/// session does.)
+/// session does: the no-inline set is the lower tiers' only.)
 #[test]
 fn a_frame_over_a_kept_closure_blocks_a_layout_patch() {
     isolated_test!(a_frame_over_a_kept_closure_blocks_a_layout_patch);
@@ -3995,8 +4000,12 @@ pub fn start(p: *mut u64) {
     assert_eq!(old.len(), 1, "the closure has code");
     // named as a refused edit names a closure: by the fn that makes it and its place
     let name = rig.shown(old[0]);
-    // (the frame of the first wait stays in the instance's first code)
-    let pumps = rig.tier_up("pump");
+    // (the frame of the first wait stays in the instance's first code; its O3 build takes no
+    // no-inline set)
+    let pumps = rig.tier_up_with("pump", |t| {
+        t.noinl = None;
+        t.noinl_callee = None;
+    });
     assert_eq!(pumps.len(), 1, "one instance of pump");
     let o3 = rig.unit.fns[pumps[0] as usize].code;
     let copied = rig.unit.code.read().unwrap().inlined_at(o3).is_some_and(|l| l.contains(&old[0]));

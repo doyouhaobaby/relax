@@ -12658,11 +12658,24 @@ fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: 
     }
 }
 
-/// Miscompile bisection knobs (read once): RELAX_NOINL=<pats> builds the matching callers
-/// without user-code inlining, RELAX_NOINL_CALLEE=<pats> never inlines the matching callees.
-/// A pattern list is comma-separated name substrings, or `hash:M/R` (name hash % M == R).
+/// Miscompile bisection knobs (read once), the same at every tier (O1, O2 and O3): RELAX_NOINL=<pats>
+/// builds the matching callers without user-code inlining (`all:<pats>`: no inlining at all),
+/// RELAX_NOINL_CALLEE=<pats> never inlines the matching callees. A pattern list is comma-separated
+/// name substrings, or `hash:M/R` (name hash % M == R). O3 builds read them from the tier's config,
+/// which takes these (Tier1Cfg::noinl).
 fn noinl_env(options: &crate::options::Options) -> (&Option<String>, &Option<String>) {
     (&options.noinl, &options.noinl_callee)
+}
+
+/// RELAX_NOINL for caller `name`: `None` when it inlines as usual, `Some(all)` when it inlines no
+/// user code (`all`: nothing at all, Relax core's callees too).
+fn noinl_caller(pat: Option<&str>, name: &str) -> Option<bool> {
+    let pat = pat?;
+    let (all, pat) = match pat.strip_prefix("all:") {
+        Some(p) => (true, p),
+        None => (false, pat),
+    };
+    name_matches(name, pat).then_some(all)
 }
 
 /// RELAX_DUMP_RIR=<name suffix>: optimised RIR of matching fns to stderr (also inline-only
@@ -15570,17 +15583,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         // fns, closures and glue stay calls
         cfg.inline_all = false;
     }
-    if let Some(pat) = noinl_env(options).0.as_deref() {
+    if let Some(all) = noinl_caller(noinl_env(options).0.as_deref(), &u.fns[id as usize].name) {
+        cfg.inline_all = false;
         // `all:<pats>`: no inlining at all in the matching callers (core builtins too)
-        let (all, pat) = match pat.strip_prefix("all:") {
-            Some(p) => (true, p),
-            None => (false, pat),
-        };
-        if name_matches(&u.fns[id as usize].name, pat) {
-            cfg.inline_all = false;
-            if all {
-                cfg.inline = false;
-            }
+        if all {
+            cfg.inline = false;
         }
     }
     let mut nested_ns = 0u64;
@@ -18169,6 +18176,11 @@ pub struct Tier1Cfg {
     pub opt: relax_codegen::opt::OptCfg,
     /// callees that have no RIR yet are built for inlining up to this many source tokens
     pub src_toks: u32,
+    /// RELAX_NOINL and RELAX_NOINL_CALLEE as O3 builds take them (noinl_env): the options', as at
+    /// every tier. Set in code for a set scoped to the lower tiers (a test whose O1 code inlines
+    /// nothing while its O3 code inlines as a session's does).
+    pub noinl: Option<String>,
+    pub noinl_callee: Option<String>,
 }
 
 impl Tier1Cfg {
@@ -18183,7 +18195,8 @@ impl Tier1Cfg {
             return None;
         }
         let threshold = tier_threshold(options.tier1_calls);
-        Some(Tier1Cfg { threshold, opt: relax_codegen::opt::OptCfg::from_options(options), src_toks: TIER1_SRC_TOKS })
+        let (noinl, noinl_callee) = noinl_env(options);
+        Some(Tier1Cfg { threshold, opt: relax_codegen::opt::OptCfg::from_options(options), src_toks: TIER1_SRC_TOKS, noinl: noinl.clone(), noinl_callee: noinl_callee.clone() })
     }
 }
 
@@ -24830,13 +24843,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         };
         let sandboxed = matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_));
+        // RELAX_NOINL on the root as this tier takes it (Tier1Cfg::noinl): no user code inlined,
+        // `all:` no callee at all
+        let (src_toks, inline_all, noinl_all) = {
+            let t = (&*up).tier1.as_ref().unwrap();
+            let noinl = noinl_caller(t.noinl.as_deref(), &(&*up).fns[id as usize].name);
+            (t.src_toks, t.opt.inline_all && noinl.is_none(), noinl == Some(true))
+        };
         let mut callees: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for b in &rir.blocks {
             for i in &b.insts {
                 if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
                     // The transform already confined this body. Inlining a host API here
                     // would introduce unconfined memory operations after that boundary.
-                    if !sandboxed && *c != id && !callees.contains(c) {
+                    if !sandboxed && !noinl_all && *c != id && seen.insert(*c) && !o3_noinl_callee(up, id, *c) {
                         callees.push(*c);
                     }
                 }
@@ -24846,11 +24867,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // then their callees (outside cold blocks), 16 levels (a binary search closure sits ~10 deep), built the same way: an inlined
         // body still calls what O1 did not inline into it (quicksort -> stable_partition ->
         // partition_one; HashMap::get -> probe_find -> Group::next)
-        let (src_toks, inline_all) = {
-            let t = (&*up).tier1.as_ref().unwrap();
-            (t.src_toks, t.opt.inline_all)
-        };
-        let seen: std::collections::HashSet<u32> = callees.iter().copied().collect();
         let frontier = callees.clone();
         TIER1_TAKE_PARTS[0].fetch_add(cpu_ns() - s0, Ordering::Relaxed);
         (epoch, rir, version, sandboxed, callees, seen, src_toks, inline_all, frontier, 0usize, 0usize)
@@ -27303,6 +27319,18 @@ fn o3_view(u: &Unit, c: u32) -> O3View {
     O3View { rir: f.rir.clone(), ran: f.compiled || f.ran_before.load(Ordering::Relaxed), uninlined: f.history().inlined_into.is_empty() }
 }
 
+/// RELAX_NOINL_CALLEE in the O3 walk of root `id` (Tier1Cfg::noinl_callee): callee `c` stays a call.
+/// Left out of the walk, not only the snapshot: an install waits for no body of a callee the walk
+/// never visited. (Also off the owner: a unit's tier config is set before its O3 builds.)
+unsafe fn o3_noinl_callee(up: *const Unit, id: u32, c: u32) -> bool {
+    let (tier1, fns) = (&*std::ptr::addr_of!((*up).tier1), &*std::ptr::addr_of!((*up).fns));
+    let out = tier1.as_ref().and_then(|t| t.noinl_callee.as_deref()).is_some_and(|p| name_matches(&fns[c as usize].name, p));
+    if out && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
+        eprintln!("inline-trace-snap {}: out fn#{} {} (RELAX_NOINL_CALLEE)", fns[id as usize].name, c, fns[c as usize].name);
+    }
+    out
+}
+
 /// The next level of an O3 snapshot's walk: the calls (and taken addresses) in the frontier's RIR
 /// outside cold blocks, skipping never-run bodies the cost model does not admit. Reads only the
 /// views, immutable slot keys and prog/tcx (off the owner: under a front read).
@@ -27335,7 +27363,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                     if *x != id && callees.len() >= 1024 && !seen.contains(x) && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
                         eprintln!("inline-trace-snap {}: out fn#{} {} (1024 candidates)", fns[id as usize].name, x, fns[*x as usize].name);
                     }
-                    if *x != id && callees.len() < 1024 && seen.insert(*x) {
+                    if *x != id && callees.len() < 1024 && seen.insert(*x) && !o3_noinl_callee(up, id, *x) {
                         callees.push(*x);
                         next.push(*x);
                     }
