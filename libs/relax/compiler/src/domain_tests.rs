@@ -301,10 +301,13 @@ fn a_live_domain_only_receives_its_units_statics() {
 // The CPU budget's source and an app whose task pool lives in a static (tests/static_pool/pool.rs).
 // The budget's `#[relax_api]` marks and its `relax_api::option_layouts!` entries name a crate a
 // one-file program does not have; the entries are for its provided build, the fixture runs it as JIT code.
+// So does its `extern crate makepad_thread_local`, whose `thread_local!` is std's in code Relax
+// compiles: without it the budget's thread-locals are std's macro, the same declarations.
 fn static_pool_fixture() -> String {
     let mut budget = include_str!("../../../../libs/cpu_budget/src/lib.rs")
         .replace("use relax_api::relax_api;\n", "")
-        .replace("#[relax_api]\n", "");
+        .replace("#[relax_api]\n", "")
+        .replace("#[macro_use(thread_local)]\nextern crate makepad_thread_local;\n", "");
     while let Some(at) = budget.find("relax_api::option_layouts! {") {
         let end = at + budget[at..].find("\n}\n").expect("an option_layouts! block ends with a `}` line") + 3;
         budget.replace_range(at..end, "");
