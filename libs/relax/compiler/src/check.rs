@@ -984,6 +984,8 @@ pub(crate) struct CheckBatch {
     next: std::sync::atomic::AtomicUsize,
     /// items whose result is not in `out` yet
     left: std::sync::atomic::AtomicUsize,
+    /// its jobs queued or running
+    jobs: std::sync::atomic::AtomicUsize,
     out: relax_session::sync::Mutex<Vec<(usize, Option<Vec<String>>)>>,
     done: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar),
 }
@@ -1008,6 +1010,13 @@ pub(crate) fn slice_queued(ns: u64) {
     CHECK_SLICES[4].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How many jobs a check batch runs at once: the budget's limit, and every core while something
+/// waits for the check (its jobs are Interactive then, whose room is the cores).
+fn check_width() -> usize {
+    let width = if check_waited() { makepad_cpu_budget::cores() } else { makepad_cpu_budget::limit() };
+    width.max(1) as usize
+}
+
 /// The app's first window frame or the run's exit waits for the check beside the program.
 fn waited() {
     if !CHECK_WAITED.swap(true, std::sync::atomic::Ordering::AcqRel) { jit::promote_checks(); }
@@ -1018,12 +1027,13 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
     use std::sync::atomic::{AtomicUsize, Ordering};
     let n = items.len();
     if n == 0 { return Vec::new(); }
+    // as many jobs as the budget admits at most: its classes decide how many of them run
+    let jobs = n.min(check_width());
     let batch = std::sync::Arc::new(CheckBatch {
-        ctx: ctx.clone(), items, kind, next: AtomicUsize::new(0), left: AtomicUsize::new(n),
+        ctx: ctx.clone(), items, kind, next: AtomicUsize::new(0), left: AtomicUsize::new(n), jobs: AtomicUsize::new(jobs),
         out: relax_session::sync::Mutex::new(Vec::with_capacity(n)), done: (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new()),
     });
-    // as many jobs as the budget admits at most: its classes decide how many of them run
-    jit::queue_check(&batch, n.min(makepad_cpu_budget::limit() as usize));
+    jit::queue_check(&batch, jobs);
     {
         let mut g = batch.done.0.lock().unwrap_or_else(|e| e.into_inner());
         while batch.left.load(Ordering::Acquire) != 0 { g = batch.done.1.wait(g).unwrap_or_else(|e| e.into_inner()); }
@@ -1033,8 +1043,9 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
     out.into_iter().map(|(_, r)| r).collect()
 }
 
-/// One job of a check batch (on a worker of the JIT's queue): items until its slice is
-/// used, then the job queues itself again while items are left.
+/// One job of a check batch (on a worker of the JIT's queue): items until its slice is used, then
+/// the job gives its place to as many as the batch's width allows now (`check_width`) while items
+/// are left.
 pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     use std::sync::atomic::Ordering;
     let _span = crate::inspect::timeline::span(match batch.kind {
@@ -1060,7 +1071,10 @@ pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     }
     loop {
         let i = batch.next.fetch_add(1, Ordering::Relaxed);
-        let Some(&d) = batch.items.get(i) else { return };
+        let Some(&d) = batch.items.get(i) else {
+            batch.jobs.fetch_sub(1, Ordering::AcqRel);
+            return;
+        };
         // (a check's own panics are its ICE verdict; this is one outside them, its bookkeeping)
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch.ctx.check(d, batch.kind)))
             .unwrap_or_else(|p| {
@@ -1071,12 +1085,24 @@ pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
             });
         batch.out.lock().unwrap_or_else(|e| e.into_inner()).push((i, r));
         if batch.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            batch.jobs.fetch_sub(1, Ordering::AcqRel);
             let _g = batch.done.0.lock().unwrap_or_else(|e| e.into_inner());
             batch.done.1.notify_all();
             return;
         }
         if start.elapsed() >= CHECK_SLICE {
-            if batch.next.load(Ordering::Relaxed) < batch.items.len() { jit::queue_check(&batch, 1); }
+            // this job leaves, and the batch's jobs are made up to its width now: every core once
+            // something waits for the check (a wait that began after the batch did), at least one
+            // while items are unclaimed
+            let unclaimed = batch.items.len().saturating_sub(batch.next.load(Ordering::Relaxed));
+            let wanted = unclaimed.min(check_width());
+            let mut add = 0;
+            let _ = batch.jobs.try_update(Ordering::AcqRel, Ordering::Acquire, |jobs| {
+                let others = jobs - 1;
+                add = wanted.saturating_sub(others);
+                Some(others + add)
+            });
+            if add > 0 { jit::queue_check(&batch, add); }
             return;
         }
         crate::pool::checkpoint(0, "check beside the program");
@@ -3105,6 +3131,7 @@ mod def_work_tests {
         let old_hold = std::mem::replace(&mut *FRAME_HOLD.lock().unwrap(), FrameHold::None);
         assert!(!first_frame_ready(0));
         assert!(first_frame_waits() && crate::preempt::ui_waits(), "the held draw gives the check priority");
+        assert_eq!(super::check_width(), makepad_cpu_budget::cores().max(1) as usize, "a waited check's batches take every core");
         let cpu_start = APP_CHECK_CPU.fetch_add(7, Relaxed);
         assert!(!first_frame_ready(wake as *const () as usize));
         finish_app_check(2);
