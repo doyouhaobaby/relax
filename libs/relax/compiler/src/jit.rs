@@ -26207,6 +26207,13 @@ pub extern "C" fn relax_before_first_frame() {
     crate::jit::host_boundary("relax_before_first_frame", crate::check::first_frame_gate)
 }
 
+/// The platform asks before it builds its first window frame. True: build it.
+/// False: the app check beside main runs; build nothing, and `wake` (an `extern "C" fn()`) is
+/// called once when the check ends.
+pub extern "C" fn relax_first_frame_ready(wake: usize) -> bool {
+    host_boundary("relax_first_frame_ready", || crate::check::first_frame_ready(wake))
+}
+
 /// The program enters `app_main!`'s entry (platform): it is an app, whose first frame has a
 /// deadline from here.
 pub extern "C" fn relax_app_main() {
@@ -28411,6 +28418,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_set_payload_end" => Some(relax_set_payload_end as *const () as usize),
         b"relax_alloc_error" => Some(crate::os::fault::relax_alloc_error as *const () as usize),
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
+        b"relax_first_frame_ready" => Some(relax_first_frame_ready as *const () as usize),
         b"relax_app_main" => Some(relax_app_main as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),

@@ -1204,6 +1204,70 @@ pub(crate) fn first_frame_waits() -> bool {
     FIRST_FRAME_WAITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+enum FrameHold {
+    None,
+    Waiting {
+        wake: Option<(Option<crate::domain::Callback>, extern "C" fn())>,
+        start: std::time::Instant,
+        cpu_start: u64,
+        ui: crate::preempt::UiWaits,
+        main: jit::MainHeld,
+    },
+    Finished { wall_ns: u64, cpu_ns: u64 },
+}
+static FRAME_HOLD: relax_session::sync::Mutex<FrameHold> = relax_session::sync::Mutex::new(FrameHold::None);
+
+/// Register the event-loop wake under the check's state lock, so completion cannot miss it.
+pub(crate) fn first_frame_ready(wake: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    if *state != 1 { return true; }
+    let wake = (wake != 0).then(|| (crate::domain::callback(), unsafe {
+        std::mem::transmute::<usize, extern "C" fn()>(wake)
+    }));
+    let mut hold = FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if let FrameHold::Waiting { wake: registered, .. } = &mut *hold {
+        *registered = wake;
+        return false;
+    }
+    waited();
+    *hold = FrameHold::Waiting {
+        wake, start: std::time::Instant::now(), cpu_start: APP_CHECK_CPU.load(Relaxed),
+        ui: crate::preempt::UiWaits::new(), main: jit::MainHeld::new(),
+    };
+    FIRST_FRAME_WAITS.store(true, Relaxed);
+    drop((hold, state));
+    // (a cold start's window stays empty until the gate line: this says why, and when it began)
+    eprintln!("relax: the first frame waits for the app check (the window answers meanwhile)");
+    false
+}
+
+fn finish_app_check(verdict: u8) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hold = FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = std::mem::replace(&mut *hold, FrameHold::None);
+    *state = verdict;
+    BESIDE.1.notify_all();
+    drop(state);
+    if let FrameHold::Waiting { wake, start, cpu_start, ui, main } = waiting {
+        drop((ui, main));
+        FIRST_FRAME_WAITS.store(false, Relaxed);
+        let wall_ns = start.elapsed().as_nanos() as u64;
+        let cpu_ns = APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu_start);
+        // A submit that already sees the verdict reads the complete timing under this lock.
+        *hold = FrameHold::Finished { wall_ns, cpu_ns };
+        drop(hold);
+        crate::inspect::flightrec::gate_wait(wall_ns);
+        if let Some((scope, wake)) = wake {
+            match scope {
+                Some(scope) => { let _ = scope.call(|| wake()); }
+                None => wake(),
+            }
+        }
+    }
+}
+
 /// makepad run of an app that presents frames: its app check runs beside main instead of before
 /// it. Every body is still checked before it first runs (a lazy compile checks its body; a body
 /// with errors is a compile error, which ends the run). The first frame waits for the check
@@ -1244,17 +1308,16 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
             // thread, never from under the program's threads here; the first frame's gate lets
             // the app's thread go to it (wait_app_check)
             if crate::run::live_session() && crate::run::hosted_run() && crate::run_end::check_failed(&errors).is_ok() {
-                *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 3;
-                BESIDE.1.notify_all();
+                finish_app_check(3);
                 return;
             }
             // as the program's own exit ends (os::proc::exit): without the C library's exit
             // handlers, which a native library registered (a GPU driver's teardown, from the
             // window's load) and which run while the program's threads go on in that library
+            // Keep the frame held through the exit. There is no surviving event loop to wake.
             crate::os::proc::exit(101);
         }
-        *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 2;
-        BESIDE.1.notify_all();
+        finish_app_check(2);
     }).expect("app check thread");
 }
 
@@ -1266,6 +1329,8 @@ pub(crate) fn app_check_running() -> bool {
 /// The first frame's gate (the platform asks before it submits its first window frame): waits
 /// for the app check beside main. An error it finds ends the run instead (start_app_check): the
 /// program's thread here leaves it, with no frame presented and no wait for the end's grace.
+/// The quit hook (run.rs) still waits here for the verdict of an app that quits before its first frame
+/// (a failed check ends that run with the check's exit code).
 pub fn wait_app_check() {
     use std::sync::atomic::Ordering::Relaxed;
     struct GateWait;
@@ -1307,21 +1372,25 @@ pub fn first_frame_gate() {
     let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     let (cpu0, t0) = (APP_CHECK_CPU.load(Relaxed), std::time::Instant::now());
     wait_app_check();
-    let waited_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let blocking_ns = t0.elapsed().as_nanos() as u64;
     // (a run whose app has no check, as a test's window, says nothing)
     if !APP_CHECK_ASKED.load(Relaxed) || GATE_SAID.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
     let n = |i: usize| RUN_CHECK[i].load(Relaxed);
     let ms = |ns: u64| ns as f64 / 1e6;
+    let held = match *FRAME_HOLD.lock().unwrap_or_else(|e| e.into_inner()) {
+        FrameHold::Finished { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
+        _ => None,
+    };
     let line = match state {
         // no check beside main: every app crate's clean verdict was stored (prepare_check)
         0 => "relax: app check: none needed (its crates' clean verdicts stored); the first frame waited 0 ms".to_string(),
-        2 => format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu), done before the first frame (it waited 0 ms)",
+        2 if held.is_none() => format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu), done before the first frame (it waited 0 ms)",
             n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed))),
         _ => {
-            let wait_cpu = ms(APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0));
+            let (wall_ns, cpu_ns) = held.unwrap_or_else(|| (blocking_ns, APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0)));
             format!("relax: app check: {} crates, {} bodies, {} item defs in {:.0} ms ({:.0} ms cpu); the first frame waited {:.0} ms for it, \
                 its checks {:.0} ms cpu meanwhile (at most {} jobs at once, CPU limit {}; {} slices raised to the frame's class at the OS, {} refused; its slices waited {:.0} ms for a worker)",
-                n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)), waited_ms, wait_cpu,
+                n(0), n(1), n(7), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)), ms(wall_ns), ms(cpu_ns),
                 CHECK_SLICES[1].load(Relaxed), makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed), ms(CHECK_SLICES[4].load(Relaxed)))
         }
     };
@@ -3001,6 +3070,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&AUDIT_DIR, std::sync::OnceLock::new());
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
+    reset(&FRAME_HOLD, relax_session::sync::Mutex::new(FrameHold::None));
     reset(&APP_CHECK_THREAD, std::sync::atomic::AtomicU64::new(0));
     reset(&FIRST_FRAME_WAITS, std::sync::atomic::AtomicBool::new(false));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 8]);
@@ -3016,15 +3086,38 @@ mod def_work_tests {
 
     #[test]
     fn first_frame_waits_for_the_app_check() {
-        use super::{first_frame_waits, wait_app_check, APP_CHECK_THREAD, BESIDE, CHECK_WAITED};
+        use super::{finish_app_check, first_frame_ready, first_frame_waits, wait_app_check, FrameHold,
+            APP_CHECK_CPU, APP_CHECK_THREAD, BESIDE, CHECK_WAITED, FRAME_HOLD};
+        use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering::Relaxed;
         use std::time::{Duration, Instant};
+
+        static WAKES: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn wake() { WAKES.fetch_add(1, Relaxed); }
 
         let holder = crate::waits::me();
         let old_holder = APP_CHECK_THREAD.swap(holder, Relaxed);
         let old_state = std::mem::replace(&mut *BESIDE.0.lock().unwrap(), 1);
         // The test holds the check itself. Its waiter has no jobs to promote on the shared queue.
         let old_waited = CHECK_WAITED.swap(true, Relaxed);
+
+        // Register a wake on the existing hold. Its CPU measurement includes work before registration.
+        let old_hold = std::mem::replace(&mut *FRAME_HOLD.lock().unwrap(), FrameHold::None);
+        assert!(!first_frame_ready(0));
+        assert!(first_frame_waits() && crate::preempt::ui_waits(), "the held draw gives the check priority");
+        let cpu_start = APP_CHECK_CPU.fetch_add(7, Relaxed);
+        assert!(!first_frame_ready(wake as *const () as usize));
+        finish_app_check(2);
+        assert!(!first_frame_waits() && !crate::preempt::ui_waits(), "release drops both hold guards");
+        assert!(first_frame_ready(wake as *const () as usize));
+        assert_eq!(WAKES.swap(0, Relaxed), 1, "only completion calls the registered wake");
+        assert!(matches!(*FRAME_HOLD.lock().unwrap(), FrameHold::Finished { cpu_ns: 7, .. }),
+            "a second query must preserve the original hold interval");
+        APP_CHECK_CPU.store(cpu_start, Relaxed);
+        *FRAME_HOLD.lock().unwrap() = old_hold;
+
+        // A caller that goes straight to the submit gate still parks until the verdict.
+        *BESIDE.0.lock().unwrap() = 1;
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let id = crate::waits::me();
