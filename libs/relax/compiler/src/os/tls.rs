@@ -386,10 +386,11 @@ pub(crate) unsafe fn reset_statics() {
 mod tests {
     /// relax#263: runtimes nested under Relax at any depth each keep their thread's block pointer
     /// in a word of the outermost runtime's thread-local block. Four words, as four nested
-    /// runtimes take them: on each of two threads the values written at the words' addresses
-    /// read back through the two-load reader JIT code inlines (the block cell at a negative fs
-    /// offset: `sar`), each thread its own; a thread with no block, then a block with no word
-    /// set, reads nulls. Under Relax the same requests go through the forward.
+    /// runtimes take them: on each of two threads the block pointers written at the words'
+    /// addresses read back through the two-load reader JIT code inlines (the block cell at a
+    /// negative fs offset: `sar`), each thread its own, and lead to a variable of that runtime's
+    /// block; a thread with no block, then a block with no word set, reads nulls. Under Relax the
+    /// same requests go through the forward.
     #[test]
     fn nested_runtimes_each_reach_their_word() {
         let keys: Vec<u64> = (0..4).map(|_| crate::jit::relax_tls_cell(0)).collect();
@@ -404,27 +405,33 @@ mod tests {
 
         let code = relax_backend::exec::Code::new(&relax_backend::x64::tls2_reader()).expect("executable memory");
         let read: rt_fn_ty!(fn(u64) -> u64) = unsafe { std::mem::transmute(code.ptr()) };
-        let write_words = |t: u64| {
+        // Each word holds what a nested runtime keeps there: its thread's block (here a buffer per
+        // thread and runtime), whose variables its JIT code reads at an offset after the two loads.
+        let write_words = |t: u64| -> Vec<Box<[u64; 4]>> {
+            let blocks: Vec<Box<[u64; 4]>> = (0..keys.len() as u64).map(|i| Box::new([t, i, t * 100 + i, !0])).collect();
             for (i, &key) in keys.iter().enumerate() {
                 let word = crate::jit::relax_tls_cell(key) as *mut u64;
                 assert!(!word.is_null(), "thread {t} needs an address for word {i}");
-                unsafe { word.write_volatile(t * 100 + i as u64) };
+                unsafe { word.write_volatile(blocks[i].as_ptr() as u64) };
             }
+            blocks
         };
-        let check_words = |t: u64| {
+        let check_words = |t: u64, blocks: &[Box<[u64; 4]>]| {
             for (i, &key) in keys.iter().enumerate() {
-                assert_eq!(read(key), t * 100 + i as u64, "thread {t} must read its own value for word {i}");
+                let block = read(key) as *const u64;
+                assert_eq!(block, blocks[i].as_ptr(), "thread {t} must read its own block pointer for word {i}");
+                assert_eq!(unsafe { block.add(2).read_volatile() }, t * 100 + i as u64, "thread {t} must reach a variable of runtime {i}'s block through its word");
             }
         };
         std::thread::scope(|s| {
             s.spawn(|| {
-                write_words(1);
+                let mine = write_words(1);
                 // Keep thread 1's words live across thread 2's writes and exit.
                 s.spawn(|| {
-                    write_words(2);
-                    check_words(2);
+                    let theirs = write_words(2);
+                    check_words(2, &theirs);
                 }).join().unwrap();
-                check_words(1);
+                check_words(1, &mine);
             });
         });
         std::thread::scope(|s| {
