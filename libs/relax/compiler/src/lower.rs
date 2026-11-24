@@ -10210,6 +10210,18 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    fn cond_binding_locals(&self, c: ExprId, out: &mut Vec<u32>) {
+        match &self.ast().expr(c).kind {
+            ExprKind::Let(p, _) => self.pat_binding_locals(*p, out),
+            ExprKind::Binary(BinOp::And | BinOp::Or, a, b) => {
+                self.cond_binding_locals(*a, out);
+                self.cond_binding_locals(*b, out);
+            }
+            ExprKind::Paren(x) => self.cond_binding_locals(*x, out),
+            _ => {}
+        }
+    }
+
     /// The value of `e` is owned by the expression (an rvalue, or a field of one: `make().1`
     /// moves the field out of the temporary), not by a local / static / pointee place.
     fn rvalue_rooted(&mut self, e: ExprId) -> bool {
@@ -10687,6 +10699,15 @@ impl<'a> Lcx<'a> {
             // temporaries and the pattern's bindings (rustc if-let guard scopes)
             self.push_scope();
             let n = combos.len();
+            if n > 1 {
+                // Each candidate lowers the guard again, sharing the locals it binds.
+                // Their slot addresses must be defined even if the first pattern fails.
+                let mut guard_locals = Vec::new();
+                self.cond_binding_locals(g, &mut guard_locals);
+                for li in guard_locals {
+                    self.local_place(li);
+                }
+            }
             for (ci, combo) in combos.into_iter().enumerate() {
                 let alt_fail = if ci + 1 == n { next } else { self.f.block() };
                 self.or_force = combo.into_iter().collect();
