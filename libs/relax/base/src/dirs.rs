@@ -544,12 +544,14 @@ mod tests {
         assert_eq!(super::anchor_in("/a/wsx/f.rs", &anchors), None);
         assert_eq!(super::anchor_in("C:/a/ws/f.rs", &[("ws", "C:/a/ws".to_string())]).as_deref(), Some("\0ws\0f.rs"));
         // read back under another checkout's anchors: its own folders
+        // (made absolute: on Windows on the current drive, `c:/b/ws`)
         let other = super::Anchors::of(&[("ws", "/b/ws"), ("run", "/b/ws/target/run")], "/s");
-        assert_eq!(other.unanchored("\0ws\0src/f.rs").as_deref(), Some("/b/ws/src/f.rs"), "a path");
-        assert_eq!(other.unanchored("\0run\0").as_deref(), Some("/b/ws/target/run"), "an anchor's own folder");
+        let b = super::absolute_dir("/b/ws");
+        assert_eq!(other.unanchored("\0ws\0src/f.rs").as_deref(), Some(format!("{b}/src/f.rs").as_str()), "a path");
+        assert_eq!(other.unanchored("\0run\0").as_deref(), Some(format!("{b}/target/run").as_str()), "an anchor's own folder");
         assert_eq!(other.unanchored("/b/f.rs").as_deref(), Some("/b/f.rs"), "an unanchored path");
         assert_eq!(other.unanchored("\0cargo\0f.rs"), None, "an anchor it lacks");
-        assert_eq!(other.unanchored_text("\0ws\0f.rs:3:9: warning: x\n  --> \0run\0g.rs:1:2").as_deref(), Some("/b/ws/f.rs:3:9: warning: x\n  --> /b/ws/target/run/g.rs:1:2"), "a text");
+        assert_eq!(other.unanchored_text("\0ws\0f.rs:3:9: warning: x\n  --> \0run\0g.rs:1:2").as_deref(), Some(format!("{b}/f.rs:3:9: warning: x\n  --> {b}/target/run/g.rs:1:2").as_str()), "a text");
         assert_eq!((other.unanchored_text("a \0 b"), other.unanchored_text("\0cargo\0f.rs")), (None, None), "a NUL that starts no marker of its anchors");
         // a checkout whose own paths print its folder otherwise (Windows: `C:\b\ws` for `c:/b/ws`):
         // learned from its first path that does, stored with the rest as printed, read back in
