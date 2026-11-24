@@ -783,6 +783,11 @@ impl<'a> Parser<'a> {
         if !args_in_place(&name) {
             return NO_MAC_ARGS;
         }
+        // a qualified call is the built-in only where its path reaches it: `not_a_crate::vec!` is
+        // rustc's E0433, never `vec!`
+        if (path.segs.len() > 1 || path.global()) && !self.path_reaches_builtin(path) {
+            return NO_MAC_ARGS;
+        }
         let is_matches = matches!(name.as_slice(), b"matches" | b"assert_matches" | b"debug_assert_matches");
         let has_msg = name != b"matches" && is_matches;
         let is_vec = name == b"vec";
@@ -1465,6 +1470,20 @@ impl<'a> Parser<'a> {
             prefix.push(String::new());
         }
         self.record_use_tree(m, &module, &mut prefix, tree);
+    }
+
+    /// Whether the qualified macro path `path` reaches a built-in (MacroScope::reaches_builtin); with
+    /// no macro table, as the name says.
+    fn path_reaches_builtin(&self, path: &Path) -> bool {
+        let Some(m) = self.macros.as_ref() else { return true };
+        let mut full: Vec<String> = Vec::new();
+        if path.global() { full.push(String::new()); }
+        full.extend(self.ast.segs(path.segs).iter().map(|s| self.seg_text(s)));
+        // `::__relax_crate_x::m!` is `$crate::m!` of crate x
+        if full.len() >= 2 && full[0].is_empty() && full[1].starts_with("__relax_crate_") {
+            full.remove(0);
+        }
+        m.reaches_builtin(&self.krate, &self.cur_module(), &full)
     }
 
     fn seg_text(&self, sg: &PathSeg) -> String {

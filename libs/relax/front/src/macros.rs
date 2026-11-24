@@ -2073,6 +2073,19 @@ impl MacroScope {
         r
     }
 
+    /// Whether the qualified call `path` of a built-in the parser reads in place (`std::vec!`)
+    /// reaches a built-in, as rustc's resolve of the path must: its module part names a module
+    /// (else rustc's E0433 at the segment that names nothing), of a std crate, whose built-ins
+    /// Relax takes by name, or one that re-exports the built-in (builtin_macro). A plain name: true.
+    pub fn reaches_builtin(&self, cur: &str, module: &str, path: &[String]) -> bool {
+        let Some((_, prefix)) = path.split_last() else { return false };
+        if prefix.is_empty() { return true; }
+        match (Res { table: &self.table }).resolve_mod(cur, module, prefix) {
+            None => false,
+            Some((k, _)) => matches!(krate_name(k), "core" | "std" | "alloc") || self.builtin_macro(cur, module, path).is_some(),
+        }
+    }
+
     /// Follow standard macro re-exports as well as re-exported library modules.
     pub(crate) fn builtin_macro_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<String> {
         let (name, prefix) = path.split_last()?;

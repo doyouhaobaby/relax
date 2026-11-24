@@ -8401,13 +8401,20 @@ impl<'a> Fcx<'a> {
     /// A call no macro resolved (the parser keeps it without arguments): rustc's resolve error. A
     /// path's is E0433 at its first segment that names nothing, the macro's own included
     /// (rustc_resolve finalize_macro_resolutions, FailedToResolve: `not_a_dependency::log!`,
-    /// `dependency::no_such_macro!`); a name's is "cannot find macro" in this scope, uncoded.
-    fn unresolved_macro(&mut self, path: &crate::ast::Path) {
+    /// `dependency::no_such_macro!`, `not_a_crate::vec!`); a name's is "cannot find macro" in this
+    /// scope, uncoded. A built-in the parser reads in place, by its name or through a std crate's
+    /// path, whose arguments did not parse keeps the dialect's message.
+    fn unresolved_macro(&mut self, path: &crate::ast::Path, name: &str, lo: u32) {
         let prog = self.prog;
         let segs = crate::program::path_segs(prog, self.file, path);
         let written = self.ast().segs(path.segs);
         let n = segs.len();
+        let in_place = crate::parser::args_in_place(name.as_bytes());
         if n == 1 && !path.global() {
+            if in_place {
+                self.err(lo, format!("macro `{}!` is not supported", name));
+                return;
+            }
             let (at, message) = prog.unresolved_name_message(self.file, self.module, path, "macro");
             self.err(at, format!("{}{message}", relax_front::diagnostics::UNCODED_PREFIX));
             return;
@@ -8420,6 +8427,11 @@ impl<'a> Fcx<'a> {
                 Some(d) => parent = Some(d),
                 None => { failed = k; break; }
             }
+        }
+        let std_module = parent.is_some_and(|d| matches!(prog.syms.str(prog.crates[prog.def(d).krate as usize].name), "core" | "std" | "alloc"));
+        if failed == n - 1 && in_place && std_module {
+            self.err(lo, format!("macro `{}!` is not supported", name));
+            return;
         }
         let names: Vec<_> = written.iter().map(|s| self.text(s.name)).collect();
         let message = prog.path_resolution_message(self.module, path.global(), &names, failed, parent);
@@ -8478,12 +8490,7 @@ impl<'a> Fcx<'a> {
             return never;
         }
         if m.args == NO_MAC_ARGS {
-            // a built-in whose arguments did not parse in place keeps the dialect's message
-            if crate::parser::args_in_place(name.as_bytes()) {
-                self.err(lo, format!("macro `{}!` is not supported", name));
-            } else {
-                self.unresolved_macro(&m.path);
-            }
+            self.unresolved_macro(&m.path, name, lo);
             return self.tcx.tys.error;
         }
         let margs = ast.mac_arg(m.args);
