@@ -1566,6 +1566,139 @@ fn round50_inline_const_reload() {
 }
 
 #[test]
+fn live_o3_split_keeps_the_saved_host_current() {
+    const CHILD: &str = "RELAX_TEST_OUTLINE_OPT";
+    let Ok(tokens) = std::env::var(CHILD) else {
+        // the in-function form is the default; outline_requested_needs_plus_outline_without_minus
+        // pins which tokens choose it, and the expected values hold for both forms
+        for opt in ["+outline"] {
+            let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jit::settle_tests::live_o3_split_keeps_the_saved_host_current", "--nocapture"])
+                .env(CHILD, opt).env("RELAX_OPT", opt).env("RELAX_CACHE", "off").env("RELAX_O3_STATS", "1")
+                .env("RELAX_GANDALF", "0").env_remove("RELAX_OUTLINE_WHOLE"));
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(result.status.success() && stdout.contains("1 passed"), "RELAX_OPT={opt}\n{stdout}\n{stderr}");
+            for line in stderr.lines().filter(|l| l.starts_with("relax o3-stats: outline ")) { eprintln!("{line}"); }
+        }
+        return;
+    };
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-outline-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    let source = "#[inline] pub fn leaf(x: u32) -> u32 { (x << 1) ^ (x >> 3) ^ 7 }\n\
+        pub fn caller(out: &mut u32) { let mut i = 0; let mut s = 0u32; while i < 100 { s = s.wrapping_add(leaf(i)); i += 1; } *out = s; }\nfn main() {}";
+    std::fs::write(&path, source).unwrap();
+    let mut session = crate::Session::default();
+    session.options.live = true;
+    session.options.opt = tokens.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(session), path.to_str().unwrap(), "split_live", false).unwrap();
+    let [leaf, caller] = ["leaf", "caller"].map(|name| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && prog.name(id) == name).then_some(id)
+    }).unwrap());
+    let file = prog.def(leaf).file;
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    let caller = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [leaf, caller].map(|d| u.fn_id(FnKey::Inst(d, vec![])));
+        for id in ids {
+            let (code, map, relocs) = unsafe { compile_fn(up, id) }.unwrap();
+            u.install(id, &code, &relocs, map, 0).unwrap();
+        }
+        ids[1]
+    });
+    assert!(unsafe { compile_tier1(up, caller) }, "the live O3 host installs");
+    tier1_stats_report();
+    let host = &u.fns[caller as usize];
+    let saved = host.code;
+    let end = saved + u64::from(host.code_len);
+    {
+        let tables = u.code.read().unwrap();
+        let part = tables.function_base(saved, end - 1);
+        assert!(part > saved && part < end, "the joined continuation has its own function base");
+        assert_eq!(tables.function_base(saved, part - 1), saved);
+        assert_eq!(tables.function_base(saved, part), part);
+    }
+    let run_saved = || {
+        let mut result = 0u32;
+        unsafe { call_jit(up, saved, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        result
+    };
+    assert_eq!(run_saved(), 9984);
+    let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
+        file, path: path.to_string_lossy().into_owned(), src: source.replace("(x << 1) ^ (x >> 3) ^ 7", "((x << 1) ^ (x >> 3) ^ 7) + 1").into_bytes(),
+    }]) };
+    assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+    assert_eq!(run_saved(), 10084, "the original host reaches the patched leaf");
+    unsafe { UNIT = std::ptr::null_mut() };
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn outline_requested_needs_plus_outline_without_minus() {
+    for (live, tokens, on) in [(true, "", false), (true, "+outline", true), (true, "+outline,-outline", false), (true, "-outline", false), (false, "+outline", false)] {
+        let mut session = crate::Session::default();
+        session.options.live = live;
+        session.options.opt = tokens.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+        assert_eq!(outline_requested(&session.options), on, "live={live} RELAX_OPT={tokens}");
+    }
+}
+
+#[test]
+fn part_flag_misses_register_each_slot_once() {
+    use relax_backend::rir::{part_trailer_words, unwind_info_words, Reloc, RelocAt, RelocKind};
+    isolated_test!(part_flag_misses_register_each_slot_once);
+    std::env::set_var("RELAX_O3_STATS", "1");
+    let path = std::env::temp_dir().join(format!("relax-part-flags-{}.rs", std::process::id()));
+    std::fs::write(&path, "#![no_std] fn early() {} fn late() {} fn listed() {} fn host() {}").unwrap();
+    let mut session = crate::Session::default();
+    session.options.live = true;
+    let session = std::sync::Arc::new(session);
+    let mut prog = Program::new(&session);
+    prog.load_crate("part_flags", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    let defs = ["early", "late", "listed", "host"].map(|name| prog.defs.iter().enumerate()
+        .find_map(|(i, _)| (prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap());
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, 0);
+    crate::owner::call(crate::owner::Class::Program, || {
+        let [early, late, listed, host] = defs.map(|d| u.fn_id(FnKey::Inst(d, vec![])));
+        let flag = |at, slot| RelocAt { at, kind: RelocKind::Pool64, target: Reloc::Sym(patch_flag(&u, slot).unwrap()) };
+        let relocs = [flag(0, host), flag(16, early), flag(24, early), flag(32, late), flag(40, listed), flag(48, host)];
+        let mut words = vec![0u32; 12];
+        let trailer = unwind_info_words(&[], &[], &[], 16);
+        words.extend(&trailer);
+        words.extend(&trailer);
+        words.extend(part_trailer_words(16, trailer.len()));
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let ver = |u: &Unit| unsafe { (*tier_rec(&u.slots, host).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) };
+        set_patched(&u, early);
+        let mut inlined = vec![listed];
+        let n = append_part_flags(&u, &code, &relocs, &mut inlined);
+        assert_eq!(n, 2, "only distinct missing flags in P's range");
+        assert_eq!(inlined, [listed, early, late]);
+        assert_eq!(ver(&u), 0, "checking a candidate does not register it");
+        register_part_flags(&mut u, host, &inlined[inlined.len() - n..]);
+        assert_eq!(TIER1_STATS.lock().unwrap().as_ref().unwrap().outline[&("flag miss", "absent from inlined")].0, 2);
+        assert_eq!(ver(&u), 1, "a pre-set flag moves the host once");
+        set_patched(&u, late);
+        assert_eq!(ver(&u), 2, "a later patch moves the registered host");
+        for c in [early, late] {
+            assert_eq!(u.fns[c as usize].history().copy_hosts, [host]);
+            assert_eq!(u.fns[c as usize].history().inlined_into, [host]);
+        }
+    });
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn copy_versions_move_with_the_flags_their_code_reads() {
     isolated_test!(copy_versions_move_with_the_flags_their_code_reads);
     // Copy versions (note_guard_reads): code that reads patch flags notes the copy versions it

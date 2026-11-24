@@ -72,7 +72,7 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &target::Env) ->
 /// RELAX_OUTLINE_WHOLE: comma-separated function name suffixes whose entire native body runs
 /// as a private part. Exercises the joined install, unwind and inspection paths.
 #[inline]
-fn outline_whole(name: &str) -> bool {
+pub fn outline_whole(name: &str) -> bool {
     static SUFFIXES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     relax_session::phase::env_once(&SUFFIXES, "RELAX_OUTLINE_WHOLE").is_some_and(|s| s.split(',').any(|p| !p.is_empty() && name.ends_with(p)))
 }

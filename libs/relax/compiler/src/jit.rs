@@ -9,6 +9,7 @@ mod queue;
 
 include!("rt_abi.rs");
 use relax_backend::rir::{SplitUnwindInfo, UnwindInfo};
+use relax_codegen::patched::{OutlineBody, OutlinedPart};
 use relax_types::next_solver::TraitRef;
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use relax_types::consts::GenericArg;
@@ -18091,9 +18092,12 @@ impl Tier1Cfg {
 /// captured `self` and kept every `self.spectra` load in decode_spectra's loops (RELAX_OPT=-nocap8: 4).
 const NOCAP_DEPTH: u32 = 8;
 
+// Only the root split may put a private part in this build's output.
+type OutlineRequest<'a> = Option<(OutlineBody, &'a mut Option<OutlinedPart>)>;
+
 /// The O3 optimisation of a function (backend lane): `func` is a copy of its O1
 /// RIR, `get` gives the callees' RIR (snapshot). Returns the inlined callees.
-fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, hot: bool) -> Vec<(u32, usize)> {
+fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, hot: bool, outline: OutlineRequest<'_>) -> Vec<(u32, usize)> {
     let _cost_opt = relax_codegen::fncost::phase(4);
     relax_codegen::fncost::size(true, func);
     func.baseline = false;
@@ -18190,7 +18194,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         r
     };
     compile_checkpoint();
-    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot);
+    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot, outline);
     if let Some(st) = inline_stats.as_mut() {
         crate::inspect::remarks::record_inline(id, std::mem::take(&mut st.remarks));
     }
@@ -18609,7 +18613,7 @@ impl<'a> InlineBodies<'a> {
         // a preparation only serves while its priced body stays admissible: it grows to the
         // largest size its rules admit, not to a caller's growth room
         let cap = relax_codegen::opt::max_admitted_insts(attrs);
-        tier1_simplify(options, &mut f, c, &o1.name, get, &sub_prepared, &single_rec, self.ro, self.cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap), false);
+        tier1_simplify(options, &mut f, c, &o1.name, get, &sub_prepared, &single_rec, self.ro, self.cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap), false, None);
         let rd = self.reads.borrow_mut().pop().unwrap();
         TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
         if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, self.root)); }
@@ -18751,7 +18755,7 @@ mod inline_bodies_tests {
 /// slot cleanup): what a caller's build inlines when it takes this function bottom-up.
 /// `inlined_only`: receives the body after the first inlining round, before any optimisation,
 /// with the callees that round inlined.
-fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>, hot: bool) -> Vec<(u32, usize)> {
+fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>, hot: bool, outline: OutlineRequest<'_>) -> Vec<(u32, usize)> {
     compile_checkpoint();
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func, hot);
     // a wasm export's O3 body ships: size-first at its cold sites
@@ -18785,7 +18789,18 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         // a guard's slow call (relax_codegen::patched); RELAX_OPT=-patchedpath keeps the
         // guards (bisection)
         if inlined_only.is_none() && options.live && !relax_backend::stats::opt_off(options, "-patchedpath") {
-            if let Some(st) = relax_codegen::patched::split_patched_path(func, get) {
+            let split = if let Some((kind, part)) = outline {
+                relax_codegen::patched::split_patched_path_with_layout(func, get).map(|(st, layout)| {
+                    match layout.and_then(|l| relax_codegen::patched::extract_patched_part(func, l, kind)) {
+                        Ok(p) => *part = Some(p),
+                        Err(why) => outline_stat("refused", why, 0),
+                    }
+                    st
+                })
+            } else {
+                relax_codegen::patched::split_patched_path(func, get)
+            };
+            if let Some(st) = split {
                 if relax_codegen::opt::inline_trace(name) {
                     eprintln!("inline-trace {}: patched path: {} exits for copy sites, {} for calls, {} sites covered; {} blocks, {} insts copied; {} slots copied, {} shared; the exits move {} registers and fill {} slots, {} bytes", name, st.site_exits, st.call_exits, st.covered, st.blocks, st.insts, st.cloned, st.shared, st.moved, st.filled, st.fill_bytes);
                 }
@@ -19893,6 +19908,31 @@ fn guard_reads(u: &Unit, syms: impl Iterator<Item = relax_backend::rir::Sym>) ->
         v.dedup();
     }
     (flags, vers)
+}
+
+// Append P's missing dependencies for the install's verdict, group and cache checks.
+fn append_part_flags(u: &Unit, code: &[u8], relocs: &[relax_backend::rir::RelocAt], inlined: &mut Vec<u32>) -> usize {
+    use relax_backend::rir::{Reloc, RelocKind};
+    let trailer = relax_backend::rir::split_unwind_info(code);
+    let Some((off, _)) = trailer.part else { return 0 };
+    let (flags, _) = guard_reads(u, relocs.iter().filter_map(|r| match r.target {
+        Reloc::Sym(s) if r.at >= off && (r.at as usize) < trailer.code_len && r.kind != RelocKind::Note => Some(s),
+        _ => None,
+    }));
+    let listed = inlined.len();
+    for c in flags {
+        if inlined[..listed].binary_search(&c).is_err() { inlined.push(c); }
+    }
+    inlined.len() - listed
+}
+
+// Only an accepted build registers the repairs. Its ordinary registration visits the prefix.
+fn register_part_flags(u: &mut Unit, host: u32, missing: &[u32]) {
+    for &c in missing {
+        outline_stat("flag miss", "absent from inlined", 0);
+        u.exec_event(c, "inline");
+        note_inlined_copy(u, c, host);
+    }
 }
 
 /// Code being installed (any tier, a disk-cache link or the startup image's) reads the patch
@@ -22959,6 +22999,12 @@ pub(crate) fn queue_held_line() -> String { queue::held_line() }
 const BURST_UI_QUIET_NS: u64 = 1_000_000_000;
 
 /// Opt-in only: no extra clocks, pass timing, allocations or statistics locks when off.
+/// A live session's O3 builds outline their patched path into a private part only with
+/// RELAX_OPT=+outline, and -outline keeps the in-function form (the differential's oracle).
+fn outline_requested(options: &relax_session::Options) -> bool {
+    options.live && relax_backend::stats::opt_off(options, "+outline") && !relax_backend::stats::opt_off(options, "-outline")
+}
+
 fn tier1_stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RELAX_O3_STATS").as_deref() == Ok("1"))
@@ -22966,6 +23012,7 @@ fn tier1_stats_on() -> bool {
 
 #[derive(Default)]
 struct Tier1Stats {
+    outline: std::collections::BTreeMap<(&'static str, &'static str), (u64, u64)>,
     builds: u64,
     cpu: u64,
     phases: [u64; 3], // snapshot (including RIR rebuild), backend, install
@@ -22976,6 +23023,17 @@ struct Tier1Stats {
     max_active: usize,
 }
 static TIER1_STATS: relax_session::sync::Mutex<Option<Tier1Stats>> = relax_session::sync::Mutex::new(None);
+
+fn outline_stat(event: &'static str, reason: &'static str, cpu: u64) {
+    if !tier1_stats_on() { return; }
+    let mut g = TIER1_STATS.lock().unwrap();
+    let s = g.get_or_insert_with(Tier1Stats::default);
+    crate::zone_alloc::kept_with(|| {
+        let count = s.outline.entry((event, reason)).or_default();
+        count.0 += 1;
+        count.1 += cpu;
+    });
+}
 
 struct Tier1Active;
 impl Tier1Active {
@@ -23049,6 +23107,9 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("relax o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
+    for ((event, reason), (n, cpu)) in &s.outline {
+        eprintln!("relax o3-stats: outline {event} ({reason}) n={n} part_cpu_ms={:.3} mean_ms={:.3}", ms(*cpu), ms(*cpu) / *n as f64);
+    }
     eprintln!("relax o3-stats: pgo counted_builds={} parked={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} final_loop_unfinals={}", PGO_STATS[0].load(Ordering::Relaxed), PGO_PARKED.load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), PGO_LOOP_UNFINALS.load(Ordering::Relaxed));
     eprintln!("relax o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
@@ -25077,7 +25138,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
     }
     // optimise and generate code without the lock
-    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
+    let mut try_outline = outline_requested(options);
+    // The snapshot stays owned by this job. Only a failed outlined attempt rebuilds it.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+        let outline = try_outline.then(|| {
+            if sandboxed { OutlineBody::SandboxTwin }
+            else if export_o3_mode() || relax_codegen::web32::applies(env.syms).is_some() { OutlineBody::Web }
+            else if relax_codegen::native::outline_whole(&name) { OutlineBody::WholeBody }
+            else if relax_codegen::interp::selected(&name) { OutlineBody::Interpreter }
+            else { OutlineBody::Native }
+        });
         let _arena = crate::zone_alloc::job("O3", runtime.burst_arena);
         let mut func = (*rir).clone();
         func.copy_ver = host_ver;
@@ -25110,8 +25180,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
+        let mut part = None;
         let optimize = || queries.optimize(id, func, &mut |func, nounwind| {
-            Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies, hot_root))
+            Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies, hot_root, outline.map(|kind| (kind, &mut part))))
         });
         // makepad inspect remarks of this build: the vectorisers' loops, then the allocator's spills
         let remarks = relax_backend::remark::begin();
@@ -25131,7 +25202,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         }
         let tv = relax_backend::stats::pass_clock();
-        let verified = func.verify();
+        let verified = if let Some(p) = &part {
+            if let Err(why) = relax_codegen::patched::verify_outline(&func, p) {
+                outline_stat("late failure", why, 0);
+                try_outline = false;
+                continue;
+            }
+            Ok(())
+        } else { func.verify() };
         relax_backend::stats::pass_time(13, tv);
         verified.map_err(|e| format!("RIR verify after O3: {}", e))?;
         // a wasm export's O3 body (export_o3_rir): the optimised RIR is the result, no native code
@@ -25169,7 +25247,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         crate::inspect::remarks::record_loops(id, rk.loops);
         crate::memstat::note_big("codegen O3", &func.name, mps, || cg_shape(&func));
-        let c = c?;
+        let c = match c {
+            Err(_) if part.is_some() => {
+                outline_stat("late failure", "host code generation", 0);
+                try_outline = false;
+                continue;
+            }
+            c => c?,
+        };
+        if c.part_calls.is_empty() { part = None; }
         code_sig(id, &func, &c.code, c.alloc_sig, true);
         note_frame(id, c.frame_size, slot_bytes(&func), true);
         if func.patched_path && relax_codegen::opt::inline_trace(&name) {
@@ -25235,8 +25321,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut cold_left: Vec<u32> = Vec::new();
         // calls left to callees the snapshot had no body of (the install sorts out why)
         let mut absent: Vec<u32> = Vec::new();
-        let self_call = func.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) if *c == id)));
-        for b in &func.blocks {
+        let bodies = || std::iter::once(&func).chain(part.as_ref().map(|p| &p.part));
+        let self_call = bodies().flat_map(|f| &f.blocks).any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) if *c == id)));
+        for b in bodies().flat_map(|f| &f.blocks) {
             if matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume) {
                 continue;
             }
@@ -25258,21 +25345,41 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // a live patch replaced it.
         let mut left: Vec<(u32, bool, u8)> = Vec::new();
         if tier1_trace() {
-            for (bi, b) in func.blocks.iter().enumerate() {
-                let cold = matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
-                for (ii, i) in b.insts.iter().enumerate() {
-                    if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
-                        if !func.guard_call(bi, ii) {
-                            left.push((*c, cold, get(*c).map_or(255, |x| x.1)));
+            for func in bodies() {
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    let cold = matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
+                    for (ii, i) in b.insts.iter().enumerate() {
+                        if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
+                            if !func.guard_call(bi, ii) {
+                                left.push((*c, cold, get(*c).map_or(255, |x| x.1)));
+                            }
                         }
                     }
                 }
             }
         }
+        let outlined = part.is_some();
+        let c = if let Some(mut p) = part {
+            let start = tier1_stats_on().then(cpu_ns);
+            baseline_rir(options, &mut p.part, ro);
+            let cg = tier0_codegen_rir(options, &p.part, cfg.fold, cfg.layout);
+            let base = x64::Env { opt_regs: false, ..env };
+            let compiled = relax_codegen::native::compile(options, &cg, &base);
+            let cpu = start.map_or(0, |t| cpu_ns() - t);
+            let joined = compiled.map_err(|_| "part code generation").and_then(|p| x64::join_part(c, p).map_err(|_| "join"));
+            match joined {
+                Ok(c) => { outline_stat("built", "joined", cpu); c }
+                Err(why) => {
+                    outline_stat("late failure", why, cpu);
+                    try_outline = false;
+                    continue;
+                }
+            }
+        } else { c };
         // the result leaves the job arena; the job's own copies die with it
         let c = copied_out(c);
         let (left, cold_left, absent, inlined, nounwind_used) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone(), absent.clone(), inlined.clone(), nounwind_used.clone()));
-        Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used, o3_digest)))
+        break Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used, o3_digest, outlined)));
     }));
     if export_o3_mode() {
         return false;
@@ -25311,8 +25418,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let u = &mut *up;
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
+        let mut built = built;
+        let misses = match &mut built {
+            Ok(Ok((code, _, relocs, (inlined, _, _, _, _, _, _, _, true)))) => append_part_flags(u, code, relocs, inlined),
+            _ => 0,
+        };
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, o3_digest)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, o3_digest, _)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
                 // (a lean code window keeps a slot's code: an O3-always build is a slot's first)
                 && (o3_first() || !u.code_lean())
                 // (the reach's: none came meanwhile -- a program thread's call built it)
@@ -25325,6 +25437,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 o3_owner(1, tl);
                 ok
             } => {
+                let (listed, missing) = inlined.split_at(inlined.len() - misses);
+                register_part_flags(u, id, missing);
                 // Sign O3 machine bytes and symbolic relocations while the unit is locked.
                 // The ordinary signature path only covers foreground/O1 compilation.
                 if reloc_sig_on() {
@@ -25508,7 +25622,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     if u.tier1.is_some() {
                         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
                     }
-                    for &c in &inlined {
+                    for &c in listed {
                         u.exec_event(c, "inline");
                         if c != id {
                             note_inlined_copy(u, c, id);
@@ -25604,7 +25718,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let tn = cpu_ns();
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
-                for c in inlined {
+                for &c in listed {
                     u.exec_event(c, "inline");
                     note_inlined_copy(u, c, id);
                 }

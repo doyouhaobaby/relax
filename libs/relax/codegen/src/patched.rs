@@ -182,6 +182,8 @@ pub struct OutlinedPart {
     // Original normal and cleanup edges, and every unwind-resume, in P's numbering.
     unwind: Vec<(u32, Term)>,
     bases: Vec<VReg>,
+    // Shared slots in P's current numbering. After verification compaction removes them all.
+    shared_slots: Vec<u32>,
 }
 
 fn record_mem(c: Cls) -> Option<Mem> {
@@ -455,7 +457,7 @@ pub fn extract_patched_part(f: &mut Func, layout: SplitLayout, body: OutlineBody
         b.term.map_succs(|t| if t as usize >= region.end { t - region.len() as u32 } else { t });
     }
     f.blocks.extend(new_exits);
-    let mut out = OutlinedPart { part: p, exits: layout.exits, region: layout.region, record_size: layout.record_size, unwind, bases };
+    let mut out = OutlinedPart { part: p, exits: layout.exits, region: layout.region, record_size: layout.record_size, unwind, bases, shared_slots: layout.shared };
     if let Err(why) = verify_outline(f, &out) {
         f.blocks.truncate(region.start);
         for b in &mut f.blocks {
@@ -484,6 +486,7 @@ pub fn extract_patched_part(f: &mut Func, layout: SplitLayout, body: OutlineBody
         if used { next += 1; next - 1 } else { NONE }
     }).collect();
     crate::opt::compact_slots(&mut out.part);
+    out.shared_slots.clear();
     for e in &mut out.exits {
         for (_, value) in &mut e.fields {
             if let RecordValue::Fill { dst, .. } = value { *dst = slots[*dst as usize]; }
@@ -596,6 +599,11 @@ pub fn verify_outline(f: &Func, out: &OutlinedPart) -> Result<(), &'static str> 
     let p = &out.part;
     f.verify().map_err(|_| "invalid host RIR")?;
     p.verify().map_err(|_| "invalid part RIR")?;
+    // Includes the unpack leaves: remaking a host address in P would address P's frame.
+    if !out.shared_slots.is_empty() && p.blocks.iter().flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::SlotAddr(_, s) if out.shared_slots.binary_search(s).is_ok())) {
+        return Err("shared slot address in part");
+    }
     if p.params.len() != 2 || p.params.iter().any(|v| p.vregs[v.0 as usize] != Cls::I) || p.sret.is_some() ||
         !p.noalias.is_empty() || p.rets != f.rets || p.slots.iter().any(|s| s.born) { return Err("invalid part frame"); }
     verify_dispatch(out, 0, &out.exits)?;
@@ -2835,6 +2843,20 @@ mod tests {
         crate::loops::clear_unreachable(&mut f);
         relax_backend::passes::compact_vregs(&mut f);
         verify_outline(&f, &out).unwrap();
+    }
+
+    #[test]
+    fn a_shared_slot_address_remade_at_an_exit_keeps_the_in_function_split() {
+        let (mut f, mut layout) = outline_fixture(false, false);
+        let addr = Inst::SlotAddr(f.vreg(Cls::I), layout.shared[0]);
+        let e = &mut layout.exits[0];
+        let b = &mut f.blocks[e.block as usize];
+        b.insts.push(addr.clone());
+        b.pos.push(b.term_pos);
+        e.remakes.push(addr);
+        let original = f.dump();
+        assert_eq!(extract_patched_part(&mut f, layout, OutlineBody::Native).err(), Some("shared slot address in part"));
+        assert_eq!(f.dump(), original, "the refusal restores the split including the host-relative remake");
     }
 
     #[test]
