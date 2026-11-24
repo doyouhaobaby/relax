@@ -16,6 +16,16 @@
 //! JIT's builds, and the builds take the physical cores less the app's jobs that wait within it. No
 //! producer waits out the other's backlog, and waiters stay in ticket order. With the flag down
 //! Background is one part, as before.
+//! Idle tokens are lent out (work-conserving): Background work of the app and the HAL beyond its
+//! part takes tokens no one else wants, up to `limit_now`, on a borrowed row. Every other room
+//! counts borrowed tokens as free, so the person's work and the JIT's builds never wait behind
+//! one: they are admitted at once, and while the table runs over `limit_now` the borrowed rows
+//! give their tokens back at their next checkpoint (Background first), below the person's work by
+//! the OS's priorities meanwhile. A borrowed row becomes an ordinary one once its part has room.
+//! The JIT never borrows: its builds on the SMT siblings of busy cores cost far more CPU for little
+//! sooner work (`background_limit`). A thread blocked on work it cannot do itself lends the core
+//! the budget keeps outside its limit (`lend_kept_core`): `limit_now` is the cores then, Visible
+//! work beyond the limit comes in on borrowed rows, and they give way the same once it is taken back.
 //! A run whose cores are a grant on a shared box (`MAKEPAD_CPU_GRANT`: devhub's runs that are not
 //! live sessions or timed) keeps the JIT's Background builds inside its grant: they take only the
 //! cores its other work leaves, that of its threads that hold no token included (a test's own
@@ -69,6 +79,12 @@ const JIT_BUILD: u8 = 0x20;
 /// builds past the JIT's floor, and the floor's own keep theirs. So a build gives its token up
 /// only when the CPU is over its cores, and at the end of a job only to a Background waiter.
 const JIT_BUILDS: u8 = 1 << 3;
+/// A borrowed row (`Job::borrowed`): it reads its borrowed bit too.
+const BORROWED: u8 = 0x10;
+/// The yield and contended words' bits for borrowed Background and Visible rows: the table runs over
+/// `limit_now` (Visible's: over it even once every borrowed Background token is back).
+const BORROWED_BACKGROUND: u8 = 1 << 4;
+const BORROWED_VISIBLE: u8 = 1 << 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Label {
@@ -102,10 +118,13 @@ struct Job {
     lent: bool,
     /// the JIT's job admitted over a full budget: it holds no token
     above: bool,
+    /// admitted beyond its part on a token no one else's room counts (`Budget::borrow_room`): it
+    /// gives the token back at its next checkpoint while the table runs over `limit_now`
+    borrowed: bool,
 }
 impl Job {
     fn new(class: u8, client: u8, label: &str, ticket: u64) -> Self {
-        Self { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0, thread: 0, lent: false, above: false }
+        Self { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0, thread: 0, lent: false, above: false, borrowed: false }
     }
 }
 struct Waiter { class: u8, client: u8, ticket: u64, thread: Thread, id: u64 }
@@ -131,6 +150,13 @@ struct State {
     jit_waiting: usize,
     /// The tokens the JIT's Background jobs hold (the one `above` holds none).
     jit_tokens: usize,
+    /// The tokens borrowed rows hold, by class (`Job::borrowed`), and how many rows were admitted
+    /// on a borrowed token and how many gave one back, since the start.
+    borrowed: [usize; 3],
+    borrows: u64,
+    given_back: u64,
+    /// Threads that lend the kept core now (`lend_kept_core`): the outermost call of each counts.
+    kept_lends: usize,
     waiting: u8,
     parked: [u64; 3],
     admitted: [u64; 3],
@@ -202,6 +228,8 @@ struct Budget {
     jit_first: AtomicBool,
     /// `jit_part` at the table's last change, for the JIT's queue (`jit_background_limit`).
     jit_width: AtomicUsize,
+    /// `limit_now` at the table's last change, for callers that size their work by it.
+    limit_width: AtomicUsize,
     /// The performance cores of a machine with two kinds of core (Apple silicon), within the
     /// budget's; 0 on a machine with one kind: placement by kind of work is then the OS's alone.
     fast: usize,
@@ -240,13 +268,14 @@ impl Budget {
             physical: physical.clamp(1, cores),
             jit_first: AtomicBool::new(false),
             jit_width: AtomicUsize::new(0),
+            limit_width: AtomicUsize::new(limit),
             fast: 0,
             demand: AtomicU64::new(0),
             deadlines: AtomicUsize::new(0),
             fast_tier_ups: AtomicUsize::new(0),
             state: Mutex::new(State {
                 slots: vec![None; cores], waiters: Vec::new(), ticket: 0,
-                running: 0, jit_running: 0, background: 0, app_waiting: 0, visible: 0, jit_background: 0, jit_waiting: 0, jit_tokens: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
+                running: 0, jit_running: 0, background: 0, app_waiting: 0, visible: 0, jit_background: 0, jit_waiting: 0, jit_tokens: 0, borrowed: [0; 3], borrows: 0, given_back: 0, kept_lends: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
                 runtime: [0; 3], spans: [Span::default(); 3], warnings: HashMap::new(),
                 worst: VecDeque::new(),
                 strand_worst: VecDeque::new(),
@@ -314,15 +343,34 @@ impl Budget {
             self.refresh(s);
         }
     }
-    /// What `class`'s room is measured against: the tokens that run, and for the JIT's Background
-    /// builds in a granted run the cores in use outside the table too.
+    /// What `class`'s room is measured against: the tokens that run less the borrowed ones (they go
+    /// back at their next checkpoint), and for the JIT's Background builds in a granted run the
+    /// cores in use outside the table too.
     fn load(&self, s: &State, class: u8, client: u8) -> usize {
-        s.running + if class == BACKGROUND && client == JIT { s.outside } else { 0 }
+        s.running - Self::borrowed(s) + if class == BACKGROUND && client == JIT { s.outside } else { 0 }
+    }
+    /// The tokens borrowed rows hold.
+    fn borrowed(s: &State) -> usize { s.borrowed.iter().sum() }
+    /// `limit`, and the kept core too while a thread lends it (`lend_kept_core`).
+    fn limit_now(&self, s: &State) -> usize { self.limit + usize::from(s.kept_lends > 0 && self.cores > self.limit) }
+    /// Room on a borrowed token (`Job::borrowed`): every token that runs counts, borrowed ones too,
+    /// against `limit_now`. The app's and the HAL's Background work borrows beyond its part;
+    /// Visible work beyond its limit only while the kept core is lent. The JIT never borrows.
+    fn borrow_room(&self, s: &State, class: u8, client: u8) -> bool {
+        match class {
+            BACKGROUND => client != JIT && s.running < self.limit_now(s),
+            VISIBLE => s.running < self.class_limit(s, VISIBLE, client) + self.limit_now(s) - self.limit,
+            _ => false,
+        }
+    }
+    /// Admitted now, on its own room or a borrowed token.
+    fn admissible(&self, s: &State, class: u8, client: u8) -> bool {
+        self.room(s, class, client) || self.borrow_room(s, class, client)
     }
     /// The JIT's Background builds give their tokens up at their next checkpoint: the process runs
-    /// over its cores, counting a granted run's work outside the table.
+    /// over its cores, counting a granted run's work outside the table (borrowed tokens go first).
     fn builds_over(&self, s: &State) -> bool {
-        s.running + s.outside > self.cores
+        s.running - Self::borrowed(s) + s.outside > self.cores
     }
     /// The performance cores the person's work leaves now: 0 on a machine with one kind of core.
     fn fast_room(&self) -> usize {
@@ -375,17 +423,31 @@ impl Budget {
             _ => 0,
         }
     }
+    /// Over the cores without the borrowed tokens: they go back first.
     fn over_cores(&self, s: &State, class: u8) -> bool {
-        s.running - self.builds_passed(s, class) > self.cores
+        s.running - Self::borrowed(s) - self.builds_passed(s, class) > self.cores
     }
     fn room(&self, s: &State, class: u8, client: u8) -> bool {
         client == JIT && s.jit_running == 0
             || self.load(s, class, client) < self.class_limit(s, class, client)
     }
     fn first(&self, s: &State) -> Option<usize> {
-        s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
+        s.waiters.iter().enumerate().filter(|(_, w)| self.admissible(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
+    }
+    /// Borrowed rows whose part has room now are ordinary rows: room as if they waited (their own
+    /// token is a borrowed one, which `load` leaves out).
+    fn promote(&self, s: &mut State) {
+        if Self::borrowed(s) == 0 { return; }
+        for i in 0..s.slots.len() {
+            let Some(job) = s.slots[i].filter(|j| j.borrowed && !j.lent) else { continue };
+            if self.room(s, job.class, job.client) {
+                s.slots[i].as_mut().unwrap().borrowed = false;
+                s.borrowed[job.class as usize] -= 1;
+            }
+        }
     }
     fn refresh(&self, s: &mut State) {
+        self.promote(s);
         s.waiting = s.waiters.iter().fold(0, |bits, w| bits | (1 << w.class));
         s.jit_waiting = s.waiters.iter().filter(|w| w.class == BACKGROUND && w.client == JIT).count();
         s.app_waiting = s.waiters.iter().filter(|w| w.class == BACKGROUND && w.client != JIT).count();
@@ -397,21 +459,23 @@ impl Budget {
             if s.waiting & ((2 << class) - 1) != 0 || self.over_cores(s, class)
             { contended |= 1 << class; }
         }
-        if s.running >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
+        if s.running - Self::borrowed(s) >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
         let over = self.builds_over(s);
         if over { bits |= JIT_BUILDS; }
         if over || s.waiting & (1 << BACKGROUND) != 0 { contended |= JIT_BUILDS; }
+        let limit_now = self.limit_now(s);
+        self.limit_width.store(limit_now, Relaxed);
+        if s.borrowed[BACKGROUND as usize] > 0 && s.running > limit_now { bits |= BORROWED_BACKGROUND; }
+        if s.borrowed[VISIBLE as usize] > 0 && s.running - s.borrowed[BACKGROUND as usize] > limit_now { bits |= BORROWED_VISIBLE; }
+        contended |= bits & (BORROWED_BACKGROUND | BORROWED_VISIBLE);
         self.yield_classes.store(bits, Relaxed);
         self.contended_classes.store(contended, Relaxed);
         for (index, job) in s.slots.iter().enumerate() {
             if let Some(job) = job {
-                let build = job.client == JIT && job.class == BACKGROUND;
-                self.classes[index].store(job.class | if job.above { NEVER_YIELDS } else { 0 } | if build { JIT_BUILD } else { 0 }, Relaxed);
+                self.classes[index].store(Self::row_word(job), Relaxed);
             }
         }
-        if let Some(i) = self.first(s) {
-            if self.room(s, s.waiters[i].class, s.waiters[i].client) { s.waiters[i].thread.unpark(); }
-        }
+        if let Some(i) = self.first(s) { s.waiters[i].thread.unpark(); }
         s.changes = s.changes.wrapping_add(1);
         if s.watchers > 0 { self.changed.notify_all(); }
     }
@@ -428,7 +492,7 @@ impl Budget {
     fn acquire<'a>(&'a self, mut s: MutexGuard<'a, State>, mut job: Job, desired: Option<&AtomicU8>) -> u32 {
         let key = (job.class, job.ticket);
         let first = self.first(&s);
-        let immediate = self.room(&s, job.class, job.client)
+        let immediate = self.admissible(&s, job.class, job.client)
             && first.is_none_or(|i| key < (s.waiters[i].class, s.waiters[i].ticket));
         if !immediate {
             // Only the contended path grows the waiter list. No thread is created here.
@@ -468,12 +532,14 @@ impl Budget {
         job.checkpoint_at = now;
         job.thread = me();
         job.above = job.client == JIT && self.load(&s, job.class, job.client) >= self.class_limit(&s, job.class, job.client);
+        job.borrowed = !job.above && !self.room(&s, job.class, job.client);
+        s.borrows += u64::from(job.borrowed);
         ADMITTED.with(|admitted| admitted.set(true));
         s.slots[index] = Some(job);
         self.roll(&mut s, now);
         self.start_counting(&mut s, &job, now);
         s.admitted[job.class as usize] += 1;
-        self.classes[index].store(job.class, Relaxed);
+        self.classes[index].store(Self::row_word(&job), Relaxed);
         self.refresh(&mut s);
         drop(s);
         set_thread_class(job.class);
@@ -504,9 +570,19 @@ impl Budget {
         let class = self.classes[permit as usize].load(Relaxed);
         self.contended_classes.load(Relaxed) & Self::bit(class) != 0
     }
-    /// A row's bit in the yield and contended words.
+    /// A row's word in `classes`.
+    fn row_word(job: &Job) -> u8 {
+        let build = job.client == JIT && job.class == BACKGROUND;
+        job.class | if job.above { NEVER_YIELDS } else { 0 } | if build { JIT_BUILD } else { 0 } | if job.borrowed { BORROWED } else { 0 }
+    }
+    /// A row's bits in the yield and contended words.
     fn bit(class: u8) -> u8 {
-        if class & JIT_BUILD != 0 { JIT_BUILDS } else { 1 << (class & CLASS_BITS) }
+        let own = if class & JIT_BUILD != 0 { JIT_BUILDS } else { 1 << (class & CLASS_BITS) };
+        match class & (BORROWED | CLASS_BITS) {
+            c if c == BORROWED | BACKGROUND => own | BORROWED_BACKGROUND,
+            c if c & BORROWED != 0 => own | BORROWED_VISIBLE,
+            _ => own,
+        }
     }
     fn span(s: &mut State, label: Label, ns: u64) {
         if let Some(span) = s.spans.iter_mut().find(|span| span.label == label) {
@@ -535,6 +611,7 @@ impl Budget {
         s.visible += usize::from(job.class == VISIBLE);
         s.jit_background += usize::from(job.class == BACKGROUND && job.client == JIT);
         s.jit_tokens += usize::from(job.class == BACKGROUND && job.client == JIT && !job.above);
+        s.borrowed[job.class as usize] += usize::from(job.borrowed);
     }
     fn stop_counting(&self, s: &mut State, job: &Job, now: u64) {
         self.roll(s, now);
@@ -546,6 +623,7 @@ impl Budget {
         s.visible -= usize::from(job.class == VISIBLE);
         s.jit_background -= usize::from(job.class == BACKGROUND && job.client == JIT);
         s.jit_tokens -= usize::from(job.class == BACKGROUND && job.client == JIT && !job.above);
+        s.borrowed[job.class as usize] -= usize::from(job.borrowed);
         s.runtime[job.class as usize] += now.saturating_sub(job.admitted_at);
         Self::span(s, job.label, now.saturating_sub(job.checkpoint_at));
     }
@@ -603,6 +681,24 @@ impl Budget {
         self.count_again(&mut s, permit as usize, now);
         self.refresh(&mut s);
     }
+    /// A thread blocked on work it cannot do itself lends the core the budget keeps outside its
+    /// limit: `limit_now` is the cores until the last lender takes it back. It never waits; the
+    /// first waiter that now has room is woken. Nothing is kept on one core.
+    fn lend_kept_core(&self) {
+        if self.cores == self.limit { return; }
+        let mut s = self.lock();
+        s.kept_lends += 1;
+        if s.kept_lends == 1 { self.refresh(&mut s); }
+    }
+    /// The end of `lend_kept_core`. It never waits: over the limit no one new is admitted, and the
+    /// rows that came in on the kept core give it back at their next checkpoint.
+    fn take_back_kept_core(&self) {
+        if self.cores == self.limit { return; }
+        let mut s = self.lock();
+        assert!(s.kept_lends > 0, "took the kept core back more often than it was lent");
+        s.kept_lends -= 1;
+        if s.kept_lends == 0 { self.refresh(&mut s); }
+    }
     fn count_again(&self, s: &mut State, index: usize, now: u64) {
         let job = s.slots[index].as_mut().expect("took back a released CPU permit");
         job.lent = false;
@@ -616,10 +712,10 @@ impl Budget {
         let now = self.now();
         let holders = s.slots.iter().flatten().map(|j| Holder {
             thread: j.thread, class: j.class, client: j.client, label: j.label.text().to_owned(), lent: j.lent, above: j.above,
-            held_ns: now.saturating_sub(j.admitted_at),
+            borrowed: j.borrowed, held_ns: now.saturating_sub(j.admitted_at),
         }).collect();
         let waiting = s.waiters.iter().map(|w| Waiting { thread: w.id, class: w.class, client: w.client }).collect();
-        Tokens { running: s.running, limits: [self.cores, self.limit, self.background_limit], holders, waiting }
+        Tokens { running: s.running, limits: [self.cores, self.limit_now(&s), self.background_limit], holders, waiting }
     }
     fn checkpoint(&self, permit: u32, held_locks: u32, lock_site: &str) -> u32 {
         self.checkpoint_following(permit, held_locks, lock_site, None)
@@ -657,6 +753,7 @@ impl Budget {
         }
         let job = self.remove(s, permit, now);
         s.parked[class as usize] += 1;
+        s.given_back += u64::from(job.borrowed);
         Some(job)
     }
     /// A run of the app ended in place (`makepad run`): the threads of the app's and the JIT's rows
@@ -697,6 +794,8 @@ impl Budget {
         let was = *job;
         job.class = class;
         job.admitted_at = now;
+        // a borrowed row keeps its token as its new class's own
+        job.borrowed = false;
         if !was.lent && Self::urgent_row(&was) != Self::urgent_row(&Job { class, ..was }) {
             self.roll(&mut s, now);
             if class == BACKGROUND { s.urgent -= 1 } else { s.urgent += 1 }
@@ -710,6 +809,7 @@ impl Budget {
         s.jit_background += usize::from(class == BACKGROUND && client == JIT);
         s.jit_tokens -= usize::from(old == BACKGROUND && client == JIT && !above);
         s.jit_tokens += usize::from(class == BACKGROUND && client == JIT && !above);
+        s.borrowed[old as usize] -= usize::from(was.borrowed && !was.lent);
         self.classes[permit as usize].store(class, Relaxed);
         self.refresh(&mut s);
     }
@@ -747,6 +847,7 @@ impl Budget {
         let mut running = [[0u32; 3]; 3];
         let mut spans = s.spans;
         let lent = s.slots.iter().flatten().filter(|j| j.lent).count();
+        let (borrowed, borrows, given_back, limit_now) = (Self::borrowed(&s), s.borrows, s.given_back, self.limit_now(&s));
         let above = s.slots.iter().flatten().filter(|j| j.above && !j.lent).count();
         for job in s.slots.iter().flatten().filter(|j| !j.lent) {
             running[job.class as usize][job.client as usize] += 1;
@@ -768,8 +869,10 @@ impl Budget {
         drop(s);
         warnings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         spans.sort_by_key(|span| std::cmp::Reverse(span.ns));
-        let mut out = format!("cpu {total}/{} running", self.limit);
-        if total > self.limit { let _ = write!(out, " (+{} over)", total - self.limit); }
+        let mut out = format!("cpu {total}/{limit_now} running");
+        if total > limit_now { let _ = write!(out, " (+{} over)", total - limit_now); }
+        if limit_now > self.limit { out.push_str(", the kept core lent"); }
+        if borrows != 0 { let _ = write!(out, ", {borrowed} borrowed ({borrows} borrowed admissions, {given_back} given back)"); }
         if lent != 0 { let _ = write!(out, ", {lent} lent by sleeping threads"); }
         if above != 0 { let _ = write!(out, ", {above} JIT job above the budget"); }
         let _ = write!(out, ", jit settled: {}", if jit_settled() { "yes" } else { "no" });
@@ -991,6 +1094,22 @@ pub fn limit() -> u32 { global().limit as u32 }
 pub fn pool_cores() -> u32 {
     granted_cores(cores() as usize, std::env::var("MAKEPAD_POOL_CORES").ok().as_deref()) as u32
 }
+/// How many tokens the budget admits now: `limit`, and the kept core too while a thread lends it
+/// (`lend_kept_core`). For callers that size their work by the tokens it can have (a batch of
+/// checks); read at the budget's last change, without its lock.
+#[relax_api]
+pub fn limit_now() -> u32 { global().limit_width.load(Relaxed) as u32 }
+/// The calling thread blocks on work it cannot do itself (the UI thread on the app's first check):
+/// the core the budget keeps outside its limit runs that work meanwhile. The budget admits up to
+/// the cores (`limit_now`) until the last lender takes it back, and wakes the first waiter that now
+/// has room. Needs no permit and never waits; nested and concurrent lends count, the first lends.
+/// Nothing is kept on one core: there it does nothing.
+#[relax_api]
+pub fn lend_kept_core() { global().lend_kept_core(); }
+/// The end of a `lend_kept_core`, when the last one ends: no one new is admitted over the limit,
+/// and the rows that came in on the kept core give it back at their next checkpoint. Never waits.
+#[relax_api]
+pub fn take_back_kept_core() { global().take_back_kept_core(); }
 /// How many Background jobs run at once.
 #[relax_api]
 pub fn background_limit() -> u32 { global().background_limit as u32 }
@@ -1039,6 +1158,9 @@ impl BudgetHandle {
     pub fn cores(&self) -> u32 { self.0.get().cores as u32 }
     pub fn limit(&self) -> u32 { self.0.get().limit as u32 }
     pub fn background_limit(&self) -> u32 { self.0.get().background_limit as u32 }
+    pub fn limit_now(&self) -> u32 { self.0.get().limit_width.load(Relaxed) as u32 }
+    pub fn lend_kept_core(&self) { self.0.get().lend_kept_core(); }
+    pub fn take_back_kept_core(&self) { self.0.get().take_back_kept_core(); }
     pub fn pool_cores(&self) -> u32 {
         match &self.0 { Which::Process => pool_cores(), Which::Own(budget) => budget.cores as u32 }
     }
@@ -1260,6 +1382,9 @@ pub struct Holder {
     pub lent: bool,
     /// the JIT's one job over a full budget: it holds no token
     pub above: bool,
+    /// admitted beyond its part on a borrowed token: it gives way at its next checkpoint once the
+    /// budget runs over `limit_now`
+    pub borrowed: bool,
     pub held_ns: u64,
 }
 /// One thread queued for a token.
@@ -1267,7 +1392,7 @@ pub struct Waiting { pub thread: u64, pub class: u8, pub client: u8 }
 /// Who has the budget now, for the inspector (the thread ids are `relax_base::waits::me`'s).
 pub struct Tokens {
     pub running: usize,
-    /// what each class may reach: it is admitted below this
+    /// what each class may reach: it is admitted below this (Visible's is `limit_now`)
     pub limits: [usize; 3],
     pub holders: Vec<Holder>,
     pub waiting: Vec<Waiting>,
@@ -1279,7 +1404,7 @@ fn write_tokens(budget: &Budget, out: &mut [u8]) -> usize {
     let t = budget.tokens();
     let mut text = format!("{} {} {} {}\n", t.running, t.limits[0], t.limits[1], t.limits[2]);
     for h in &t.holders {
-        text += &format!("h {} {} {} {} {} {} {}\n", h.thread, h.class, h.client, u8::from(h.lent), u8::from(h.above), h.held_ns, h.label.replace('\n', " "));
+        text += &format!("h {} {} {} {} {} {} {} {}\n", h.thread, h.class, h.client, u8::from(h.lent), u8::from(h.above), u8::from(h.borrowed), h.held_ns, h.label.replace('\n', " "));
     }
     for w in &t.waiting {
         text += &format!("w {} {} {}\n", w.thread, w.class, w.client);
@@ -1294,15 +1419,15 @@ fn read_tokens(op: impl Fn(&mut [u8]) -> usize) -> Tokens {
     let mut next = || head.next().unwrap();
     let mut tokens = Tokens { running: next(), limits: [next(), next(), next()], holders: Vec::new(), waiting: Vec::new() };
     for line in lines {
-        let mut fields = line.splitn(8, ' ');
+        let mut fields = line.splitn(9, ' ');
         let row = fields.next().unwrap();
         let mut number = || fields.next().unwrap().parse::<u64>().unwrap();
         let (thread, class, client) = (number(), number() as u8, number() as u8);
         if row == "w" {
             tokens.waiting.push(Waiting { thread, class, client });
         } else {
-            let (lent, above, held_ns) = (number() != 0, number() != 0, number());
-            tokens.holders.push(Holder { thread, class, client, label: fields.next().unwrap().to_owned(), lent, above, held_ns });
+            let (lent, above, borrowed, held_ns) = (number() != 0, number() != 0, number() != 0, number());
+            tokens.holders.push(Holder { thread, class, client, label: fields.next().unwrap().to_owned(), lent, above, borrowed, held_ns });
         }
     }
     tokens
