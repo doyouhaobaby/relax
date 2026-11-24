@@ -30692,7 +30692,9 @@ pub(crate) mod front_holders {
     }
 
     /// Every thread with a row: about to take a front read, holding one, or just given it back.
-    /// The pause lets them run on (inspect::instrument::pause_lets_front_readers_go).
+    /// The pause lets them run on (inspect::instrument::pause_lets_front_readers_go; the Linux
+    /// one asks the thread's own count).
+    #[cfg(any(target_vendor = "apple", all(windows, target_arch = "x86_64")))]
     pub(crate) fn threads() -> Vec<u64> {
         (0..ROWS).map(|k| TID[k].load(Acquire)).filter(|&t| t != 0).collect()
     }

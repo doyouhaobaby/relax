@@ -1924,7 +1924,8 @@ mod pause_tests {
         }
         use crate::jit::FRONT_RW;
         // where the reader stands: 1 between taking its read's two steps, 2 holding the read, 3
-        // between giving it back's two steps, 4 out of the front end
+        // between giving it back's two steps, 4 out of the front end (its last stand: held there
+        // or on its way, it is seen held, not at 4)
         static AT: AtomicU32 = AtomicU32::new(0);
         // how far it may go: past position p once GO is p or more
         static GO: AtomicU32 = AtomicU32::new(0);
@@ -1944,6 +1945,11 @@ mod pause_tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::Builder::new().name("pause-reader".into()).spawn(move || {
+            // a read taken and given back once first: under a JIT its code is built before the
+            // pause (a lazy compile while the pause holds the program's threads can wait for
+            // what one of them holds in the JIT running these tests, which this pause knows
+            // nothing of)
+            drop(crate::jit::front_read("pause test"));
             crate::jit::FRONT_READ_BETWEEN.with(|h| h.set(Some(between)));
             tx.send(crate::inspect::threads::self_os_id()).unwrap();
             let read = crate::jit::front_read("pause test");
@@ -1984,8 +1990,9 @@ mod pause_tests {
                     break 'steps;
                 }
                 GO.store(3, SeqCst);
-                reached(4);
-                // (the pause's sweep, every 5 ms, holds it)
+                // Once it has left, the pause's sweep (every 5 ms) holds it, wherever it is then:
+                // at 4, or on its way there (a JIT's lazy compile on that way is a wait the sweep
+                // holds it in), so this waits for the hold, not for 4.
                 let t0 = std::time::Instant::now();
                 while !super::held_now(os_id) && t0.elapsed().as_secs() < 5 {
                     std::thread::yield_now();
