@@ -799,10 +799,11 @@ mod windows {
             let pi = unsafe { &*pi };
             note_handle(pi.process);
             note_handle(pi.thread);
-            // (the run's own handle may be closed long before the process ends)
+            // (the run's own handle may be closed long before the process ends; with no run to
+            // record the child, no copy: nothing would ever close it)
             let me = unsafe { os::GetCurrentProcess() };
             let mut process = 0;
-            if unsafe { os::DuplicateHandle(me, pi.process, me, &mut process, 0, 0, DUPLICATE_SAME_ACCESS) } != 0 {
+            if owner().is_some() && unsafe { os::DuplicateHandle(me, pi.process, me, &mut process, 0, 0, DUPLICATE_SAME_ACCESS) } != 0 {
                 forget_ended_children();
                 note(Res::Child { process, detached: flags & DETACHED_PROCESS != 0 });
             }

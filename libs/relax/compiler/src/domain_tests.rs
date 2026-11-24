@@ -1891,7 +1891,7 @@ fn socket_path(fd: i32) -> Option<String> {
 
 /// What the process has open now: each descriptor and the file it names ("" for a pipe or a
 /// socket where the system names none; a Unix socket with the path it is bound to), but the
-/// listing's own; on Windows, one row per handle.
+/// listing's own; on Windows, each handle with its object type, a disk file with its path).
 fn open_now() -> Vec<(u64, String)> {
     #[cfg(target_os = "linux")]
     return std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).map(|e| {
@@ -1913,12 +1913,65 @@ fn open_now() -> Vec<(u64, String)> {
             (fd as u64, if named { String::from_utf8_lossy(&buf[..end]).into_owned() } else { socket_path(fd).unwrap_or_default() })
         }).filter(|(_, file)| file != "/dev/fd").collect();
     }
+    // each handle by its value, named by its object type and, for a disk file, its path (a
+    // pipe's name is never asked: that query can block)
     #[cfg(windows)]
     {
         use crate::os::win32::{GetCurrentProcess, GetProcessHandleCount};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetHandleInformation(h: usize, flags: *mut u32) -> i32;
+            fn GetFileType(h: usize) -> u32;
+            fn GetFinalPathNameByHandleW(h: usize, path: *mut u16, len: u32, flags: u32) -> u32;
+            fn GetProcessId(h: usize) -> u32;
+            fn GetThreadId(h: usize) -> u32;
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQueryObject(h: usize, class: u32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+        }
+        const OBJECT_TYPE_INFORMATION: u32 = 2;
+        const FILE_TYPE_DISK: u32 = 1;
+        let describe = |h: usize| -> String {
+            // OBJECT_TYPE_INFORMATION begins with the type's UNICODE_STRING (length in bytes, buffer)
+            let mut info = [0u64; 128];
+            let mut kind = String::new();
+            if unsafe { NtQueryObject(h, OBJECT_TYPE_INFORMATION, info.as_mut_ptr() as *mut u8, 1024, std::ptr::null_mut()) } >= 0 {
+                let len = (info[0] & 0xffff) as usize / 2;
+                let buf = info[1] as *const u16;
+                if !buf.is_null() {
+                    kind = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(buf, len) });
+                }
+            }
+            if kind == "File" && unsafe { GetFileType(h) } == FILE_TYPE_DISK {
+                let mut path = [0u16; 1024];
+                let n = unsafe { GetFinalPathNameByHandleW(h, path.as_mut_ptr(), path.len() as u32, 0) } as usize;
+                if n > 0 && n < path.len() {
+                    return format!("File {}", String::from_utf16_lossy(&path[..n]));
+                }
+            }
+            match kind.as_str() {
+                "Process" => format!("Process {}", unsafe { GetProcessId(h) }),
+                "Thread" => format!("Thread {}", unsafe { GetThreadId(h) }),
+                _ => kind,
+            }
+        };
         let mut n = 0;
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-        (0..n as u64).map(|i| (i, String::new())).collect()
+        // handle values are multiples of 4: walk them until every counted handle is found, or
+        // past a long run of unused values (the count can move while this walks)
+        let (mut open, mut h, mut unused) = (Vec::new(), 4usize, 0u32);
+        while open.len() < n as usize && unused < 1 << 16 {
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(h, &mut flags) } != 0 {
+                open.push((h as u64, describe(h)));
+                unused = 0;
+            } else {
+                unused += 1;
+            }
+            h += 4;
+        }
+        open
     }
 }
 
@@ -2000,6 +2053,35 @@ fn a_run_ends_with_what_it_held_given_back() {
     // (the first round's lazy compiles open what stays open for the whole process)
     assert_eq!(&counts[1..], &[0, 0], "left open: {lefts:?}");
 }
+
+/// A child the main program starts leaves no handle of the runtime's behind. The runtime keeps
+/// its own copy of a child's process handle, to end a run's children with their run; it made that
+/// copy before asking whether a run records the child, and for the main program none does: the
+/// copy was never closed, one process (and its pid) held per child for the life of the process.
+#[cfg(windows)]
+#[test]
+fn a_main_programs_child_leaves_no_handle_behind() {
+    isolated_test!(a_main_programs_child_leaves_no_handle_behind);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(MAIN_CHILD, "fixture");
+    let out = [0u64; 1];
+    // (on this thread, in no run: where the main program runs)
+    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    let child = format!("Process {}", out[0]);
+    let held: Vec<_> = open_now().into_iter().filter(|(_, name)| *name == child).collect();
+    assert!(held.is_empty(), "the ended child's process is still held: {held:?}");
+    drop(u);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+const MAIN_CHILD: &str = r#"
+fn fixture(p: *mut u64) {
+    let mut child = std::process::Command::new("cmd").args(["/c", "exit 0"]).spawn().unwrap();
+    unsafe { *p = child.id() as u64 };
+    child.wait().unwrap();
+}
+"#;
 
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
