@@ -1568,7 +1568,12 @@ mod imp {
         if rec.code == EXCEPTION_ACCESS_VIOLATION && rec.n_params >= 2 && crate::jit::transit_retry(rec.info[1] as u64, pc) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if chained && !crate::jit::in_jit_code(pc) && !crate::stale::in_ended_run(pc) && !crate::domain::current_is_ending() {
+        // (an access into retired memory -- invalidated code's trap fill, a retired window -- is this
+        // runtime's on any thread, as on_fault decides first: on a thread whose current unit does
+        // not own that code it went on to the search, which ended the process with no stale report)
+        let data = matches!(rec.code, EXCEPTION_ACCESS_VIOLATION | EXCEPTION_IN_PAGE_ERROR) && rec.n_params >= 2;
+        let stale = || crate::stale::lookup(pc).is_some() || (data && crate::stale::lookup(rec.info[1] as u64).is_some());
+        if chained && !crate::jit::in_jit_code(pc) && !crate::stale::in_ended_run(pc) && !crate::domain::current_is_ending() && !stale() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // the data address of an access violation / in-page error (ExceptionInformation[1]);
