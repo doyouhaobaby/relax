@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Five warm edits against isolated one-shot references; original app is read-only.
-Spec is a JSON array of five {name, replace: [old,new]} or {name, append: text}.
-Each edit starts from the initial text; {name: 'revert'} restores it.
+"""Warm edits against isolated one-shot references; original app is read-only.
+Spec is a JSON array of at least five {name, replace: [old,new]} or {name, append: text}.
+Each edit starts from the initial text; {name: 'revert'} restores it. An edit's change is the
+difference from the step before it: a step that keeps the last one's edit and adds a body edit is a
+body-only change.
 """
 import json, os, pathlib, queue, re, shutil, subprocess, sys, tempfile, threading, time
 
 relax, app, pkg, edit, spec = sys.argv[1:]
 relax, app, edit = map(lambda p: pathlib.Path(p).resolve(), (relax, app, edit))
 steps = json.loads(pathlib.Path(spec).read_text())
-assert len(steps) == 5, 'expected body error, revert, signature, new fn, unresolved name'
+assert len(steps) >= 5, 'expected body error, revert, signature, new fn, unresolved name'
 tmp = pathlib.Path(tempfile.mkdtemp(prefix='relax-check-watch-'))
 relative = edit.relative_to(app)
 # The copy is a workspace of its own, outside the tree. Offline, the workspace resolves the registry crates it
@@ -103,7 +105,7 @@ try:
     child.stdin.write('{"method":"shutdown"}\n'); child.stdin.flush()
     assert child.wait(timeout=10) == 0
     # (each edit's check time is printed above: a measure, not a verdict)
-    print('PASS: all five edits equal one-shot diagnostics', flush=True)
+    print(f'PASS: all {len(steps)} edits equal one-shot diagnostics', flush=True)
     shutil.rmtree(tmp)
 finally:
     if child.poll() is None:
