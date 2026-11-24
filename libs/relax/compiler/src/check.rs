@@ -2731,11 +2731,7 @@ fn is_internal(u: &Unit, e: &str) -> bool {
         return true;
     }
     // `path:line:col: E0123: ..`
-    let mut it = first.splitn(4, ':');
-    let (Some(path), Some(l), Some(c), Some(rest)) = (it.next(), it.next(), it.next(), it.next()) else { return true };
-    if l.trim().parse::<u32>().is_err() || c.trim().parse::<u32>().is_err() {
-        return true;
-    }
+    let Some((path, _, _, Some(rest))) = place_of(first) else { return true };
     let rest = rest.trim_start();
     // (an error rustc words without a code: Program::record_uncoded_error)
     let coded = rest.starts_with(relax_front::diagnostics::UNCODED_PREFIX) || (rest.len() > 5 && rest.starts_with('E') && rest[1..5].bytes().all(|b| b.is_ascii_digit()));
@@ -2748,13 +2744,27 @@ fn is_internal(u: &Unit, e: &str) -> bool {
     }
 }
 
-/// `path:line:col: internal: msg` for a makepad run bug (the error keeps its own text otherwise).
-fn label_internal(e: &str) -> String {
-    let mut it = e.splitn(4, ':');
-    if let (Some(p), Some(l), Some(c), Some(rest)) = (it.next(), it.next(), it.next(), it.next()) {
-        if l.trim().parse::<u32>().is_ok() && c.trim().parse::<u32>().is_ok() {
-            return format!("{}:{}:{}: internal:{}", p, l, c, rest);
+/// The path, line, column and the text after them (None: nothing follows the column) of an
+/// error whose first line starts `path:line:col`. The path ends at the first colon that a line
+/// and a column follow, so a Windows drive's own colon (`C:\ws\lib.rs:1:19: E0425: ..`) is
+/// the path's: split at every colon, each located error of a check on Windows was `internal`.
+pub(crate) fn place_of(e: &str) -> Option<(&str, &str, &str, Option<&str>)> {
+    let first = e.lines().next().unwrap_or("");
+    for (i, _) in first.match_indices(':') {
+        let mut it = e[i + 1..].splitn(3, ':');
+        if let (Some(l), Some(c)) = (it.next(), it.next()) {
+            if l.trim().parse::<u32>().is_ok() && c.trim().parse::<u32>().is_ok() {
+                return Some((&e[..i], l, c, it.next()));
+            }
         }
+    }
+    None
+}
+
+/// `path:line:col: internal: msg` for a makepad run bug (the error keeps its own text otherwise).
+pub(crate) fn label_internal(e: &str) -> String {
+    if let Some((p, l, c, Some(rest))) = place_of(e) {
+        return format!("{}:{}:{}: internal:{}", p, l, c, rest);
     }
     format!("internal: {}", e)
 }
@@ -2765,10 +2775,7 @@ fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, erro
     let u = unsafe { &*up };
     let mut first = e.lines().next().unwrap_or("").to_string();
     // an error without a location takes its fn's
-    let located = {
-        let mut it = first.splitn(4, ':');
-        matches!((it.next(), it.next(), it.next()), (Some(_), Some(l), Some(c)) if l.trim().parse::<u32>().is_ok() && c.trim().parse::<u32>().is_ok())
-    };
+    let located = place_of(&first).is_some();
     if !located {
         if let Some((file, pos)) = function_origin(u, id) {
             let path = &u.prog.file_paths[file as usize];

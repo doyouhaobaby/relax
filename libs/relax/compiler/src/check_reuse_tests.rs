@@ -823,6 +823,11 @@ fn an_app_check_restores_the_crates_its_image_holds_as_they_are() {
 #[test]
 fn a_dependency_error_fails_the_check() {
     if std::env::var_os(CHILD).is_some() || std::env::var_os(EARLY_CHILD).is_some() || std::env::var_os(APP_CHILD).is_some() { return; }
+    // a Windows path's drive colon is the path's: the error stays the dependency's on every host
+    let windows = "C:\\ws\\dep\\lib.rs:1:19: E0425: cannot find type `NoSuchType` in this scope";
+    assert_eq!(crate::check::place_of(windows), Some(("C:\\ws\\dep\\lib.rs", "1", "19", Some(" E0425: cannot find type `NoSuchType` in this scope"))));
+    assert_eq!(crate::check::label_internal("C:\\ws\\lib.rs:2:3: oops\nmore"), "C:\\ws\\lib.rs:2:3: internal: oops\nmore");
+    assert_eq!((crate::check::place_of("/ws/lib.rs:2:3"), crate::check::place_of("no place: here")), (Some(("/ws/lib.rs", "2", "3", None)), None));
     let dir = package("deperror", &[]);
     let write = |f: &str, src: &str| {
         let path = dir.join(f);
