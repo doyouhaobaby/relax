@@ -452,7 +452,9 @@ pub(crate) static TRANSIT_HOLD_US: AtomicU64 = AtomicU64::new(0);
 /// instruction again: a live neighbour's runs on, a dead range's traps. No core can fetch the
 /// dead bytes, or read a dead range's literal pool, while they change. Registration and the
 /// slots' stubs come first (`invalidate`); nothing here takes a lock a faulting thread can hold.
-fn trap_fill(ranges: &mut [(u64, u64, u64)]) {
+/// It writes [lo, hi) and not a byte past it: a body's length on x86-64 is any number of bytes,
+/// and the next function's code can start at `hi`.
+pub(crate) fn trap_fill(ranges: &mut [(u64, u64, u64)]) {
     if ranges.is_empty() {
         return;
     }
@@ -479,7 +481,8 @@ fn trap_fill(ranges: &mut [(u64, u64, u64)]) {
             let n = (hi - lo) as usize;
             let w = crate::os::mem::code_alias(lo, n) as *mut u8;
             for q in (0..n).step_by(4) {
-                unsafe { std::ptr::copy_nonoverlapping(TRAP.as_ptr(), w.add(q), 4) };
+                // the last write ends at `hi` (x86-64: TRAP is one byte repeated)
+                unsafe { std::ptr::copy_nonoverlapping(TRAP.as_ptr(), w.add(q), (n - q).min(4)) };
             }
             FILLED_BYTES.fetch_add(hi - lo, Ordering::Relaxed);
         }
