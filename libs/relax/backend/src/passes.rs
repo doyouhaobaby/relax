@@ -122,6 +122,9 @@ pub enum RoRead {
     /// For a zero-size query only: this many bytes starting at the symbol are immutable.
     /// Unlike a scalar read this does not require classifying pointer words or padding.
     Range(u64),
+    /// For a `FN_QUERY` only: the symbol is function slot `.0`'s permanent callable address (what
+    /// a fn pointer stored in data holds), so a call through it is a call of that slot
+    Fn(u32),
     No,
 }
 
@@ -145,7 +148,18 @@ impl RoReader {
     pub fn read(&self, s: Sym, n: u32) -> RoRead {
         (self.read)(self.ctx, s, n)
     }
+
+    /// The function slot whose callable address `s` is (`RoRead::Fn`), if it is one.
+    pub fn fn_slot(&self, s: Sym) -> Option<u32> {
+        match (self.read)(self.ctx, s, FN_QUERY) {
+            RoRead::Fn(id) => Some(id),
+            _ => None,
+        }
+    }
 }
+
+/// `RoReader::read`'s query of a symbol's function (`RoReader::fn_slot`): no byte count.
+pub const FN_QUERY: u32 = u32::MAX;
 
 /// `IBit` on a constant (the semantics every backend implements).
 pub fn bit_op(o: BitOp, x: u64) -> u64 {
@@ -1214,6 +1228,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         // built on several paths): known like a single definition
         let mut same_k: Vec<Option<(i64, u32)>> = vec![None; nv];
         let mut kn: Vec<Option<K>> = vec![None; nv];
+        let devirt = ro.is_some() && !crate::stats::opt_off(options, "-devirt");
         let mut alias: Vec<u32> = (0..nv as u32).collect();
         let mut def_inst: Vec<Option<(IOp, VReg, i64)>> = vec![None; nv];
         // single-def integer compares: (cond, signed, a, b-or-imm, is_imm); operands must be
@@ -1692,10 +1707,23 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             new = Inst::Mov(d, x);
                         }
                     }
-                    // a call through a known function's address: a direct call (inlinable)
+                    // a call through a known function's address: a direct call (inlinable). The
+                    // address is the function's (FnAddr), or a symbol that is a function's
+                    // callable address: a fn pointer read from immutable data, such as a
+                    // thread-local key's getter (`LocalKey::with` calls its `inner`). Immutable
+                    // data never changes: an edit makes new data, and the code that read the old
+                    // data is built again. A call through the slot follows the slot's edits.
+                    // In a live test session the indirect call went through the callee's
+                    // marking thunk on every call; a direct one is bypassable (RELAX_OPT=-devirt:
+                    // only FnAddr)
                     if let Inst::Call(Callee::Indirect(v), ref args, ref rets) = new {
-                        if fn_def[v.0 as usize] != u32::MAX {
-                            new = Inst::Call(Callee::Fn(fn_def[v.0 as usize]), args.clone(), rets.clone());
+                        let known = match kn[v.0 as usize] {
+                            _ if fn_def[v.0 as usize] != u32::MAX => Some(fn_def[v.0 as usize]),
+                            Some(K::A(p)) if devirt && p.off == 0 => ro.and_then(|rd| rd.fn_slot(p)),
+                            _ => None,
+                        };
+                        if let Some(id) = known {
+                            new = Inst::Call(Callee::Fn(id), args.clone(), rets.clone());
                         }
                     }
                     // x <=> x

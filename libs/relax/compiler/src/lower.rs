@@ -1156,7 +1156,7 @@ impl<'a> Lcx<'a> {
         match crate::syms::read_leaf(self.u, at, lf.mem) {
             relax_backend::passes::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
             relax_backend::passes::RoRead::Ptr(t) => Some(self.sym_val(t)),
-            relax_backend::passes::RoRead::No | relax_backend::passes::RoRead::Range(_) => None,
+            relax_backend::passes::RoRead::No | relax_backend::passes::RoRead::Range(_) | relax_backend::passes::RoRead::Fn(_) => None,
         }
     }
     fn addr_add(&mut self, base: VReg, off: i32) -> VReg {

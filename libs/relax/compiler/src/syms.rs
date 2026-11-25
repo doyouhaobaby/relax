@@ -598,6 +598,12 @@ pub fn set_unit(u: *mut Unit) {
 /// length read as 0; that O2 code went to the disk cache, so every later warm start ran it).
 pub fn ro_read(ctx: usize, s: Sym, n: u32) -> relax_backend::passes::RoRead {
     let u = unsafe { &*(ctx as *const Unit) };
+    if n == relax_backend::passes::FN_QUERY {
+        return match u.syms.kind(s.id) {
+            Some(SymKind::Thunk(id)) if s.off == 0 => relax_backend::passes::RoRead::Fn(id),
+            _ => relax_backend::passes::RoRead::No,
+        };
+    }
     read_obj(u, s, n)
 }
 

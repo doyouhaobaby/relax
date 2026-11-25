@@ -878,9 +878,17 @@ fn a_take_that_gives_way_waits_for_a_change() {
 
 const EDIT_SOURCE: &str = r#"
 pub fn hot(out: &mut u32) { *out = 6; }
+pub struct Key { f: fn() -> u32 }
+fn one() -> u32 { 1 }
+fn two() -> u32 { 2 }
+const KEY: Key = Key { f: one };
+#[inline(always)]
+fn call(k: &'static Key) -> u32 { (k.f)() }
+pub fn keyed(out: &mut u32) { *out = call(&KEY); }
 fn main() {
     let mut x = 0;
     hot(&mut x);
+    keyed(&mut x);
 }
 "#;
 
@@ -891,7 +899,10 @@ fn main() {
 /// to it, where it counts a slot this run made final again at the threshold). A patch left a slot marked queued (O3 code, a counted
 /// window, a take) with its count stub gone, and a take it dropped left its slot the same: their
 /// calls were never counted again, and a live app's edited draw ran O1 code for the rest of the
-/// run (11-17).
+/// run (11-17). And a hot fn that calls through a fn pointer in constant data (a thread-local
+/// key's getter, a known vtable's method) calls that function directly at O3 and inlines it; an
+/// edit that points the constant at another function makes new data, which the next call and
+/// the next O3 build follow.
 #[test]
 fn a_hot_fn_edited_mid_run_returns_to_o3() {
     isolated_test!(a_hot_fn_edited_mid_run_returns_to_o3);
@@ -904,10 +915,11 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     let path = dir.join("input.rs");
     std::fs::write(&path, EDIT_SOURCE).unwrap();
     let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "edited_hot", false).unwrap();
-    let hot = prog.defs.iter().enumerate().find_map(|(i, d)| {
+    let def = |prog: &Program, n: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
-        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "hot").then_some(id)
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == n).then_some(id)
     }).unwrap();
+    let (hot, keyed, one, two) = (def(&prog, "hot"), def(&prog, "keyed"), def(&prog, "one"), def(&prog, "two"));
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
@@ -1057,6 +1069,43 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     counting("parked by a stored verdict, then new code reached");
     assert_eq!(w5() & (STORED_FINAL | STORED_PARKED), 0, "counting again clears the parked marks");
     assert_eq!(run(), 12);
+    // keyed calls through the fn pointer of constant data: at O3 a direct call, inlined, of the
+    // function the pointer names (passes::simplify, RoReader::fn_slot)
+    let k = crate::owner::call(crate::owner::Class::Program, || {
+        let k = u.fn_id(FnKey::Inst(keyed, Vec::new()));
+        let c = unsafe { compile_fn(up, k) }.unwrap();
+        u.install(k, &c.0, &c.2, c.1, 0).unwrap();
+        let code = u.fns[k as usize].code;
+        u.arm_counter_as(k, code, true);
+        k
+    });
+    let krec = crate::owner::call(crate::owner::Class::Program, || tier_rec(&u.slots, k) as usize) as *const AtomicU64;
+    let run_keyed = || {
+        let entry = unsafe { (&*up).fns[k as usize].code };
+        let mut r = 0u32;
+        unsafe { call_jit(up, entry, &mut r as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        r
+    };
+    let keyed_o3 = |what: &str| unsafe {
+        let (code, stub) = ((*krec.add(1)).load(Ordering::Relaxed), (*krec.add(2)).load(Ordering::Relaxed));
+        let _ = crate::owner::call(crate::owner::Class::Program, || SlotWord::of(&(&*up).slots, k).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst));
+        assert!((*krec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok(), "{what}: keyed was counting");
+        assert!(compile_tier1(up, k), "{what}: keyed gets O3 code");
+    };
+    let inlined = |f: DefId| crate::owner::call(crate::owner::Class::Program, || {
+        let c = u.fn_id(FnKey::Inst(f, Vec::new()));
+        u.fns[c as usize].history().inlined_into.contains(&k)
+    });
+    assert_eq!(run_keyed(), 1);
+    keyed_o3("first");
+    assert!(inlined(one), "keyed's O3 build calls `one` through the constant's fn pointer directly, and inlines it");
+    assert_eq!(run_keyed(), 1);
+    // the constant points at `two` now: new data, which the next call and the next O3 build read
+    edit("Key { f: one }", "Key { f: two }");
+    assert_eq!(run_keyed(), 2, "the call follows the edited constant");
+    keyed_o3("edited");
+    assert!(inlined(two), "the edit's O3 build calls `two` directly, and inlines it");
+    assert_eq!(run_keyed(), 2, "the edit's O3 code calls `two`");
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
