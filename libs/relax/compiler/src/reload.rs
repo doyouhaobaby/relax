@@ -195,7 +195,7 @@ pub(crate) fn gandalf_app_roots(units: &crate::unitgraph::Units, launched_dir: &
         let rel = std::path::Path::new(&path).strip_prefix(&tree).ok()?;
         // tools/: the framework's runtime crates apps link (relax, ...)
         if ["platform", "draw", "widgets", "libs", "tools", "engine", "relax",
-            "apps/commercial/engine"].iter().any(|p| rel.starts_with(p)) {
+            "apps/commercial/engine", "apps/apps/engine"].iter().any(|p| rel.starts_with(p)) {
             return None;
         }
         Some(crate::vfs::normalize_path(source))
