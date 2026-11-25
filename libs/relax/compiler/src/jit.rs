@@ -8334,6 +8334,7 @@ impl Unit {
         }
         self.slot_named(id, key);
         self.fns.push(Self::new_entry(key, &name, file, stub_addr, stub.len() as u32));
+        if main_compile_log() { slot_note(&SLOT_BORN, id, |t| *t = wall_ns()); }
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             index.insert(key, id);
         }
@@ -10935,6 +10936,54 @@ pub struct MainCompile {
     /// first present only: postframe.rs)
     pub jobs: u32,
     pub queued: [u32; 3],
+    /// (RELAX_MAIN_COMPILE_LOG) the owner's front of the slot itself, not its candidates': the
+    /// take and lowering, the inline candidates (with their nested fronts), the tail facts, the
+    /// rest of the preparation (wall ns)
+    pub front: [u64; 4],
+    /// its preparation's shape: ready candidates, deferred candidates, tail facts
+    pub prep: [u32; 3],
+    /// the back end on this thread: the memo key, its lookup, a hit's copies, a miss's copy of the
+    /// preparation, the signatures and notes after codegen, the store and the pc section (wall ns)
+    pub back: [u64; 6],
+    /// the program's collect epoch at the compile's start and end (moved: a front write, such as a
+    /// crate loaded on demand, ran inside it)
+    pub epoch: [u64; 2],
+}
+
+/// RELAX_MAIN_COMPILE_LOG: per slot the wall time it was made at (ns; 0: before the log's start).
+pub static SLOT_BORN: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::Mutex::new(Vec::new());
+/// RELAX_MAIN_COMPILE_LOG: per slot its first lowering ahead: when it was ready (wall ns; 0: none),
+/// by whom (1 a helper, 2 the thread about to build it), its RIR instructions, and when a build
+/// first took it (0: never).
+pub static SLOT_LOWERED: relax_session::sync::Mutex<Vec<(u64, u8, u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+
+fn slot_note<T: Copy + Default>(v: &relax_session::sync::Mutex<Vec<T>>, id: u32, f: impl FnOnce(&mut T)) {
+    let mut g = v.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() <= id as usize {
+        g.resize(id as usize + 1, T::default());
+    }
+    f(&mut g[id as usize]);
+}
+
+/// RELAX_MAIN_COMPILE_LOG: each ahead check's last attempt: when it claimed the body, when it had
+/// the front read, its thread CPU in the check, and when it published (wall ns).
+static CHECK_TIMES: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<AheadKey, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
+
+thread_local! {
+    /// prepare_rir_from's nesting on this thread (1: a build's own preparation; more: a candidate's
+    /// or a fact's, inside it)
+    static PREP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+struct PrepDepth(u32);
+impl PrepDepth {
+    fn enter() -> PrepDepth {
+        PrepDepth(PREP_DEPTH.with(|d| { let n = d.get() + 1; d.set(n); n }))
+    }
+}
+impl Drop for PrepDepth {
+    fn drop(&mut self) {
+        PREP_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 pub const MAIN_HOW_NAMES: [&str; 7] = ["done", "cache", "spec", "inflight", "split", "plain", "memo"];
@@ -11143,6 +11192,7 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
     let recorded = on_main || !owner::is_owner() && crate::inspect::flightrec::on();
     if recorded {
         let mut rec = MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() };
+        if main_compile_log() { rec.epoch[0] = (&*up).tcx.collect_epoch.load(Ordering::Relaxed); }
         if FIRST_PRESENT.load(Ordering::Relaxed) {
             rec.jobs = BG_ACTIVE.load(Ordering::Relaxed);
             let len = |n: Option<usize>| n.map_or(u32::MAX, |n| n as u32);
@@ -11161,6 +11211,7 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
     if recorded {
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
+            if main_compile_log() { rec.epoch[1] = (&*up).tcx.collect_epoch.load(Ordering::Relaxed); }
             let name = &(&*up).fns[id as usize].name;
             if rec.end - rec.start >= crate::postframe::STALL_LOG_NS {
                 lazy_long_event(name, &rec);
@@ -15558,6 +15609,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     cost_name(up, id);
     let _cost_opt = relax_codegen::fncost::phase(4);
+    let depth = PrepDepth::enter();
+    let tm = depth.0 == 1 && main_compile_log();
+    let tw0 = if tm { wall_ns() } else { 0 };
     let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     // Freeze the mode before lowering, which may release the lock or cross present.
@@ -15601,6 +15655,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         (&mut *up).fns[id as usize].build_err = Some(crate::zone_alloc::slots_with(|| e.as_str().into()));
     }
     let mut func = r?;
+    let tw1 = if tm { wall_ns() } else { 0 };
     // inside a take its lowering came from lowering ahead (a take runs no front): given back if the
     // take bails after this point (its candidates' fronts, its build budget), so the next round
     // takes it again instead of needing it fronted again
@@ -15658,6 +15713,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     let mut nested_ns = 0u64;
     let t0 = cpu_ns();
+    let tw2 = if tm { wall_ns() } else { 0 };
     let mut snap = Vec::new();
     let mut deferred = Vec::new();
     let mut skipped: Vec<(u32, &str)> = Vec::new();
@@ -15951,6 +16007,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let relayout = layout_for(options, &name);
     // (their builds count as nested, like the inline candidates')
     let tn = cpu_ns();
+    let tw3 = if tm { wall_ns() } else { 0 };
     let mode = if baseline { RirMode::Baseline } else { RirMode::Tier0 };
     let mut func = func;
     // RELAX_OPT=-tailfacts: no facts asked (calls in tail position after invokes and frame
@@ -15967,6 +16024,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         left.extend(unknown);
     }
     nested_ns += cpu_ns() - tn;
+    let tw4 = if tm { wall_ns() } else { 0 };
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
     // inside a take: fronts its fact builds (or a candidate loop it skipped) noted
     if owner::bailing() {
@@ -15986,6 +16044,17 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // (an inline candidate's preparation: the back end inlines it guarded, as its RIR would be)
     func.patch_flag = patch_flag(u, id);
     func.copy_ver = copy_ver(u, id);
+    if tm {
+        let tw5 = wall_ns();
+        let shape = [snap.len() as u32, deferred.len() as u32, facts.len() as u32];
+        main_rec(|r| {
+            r.front[0] += tw1 - tw0;
+            r.front[1] += tw3 - tw2;
+            r.front[2] += tw4 - tw3;
+            r.front[3] += (tw2 - tw1) + (tw5 - tw4);
+            r.prep = shape;
+        });
+    }
     Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
 }
 
@@ -29549,15 +29618,24 @@ impl BackWork {
         let options = &session.options;
         let runtime = &session.runtime;
         let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
+        let tm = !spec && main_compile_log();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
             let t0 = cpu_ns();
+            let now = || if tm { wall_ns() } else { 0 };
+            let mut bt = [0u64; 6];
             // the back-end memo (bmemo.rs): an earlier back end over the same preparation up to
             // slot names made this code; a miss keeps what the back end got for its entry
             let mut memo = None;
             if let Front::Opt(p, _) = &front {
                 if worthy && bmemo::on(options) {
+                    let a = now();
                     let k = bmemo::key(id, p, (fold, rotate, env.opt_regs, lc.is_some(), epoch));
-                    if let Some((opt, code, map, relocs, cg_ns, mut done, frame)) = bmemo::lookup(&k, p, lc.map(|x| x.0)) {
+                    let b = now();
+                    let hit = bmemo::lookup(&k, p, lc.map(|x| x.0));
+                    let c = now();
+                    bt[0] += b - a;
+                    bt[1] += c - b;
+                    if let Some((opt, code, map, relocs, cg_ns, mut done, frame)) = hit {
                         // (the memo's copies carry no lowering: a baseline body gets this
                         // preparation's own, the input of its upgrade)
                         let opt = opt.map(|(f, inl, ns)| (std::sync::Arc::new(relax_backend::rir::Func { lowering: p.func.lowering.clone(), ..std::sync::Arc::unwrap_or_clone(f) }), inl, ns));
@@ -29572,9 +29650,15 @@ impl BackWork {
                             main_rec(|r| if r.how == 4 { r.how = 6 });
                         }
                         let pc = crate::cache::pc_section(&map);
+                        if tm {
+                            bt[2] += now() - c;
+                            main_rec(|r| for i in 0..6 { r.back[i] += bt[i] });
+                        }
                         return Ok((opt, code, map, relocs, cg_ns, pc));
                     }
+                    let a = now();
                     memo = Some((k, bmemo::SPrep::of(p)));
+                    bt[3] += now() - a;
                 }
             } else {
                 bmemo::STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -29610,6 +29694,7 @@ impl BackWork {
             crate::memstat::note_big("codegen", &cg.name, mps, || cg_shape(&cg));
             compile_watch(None);
             let c = c?;
+            let a = now();
             let frame = (c.frame_size, slot_bytes(&cg));
             note_frame(id, frame.0, frame.1, false);
             dump_o1(&cg, &c);
@@ -29618,6 +29703,7 @@ impl BackWork {
                 crate::syms::reloc_sig(u, || crate::syms::stable_fn_name(u, id), &c.code, &c.relocs, &c.pc_map);
             }
             let t2 = cpu_ns();
+            bt[4] += now() - a;
             if !spec {
                 let n = relax_codegen::opt::inst_count(&cg) as u32;
                 main_rec(|r| {
@@ -29626,10 +29712,15 @@ impl BackWork {
                     r.insts[1] += n;
                 });
             }
+            let a = now();
             if let Some((k, prep)) = memo {
                 bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0, lc.map(|x| x.0));
             }
             let pc = crate::cache::pc_section(&c.pc_map);
+            if tm {
+                bt[5] += now() - a;
+                main_rec(|r| for i in 0..6 { r.back[i] += bt[i] });
+            }
             Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1, pc))
         }));
         let w2 = wall_ns();
@@ -31543,6 +31634,12 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
             }
         }
         lowered_end();
+        if main_compile_log() {
+            if let Some(LoweredState::Ready(l)) = f.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+                let n = relax_codegen::opt::inst_count(&l.func) as u32;
+                slot_note(&SLOT_LOWERED, id, |e| if e.0 == 0 { *e = (wall_ns(), if own { 2 } else { 1 }, n, 0) });
+            }
+        }
         for k in small {
             u.fn_id(k);
         }
@@ -31913,6 +32010,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
     if ahead_trace() {
         eprintln!("ahead-lower taken: {}", u.fns[id as usize].name);
     }
+    if main_compile_log() { slot_note(&SLOT_LOWERED, id, |e| if e.3 == 0 { e.3 = wall_ns() }); }
     Some(lowered.func)
 }
 
@@ -32114,9 +32212,21 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
             let _w = AheadWait::begin(0);
+            let w0 = wall_ns();
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
+            }
+            drop(g);
+            // RELAX_MAIN_COMPILE_LOG: a long wait, against the helper's check (its front read
+            // waited behind a writer, or the check itself took that long)
+            let w1 = wall_ns();
+            if main_compile_log() && w1 - w0 >= 5_000_000 {
+                let t = CHECK_TIMES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied());
+                let ms = |ns: u64| ns as f64 / 1e6;
+                let what = t.map_or("no check of it published".to_string(), |t| format!("its check claimed it {:.1} ms before the wait, waited {:.1} ms for the front read, ran {:.1} ms wall ({:.1} ms cpu) and published {:.1} ms after the wait began",
+                    ms(w0.saturating_sub(t[0])), ms(t[1] - t[0]), ms(t[3] - t[1]), ms(t[2]), ms(t[3].saturating_sub(w0))));
+                eprintln!("relax ahead: #{} waited {:.1} ms for a helper's check: {}", id, ms(w1 - w0), what);
             }
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
@@ -32200,8 +32310,11 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
                 continue;
             }
         }
+        let tclaim = if main_compile_log() { wall_ns() } else { 0 };
         // the program and its types stay unchanged while the read guard is held
         let fr = front_read("typeck_ahead");
+        let tread = if tclaim != 0 { wall_ns() } else { 0 };
+        let tcpu = if tclaim != 0 { cpu_ns() } else { 0 };
         if !f.alive.load(Ordering::SeqCst) {
             inprog_end(f, &key);
             return next;
@@ -32266,6 +32379,10 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             }
         } else { Vec::new() };
         AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        if tclaim != 0 {
+            let t = [tclaim, tread, cpu_ns() - tcpu, wall_ns()];
+            CHECK_TIMES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key.clone(), t);
+        }
         publish_ahead(f, key.clone(), epoch, b);
         inprog_end(f, &key);
         for (c, mut cargs) in callees {
@@ -37449,6 +37566,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TIER1_FINISHED, AtomicU64::new(0));
     reset(&CODE_CACHE_EMPTY, AtomicBool::new(false));
     reset(&MAIN_COMPILES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&SLOT_BORN, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&SLOT_LOWERED, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&CHECK_TIMES, relax_session::sync::Mutex::new(None));
     reset(&RT_LAZY, AtomicU64::new(0));
     reset(&RT_LIVE, AtomicBool::new(false));
     reset(&RT_LAZY_NS, AtomicU64::new(0));

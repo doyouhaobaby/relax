@@ -6011,6 +6011,10 @@ fn summary_inner(why: &str) {
         // lock_wait front back relock inflight_wait (ms) slot-key name (spaces as `~`), then `cpu` front opt codegen (thread cpu ms) `insts` entering opt / codegen; `slot` indexes RELAX_COMPILE_REPORT's rows
         if let Ok(path) = std::env::var("RELAX_MAIN_COMPILE_LOG") {
             let base = MAIN_START_WALL.load(Ordering::Relaxed);
+            let born = std::mem::take(&mut *jit::SLOT_BORN.lock().unwrap());
+            let lowered = std::mem::take(&mut *jit::SLOT_LOWERED.lock().unwrap());
+            // ms since main started, -1: none
+            let at = |ns: u64| if ns == 0 { -1.0 } else { (ns as f64 - base as f64) / 1e6 };
             let mut out = format!("# package {}\n", ROOT_DIR.lock().unwrap());
             let ms = |ns: u64| ns as f64 / 1e6;
             for r in jit::MAIN_COMPILES.lock().unwrap().iter() {
@@ -6023,9 +6027,22 @@ fn summary_inner(why: &str) {
                     ("-", "-".to_string())
                 };
                 out.push_str(&format!(
-                    "{:.3} {:.3} {} {} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {} {}  cpu {:.3} {:.3} {:.3} insts {} {}\n",
-                    ms(r.start.saturating_sub(base)), ms(r.end.saturating_sub(base)), r.slot, how, ms(r.ns[0]), ms(r.ns[1]), ms(r.ns[2]), ms(r.ns[3]), ms(r.ns[4]), ms(r.ns[5]), hint.replace(' ', "~"), name.replace(' ', "~"), ms(r.cpu[0]), ms(r.cpu[1]), ms(r.cpu[2]), r.insts[0], r.insts[1]
+                    "{:.3} {:.3} {} {} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {} {}  cpu {:.3} {:.3} {:.3} insts {} {}{}\n",
+                    ms(r.start.saturating_sub(base)), ms(r.end.saturating_sub(base)), r.slot, how, ms(r.ns[0]), ms(r.ns[1]), ms(r.ns[2]), ms(r.ns[3]), ms(r.ns[4]), ms(r.ns[5]), hint.replace(' ', "~"), name.replace(' ', "~"), ms(r.cpu[0]), ms(r.cpu[1]), ms(r.cpu[2]), r.insts[0], r.insts[1],
+                    {
+                        // the front's and the back's splits, the preparation's shape, the epochs, and
+                        // the slot's birth and lowering ahead (ms since main; -1: none)
+                        let l = lowered.get(r.slot as usize).copied().unwrap_or_default();
+                        format!(" front {:.3} {:.3} {:.3} {:.3} prep {} {} {} back {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} epoch {} {} born {:.3} lowered {:.3} by {} lins {} taken {:.3}",
+                            ms(r.front[0]), ms(r.front[1]), ms(r.front[2]), ms(r.front[3]), r.prep[0], r.prep[1], r.prep[2],
+                            ms(r.back[0]), ms(r.back[1]), ms(r.back[2]), ms(r.back[3]), ms(r.back[4]), ms(r.back[5]), r.epoch[0], r.epoch[1],
+                            at(born.get(r.slot as usize).copied().unwrap_or(0)), at(l.0), l.1, l.2, at(l.3))
+                    }
                 ));
+            }
+            // every lowering ahead: `L slot ready by insts taken born` (ms since main; -1: none)
+            for (id, l) in lowered.iter().enumerate().filter(|(_, l)| l.0 != 0) {
+                out.push_str(&format!("L {} {:.3} {} {} {:.3} {:.3}\n", id, at(l.0), l.1, l.2, at(l.3), at(born.get(id).copied().unwrap_or(0))));
             }
             let _ = std::fs::write(path, out);
         }
