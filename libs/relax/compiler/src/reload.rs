@@ -9812,6 +9812,7 @@ fn handover_blocked() -> Option<String> {
 /// The next run starts now, without the app's state (the app is not asked: a test run of `makepad
 /// test --live`, an app stopped at a parked panic or at an internal compiler error in a call).
 pub fn restart_run(why: &str) -> Result<(), String> {
+    if crate::harness::live::another_waits() { return Err("held: the next save restarts the tests".into()); }
     *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.to_string();
     next_run(why, None)
 }
@@ -10177,6 +10178,7 @@ fn note_restart_pending_in(why: &str, files: Vec<String>) {
 /// click (three apps restarted for a landing, 11-06). `anyway` (`anyway=1`): the app is not asked
 /// whether it can restart now ([`RESTART_ANYWAY`]); without it a blocker the app names postpones it.
 pub fn relaunch_pending(who: &str, anyway: bool) -> Result<String, String> {
+    if crate::harness::live::another_waits() { return Err("held: the next save restarts the tests".into()); }
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     RESTART_ANYWAY.store(anyway, Ordering::SeqCst);
     let why = restart_pending().join("; ");
@@ -10189,6 +10191,7 @@ pub fn relaunch_pending(who: &str, anyway: bool) -> Result<String, String> {
 /// runs, nothing rebuilt (host::relaunch_process), with the edits that wait; `anyway` as for
 /// [`relaunch_pending`].
 pub fn relaunch_process(who: &str, anyway: bool) -> Result<String, String> {
+    if crate::harness::live::another_waits() { return Err("held: the next save restarts the tests".into()); }
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     RESTART_ANYWAY.store(anyway, Ordering::SeqCst);
     let why = restart_pending().join("; ");
@@ -10946,7 +10949,7 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     while g.is_none() && crate::run::live_session() && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) && !crate::run::host_held() {
         g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
     }
-    if g.is_none() && crate::run::host_held() {
+    if crate::harness::live::held() || g.is_none() && crate::run::host_held() {
         return Err(HELD_NO_RUN.into());
     }
     let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;

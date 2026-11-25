@@ -37,6 +37,18 @@ fn loader_package() -> Option<(&'static str, &'static str)> {
     *PACKAGE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type SaveWait = fn(Vec<PathBuf>, std::time::SystemTime) -> Result<(), String>;
+static SAVE_WAIT: std::sync::OnceLock<SaveWait> = std::sync::OnceLock::new();
+
+pub fn set_save_wait(wait: SaveWait) {
+    SAVE_WAIT.set(wait).expect("the runner's save wait was already registered");
+}
+
+pub fn wait_for_save(dirs: Vec<PathBuf>, since: std::time::SystemTime) -> Result<(), String> {
+    relax_base::host::init();
+    SAVE_WAIT.get().ok_or("no runner registered to wait for a save")?(dirs, since)
+}
+
 /// Snapshot the loader file at runtime startup, after the launcher has set its path and
 /// before a later build can replace the file this process runs ([`loader_replaced`]).
 pub fn snapshot_loader() {

@@ -1195,7 +1195,7 @@ struct TestDepsResult {
 }
 struct TestDeps {
     worker: relax_session::sync::Mutex<Option<std::thread::JoinHandle<TestDepsResult>>>,
-    failed: std::sync::OnceLock<bool>,
+    errors: std::sync::OnceLock<Vec<String>>,
 }
 static TEST_DEPS: std::sync::OnceLock<TestDeps> = std::sync::OnceLock::new();
 
@@ -1250,15 +1250,19 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
             cpu_ns: checked.cpu_ns + relax_session::clock::cpu_ns() - cpu0, wall_ns: jit::wall_ns() - t0,
         }
     }).expect("test dependency check thread");
-    assert!(TEST_DEPS.set(TestDeps { worker: relax_session::sync::Mutex::new(Some(worker)), failed: std::sync::OnceLock::new() }).is_ok(), "test dependency check already started");
+    assert!(TEST_DEPS.set(TestDeps { worker: relax_session::sync::Mutex::new(Some(worker)), errors: std::sync::OnceLock::new() }).is_ok(), "test dependency check already started");
 }
 
 /// Every test exit joins the same check and reports its errors once, before the cache write.
 pub fn finish_test_deps(code: i32) -> i32 {
+    if test_dep_errors().is_empty() { code } else { 101 }
+}
+
+pub(crate) fn test_dep_errors() -> &'static [String] {
     // An exit inside a unit call cannot wait for work that needs that owner.
-    if crate::run::exit_caller_holds_owner() { return code; }
-    let Some(check) = TEST_DEPS.get() else { return code };
-    let failed = check.failed.get_or_init(|| {
+    if crate::run::exit_caller_holds_owner() { return &[]; }
+    let Some(check) = TEST_DEPS.get() else { return &[] };
+    check.errors.get_or_init(|| {
         let t0 = jit::wall_ns();
         waited();
         let worker = check.worker.lock().unwrap_or_else(|e| e.into_inner()).take().expect("test dependency check worker");
@@ -1276,8 +1280,9 @@ pub fn finish_test_deps(code: i32) -> i32 {
             eprintln!("{}", e);
         };
         let Ok(r) = result else {
-            report("internal compiler error while checking test dependencies -- Relax bug, report it");
-            return true;
+            let error = "internal compiler error while checking test dependencies -- Relax bug, report it";
+            report(error);
+            return vec![error.into()];
         };
         for (_, e) in &r.errors { report(e); }
         for (k, name) in &r.names {
@@ -1290,9 +1295,8 @@ pub fn finish_test_deps(code: i32) -> i32 {
             eprintln!("relax: test dependency check: {} crates selected, {} stored clean, {} body owners, {} errors, cpu {:.0} ms, wall {:.0} ms, end waited {:.0} ms",
                 r.selected, r.stored, r.owners, r.errors.len(), r.cpu_ns as f64 / 1e6, r.wall_ns as f64 / 1e6, waited as f64 / 1e6);
         }
-        !r.errors.is_empty()
-    });
-    if *failed { 101 } else { code }
+        r.errors.into_iter().map(|(_, e)| e).collect()
+    })
 }
 
 /// At process exit, let the app check finish before choosing the exit code. As for test
@@ -1659,15 +1663,15 @@ pub(crate) fn reuse_allowed(options: &crate::options::Options) -> bool {
 }
 
 /// `makepad test`'s check of the crates under test before they run (run.rs check_test_subjects):
-/// the app check of `crates`, its errors printed; the number of errors (borrow errors included)
+/// the app check of `crates`, its errors printed; the diagnostics (borrow errors included)
 /// and the warnings, in order (the caller prints them). No statistics. `harness`: the root is
 /// built with `--test` (libtest's generated main replaces the crate's own, rustc_builtin_macros
 /// test_harness.rs), so it has no entry point to check.
-pub fn check_subjects(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, harness: bool) -> (usize, Vec<String>) {
+pub fn check_subjects(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, harness: bool) -> (Vec<crate::diag::Diagnostic>, Vec<String>) {
     SUBJECTS.store(if harness { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
-    let n = check_crate_impl(u, root, crates, errors, true, false, None).1.len();
+    let diagnostics = check_crate_impl(u, root, crates, errors, true, false, None).1;
     SUBJECTS.store(0, std::sync::atomic::Ordering::Relaxed);
-    (n, std::mem::take(&mut *SUBJECT_WARNINGS.lock().unwrap_or_else(|e| e.into_inner())))
+    (diagnostics, std::mem::take(&mut *SUBJECT_WARNINGS.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// The warnings of the last check of `check_subjects`, in order

@@ -1385,7 +1385,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let mut u = jit::Unit::new(prog, tcx, core);
     // (a failed enum discriminant does not end it before the check: the check's item checks report
     // it beside the rest, as rustc's analysis carries on past it, tcx.rs check_def_signature)
-    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false).len();
     // (what the tests' own code resolves and expands from now on is no lint's input)
     relax_types::macros::uses::record(false);
     relax_front::program::set_record_import_uses(false);

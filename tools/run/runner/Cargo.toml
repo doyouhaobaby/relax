@@ -29,3 +29,4 @@ makepad-remote = { workspace = true }
 # system's HTTP stack
 makepad-network = { path = "../../../platform/network" }
 makepad-core-util = { path = "../../../libs/core_util" }
+makepad-filesystem-watcher = { path = "../../../libs/filesystem_watcher" }

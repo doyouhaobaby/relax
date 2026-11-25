@@ -34,6 +34,10 @@ macro_rules! print {
     ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
 }
 
+use makepad_filesystem_watcher::{FileSystemEventKind, FileSystemWatcher, WatchRoot};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
 mod lexer {
     pub use relax_compiler::lexer::*;
 }
@@ -172,6 +176,105 @@ pub fn apply_host(host: &'static Host) {
     relax_compiler::progenv::set_host_env(host.env);
     relax_compiler::set_tool_name(host.tool);
     relax_compiler::reload::set_loader_package(host.package, host.manifest);
+    relax_compiler::reload::host::set_save_wait(wait_for_save);
+}
+
+/// Whether a source file under `roots` (`.rs` or `.toml`, the watcher's own filter; no `target` or
+/// hidden folder) was modified after `since`: a save the watcher that starts now would not tell.
+pub fn changed_since(roots: &[WatchRoot], since: SystemTime) -> bool {
+    fn walk(dir: &Path, since: SystemTime) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                if walk(&path, since) {
+                    return true;
+                }
+            } else if kind.is_file()
+                && matches!(path.extension().and_then(|e| e.to_str()), Some("rs" | "toml"))
+                && entry.metadata().and_then(|m| m.modified()).is_ok_and(|m| m > since)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    roots.iter().any(|root| walk(&root.path, since))
+}
+
+/// Arm the recursive watcher before looking for a save made during the failed boot.
+fn wait_for_save(mut dirs: Vec<PathBuf>, since: SystemTime) -> Result<(), String> {
+    dirs.sort();
+    let mut roots = Vec::<WatchRoot>::new();
+    for dir in dirs {
+        if !roots.iter().any(|r| dir.starts_with(&r.path)) {
+            roots.push(WatchRoot { mount: roots.len().to_string(), path: dir });
+        }
+    }
+    let source = |p: &Path| matches!(p.extension().and_then(|e| e.to_str()), Some("rs" | "toml"));
+    // One notification suffices even if a save produces several events.
+    let (saved, rx) = std::sync::mpsc::sync_channel(1);
+    let watched = roots.clone();
+    let _watcher = FileSystemWatcher::start(roots.clone(), move |event| {
+        let changed = match event.kind {
+            // lost events: re-inventory the roots, as the watcher asks (no save, no restart)
+            FileSystemEventKind::RescanRequired { .. } => changed_since(&watched, since),
+            FileSystemEventKind::Renamed { from } => source(&from) || source(&event.path),
+            // The macOS fallback reports changes at the root, including periodic hints.
+            FileSystemEventKind::Changed if watched.iter().any(|r| r.path == event.path) => changed_since(&watched, since),
+            _ => source(&event.path),
+        };
+        if changed { let _ = saved.try_send(()); }
+    })?;
+    if !changed_since(&roots, since) {
+        rx.recv().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::{changed_since, WatchRoot};
+
+    /// A save made after a failed build began, before the watcher that covers its folder was up,
+    /// is found by one walk of the roots: a source file after `since`, in no `target` or hidden
+    /// folder. A file before it, or a file that is no source, is not.
+    #[test]
+    fn a_save_since_the_build_began_is_found_in_the_roots() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("relax-changed-since-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("dep");
+        for sub in ["src", "target/debug", ".git"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        // since is the file system's own clock: the marker's mtime; every file's time is set from it
+        let marker = dir.join("marker");
+        std::fs::write(&marker, "").unwrap();
+        let since = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let write = |rel: &str, after: bool| {
+            let path = root.join(rel);
+            std::fs::write(&path, "x").unwrap();
+            let time = if after { since + Duration::from_secs(60) } else { since - Duration::from_secs(60) };
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        };
+        let roots = [WatchRoot { mount: "app-0".into(), path: root.clone() }];
+        write("src/lib.rs", false);
+        assert!(!changed_since(&roots, since), "a source file written before the build began is not a save");
+        write("README.md", true);
+        write("target/debug/build.rs", true);
+        write(".git/config.toml", true);
+        assert!(!changed_since(&roots, since), "a file that is no source, or lies under target or a hidden folder, is not a save");
+        write("src/lib.rs", true);
+        assert!(changed_since(&roots, since), "a source file written after the build began is a save");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Start the linked host once the entry point has prepared its environment.
