@@ -73,11 +73,14 @@ pub struct Raw {
     /// why the walk ended at the last frame when that frame is not the stack's outermost: the
     /// step to its caller could not be proven (a walk never guesses a caller)
     pub stop: Option<&'static str>,
+    /// the return address the walk could not step into (`NOT_CODE`), else 0: the report names
+    /// what maps it
+    pub stop_at: u64,
 }
 
 impl Raw {
     pub fn new() -> Raw {
-        Raw { pcs: [0; MAX_FRAMES], n: 0, lr: 0, sp: 0, handle: 0, stop: None }
+        Raw { pcs: [0; MAX_FRAMES], n: 0, lr: 0, sp: 0, handle: 0, stop: None, stop_at: 0 }
     }
     pub fn frames(&self) -> &[u64] {
         &self.pcs[..self.n]
@@ -158,6 +161,7 @@ pub fn waited_ns(id: u64) -> u64 {
 pub fn capture(t: &Thread, raw: &mut Raw) -> Result<(), &'static str> {
     raw.n = 0;
     raw.stop = None;
+    raw.stop_at = 0;
     if t.os_id == self_os_id() {
         return Err("the calling thread (not captured)");
     }
@@ -999,6 +1003,7 @@ mod imp {
                 }
                 raw.n = 0;
                 raw.stop = None;
+                raw.stop_at = 0;
             }
         }
         let slot = hold(t.os_id, HOLD_CAPTURE)?;
@@ -1176,6 +1181,8 @@ mod x64_walk {
             *n += 1;
             *n < MAX_FRAMES
         });
+        // (a walk ends at NOT_CODE with that return address as its next pc)
+        raw.stop_at = if raw.stop == Some(NOT_CODE) { r.rip } else { 0 };
     }
 
     /// `walk_with`'s walk, each pc handed to `push` (innermost first; false: the walk ends after

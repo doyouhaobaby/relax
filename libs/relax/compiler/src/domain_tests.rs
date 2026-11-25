@@ -1359,6 +1359,106 @@ fn a_layout_patch_returns_the_native_lock_before_the_stale_frame_parks() {
     if let Err(panic) = driver.join() { std::panic::resume_unwind(panic); }
 }
 
+/// The domain's main waits in libc's condvar through a native call (flags[2]), as a library's
+/// thread does; `reads` uses the layout the patch changes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LAYOUT_LIBC_WAIT: &str = r#"
+pub struct Layout { pub value: u64 }
+#[inline(never)]
+pub fn reads(out: *mut u64) {
+    let fields = Layout { value: 7 };
+    unsafe { *out = fields.value; }
+}
+#[inline(never)]
+pub fn waits(p: *mut u64) {
+    let native: extern "C" fn() = unsafe { std::mem::transmute(*p.add(2) as usize) };
+    native();
+    unsafe { *p.add(1) = 1; }
+}
+"#;
+
+/// A pthread_mutex_t (40 bytes) and, at 64, a pthread_cond_t (48): glibc's initializers are zeros.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIBC_WAIT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIBC_WAIT_GO: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" {
+    fn pthread_mutex_lock(m: *mut u64) -> i32;
+    fn pthread_mutex_unlock(m: *mut u64) -> i32;
+    fn pthread_cond_wait(c: *mut u64, m: *mut u64) -> i32;
+    fn pthread_cond_signal(c: *mut u64) -> i32;
+}
+
+/// A native op that waits in libc's condvar until LIBC_WAIT_GO.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" fn native_waits_in_libc() {
+    crate::os::thread::set_own_name("in-libc-wait");
+    let lock = LIBC_WAIT.as_ptr() as *mut u64;
+    unsafe {
+        pthread_mutex_lock(lock);
+        while LIBC_WAIT_GO.load(Ordering::SeqCst) == 0 {
+            pthread_cond_wait(lock.add(8), lock);
+        }
+        pthread_mutex_unlock(lock);
+    }
+}
+
+/// A layout patch reads every program thread's stack before it installs (no frame may run code
+/// built for the old layout). A thread parked in libc's condvar wait (glibc built with frame
+/// pointers, whose early returns remember and restore the CFI state) is walked through libc's
+/// frames to its program frames, and the patch installs. On a Linux box the walk stopped at
+/// pthread_cond_wait, and every layout edit of an app with such a thread was a restart (11-24).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_layout_patch_reads_a_thread_parked_in_a_libc_condvar_wait() {
+    isolated_test!(a_layout_patch_reads_a_thread_parked_in_a_libc_condvar_wait);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(LAYOUT_LIBC_WAIT, "waits");
+    let up = &mut *u as *mut Unit;
+    let reads_def = crate::program::DefId(u.prog.defs.iter().rposition(|d| u.prog.syms.str(d.name) == "reads").unwrap() as u32);
+    let file = u.prog.def(reads_def).file;
+    let reads = u.fn_id(crate::jit::FnKey::Inst(reads_def, Vec::new()));
+    let reads_entry = u.entry(reads);
+    let read = || {
+        let mut n = 0u64;
+        unsafe { crate::jit::call_jit(up, reads_entry, &mut n as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        n
+    };
+    assert_eq!(read(), 7);
+    let first = u.fns[reads as usize].code;
+    let flags: [AtomicU64; 4] = Default::default();
+    flags[2].store(native_waits_in_libc as *const () as usize as u64, Ordering::SeqCst);
+    let (domain, _, main) = launch(&mut u, entry, None, &flags);
+    // until it blocks in the condvar's futex (syscall 202; its lock is not contended)
+    wait(|| {
+        crate::inspect::threads::list().into_iter().find(|t| t.name == "in-libc-wait").is_some_and(|t| {
+            std::fs::read_to_string(format!("/proc/self/task/{}/syscall", t.os_id)).is_ok_and(|s| s.split_whitespace().next() == Some("202"))
+        })
+    });
+    let src = LAYOUT_LIBC_WAIT.replace("pub value: u64 }", "pub extra: u64, pub value: u64 }").replace("value: 7 }", "extra: 9, value: 7 }");
+    let edit = crate::reload::Edit { file, path: root.join("fixture.rs").to_string_lossy().into_owned(), src: src.into_bytes() };
+    let patch = unsafe { crate::reload::apply(up, vec![edit]) };
+    // the wait ends before any check, so a failed one leaves no thread behind
+    let lock = LIBC_WAIT.as_ptr() as *mut u64;
+    unsafe {
+        pthread_mutex_lock(lock);
+        LIBC_WAIT_GO.store(1, Ordering::SeqCst);
+        pthread_cond_signal(lock.add(8));
+        pthread_mutex_unlock(lock);
+    }
+    main.join().unwrap();
+    assert_eq!(patch.rung, crate::reload::Rung::Patch, "the layout patch installs: {:?}", patch.lines);
+    assert_ne!(u.fns[reads as usize].code, first, "reads is rebuilt for the new layout");
+    assert_eq!(read(), 7, "the new layout's code runs");
+    assert_eq!(flags[1].load(Ordering::SeqCst), 1, "the thread went on from its wait");
+    wait_thread_done(domain);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.
 const NATIVE_CROSSINGS: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -395,11 +395,13 @@ fn run(row: &mut Row, init: &Row, cie: &Cie, from: u64, to: u64, mut loc: u64, t
                     return None;
                 }
                 depth -= 1;
-                // the CFA stays as it is (DWARF: restore_state restores register rules)
-                let (cr, co) = (row.cfa_reg, row.cfa_off);
+                // the whole row, the CFA with the register rules, as libgcc, LLVM's libunwind and
+                // gimli restore it: gcc ends a mid-function epilogue with it (remember_state,
+                // `leave` or pops moving the CFA to rsp + 8, ret, restore_state), and the code
+                // after that `ret` has the body's CFA again (glibc's pthread_cond_wait, built with
+                // frame pointers: rbp + 16; keeping rsp + 8 read a heap pointer as its return
+                // address and a layout patch was refused, 11-24)
                 *row = stack[depth];
-                row.cfa_reg = cr;
-                row.cfa_off = co;
             }
             0x0c => {
                 row.cfa_reg = c.uleb() as u16;
@@ -795,6 +797,37 @@ impl Foreign {
             Some(m) => step_in(m, pc, r, read),
             None => Step::Fail("no mapped file with CFI covers it"),
         }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// glibc's pthread_cond_wait (2.44, frame pointers): the body's CFA is rbp + 16; an early
+    /// return's epilogue remembers the state, moves the CFA to rsp + 8 for its `ret`, and the code
+    /// after the `ret` restores the state, the CFA with it. A step anywhere in the rest of the
+    /// body needs rbp + 16.
+    #[test]
+    fn restore_state_brings_back_the_cfa_with_the_rules() {
+        let cie = Cie { code_align: 1, data_align: -8, ra: 16, fde_enc: 0, has_aug: false, init: (0, 0) };
+        let mut init = Row { cfa_reg: 7, cfa_off: 8, rules: [Rule::Same; NREG] };
+        init.rules[16] = Rule::Offset(-8);
+        let program: &[u8] = &[
+            0x40 | 5, 0x0e, 16, 0x80 | 6, 2, // +5 push rbp: CFA rsp + 16, rbp at CFA - 16
+            0x40 | 3, 0x0d, 6, //               +8 mov rbp, rsp: CFA rbp + 16
+            0x40 | 9, 0x80 | 3, 7, //            +17 pushes: rbx at CFA - 56
+            0x02, 0xcf, 0x0a, 0x0c, 7, 8, //   +224 an early return: remember, CFA rsp + 8
+            0x40 | 8, 0x0b, //                  +232 after its ret: restore
+        ];
+        let at = |target: u64| {
+            let mut row = init;
+            run(&mut row, &init, &cie, program.as_ptr() as u64, program.as_ptr() as u64 + program.len() as u64, 0, target).unwrap();
+            (row.cfa_reg, row.cfa_off, row.rules[3] == Rule::Offset(-56), row.rules[6] == Rule::Offset(-16))
+        };
+        assert_eq!(at(0x20), (6, 16, true, true), "the body: rbp + 16, rbx and rbp saved");
+        assert_eq!(at(0xe4), (7, 8, true, true), "the early return's ret: rsp + 8");
+        assert_eq!(at(0x13b), (6, 16, true, true), "after that ret: the body's CFA and rules again");
     }
 }
 

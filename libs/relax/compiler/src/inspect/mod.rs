@@ -697,6 +697,8 @@ pub struct Captured {
     pub err: Option<&'static str>,
     /// why the walk ended at the last frame when that is not the stack's outermost (threads::Raw)
     pub stop: Option<&'static str>,
+    /// the return address it could not step into, else 0 (threads::Raw)
+    pub stop_at: u64,
 }
 
 impl Captured {
@@ -712,7 +714,38 @@ impl Captured {
         } else {
             symbols::host_symbol(pc).map_or_else(String::new, |(name, image, d)| format!(" ({name}+{d:#x} in {image})"))
         };
-        Some(format!("walk stops at {pc:#x}{at}: {why}"))
+        let into = match self.stop_at {
+            0 => String::new(),
+            ra => format!(" ({ra:#x}{})", mapping_of(ra)),
+        };
+        Some(format!("walk stops at {pc:#x}{at}: {why}{into}"))
+    }
+}
+
+/// What maps address `a`, for a report of a return address no walk could step into: ", in
+/// <file> (<perms>)", ", in an anonymous <perms> mapping", ", in no mapping" (Linux:
+/// /proc/self/maps; elsewhere nothing). Reads a file: never while a thread is held.
+fn mapping_of(a: u64) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        for line in maps.lines() {
+            let mut w = line.split_whitespace();
+            let (Some(range), Some(perms)) = (w.next(), w.next()) else { continue };
+            let Some((lo, hi)) = range.split_once('-') else { continue };
+            let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else { continue };
+            if !(lo..hi).contains(&a) {
+                continue;
+            }
+            let file = w.nth(3).unwrap_or("");
+            return if file.is_empty() { format!(", in an anonymous {perms} mapping") } else { format!(", in {file} ({perms})") };
+        }
+        ", in no mapping".to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = a;
+        String::new()
     }
 }
 
@@ -735,7 +768,7 @@ pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Result<Vec<Captur
         if t.handle == 0 && raw.handle != 0 {
             t.handle = raw.handle;
         }
-        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), stop: raw.stop, t });
+        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), stop: raw.stop, stop_at: raw.stop_at, t });
     }
     Ok(out)
 }
