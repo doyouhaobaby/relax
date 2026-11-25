@@ -846,7 +846,7 @@ impl CodeRefs {
         let mut l = RefList::default();
         for r in relocs {
             match r.target {
-                Reloc::Call(c) | Reloc::Slot(c) => l.slot(c, false),
+                Reloc::Call(c) | Reloc::Body(c) | Reloc::Slot(c) => l.slot(c, false),
                 Reloc::Thunk(c) => l.slot(c, true),
                 Reloc::Sym(s) => l.sym(s.id, u.syms.kind(s.id)),
                 _ => {}
@@ -10003,6 +10003,11 @@ impl Unit {
     fn install_code_refs(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], refs: CodeRefs, pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = relax_codegen::fncost::phase(6);
         note_code_guard_reads(self, relocs);
+        // the slots its hot sites call through their body words, past their entry marks, are
+        // reached with it (noted before it can run; the O3 install and the links note their own)
+        if !self.aux && relocs.iter().any(|r| matches!(r.target, relax_backend::rir::Reloc::Body(_))) {
+            crate::harness::reach::note(id, body_calls(relocs));
+        }
         // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
         // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
         // SPEC-V twin (or base) is instrumented runs the same fn: either way the instruments are
@@ -10101,7 +10106,7 @@ impl Unit {
             self.follow_twin(id);
         }
         if TWINS_RAN.load(Ordering::Relaxed) > 0 && code_as_now().is_none_or(|k| k.tier != tier::STUB) {
-            self.borrow_callees(relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) => Some(c), _ => None }));
+            self.borrow_callees(relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Body(c) => Some(c), _ => None }));
         }
         self.stats.code_bytes += code.len() as u64;
         self.exec_event(id, "install");
@@ -12154,6 +12159,13 @@ pub(crate) fn perf_name(u: &Unit, id: u32) -> String {
     name
 }
 
+/// The slots code with relocations `relocs` calls through their body words (`Reloc::Body`: hot
+/// sites of O3 code in a live test session, past the callee's entry mark): reached whenever the
+/// code is (harness reach, as an inlined slot is).
+pub(crate) fn body_calls(relocs: &[relax_backend::rir::RelocAt]) -> impl Iterator<Item = u32> + '_ {
+    relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Body(c) => Some(c), _ => None })
+}
+
 /// Records that slot `id`'s RIR took in the RIR of `deps` (Unit::body_deps).
 pub(crate) fn note_body_deps(u: &mut Unit, id: u32, deps: impl Iterator<Item = u32>) {
     let mut v: Vec<u32> = deps.filter(|&c| c != id).collect();
@@ -14115,7 +14127,7 @@ unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_bac
     use relax_backend::rir::Reloc;
     let mut todo = Vec::new();
     for r in relocs {
-        let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) => c, _ => continue };
+        let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) | Reloc::Body(c) => c, _ => continue };
         let u = &*up;
         if c == id || (c as usize) >= u.fns.len() || u.fns[c as usize].compiled || todo.contains(&c) {
             continue;
@@ -22147,7 +22159,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
     // comes back for its install
     let _behind = WorkBehind::on();
     let calls = |relocs: &[relax_backend::rir::RelocAt]| -> Vec<u32> {
-        let mut v: Vec<u32> = relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) => Some(c), _ => None }).collect();
+        let mut v: Vec<u32> = relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Body(c) => Some(c), _ => None }).collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -25881,7 +25893,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     // (a twin by its base: the base's verdict decides)
                     crate::zone_alloc::kept_with(|| for &c in &unverified_inl { a.push((up as usize, match u.fns[c as usize].key { FnKey::Plain(b) => b, _ => c }, id)); });
                 }
-                if !u.aux { crate::harness::reach::note(id, inlined.iter().copied()); }
+                // the slots its hot sites call through their body words (Reloc::Body, past their
+                // entry marks) are reached with it, as its inlined ones are
+                if !u.aux { crate::harness::reach::note(id, inlined.iter().copied().chain(body_calls(&relocs))); }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
                 if o3_first() {
                     // #[relax(O3, always)]: its first code (no O1/O2 ever), installed as a lazy
@@ -25980,7 +25994,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     u.follow_twin(id);
                 }
                 if TWINS_RAN.load(Ordering::Relaxed) > 0 {
-                    u.borrow_callees(relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) => Some(c), _ => None }));
+                    u.borrow_callees(relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Body(c) => Some(c), _ => None }));
                 }
                 o3_owner(3, tx);
                 let tn = cpu_ns();

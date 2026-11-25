@@ -361,6 +361,7 @@ impl Env {
             Reloc::Slot(id) => self.slots.table(id),
             Reloc::Thunk(id) => self.slots.callable(id),
             Reloc::Call(id) => self.slots.thunk(id),
+            Reloc::Body(id) => self.slots.body(id),
             // the TSD slot's byte offset (ldr x16, [x16, x17]); under Relax on Android the
             // two-load key as it is (`TLS_TWO_LOAD`)
             Reloc::TlsKey => if TLS_TWO_LOAD { self.tls_key } else { self.tls_key * 8 },
@@ -988,6 +989,12 @@ struct Gen<'a> {
     sym_class: u64,
     /// `Env::near`: host and runtime calls are `bl` (the embedder places veneers)
     near: bool,
+    /// the slots' table words name entry wrappers (a live test session's reach marks) and this
+    /// is counted code's O3 build: calls of a block that ran at least once per entry go through
+    /// the callee's body word, past its wrapper (`Reloc::Body`; RELAX_OPT=-bypass: never)
+    bypass: bool,
+    /// `bypass` for the block being emitted
+    bypass_here: bool,
     /// sp offset of the frame word holding the domain base (-1: the function names no domain symbol)
     dom_slot: i64,
     /// per block: whether its start reads the domain base into that slot (block 0: the prologue;
@@ -1485,6 +1492,7 @@ impl<'a> Gen<'a> {
             }
             let b = &self.f.blocks[bi];
             let n = b.insts.len();
+            self.bypass_here = self.bypass && b.count >= self.f.blocks[0].count;
             // the compare the branch reads (fused into cmp + b.cond): the instructions before it
             // (-fuse: a compare made for the branch is a bool the branch tests)
             let (bcmp, mut ne) = match regalloc::branch_compare(b, &self.al.uses) {
@@ -1717,6 +1725,7 @@ impl<'a> Gen<'a> {
             }
             self.term(&b.term, bi, bcmp);
         }
+        self.bypass_here = false;
         if crate::rir::unwind_stats_on() {
             // bytes of blocks only reachable through unwind edges (cleanup pads)
             let nb = self.f.blocks.len();
@@ -4123,6 +4132,12 @@ impl<'a> Gen<'a> {
         self.moves(&mv);
         self.frame_exit();
         match c {
+            // a hot site: through the callee's body word (`bypass`)
+            Callee::Fn(id) if self.bypass_here => {
+                self.ldr_reloc(IP0, Reloc::Body(*id));
+                self.a.ldst(LDRX, 8, IP0, IP0, 0);
+                self.a.br(IP0);
+            }
             Callee::Fn(id) | Callee::CFn(id, _) => {
                 let at = self.a.pos();
                 self.a.e(0x1400_0000);
@@ -5104,6 +5119,12 @@ impl<'a> Gen<'a> {
         }
         self.moves(&mv);
         match c {
+            // a hot site: through the callee's body word (`bypass`; x16 is no argument register)
+            Callee::Fn(id) if self.bypass_here => {
+                self.ldr_reloc(IP0, Reloc::Body(*id));
+                self.a.ldst(LDRX, 8, IP0, IP0, 0);
+                self.a.blr(IP0);
+            }
             Callee::Fn(id) => self.bl_reloc(Reloc::Call(*id)),
             Callee::Part(id) => {
                 if let Some(id) = id {
@@ -5901,6 +5922,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         asm_veneers: Vec::new(),
         sym_class: env.sym_class,
         near: env.near,
+        bypass: env.slots.wrapped() && f.blocks.first().is_some_and(|b| b.count > 0.0) && !crate::stats::opt_off(options, "-bypass"),
+        bypass_here: false,
         dom_slot: -1,
         dom_read: Vec::new(),
         relocs: Vec::new(),

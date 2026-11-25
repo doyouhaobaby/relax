@@ -704,12 +704,13 @@ impl Cache {
     }
 }
 
-/// The startup image section of a manifest ("PLIA" after the slot list; its slots' pending lists
+/// The startup image section of a manifest ("PLIB" after the slot list; its slots' pending lists
 /// are written empty, unused at the link, but O3 code's: the callees it kept as calls, registered
 /// at the link -- jit.rs cached_tier1; each slot ends with its entry's digest gate tail, gate.rs;
-/// older images -- PLI9's slots carry no digests, PLI8's no pending slots, PLI7's no payload
-/// checksum -- are not read: the manifest is written again with a new one).
-pub(super) const IMAGE_MAGIC: u32 = 0x4149_4c50;
+/// older images -- PLIA's know no body-word calls (IMG_BODY), PLI9's slots carry no digests,
+/// PLI8's no pending slots, PLI7's no payload checksum -- are not read: the manifest is written
+/// again with a new one).
+pub(super) const IMAGE_MAGIC: u32 = 0x4249_4c50;
 
 /// A loaded manifest's image section, read in place: the store it is mapped from stays open.
 pub(super) struct ManifestImage {
@@ -918,7 +919,8 @@ impl ImageData {
     }
 }
 
-/// Relocation targets in an image: a slot's table word, its thunk, a symbol, or the fixed values.
+/// Relocation targets in an image: a slot's table word, its thunk, a symbol, or the fixed values;
+/// a call through a slot's thunk or its body word.
 const IMG_SLOT: u8 = 0;
 const IMG_THUNK: u8 = 1;
 const IMG_SYM: u8 = 2;
@@ -926,6 +928,7 @@ const IMG_TLS_KEY: u8 = 3;
 const IMG_TLS_SLOW: u8 = 4;
 const IMG_RESUME: u8 = 5;
 const IMG_CALL: u8 = 6;
+const IMG_BODY: u8 = 7;
 
 /// One slot of a startup image, from code entry `entry` (key `entry_key`, slot key encoding
 /// `key`): appended to `out` (its record) and `blob` (its code) unless the payload does not
@@ -1021,14 +1024,14 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
         kind_of(kind)?;
         let tag = d.b.get(d.p).copied()?;
         match tag {
-            20 | 21 | 25 | 26 | 27 | 31 => {
+            t if is_callee_tag(t) => {
                 d.u8()?;
                 let (twin, key) = read_callee(&mut d, tag, &mut keys, |t| {
                     let twin = retarget(t);
                     Some((twin, tab.keys.id(if twin { &t[1..] } else { t })))
                 })?;
                 if twin { crate::jit::TWIN_RETARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                rel.push((at, kind, match callee_tag(tag) { 20 => IMG_SLOT, 25 => IMG_CALL, _ => IMG_THUNK }, key));
+                rel.push((at, kind, match callee_tag(tag) { 20 => IMG_SLOT, 25 => IMG_CALL, RELOC_BODY => IMG_BODY, _ => IMG_THUNK }, key));
             }
             22..=24 => {
                 d.u8()?;
@@ -2005,7 +2008,7 @@ impl Linker {
         }
         for ri in (s.rel.0..s.rel.1).step_by(REL_SIZE) {
             match im.rel_at(ri) {
-                Some((_, _, IMG_SLOT | IMG_THUNK | IMG_CALL, ix)) => {
+                Some((_, _, IMG_SLOT | IMG_THUNK | IMG_CALL | IMG_BODY, ix)) => {
                     if !mark(ix) {
                         return false;
                     }
@@ -2049,7 +2052,7 @@ impl Linker {
                 return Resolved::Lazy;
             };
             let ok = match t {
-                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).is_some(),
+                IMG_SLOT | IMG_THUNK | IMG_CALL | IMG_BODY => im.slot_of(ix).is_some(),
                 IMG_SYM if !statics && im.syms.get(ix as usize).map_or(false, |b| is_static_sym(b)) => {
                     needs = true;
                     true
@@ -2142,9 +2145,9 @@ impl Linker {
                                 break;
                             };
                             let target = match t {
-                                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| {
+                                IMG_SLOT | IMG_THUNK | IMG_CALL | IMG_BODY => im.slot_of(ix).map(|x| {
                                     refs[k].slot(x, t == IMG_THUNK);
-                                    match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) }
+                                    match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), IMG_BODY => Reloc::Body(x), _ => Reloc::Thunk(x) }
                                 }),
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| {
                                     if live && (s.off == crate::jit::PATCH_FLAG_OFF || s.off == crate::jit::COPY_VER_OFF) {
@@ -2191,7 +2194,9 @@ impl Linker {
             let digest = crate::gate::decode(&im.bytes[gate.0..gate.1], id, &|i| im.flat[inl.0..inl.1].get(i as usize).and_then(|&k| im.slot_of(k)));
             let inlined: Vec<u32> = im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k)).collect();
             let kept: Vec<u32> = im.flat[kept.0..kept.1].iter().filter_map(|&k| im.slot_of(k)).collect();
-            if !u.aux { crate::harness::reach::note(id, inlined.iter().copied()); }
+            // the slots its hot sites call through their body words are reached with it
+            let bypassed = (s.rel.0..s.rel.1).step_by(REL_SIZE).filter_map(|ri| im.rel_at(ri)).filter(|r| r.2 == IMG_BODY).filter_map(|r| im.slot_of(r.3));
+            if !u.aux { crate::harness::reach::note(id, inlined.iter().copied().chain(bypassed)); }
             let kind = im.keys[key as usize].first().copied().and_then(KeyKind::of);
             for &a in makes.get(k).map_or(&[][..], |v| v.as_slice()) {
                 u.note_vtable_maker(a, id);

@@ -741,6 +741,15 @@ impl SlotsPtr {
     pub fn callable(&self, id: u32) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { (*self.0).callable(id) } }
     }
+    /// The slot's replaceable target word (SlotTable::body).
+    pub fn body(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).body(id) } }
+    }
+    /// The table word names an entry wrapper and a second word the body (a live test session's
+    /// reach marks): a call through the body word goes past the wrapper (`Reloc::Body`).
+    pub fn wrapped(&self) -> bool {
+        !self.0.is_null() && unsafe { (*self.0).table_stride() } > 8
+    }
 }
 
 /// Writes every relocated field of `code`, to run at address `base`. Backends emit the fields
@@ -856,6 +865,11 @@ pub enum Reloc {
     /// a slot as a call target: its thunk (`SlotTable::thunk`), which jumps to the slot's current
     /// code (a direct branch the runtime keeps in step with the table word)
     Call(u32),
+    /// a slot's body word (`SlotTable::body`): a hot call site of O3 code calls through it
+    /// (`call [word]`), past the entry wrapper a live test session's table word names (its reach
+    /// mark). The embedder counts the slot as reached by the calling code. Without a wrapper it
+    /// is the table word.
+    Body(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
     /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`,
     /// as Android under Relax has, `arm64::TLS_TWO_LOAD`)

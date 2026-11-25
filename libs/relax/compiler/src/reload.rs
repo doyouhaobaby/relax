@@ -5109,7 +5109,7 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
 fn referenced_slots(relocs: &[relax_backend::rir::RelocAt], out: &mut Vec<u32>) {
     for r in relocs {
         match r.target {
-            relax_backend::rir::Reloc::Slot(id) | relax_backend::rir::Reloc::Thunk(id) | relax_backend::rir::Reloc::Call(id) => out.push(id),
+            relax_backend::rir::Reloc::Slot(id) | relax_backend::rir::Reloc::Thunk(id) | relax_backend::rir::Reloc::Call(id) | relax_backend::rir::Reloc::Body(id) => out.push(id),
             _ => {}
         }
     }

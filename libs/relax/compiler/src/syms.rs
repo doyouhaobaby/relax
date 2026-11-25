@@ -1333,6 +1333,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
             relax_backend::rir::Reloc::Sym(s) => describe(u, *s),
             relax_backend::rir::Reloc::Slot(id) => format!("slot:{}", stable_fn_name(u, *id)),
             relax_backend::rir::Reloc::Call(id) => format!("call:{}", stable_fn_name(u, *id)),
+            relax_backend::rir::Reloc::Body(id) => format!("body:{}", stable_fn_name(u, *id)),
             relax_backend::rir::Reloc::Thunk(id) => format!("thunk:{}", stable_fn_name(u, *id)),
             other => format!("{:?}", other),
         };

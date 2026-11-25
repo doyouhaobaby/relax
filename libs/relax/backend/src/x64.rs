@@ -138,6 +138,7 @@ impl Env {
             Reloc::Slot(id) => self.slots.table(id),
             Reloc::Thunk(id) => self.slots.callable(id),
             Reloc::Call(id) => self.slots.thunk(id),
+            Reloc::Body(id) => self.slots.body(id),
             // fs-relative offset of the block pointer cell (mov r11, fs:[rax])
             Reloc::TlsKey => self.tls_key,
             Reloc::TlsSlow => self.tls_slow,
@@ -554,6 +555,11 @@ impl Asm {
         self.rex(false, 0, 0, r, false);
         self.byte(0xff);
         self.modrm_rr(2, r);
+    }
+    fn call_mem(&mut self, base: u8, disp: i32) {
+        self.rex(false, 0, 0, base, false);
+        self.byte(0xff);
+        self.modrm_mem(2, base, disp);
     }
     fn jmp_mem(&mut self, base: u8, disp: i32) {
         self.rex(false, 0, 0, base, false);
@@ -1144,6 +1150,12 @@ struct Gen<'a> {
     sym_class: u64,
     /// `Env::near`: host and runtime calls are `call rel32` (the embedder places veneers)
     near: bool,
+    /// the slots' table words name entry wrappers (a live test session's reach marks) and this
+    /// is counted code's O3 build: calls of a block that ran at least once per entry go through
+    /// the callee's body word, past its wrapper (`Reloc::Body`; RELAX_OPT=-bypass: never)
+    bypass: bool,
+    /// `bypass` for the block being emitted
+    bypass_here: bool,
     /// rbp offset of the frame word holding the domain base (0: the function names no domain symbol)
     dom_slot: i32,
     /// per block: whether its start reads the domain base into that slot (block 0: the prologue;
@@ -1929,6 +1941,7 @@ impl<'a> Gen<'a> {
             }
             let b = &self.f.blocks[bi];
             let n = b.insts.len();
+            self.bypass_here = self.bypass && b.count >= self.f.blocks[0].count;
             // the compare the branch reads (fused into cmp + jcc): the instructions before it
             let (bcmp, ne) = regalloc::branch_compare(b, &self.al.uses);
             let fused = bcmp.is_some();
@@ -2132,6 +2145,7 @@ impl<'a> Gen<'a> {
             }
             self.term(options, &b.term, bi, bcmp);
         }
+        self.bypass_here = false;
         // landing stubs of invoked calls: the unwinder resumes here with rbp, rsp and the
         // callee-saved registers of this frame restored; reload the caller-saved values the
         // call's normal path reloads, then the cleanup pad
@@ -3043,6 +3057,11 @@ impl<'a> Gen<'a> {
         }
         self.frame_exit();
         match c {
+            // a hot site: through the callee's body word (`bypass`)
+            Callee::Fn(id) if self.bypass_here => {
+                self.mov_reloc(R11, Reloc::Body(*id));
+                self.a.jmp_mem(R11, 0);
+            }
             Callee::Fn(id) | Callee::CFn(id, _) => {
                 self.a.byte(0xe9);
                 let at = self.a.pos();
@@ -6472,6 +6491,11 @@ impl<'a> Gen<'a> {
             self.a.vzeroupper();
         }
         match c {
+            // a hot site: through the callee's body word (`bypass`; r11 is no argument register)
+            Callee::Fn(id) if self.bypass_here => {
+                self.mov_reloc(R11, Reloc::Body(*id));
+                self.a.call_mem(R11, 0);
+            }
             Callee::Fn(id) => self.call_reloc(Reloc::Call(*id)),
             Callee::Part(id) => {
                 if let Some(id) = id {
@@ -7108,6 +7132,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         asm_veneers: Vec::new(),
         sym_class: env.sym_class,
         near: env.near,
+        bypass: env.slots.wrapped() && f.blocks.first().is_some_and(|b| b.count > 0.0) && !crate::stats::opt_off(options, "-bypass"),
+        bypass_here: false,
         dom_slot: 0,
         dom_read: Vec::new(),
         relocs: Vec::new(),

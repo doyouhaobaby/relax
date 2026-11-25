@@ -2584,7 +2584,7 @@ fn realtime_reach_reads_the_installed_code() {
         f.normal_rir = None;
         f.lowering = None;
         let mut callees: Vec<u32> = relocs.iter().filter_map(|r| match r.target {
-            relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Slot(c) if c != run => Some(c),
+            relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Body(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Slot(c) if c != run => Some(c),
             _ => None,
         }).collect();
         callees.sort_unstable();

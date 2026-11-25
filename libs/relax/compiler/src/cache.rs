@@ -288,16 +288,38 @@ const RT_SET_RULE: u32 = 5;
 const TY_BACKREF: u8 = 63;
 /// A back-reference's length (its tag and its u32).
 const TY_BACKREF_LEN: u32 = 5;
-/// A callee relocation's tag (20 slot, 21 thunk, 25 call) plus this: its key is the n-th one the
-/// entry's relocation list wrote (a u32 n follows instead of the key's bytes): 26, 27 and 31.
+/// A callee relocation's tag (20 slot, 21 thunk, 25 call, 32 body word) plus this: its key is the
+/// n-th one the entry's relocation list wrote (a u32 n follows instead of the key's bytes): 26,
+/// 27, 31 and 38.
 const RELOC_KEY_REF: u8 = 6;
+/// The callee tag of a slot's body word (`Reloc::Body`: a hot site of O3 code calls through it)
+pub(crate) const RELOC_BODY: u8 = 32;
 
-/// The callee tag (20, 21, 25) of a callee relocation's tag, written in full or as a reference.
-fn callee_tag(tag: u8) -> u8 {
-    if tag >= 20 + RELOC_KEY_REF { tag - RELOC_KEY_REF } else { tag }
+/// The callee tag (20, 21, 25, 32) of a callee relocation's tag, written in full or as a reference.
+pub(crate) fn callee_tag(tag: u8) -> u8 {
+    match tag {
+        26 | 27 | 31 | 38 => tag - RELOC_KEY_REF,
+        t => t,
+    }
 }
 
-/// Writes a callee relocation (tag 20, 21 or 25) to slot `x`: the bytes of its key (`key`) the
+/// Whether `tag` is a callee relocation's tag, in full or as a reference.
+pub(crate) fn is_callee_tag(tag: u8) -> bool {
+    matches!(callee_tag(tag), 20 | 21 | 25 | RELOC_BODY)
+}
+
+/// The callee relocation tag of `r` (None: it names no slot).
+fn reloc_callee(r: &Reloc) -> Option<(u8, u32)> {
+    match *r {
+        Reloc::Slot(x) => Some((20, x)),
+        Reloc::Thunk(x) => Some((21, x)),
+        Reloc::Call(x) => Some((25, x)),
+        Reloc::Body(x) => Some((RELOC_BODY, x)),
+        _ => None,
+    }
+}
+
+/// Writes a callee relocation (tag 20, 21, 25 or 32) to slot `x`: the bytes of its key (`key`) the
 /// first time the list names `x`, after that the position of that key (RELOC_KEY_REF). False when
 /// the key cannot be encoded.
 fn write_callee(e: &mut E, tag: u8, x: u32, keyed: &mut HashMap<u32, u32>, key: impl FnOnce() -> Option<Vec<u8>>) -> bool {
@@ -318,7 +340,7 @@ fn write_callee(e: &mut E, tag: u8, x: u32, keyed: &mut HashMap<u32, u32>, key: 
 /// `first` runs once per key, the first time the list writes it, and a later reference (a
 /// RELOC_KEY_REF tag) gives that result again from `seen`.
 fn read_callee<'a, T: Copy>(d: &mut D<'a>, tag: u8, seen: &mut Vec<T>, first: impl FnOnce(&'a [u8]) -> Option<T>) -> Option<T> {
-    if tag >= 20 + RELOC_KEY_REF {
+    if callee_tag(tag) != tag {
         return seen.get(d.u32()? as usize).copied();
     }
     let t = first(d.bytes()?)?;
@@ -4769,7 +4791,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("relax cache: RELOCS rec {} {} {}", name, rl.at, t);
@@ -4828,8 +4850,8 @@ impl Cache {
                         ok
                     }
                 },
-                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
-                    let tag = match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 };
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => {
+                    let (tag, _) = reloc_callee(r).unwrap();
                     let ok = write_callee(&mut e, tag, *x, &mut keyed, || self.slot_bytes(u, *x));
                     if !ok {
                         self.why("callee key");
@@ -4857,7 +4879,7 @@ impl Cache {
                 self.stats.unencodable += 1;
                 if trace_on() {
                     let w = match r {
-                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
                         Reloc::Sym(s) => format!("{} ({})", self.last_why, crate::syms::describe(u, *s)),
                         _ => self.last_why.to_string(),
                     };
@@ -7205,13 +7227,13 @@ impl Cache {
                     let mut e = E::default();
                     let ok = match &rl.target {
                         Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
                         _ => false,
                     };
                     if ok && !rest.windows(e.0.len().max(1)).any(|w| w == &e.0[..]) {
                         missing.push(match &rl.target {
                             Reloc::Sym(s) => format!("{} {}", rl.at, crate::syms::describe(u, *s)),
-                            Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
+                            Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
                             _ => String::new(),
                         });
                     }
@@ -7220,7 +7242,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("relax cache: RELOCS fresh {} {} {}", name, rl.at, t);
@@ -7244,8 +7266,8 @@ impl Cache {
             let mut e = E::default();
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
-                    let tag = match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 };
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => {
+                    let (tag, _) = reloc_callee(r).unwrap();
                     write_callee(&mut e, tag, *x, &mut keyed, || self.slot_bytes(u, *x))
                 }
                 Reloc::TlsKey => { e.u8(22); true }
@@ -7258,7 +7280,7 @@ impl Cache {
                 // (what differs: the cached offset, kind and target bytes against the fresh ones)
                 let first = cbytes.as_deref().map_or(0, |b| b.iter().zip(&e.0).take_while(|(x, y)| x == y).count());
                 let hex = |b: &[u8]| format!("[{}/{}] {}", first, b.len(), b.iter().skip(first.saturating_sub(4)).take(16).map(|x| format!("{:02x}", x)).collect::<String>());
-                eprintln!("relax cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {}; cached at {} kind {}, target {} / fresh {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word, co, if ck == Some(rl.kind) { "same" } else { "differs" }, cbytes.as_deref().map_or(String::from("-"), |b| hex(b)), if ok { hex(&e.0) } else { String::from("unencodable") });
+                eprintln!("relax cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {}; cached at {} kind {}, target {} / fresh {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) | Reloc::Body(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word, co, if ck == Some(rl.kind) { "same" } else { "differs" }, cbytes.as_deref().map_or(String::from("-"), |b| hex(b)), if ok { hex(&e.0) } else { String::from("unencodable") });
                 if same_inputs { self.stats.verify_diff_reloc += 1 } else { self.stats.verify_diff_inputs += 1 }
                 return Some(false);
             }
@@ -12920,6 +12942,8 @@ impl Linker {
             if let Some(hook) = hook { hook(u); }
         }
         let mut callees = Vec::new();
+        // the slots hot sites call through their body words (Reloc::Body): reached with this code
+        let mut bypassed = Vec::new();
         let mut data = Vec::new();
         let mut d = D { b: payload, p: 0 };
         if d.u32()? != ENTRY_VERSION {
@@ -12960,7 +12984,7 @@ impl Linker {
             // the relocation keeps what it names (a slot, a symbol): the install records the
             // code's references from these (jit CodeRefs), as it does for code built this run
             let target = match tag {
-                20 | 21 | 25 | 26 | 27 | 31 => {
+                t if is_callee_tag(t) => {
                     d.u8()?;
                     let sid = read_callee(&mut d, tag, &mut keyed, |b| self.slot_of_bytes(u, b))?;
                     let sid = {
@@ -12975,6 +12999,11 @@ impl Linker {
                         25 => {
                             callees.push(sid);
                             Reloc::Call(sid)
+                        }
+                        RELOC_BODY => {
+                            callees.push(sid);
+                            bypassed.push(sid);
+                            Reloc::Body(sid)
                         }
                         _ => Reloc::Thunk(sid),
                     }
@@ -13041,7 +13070,7 @@ impl Linker {
                 u.note_vtable_maker(a, id);
             }
         }
-        if !u.aux { crate::harness::reach::note(id, inl.iter().copied()); }
+        if !u.aux { crate::harness::reach::note(id, inl.iter().chain(&bypassed).copied()); }
         if !is_o3 {
             // the slots this code took in run inside it: a replacement that calls one instead
             // (an O3 build missing its body) has it built before its swap (jit prebuild_callees);
