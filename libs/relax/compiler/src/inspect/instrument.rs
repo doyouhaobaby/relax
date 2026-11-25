@@ -1151,7 +1151,7 @@ pub fn pause_program() -> usize {
     n
 }
 
-/// A layout-changing patch's pause (reload.rs step 6, invalid.rs `hold_old_frames`): the program
+/// A layout-changing patch's pause (reload.rs step 6, invalid.rs `report_old_frames`): the program
 /// threads are held while the patch installs and their stacks are read. True: this call paused
 /// them (`resume_program` ends it); false: they were paused already (by `pause` or a stale
 /// access), and stay so.
@@ -1193,22 +1193,6 @@ pub(crate) fn quit_resumes() {
         eprintln!("relax: a quit: the paused program goes on so that it can quit");
         resume_program();
     }
-}
-
-/// Thread `t` (a program thread) stays held for good, past any `resume`, until the run's end
-/// (`release_held_for_good`): it has a frame in code that never runs again (stale.rs `park_held`).
-/// A thread the pause did not hold (blocked in a system call) is held now. False: it could not be
-/// held (it ended, or this platform cannot).
-pub fn hold_for_good(t: &super::threads::Thread) -> bool {
-    pause_imp::keep(t)
-}
-
-/// A run's end, once its code is gone (domain::end_run): the threads held for good go on. Their
-/// frames in code that never runs again are as gone as every other frame of the run's code, so they
-/// leave as every thread of the run does (kicked out of a wait, ended at their next instruction of
-/// that code), and the run's memory goes with them. Returns how many went on.
-pub(crate) fn release_held_for_good() -> usize {
-    pause_imp::release_kept()
 }
 
 /// A run's end began: the program's threads go on so they can be ended, and a parked hit stops
@@ -1374,12 +1358,12 @@ fn host_ui_thread(t: &super::threads::Thread) -> bool {
 /// the host's own main loop, not the program's code, and held it is a window that stops drawing and
 /// taking input: macOS suspended it (AppKit's main thread) for a stale access's report, and the
 /// app's window froze with its decision nowhere on screen (11-08); Linux held it only when a sweep
-/// found it running or in a futex. A stack read (`frame_in`, `hold_old_frames`) still reads it.
+/// found it running or in a futex. A stack read (`frame_in`, `report_old_frames`) still reads it.
 fn pause_holds(t: &super::threads::Thread) -> bool {
     program_thread(t) && !host_ui_thread(t)
 }
 
-/// Whether the pause holds thread `os_id` now (held for good included): `makepad inspect threads`.
+/// Whether the pause holds thread `os_id` now: `makepad inspect threads`.
 pub(crate) fn held_now(os_id: u64) -> bool {
     pause_imp::holds(os_id)
 }
@@ -1389,13 +1373,10 @@ pub(crate) fn held_now(os_id: u64) -> bool {
 #[cfg(any(target_vendor = "apple", all(windows, target_arch = "x86_64")))]
 mod pause_imp {
     static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
-    /// The threads held for good (`keep`): suspended until the run's end lets them go (`release_kept`).
-    static KEPT: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
 
     /// What this module holds of a run, as a fresh process has it (`run_end`).
     pub(crate) unsafe fn reset_statics() {
         relax_session::reset_static(&HELD, relax_session::sync::Mutex::new(Vec::new()));
-        relax_session::reset_static(&KEPT, relax_session::sync::Mutex::new(Vec::new()));
         relax_session::reset_static(&DECLINED, relax_session::sync::Mutex::new(Vec::new()));
     }
     #[cfg(target_vendor = "apple")]
@@ -1498,13 +1479,6 @@ mod pause_imp {
         }
         unlock_allocator();
     }
-    /// Thread `t` suspended, as the pause suspends one (`keep`, of a thread it did not hold).
-    unsafe fn hold_one(t: &crate::inspect::threads::Thread) -> bool {
-        lock_allocator();
-        let ok = crate::inspect::threads::suspend(t);
-        unlock_allocator();
-        ok
-    }
     /// Under a JIT (this runtime run by another Relax, as its own tests are under `--live`) the
     /// windows' code is built before an allocator lock is taken: a lazy compile in there asks that
     /// JIT's compiler, whose allocations wait for the locks this thread holds (on Windows, those of
@@ -1517,7 +1491,7 @@ mod pause_imp {
         let at = precompile_symbol();
         if at != 0 {
             let precompile = unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*const usize, usize, bool) -> u64>(at) };
-            let roots = [hold_picked as *const () as usize, hold_declined as *const () as usize, hold_one as *const () as usize];
+            let roots = [hold_picked as *const () as usize, hold_declined as *const () as usize];
             unsafe { precompile(roots.as_ptr(), roots.len(), false) };
         }
     }
@@ -1611,35 +1585,8 @@ mod pause_imp {
         DECLINED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         n
     }
-    /// Out of the pause's set: no resume reaches it (its suspension stays until the run's end,
-    /// `release_kept`); suspended now when the pause did not hold it.
-    pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
-        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        let kept = match held.iter().position(|h| h.os_id == t.os_id) {
-            Some(k) => Some(held.remove(k)),
-            None => {
-                drop(held);
-                let found = crate::inspect::threads::list().into_iter().find(|x| x.os_id == t.os_id);
-                build_windows();
-                found.filter(|x| unsafe { hold_one(x) })
-            }
-        };
-        let ok = kept.is_some();
-        if let Some(x) = kept {
-            crate::zone_alloc::kept_with(|| KEPT.lock().unwrap_or_else(|e| e.into_inner()).push(x));
-        }
-        ok
-    }
     pub fn holds(os_id: u64) -> bool {
-        HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().chain(KEPT.lock().unwrap_or_else(|e| e.into_inner()).iter()).any(|t| t.os_id == os_id)
-    }
-    pub fn release_kept() -> usize {
-        let kept = std::mem::take(&mut *KEPT.lock().unwrap_or_else(|e| e.into_inner()));
-        let n = kept.len();
-        for t in kept {
-            crate::inspect::threads::resume(&t);
-        }
-        n
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| t.os_id == os_id)
     }
 }
 
@@ -1704,22 +1651,8 @@ mod pause_imp {
         }
         n
     }
-    /// Out of the pause's set, held for good (signalled now when the pause did not hold it).
-    pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
-        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(k) = held.iter().position(|h| h.0 == t.os_id) {
-            let (_, s) = held.remove(k);
-            crate::inspect::threads::keep_held(s);
-            return true;
-        }
-        drop(held);
-        crate::inspect::threads::hold_for_good(t.os_id).is_ok()
-    }
     pub fn holds(os_id: u64) -> bool {
         crate::inspect::threads::is_held(os_id)
-    }
-    pub fn release_kept() -> usize {
-        crate::inspect::threads::release_held_for_good()
     }
 }
 
@@ -1731,14 +1664,8 @@ mod pause_imp {
     pub fn resume() -> usize {
         0
     }
-    pub fn keep(_t: &crate::inspect::threads::Thread) -> bool {
-        false
-    }
     pub fn holds(_os_id: u64) -> bool {
         false
-    }
-    pub fn release_kept() -> usize {
-        0
     }
 
     pub(crate) unsafe fn reset_statics() {}

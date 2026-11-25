@@ -257,28 +257,7 @@ pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
     imp::hold(tid, imp::HOLD_PAUSE)
 }
 
-/// Holds thread `tid` in its handler for good (a thread with a frame in code that never runs
-/// again: stale.rs `park_held`); a blocked thread is signalled too (it leaves the handler only at
-/// the run's end, `release_held_for_good`, when no code of the run runs any more). Linux.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn hold_for_good(tid: u64) -> Result<&'static HoldSlot, &'static str> {
-    imp::hold(tid, imp::HOLD_FOREVER)
-}
-
-/// A pause's hold of a thread becomes a hold for good (no resume releases it: the run's end does).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn keep_held(s: &HoldSlot) {
-    imp::keep(s)
-}
-
-/// The run's end, once its code is gone: every thread held for good leaves its handler (it faults
-/// out of that code at its next instruction there). Returns how many. Linux.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn release_held_for_good() -> usize {
-    imp::release_forever()
-}
-
-/// Whether thread `tid` stands still in its handler now (held by a pause or for good). Linux.
+/// Whether thread `tid` stands still in its handler now. Linux.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn is_held(tid: u64) -> bool {
     imp::held(tid).is_some()
@@ -796,16 +775,12 @@ mod imp {
         /// x86_64: rip, rsp, rbp, rbx, r12, r13, r14, r15; arm64: pc, sp, fp, lr, -, -, -, -;
         /// then the pthread handle
         regs: [AtomicU64; 9],
-        /// HOLD_CAPTURE (one walk, at most 5 s), HOLD_PAUSE (until `resume`, at most 10 minutes),
-        /// HOLD_FOREVER (a thread that must not run on while its run does: stale.rs `park_held`)
+        /// HOLD_CAPTURE (one walk, at most 5 s), HOLD_PAUSE (until `resume`, at most 10 minutes).
         mode: AtomicU32,
     }
     static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], mode: AtomicU32::new(0) } }; SLOTS];
     pub const HOLD_CAPTURE: u32 = 0;
     pub const HOLD_PAUSE: u32 = 1;
-    // a hold for good: Linux x86_64 only (`hold_for_good`, `keep_held`)
-    #[cfg(target_arch = "x86_64")]
-    pub const HOLD_FOREVER: u32 = 2;
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
     fn futex_wait(w: &AtomicU32, val: u32, ms: u64) {
@@ -855,16 +830,12 @@ mod imp {
             futex_wake(&slot.state);
             // a capture's hold is bounded (an inspector that died mid-walk must not stop this
             // thread forever); a pause's lasts until resume, or 10 minutes
+            let limit = if slot.mode.load(Relaxed) == HOLD_PAUSE { 600 } else { 5 };
             let t0 = std::time::Instant::now();
             loop {
                 if slot.state.load(Acquire) != 2 {
                     break;
                 }
-                let limit = match slot.mode.load(Relaxed) {
-                    HOLD_CAPTURE => 5,
-                    HOLD_PAUSE => 600,
-                    _ => u64::MAX,
-                };
                 if t0.elapsed().as_secs() >= limit {
                     break;
                 }
@@ -930,23 +901,6 @@ mod imp {
             r.store(0, Relaxed);
         }
         slot.state.store(0, Release);
-    }
-
-    /// A held thread stays held for good.
-    #[cfg(target_arch = "x86_64")]
-    pub fn keep(slot: &Slot) {
-        slot.mode.store(HOLD_FOREVER, Relaxed);
-    }
-
-    /// Lets every thread held for good go (`release_held_for_good`).
-    #[cfg(target_arch = "x86_64")]
-    pub fn release_forever() -> usize {
-        let mut n = 0;
-        for slot in HOLDS.iter().filter(|h| h.mode.load(Relaxed) == HOLD_FOREVER && h.state.load(Acquire) == 2) {
-            release(slot);
-            n += 1;
-        }
-        n
     }
 
     /// The slot holding `tid` now (a paused thread), if any.

@@ -8750,24 +8750,33 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         LAYOUT_GROUP.store(gen, std::sync::atomic::Ordering::Relaxed);
     }
     let layout_names: Vec<String> = saved_adts.iter().map(|(d, _)| def_name(&u.prog, *d)).collect();
-    {
+    let mut event = {
         let mut shown: Vec<&str> = out.names.iter().take(4).map(String::as_str).collect();
         if out.names.len() > 4 { shown.push(".."); }
-        crate::invalid::patch_event(gen, format!("gen {}: {} fn(s) [{}]{}", gen, out.names.len(), shown.join(", "), if layout_names.is_empty() { String::new() } else { format!("; layout of {}", layout_names.join(", ")) }));
-    }
-    // a layout patch: the earlier patch versions of the slots it rebuilt were built for the old
-    // layout and never run again (invalid.rs; a slot's first code shares pages with other code and
-    // is not invalidated: only frames live at the patch can still reach it -- none was, asked under
-    // this pause, but a thread the pause did not stop may have entered it since: held for good)
+        format!("gen {}: {} fn(s) [{}]{}", gen, out.names.len(), shown.join(", "), if layout_names.is_empty() { String::new() } else { format!("; layout of {}", layout_names.join(", ")) })
+    };
+    // A layout patch retires the code built for the old layout under the install's pause.
     if !breaking.is_empty() {
         let breaking_names: Vec<String> = breaking.iter().map(|d| def_name(&u.prog, *d)).collect();
         let rebuilt: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
         let why = format!("layout-changing patch gen {} (fields or variants of {}) replaced it: code built for the old layout never runs again", gen, breaking_names.join(", "));
+        let started = std::time::Instant::now();
         crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
-        let held = crate::invalid::hold_old_frames(u, gen, &breaking_names.join(", "), paused);
-        if held > 0 {
-            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn: the app runs on without them, the restart is offered ({tool} inspect {} stale)", held, std::process::id(), tool = crate::tool_name()));
+        let first = crate::invalid::invalidate_first(u, gen, &why);
+        let us = started.elapsed().as_micros() as u64;
+        crate::invalid::layout_fill_took(us);
+        event.push_str(&format!("; first code: {} ranges, {} bytes; retired in {} us", first.bodies.len(), first.bytes, us));
+        for warning in first.warnings {
+            offer_restart(&warning);
+            out.lines.push(warning);
         }
+        crate::invalid::patch_event(gen, event);
+        let frames = crate::invalid::report_old_frames(u, gen, &why, &first.bodies, paused);
+        if frames > 0 {
+            out.lines.push(format!("{frames} thread(s) have a frame in the first-version code of a rebuilt fn: each parks when it returns there; the restart is offered ({tool} inspect {} stale)", std::process::id(), tool = crate::tool_name()));
+        }
+    } else {
+        crate::invalid::patch_event(gen, event);
     }
     let u = &mut *up;
     u.reload_rir = None;

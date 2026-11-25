@@ -252,6 +252,7 @@ fn a_layout_patch_trap_fills_the_old_version_beside_live_code() {
     };
     let (fe, ge) = (u.entry(f), u.entry(g));
     assert_eq!((run(fe), run(ge)), (11, 20));
+    let f0 = u.fns[f as usize].code;
     let edit = |src: String| crate::reload::Edit { file, path: path.to_string_lossy().into_owned(), src: src.into_bytes() };
     // generation 1: both bodies
     let gen1 = base.replace("s.a + 10", "s.a + 11").replace("= 20", "= 21");
@@ -266,10 +267,14 @@ fn a_layout_patch_trap_fills_the_old_version_beside_live_code() {
     assert_eq!(out.rung, crate::reload::Rung::Patch, "{:?}", out.lines);
     assert_eq!((run(fe), run(ge)), (14, 21), "f runs its new code, g its generation-1 code");
     assert_eq!(u.fns[g as usize].code, g1, "g was not rebuilt");
-    let r = crate::stale::lookup(f1).unwrap_or_else(|| panic!("f's generation-1 code is a stale range: {}", invalid::stats_line()));
-    assert!(r.name.contains(&*u.fns[f as usize].name) && r.reason.contains("layout-changing patch gen 2"), "{} / {}", r.name, r.reason);
-    let bytes = unsafe { std::slice::from_raw_parts(r.lo as *const u8, (r.hi - r.lo) as usize) };
-    assert!(bytes.chunks(4).all(|w| w == invalid::TRAP), "f's generation-1 code is the trap: {:02x?}", &bytes[..16]);
+    for (gen, at) in [(0, f0), (1, f1)] {
+        let r = crate::stale::lookup(at).unwrap_or_else(|| panic!("f's generation-{gen} code is a stale range: {}", invalid::stats_line()));
+        assert!(r.name.contains(&*u.fns[f as usize].name) && r.reason.contains("layout-changing patch gen 2"), "{} / {}", r.name, r.reason);
+        let bytes = unsafe { std::slice::from_raw_parts(r.lo as *const u8, (r.hi - r.lo) as usize) };
+        assert!(bytes.chunks(4).all(|w| w == &invalid::TRAP[..w.len()]), "f's generation-{gen} code holds the trap throughout");
+    }
+    let event = invalid::patch_event_of(2).map(|e| e.1).unwrap_or_default();
+    assert!(event.contains("first code: 1 ranges"), "the patch event says what it filled of first code: {event}");
     assert!(crate::stale::lookup(g1).is_none(), "g's code beside it lives");
     let stats = invalid::stats_line();
     assert!(invalid::PROT_BYTES.load(Ordering::Relaxed) == 0 && invalid::FILLED_BYTES.load(Ordering::Relaxed) >= 16, "a fill, nothing inaccessible: {stats}");

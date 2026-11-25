@@ -1237,50 +1237,126 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// flags[0]: the thread to hold runs
-// (not on Windows yet: a run's end there crashes the JIT running these tests, before the hold --
-// "a lazy call from JIT code that interrupted a compile", 0xc0000409; the hold itself works there,
-// inspect/instrument.rs pause_tests. Android: pause_imp is a stub)
+/// The domain's main is in the native call with a first-generation return address on its stack.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-const HELD_RUN: &str = r#"
-use std::sync::atomic::{AtomicU64, Ordering};
-fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
-fn fixture(p: *mut u64) {
-    let a = p as usize;
-    std::thread::Builder::new().name("held-for-good".into()).spawn(move || {
-        flags(a)[0].fetch_add(1, Ordering::SeqCst);
-        loop { std::thread::sleep(std::time::Duration::from_millis(20)); }
-    }).unwrap();
-    loop { std::thread::park(); }
+const LAYOUT_RETURN: &str = r#"
+pub struct Layout { pub value: u64 }
+#[inline(never)]
+pub fn old(p: *mut u64) {
+    let fields = Layout { value: 7 };
+    let native: extern "C" fn() = unsafe { std::mem::transmute(*p.add(2) as usize) };
+    native();
+    unsafe { *p.add(1) = fields.value; }
 }
+#[inline(never)]
+pub fn live_neighbour(out: *mut u64) { unsafe { *out = 23; } }
 "#;
 
-/// A thread held for good (a frame of it in code a layout patch replaced: stale.rs `park_held`)
-/// leaves with its run: once the run's code is gone the end lets it go, and it ends as every other
-/// thread of the run does, its domain's memory back.
-// (not on Windows or Android yet: see HELD_RUN)
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
-fn a_thread_held_for_good_leaves_with_its_run() {
-    isolated_test!(a_thread_held_for_good_leaves_with_its_run);
-    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut u, entry, root) = fixture_of(HELD_RUN, "fixture");
-    let up = &mut *u as *mut Unit;
-    let flags: [AtomicU64; 4] = Default::default();
-    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
-    wait(|| flags[0].load(Ordering::SeqCst) == 1);
-    let held = crate::inspect::threads::list().into_iter().find(|t| t.name == "held-for-good").expect("the fixture's thread");
-    assert!(crate::inspect::instrument::hold_for_good(&held), "the thread is held");
-    let end = end_run(up, Duration::from_secs(10));
-    assert!(end.left.is_empty(), "left: {:?}", end.left);
-    main.join().unwrap();
-    wait_thread_done(domain);
-    let dead = info(domain).unwrap();
-    assert_eq!((dead.threads, dead.base), (0, 0));
-    assert_eq!(dead.state, DomainState::Stopped);
-    domains().retain(|d| d.info.id != domain);
-    drop(u);
-    std::fs::remove_dir_all(root).unwrap();
+fn a_layout_patch_returns_the_native_lock_before_the_stale_frame_parks() {
+    isolated_test!(a_layout_patch_returns_the_native_lock_before_the_stale_frame_parks);
+    // Each stage a held foreign lock could block has this bound; the one stage without it is
+    // the stale report's, which only the disk and the owner can slow down.
+    const BOUND: Duration = Duration::from_secs(2);
+    const UNBOUNDED_REPORT: &str = "the report of the fault and its decision";
+    extern "C" fn native() {
+        crate::os::thread::set_own_name("old-frame");
+        native_holds_a_host_lock();
+    }
+    // Both the driver and its deadline observer belong to the host. They must run while the
+    // fault pauses the program, including when allocating or starting a thread is what stalled.
+    crate::os::thread::set_own_name("run-test-clock");
+    let (stage, progress) = std::sync::mpsc::channel();
+    let driver = std::thread::Builder::new().name("run-test-driver".into()).spawn(move || {
+        std::env::set_var("RELAX_STALE_PARK", "1");
+        crate::borrowck::lazy::disable_gandalf();
+        let (mut u, entry, root) = fixture_of(LAYOUT_RETURN, "old");
+        let up = &mut *u as *mut Unit;
+        let def = |name| crate::program::DefId(u.prog.defs.iter().rposition(|d| u.prog.syms.str(d.name) == name).unwrap() as u32);
+        let (old_def, live_def) = (def("old"), def("live_neighbour"));
+        let file = u.prog.def(old_def).file;
+        let old = u.fn_id(crate::jit::FnKey::Inst(old_def, Vec::new()));
+        let live = u.fn_id(crate::jit::FnKey::Inst(live_def, Vec::new()));
+        let neighbour = u.entry(live);
+        let call_neighbour = || {
+            let mut n = 0u64;
+            unsafe { crate::jit::call_jit(up, neighbour, &mut n as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+            n
+        };
+        assert_eq!(call_neighbour(), 23);
+        let live_code = u.fns[live as usize].code;
+        let flags: [AtomicU64; 4] = Default::default();
+        flags[2].store(native as *const () as usize as u64, Ordering::SeqCst);
+        let (domain, _, main) = launch(&mut u, entry, None, &flags);
+        wait(|| IN_NATIVE.load(Ordering::SeqCst) != 0);
+        let tid = crate::inspect::threads::list().into_iter().find(|t| t.name == "old-frame").expect("the named thread holds the native lock").os_id;
+        assert!(HOST_LOCK.try_lock().is_err());
+        let first = u.fns[old as usize].code;
+        let src = LAYOUT_RETURN.replace("pub value: u64 }", "pub extra: u64, pub value: u64 }").replace("value: 7 }", "extra: 9, value: 7 }");
+        let edit = crate::reload::Edit { file, path: root.join("fixture.rs").to_string_lossy().into_owned(), src: src.into_bytes() };
+        crate::invalid::FRAME_CHECK_MISSES.store(tid, Ordering::Relaxed);
+        let patch = unsafe { crate::reload::apply(up, vec![edit]) };
+        crate::invalid::FRAME_CHECK_MISSES.store(0, Ordering::Relaxed);
+        assert_eq!(patch.rung, crate::reload::Rung::Patch, "{:?}", patch.lines);
+        assert!(patch.lines.iter().any(|l| l.contains("parks when it returns there")), "the install found the old frame: {:?}", patch.lines);
+        stage.send("old's first code is dead").unwrap();
+        assert!(crate::stale::lookup(first).is_some(), "old's first code is dead");
+        stage.send("a live neighbour runs on").unwrap();
+        assert_eq!(u.fns[live as usize].code, live_code, "the neighbour was not rebuilt");
+        assert_eq!(call_neighbour(), 23, "a live neighbour runs on");
+        stage.send("no thread is stopped where it did not choose").unwrap();
+        let held = crate::inspect::instrument::held_now(tid);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let held = held || crate::inspect::threads::is_held(tid);
+        stage.send("the lock came back").unwrap();
+        NATIVE_GO.store(1, Ordering::SeqCst);
+        drop(HOST_LOCK.lock().unwrap());
+        assert!(!held, "no thread is stopped where it did not choose");
+        stage.send("it parked by its fault at the return").unwrap();
+        // the fault side's own record, signal-safe stores before any output
+        wait(|| crate::stale::recorded().iter().any(|(t, name)| *t == tid && name.ends_with("::old")) && crate::stale::stuck_threads() == 1);
+        assert_eq!(flags[1].load(Ordering::SeqCst), 0, "the old layout read never completed");
+        // The watcher's report writes stderr and the flight recorder's file and asks the owner: a
+        // loaded box's disk held those writes past the bound (11-25: btrfs space reservation, the
+        // owner idle), so it is waited for as the file's other sync points are.
+        stage.send(UNBOUNDED_REPORT).unwrap();
+        wait(|| crate::stale::verdicts().iter().any(|v| v.starts_with("stale access:") && v.contains("thread `old-frame`") && v.contains("::old`") && v.contains("its thread is parked")));
+        // The decision exists before teardown starts. Seeing the verdict alone races pause_program.
+        wait(|| crate::inspect::events::parked_now().iter().any(|p| p.1 == tid));
+        stage.send("the allocator and thread creation are free").unwrap();
+        let block = vec![23u8; 1024 * 1024];
+        assert_eq!(std::thread::Builder::new().name("run-alloc-test".into()).spawn(move || std::hint::black_box(block)[1024 * 1024 - 1]).unwrap().join().unwrap(), 23);
+        stage.send("it leaves with its run").unwrap();
+        // The run's end as run_end::end begins it: the parked decision ends with the run (its
+        // pause holds the process's main thread, a program thread) and the domain's end takes
+        // the parked thread.
+        crate::run_threads::run_ends();
+        crate::inspect::events::run_ends();
+        let end = end_run(up, BOUND);
+        assert!(end.left.is_empty(), "it leaves with its run: {:?}", end.left);
+        main.join().unwrap();
+        let dead = info(domain).unwrap();
+        assert_eq!((dead.threads, dead.base), (0, 0), "it leaves with its run");
+        assert_eq!(dead.state, DomainState::Stopped);
+        wait(|| !crate::inspect::instrument::paused());
+        crate::run_threads::begin_run();
+        drop(stage);
+        domains().retain(|d| d.info.id != domain);
+        drop(u);
+        std::fs::remove_dir_all(root).unwrap();
+    }).unwrap();
+    if let Ok(mut checking) = progress.recv() {
+        loop {
+            let next = if checking == UNBOUNDED_REPORT { progress.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) } else { progress.recv_timeout(BOUND) };
+            match next {
+                Ok(next) => checking = next,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{checking}: exceeded {BOUND:?}"),
+            }
+        }
+    }
+    if let Err(panic) = driver.join() { std::panic::resume_unwind(panic); }
 }
 
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.

@@ -725,7 +725,7 @@ struct Domain {
     thread_done: bool,
     /// the main's thread token (its row in `threads`; 0: none started)
     main: u64,
-    /// the main is held for good (a stale access's fault, a frame in code a layout patch replaced):
+    /// the main is parked at a stale fault:
     /// it leaves only at its run's end, so a stop does not wait for it to return
     main_held: bool,
     compiling: bool,
@@ -962,7 +962,7 @@ pub fn stop(id: DomainId, _how: Stop) -> Result<(), String> {
 }
 
 /// Until the domain's main has returned and no teardown is under way (or the domain is gone). A
-/// main held for good returns only at its run's end, which comes after this: it is not waited for.
+/// main parked at a stale fault returns only at its run's end, which comes after this: it is not waited for.
 /// (A quit waited for a main held at a stale access, and the access waited for the run's end: the
 /// app ignored SIGTERM, 11-08.)
 fn wait_app_thread(id: DomainId) {
@@ -977,9 +977,8 @@ fn wait_app_thread(id: DomainId) {
     }
 }
 
-/// Thread `os_id` is held for good (stale.rs: a fault's thread parked until its run ends, or one
-/// held out of code a layout patch replaced): when it is a domain's main, that domain's stop no
-/// longer waits for it.
+/// Thread `os_id` parked at a stale fault until its run ends. A domain's stop no longer waits
+/// for its main once the main has parked there.
 pub(crate) fn held_for_good(os_id: u64) {
     if os_id == 0 { return; }
     let mut ds = domains();
@@ -1102,9 +1101,6 @@ pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let callbacks = crate::domain_res::take_back_callbacks(&bases);
     if !up.is_null() {
         unsafe { (*up).end_code() };
-        // (a thread held for good at a layout patch leaves as the others do now: no frame of it
-        // can run the code it was held out of)
-        crate::inspect::instrument::release_held_for_good();
     }
     let mut backoff = std::time::Duration::from_millis(1);
     let end = |left, ms| RunEnd {
@@ -2348,12 +2344,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A quit's stop waits for the app's main to return. A main held for good (its stale access
+    /// A quit's stop waits for the app's main to return. A main parked at a fault (its stale access
     /// parked until the run's end, which comes after that wait) never does: the stop waits no more
-    /// once it is held. (The quit waited for it and the app ignored SIGTERM, 11-08.)
+    /// once it parks. (The quit waited for it and the app ignored SIGTERM, 11-08.)
     #[test]
-    fn a_stop_does_not_wait_for_a_main_held_for_good() {
-        isolated_test!(a_stop_does_not_wait_for_a_main_held_for_good);
+    fn a_stop_does_not_wait_for_a_main_parked_at_a_fault() {
+        isolated_test!(a_stop_does_not_wait_for_a_main_parked_at_a_fault);
         let (id, main_os_id): (DomainId, u64) = (77, 4242);
         domains().push(Domain {
             info: DomainInfo { id, package: "held".into(), parent: None, state: DomainState::Running, base: 0x7000_0000, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), arena_reserved: 0, static_committed: 0 },
@@ -2369,16 +2365,16 @@ mod tests {
         let stop = std::thread::spawn(move || wait_app_thread(id));
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!stop.is_finished(), "the stop waits for a main that runs");
-        // a worker held for good holds nothing up: the stop still waits for the main
+        // a worker parked at a fault leaves the main running: the stop still waits for the main
         held_for_good(4343);
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!stop.is_finished(), "a held worker is not the main");
+        assert!(!stop.is_finished(), "a parked worker is not the main");
         held_for_good(main_os_id);
         let t0 = std::time::Instant::now();
         while !stop.is_finished() && t0.elapsed().as_secs() < 10 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(stop.is_finished(), "the stop waits no more for a main held for good");
+        assert!(stop.is_finished(), "the stop no longer waits for the main parked at a fault");
         stop.join().unwrap();
         domains().retain(|d| d.info.id != id);
     }
