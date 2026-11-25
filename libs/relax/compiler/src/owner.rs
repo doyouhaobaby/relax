@@ -232,6 +232,10 @@ pub static MAIN_ACC: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// requester the owner was serving when it began (a frame hitch: run summary)
 pub static MAIN_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
 static MAIN_WAIT_BEHIND: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The owner's own work between requests now (0: none; 1 the real-time vtables, 2 the constants
+/// background fronts asked for, 3 the left-out O3 builds): what main's request queued behind when
+/// the owner served no request (RELAX_MAIN_COMPILE_LOG)
+static OWN_NOW: AtomicU8 = AtomicU8::new(0);
 /// what the owner serves now: class (u8::MAX: idle) and requester
 static NOW_CLASS: AtomicU8 = AtomicU8::new(u8::MAX);
 static NOW_FROM: AtomicU64 = AtomicU64::new(0);
@@ -1175,6 +1179,7 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         wake: Condvar::new(),
     };
     let behind = NOW_CLASS.load(Ordering::Relaxed);
+    let behind_own = if behind == u8::MAX { OWN_NOW.load(Ordering::Relaxed) } else { 0 };
     let behind_from = NOW_FROM.load(Ordering::Relaxed);
     // SAFETY: only &'static Locations are stored
     let behind_site = unsafe { NOW_SITE.load(Ordering::Relaxed).as_ref() };
@@ -1207,7 +1212,7 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         let served = req.t_serve.load(Ordering::Relaxed);
         if served != 0 {
             let q = served.saturating_sub(req.t_push);
-            crate::jit::main_rec_behind(q, behind, behind_from, behind_site);
+            crate::jit::main_rec_behind(q, behind, behind_from, behind_site, behind_own);
             if behind_rt {
                 crate::jit::rt_main_waited(q);
             }
@@ -1739,15 +1744,19 @@ fn owner_loop() {
         // on the owner's stack: that request is cancelled and posted again, as inside a request)
         let frame = crate::jit::frame_enter(std::ptr::null());
         OWN_WORK.with(|w| w.set(true));
+        OWN_NOW.store(1, Ordering::Relaxed);
         if std::panic::catch_unwind(crate::jit::realtime_drain).is_err() {
             eprintln!("relax: the owner's real-time vtable drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
         // ... and the constants background builds' fronts found unevaluated
+        OWN_NOW.store(2, Ordering::Relaxed);
         if std::panic::catch_unwind(crate::jit::const_drain).is_err() {
             eprintln!("relax: the owner's constant drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
         // ... and the O3 builds that left a candidate out for what the drain makes
+        OWN_NOW.store(3, Ordering::Relaxed);
         let _ = crate::jit::left_out_drain();
+        OWN_NOW.store(0, Ordering::Relaxed);
         #[cfg(test)]
         {
             let work = OWN_WORK_TEST.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -2484,6 +2493,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MAIN_WAIT_MAX, AtomicU64::new(0));
     reset(&MAIN_WAIT_BEHIND, AtomicU64::new(u64::MAX));
     reset(&NOW_T0, AtomicU64::new(0));
+    reset(&OWN_NOW, AtomicU8::new(0));
     reset(&SITES, [const { SiteAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), class: AtomicU8::new(0), acc: [const { AtomicU64::new(0) }; SITE_FIELDS] } }; SITES_N]);
     reset(&PUMPS, [const { PumpAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), req: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), acc: [const { AtomicU64::new(0) }; 4] } }; PUMPS_N]);
     reset(&MAIN_BEHIND, [const { [const { AtomicU64::new(0) }; 2] }; CLASSES + 1]);

@@ -10950,6 +10950,15 @@ pub struct MainCompile {
     pub epoch: [u64; 2],
     /// the slot's own take of a lowering made ahead (wall ns): taken, and refused or absent
     pub take: [u64; 2],
+    /// the wall between the phases: before the type check, the owner's front request outside
+    /// split_begin's front, its hand-back to the caller, the finish's own work on the owner, and
+    /// the finish's hand-back (ns)
+    pub gap: [u64; 5],
+    /// (the owner's end of a request, for its hand-back)
+    pub mark: u64,
+    /// the owner's own work between requests when main's longest owner wait began and the owner
+    /// served no request (owner::OWN_NOW; 0: none)
+    pub behind_own: u8,
 }
 
 /// RELAX_MAIN_COMPILE_LOG: per slot the wall time it was made at (ns; 0: before the log's start).
@@ -11023,10 +11032,11 @@ fn main_rec(f: impl FnOnce(&mut MainCompile)) {
 
 /// A request of the main thread's compile waited `queue` ns in the owner's queue, queued while the
 /// owner served class `class` (u8::MAX: idle) for thread `from` (owner.rs, on the requester).
-pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64, site: Option<&'static std::panic::Location<'static>>) {
+pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64, site: Option<&'static std::panic::Location<'static>>, own: u8) {
     main_rec(|r| {
         if queue > r.behind_ns {
             r.behind_ns = queue;
+            r.behind_own = own;
             r.behind = if class == u8::MAX { 0 } else { class + 1 };
             r.behind_from = from;
             r.behind_site = site;
@@ -11304,9 +11314,16 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
         let why = if twin_ran { "its twin ran" } else { "its twin ran only inlined into twin code" };
         crate::inspect::flightrec::event("specv.lazy-base", &format!("#{} {}: first call of a base slot ({}), compiled on the calling thread", id, short_name(&(&*up).fns[id as usize].name), why), id as u64, twin_ran as u64);
     }
+    let tm = main_compile_log();
     let t = wall_ns();
+    if tm { main_rec(|r| r.gap[0] += t.saturating_sub(r.start)); }
     typeck_ahead_slot(up, id);
     main_rec(|r| r.ns[0] += wall_ns() - t);
+    // (RELAX_MAIN_COMPILE_LOG: a request's hand-back, from the owner's end of it)
+    let handed = |i: usize| if tm {
+        let e = wall_ns();
+        main_rec(|r| if r.mark != 0 { r.gap[i] += e.saturating_sub(r.mark); r.mark = 0; });
+    };
     loop {
         let t = wall_ns();
         // (None: the front gave the owner back to waiting program requests, and the build it would
@@ -11327,10 +11344,15 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             if let Compiled::Code(_) = r {
                 compile_note(up, id, w0);
             }
+            if tm {
+                let e = wall_ns();
+                main_rec(|m| { m.gap[1] += e - w0; m.mark = e; });
+            }
             (r, w0)
         }) else {
             continue;
         };
+        handed(2);
         let (work, w0) = match front {
             (Compiled::Code(a), _) => return a,
             (Compiled::Back(w), w0) => (w, w0),
@@ -11347,8 +11369,13 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             if let Split::Installed(_) = r {
                 compile_note(up, id, w0);
             }
+            if tm {
+                let e = wall_ns();
+                main_rec(|m| { m.gap[3] += e - t1; m.mark = e; });
+            }
             r
         })));
+        handed(4);
         let r = match r {
             Ok(r) => r,
             Err(p) => {
