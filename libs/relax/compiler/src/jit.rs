@@ -2159,22 +2159,6 @@ unsafe fn drop_why(up: *mut Unit, why: &'static str) {
     crate::zone_alloc::kept_with(|| *(&mut *up).stats.tier1_drop_why.entry(why).or_insert(0) += 1);
 }
 
-/// The boot window's arm of slot `id` (boot_stats): the crate of the function it is an instance of.
-fn boot_arm(u: &Unit, id: u32) -> usize {
-    let krate = match &u.fns[id as usize].key {
-        FnKey::Inst(d, _) => u.prog.def(*d).krate,
-        FnKey::Closure(file, ..) => match u.prog.file_crate.get(*file as usize) {
-            Some(k) => *k,
-            None => return crate::boot_stats::REST,
-        },
-        FnKey::Ctfe(base) => return boot_arm(u, *base),
-        _ => return crate::boot_stats::REST,
-    };
-    crate::boot_stats::arm_of(krate, || {
-        crate::boot_stats::name_bytes(u.prog.crates.get(krate as usize).map_or("", |c| u.prog.syms.str(c.name)))
-    })
-}
-
 /// A recursive #[relax(O3)] build with a larger stack frame is not recorded in the disk cache
 /// (a warm launch would install it at the first call, before a deep recursion has run, and
 /// multiply its frame by the depth: makepad_script_compute::lower::expr: 68 KB per level
@@ -12040,7 +12024,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 Err(e) => return install_error(up, id, &format!("link: {}", e)),
             };
             if linked_from_cache {
-                crate::boot_stats::fn_installed(boot_arm(u, id));
+                crate::boot_stats::fn_installed(id, u.aux, code.len());
             }
             if perf_map_on() {
                 // the code's level: cached O3 / baseline / O2 (cached or marked) / O1
@@ -12452,7 +12436,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     u.fns[id as usize].cg_ns = cpu_ns() - t0;
     u.stats.compiled += 1;
     COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
-    crate::boot_stats::fn_installed(boot_arm(u, id));
+    crate::boot_stats::fn_installed(id, u.aux, c.code.len());
     Ok((c.code, c.pc_map, c.relocs))
 }
 
@@ -25747,7 +25731,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     u.stats.tier1_installed += 1;
                     TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                     busy::note(busy::O3);
-                    crate::boot_stats::o3_installed(boot_arm(u, id), id);
+                    crate::boot_stats::o3_installed(id, u.aux, code.len());
                     // (what it inlined is what its code took in: its group follows their
                     // generation, invalid::group_of)
                     note_body_deps(u, id, inlined.iter().copied());
@@ -25902,7 +25886,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                 busy::note(busy::O3);
-                crate::boot_stats::o3_installed(boot_arm(u, id), id);
+                crate::boot_stats::o3_installed(id, u.aux, code.len());
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_INSTALLED, 0, t2 - t1, at);
                 if tier1_trace() {
                     trace_build(u, id, "installed", t2 - t1);
@@ -29532,7 +29516,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 SPEC_FNS.fetch_add(1, Ordering::Relaxed);
             }
             COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
-            crate::boot_stats::fn_installed(boot_arm(u, id));
+            crate::boot_stats::fn_installed(id, u.aux, code.len());
             if spec {
                 // a speculative build is valid code whether or not it gets called: its record now,
                 // encoded in the record batches as every install's is (a marked slot's too: its
