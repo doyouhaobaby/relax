@@ -380,7 +380,7 @@ fn tool_json(t: &Tool) -> Value {
 
 // This adapter sits below the AI hub (platform depends on remote), so sniff
 // the wire prefix here without linking a provider or decoding any pixels.
-fn picture_media_type(data: &str) -> Result<&'static str, String> {
+pub(crate) fn picture_media_type(data: &str) -> Result<&'static str, String> {
     let head = data.get(..12).ok_or("tool picture is too short")?;
     let bytes = makepad_base64::base64_decode(head.as_bytes())
         .map_err(|_| "tool picture is not base64")?;
