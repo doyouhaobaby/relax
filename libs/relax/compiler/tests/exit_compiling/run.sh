@@ -7,7 +7,7 @@
 # up to 2 s for the unit lock while the threads kept compiling.)
 R=$1
 H=$(cd "$(dirname "$0")" && pwd)
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 mkdir "$C/p" "$C/p/src"
 printf '[package]\nname = "relax-exit-compiling"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n\n[workspace]\n' > "$C/p/Cargo.toml"

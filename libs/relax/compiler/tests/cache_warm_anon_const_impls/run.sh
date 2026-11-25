@@ -5,7 +5,7 @@
 # Prints "cache_warm_anon_const_impls: ok" or "cache_warm_anon_const_impls: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 bad=""
 for k in 1 2 3; do

@@ -56,7 +56,7 @@ sys.exit(0 if ok else 1)' "$2" <<< "$1"
 }
 group() { # group <name>..: the four checks of the files, together
   local T n names="$*" out
-  T=$(mktemp -d)
+  T=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
   [ -n "$T" ] && [ -d "$T" ] || exit 2
   crate "$T/relaxed" relaxed rs "$@"
   out=$(run "$T/relaxed" check relaxed_relaxed)

@@ -2,7 +2,7 @@
 set -eu
 H=$(cd "$(dirname "$0")" && pwd)
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-T=$(mktemp -d)
+T=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 export RELAX_CACHE=off
 export RELAX_STD="$H/../../std"
 export RELAX_CACHE_DIR="$T/target"

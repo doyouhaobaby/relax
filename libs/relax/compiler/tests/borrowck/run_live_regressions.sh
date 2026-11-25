@@ -13,7 +13,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 export RELAX_CACHE=off RELAX_BORROWCK=full RELAX_GANDALF=0
 export RELAX_STD="$HERE/../../std" RELAX_CACHE_DIR="$TMP/target"

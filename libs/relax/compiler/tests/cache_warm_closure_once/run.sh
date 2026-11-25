@@ -5,7 +5,7 @@
 # Prints "cache_warm_closure_once: ok" or "cache_warm_closure_once: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 bad=""
 k=0

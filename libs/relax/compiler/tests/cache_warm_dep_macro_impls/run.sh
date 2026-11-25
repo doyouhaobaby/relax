@@ -5,7 +5,7 @@
 # Prints "cache_warm_dep_macro_impls: ok" or "cache_warm_dep_macro_impls: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 bad=""
 step() { # step <n> <cache> <test|run>

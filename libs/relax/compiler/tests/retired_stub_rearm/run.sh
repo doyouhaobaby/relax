@@ -6,7 +6,7 @@
 # Prints "retired_stub_rearm: ok" or "retired_stub_rearm: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 bad=""
 (cd "$H" && env RELAX_O3_TRACE=1 RELAX_CACHE=0 RELAX_CACHE_DIR="$C/cache" RELAX_TARGET_DIR="$C/target" RELAX_STD="$H/../../std" RSR_STOP="$C/stop" "$R" run --verbose retired-stub-rearm) > "$C/run.log" 2>&1 &

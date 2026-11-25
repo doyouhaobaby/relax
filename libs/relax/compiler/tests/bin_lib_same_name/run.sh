@@ -3,7 +3,7 @@
 # `<pkg>::dep::*` glob reaches the dep's #[macro_export] macro through the lib (apps/wm's
 # `use makepad_app_wm::makepad_widgets::*; app_main!(..)`). Prints "bin_lib: ok" or "bin_lib: FAILED".
 H=$(cd "$(dirname "$0")" && pwd)
-ERR=$(mktemp)
+ERR=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 trap 'rm -f "$ERR"' EXIT
 export RELAX_CACHE=off
 OUT=$(cd "$H" && RELAX_STD=$H/../../std "$1" run --quiet binlib-pkg 2>>"$ERR")

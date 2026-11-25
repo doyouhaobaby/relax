@@ -11,7 +11,7 @@
 # Prints "cache_warm_edit_ids: ok" or "cache_warm_edit_ids: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 mkdir "$C/pkg"
 cp -R "$H/Cargo.toml" "$H/src" "$H/edit" "$H/host" "$C/pkg/"

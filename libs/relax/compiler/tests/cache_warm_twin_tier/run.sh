@@ -14,7 +14,7 @@
 # Prints "cache_warm_twin_tier: ok" or "cache_warm_twin_tier: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 bad=""
 run() { (cd "$H" && env "$@" RELAX_CACHE_DIR="$C/cache" RELAX_TARGET_DIR="$C/target" RELAX_STD="$H/../../std" "$R" run --verbose cache-warm-twin-tier); }

@@ -6,7 +6,7 @@
 # One line per case; the last is "pm_failed_crate_isolated: ok" or "pm_failed_crate_isolated:
 # FAILED" (exit 1).
 H=$(cd "$(dirname "$0")" && pwd)
-T=$(mktemp -d)
+T=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 [ -n "$T" ] && [ -d "$T" ] || exit 2
 trap 'rm -rf "$T"' EXIT
 export RELAX_CACHE=off CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=$T/target

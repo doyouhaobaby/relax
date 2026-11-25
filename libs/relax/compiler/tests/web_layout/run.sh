@@ -9,7 +9,7 @@ set -u
 H=$(cd "$(dirname "$0")" && pwd)
 B=$1
 W=$2
-T=${3:-$(mktemp -d)}
+T=${3:-$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")}
 mkdir -p "$T"
 # TABLE=<file>: a reference table made elsewhere
 if [ -n "${TABLE:-}" ]; then
