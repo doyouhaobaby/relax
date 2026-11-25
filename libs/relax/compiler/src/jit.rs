@@ -10948,6 +10948,8 @@ pub struct MainCompile {
     /// the program's collect epoch at the compile's start and end (moved: a front write, such as a
     /// crate loaded on demand, ran inside it)
     pub epoch: [u64; 2],
+    /// the slot's own take of a lowering made ahead (wall ns): taken, and refused or absent
+    pub take: [u64; 2],
 }
 
 /// RELAX_MAIN_COMPILE_LOG: per slot the wall time it was made at (ns; 0: before the log's start).
@@ -31910,6 +31912,18 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
 /// Unit lock held. Never wait for lowering: taking an unfinished reservation cancels its
 /// publication, and this build uses the already checked body through the ordinary path.
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
+    // (RELAX_MAIN_COMPILE_LOG: the take's own cost, for a build's own preparation)
+    if !(main_compile_log() && PREP_DEPTH.with(|d| d.get()) == 1) {
+        return take_lowered_ahead_in(u, id);
+    }
+    let t = wall_ns();
+    let r = take_lowered_ahead_in(u, id);
+    let dt = wall_ns() - t;
+    main_rec(|m| m.take[r.is_none() as usize] += dt);
+    r
+}
+
+fn take_lowered_ahead_in(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
     if !queue::takes_jobs() { return None; }
     let Some(lowered) = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else {
         let copy = TakenBack::copy(u, id);

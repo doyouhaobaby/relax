@@ -6033,10 +6033,16 @@ fn summary_inner(why: &str) {
                         // the front's and the back's splits, the preparation's shape, the epochs, and
                         // the slot's birth and lowering ahead (ms since main; -1: none)
                         let l = lowered.get(r.slot as usize).copied().unwrap_or_default();
-                        format!(" front {:.3} {:.3} {:.3} {:.3} prep {} {} {} back {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} epoch {} {} born {:.3} lowered {:.3} by {} lins {} taken {:.3}",
+                        // (behind: main's longest owner-queue wait in it, what the owner served
+                        // when it asked -- class, requester thread, call site -- and the take)
+                        let class = match r.behind { 0 => "idle", c => crate::owner::CLASS_NAMES.get(c as usize - 1).copied().unwrap_or("?") };
+                        let site = r.behind_site.map_or("-".to_string(), |s| format!("{}:{}", s.file().rsplit('/').next().unwrap_or(s.file()), s.line()));
+                        let from = if r.behind_from == 0 { "-".to_string() } else { crate::os::thread::name(r.behind_from).replace(' ', "~") };
+                        format!(" front {:.3} {:.3} {:.3} {:.3} prep {} {} {} back {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} epoch {} {} born {:.3} lowered {:.3} by {} lins {} taken {:.3} take {:.3} {:.3} behind {:.3} {} {} {}",
                             ms(r.front[0]), ms(r.front[1]), ms(r.front[2]), ms(r.front[3]), r.prep[0], r.prep[1], r.prep[2],
                             ms(r.back[0]), ms(r.back[1]), ms(r.back[2]), ms(r.back[3]), ms(r.back[4]), ms(r.back[5]), r.epoch[0], r.epoch[1],
-                            at(born.get(r.slot as usize).copied().unwrap_or(0)), at(l.0), l.1, l.2, at(l.3))
+                            at(born.get(r.slot as usize).copied().unwrap_or(0)), at(l.0), l.1, l.2, at(l.3),
+                            ms(r.take[0]), ms(r.take[1]), ms(r.behind_ns), if r.behind_ns == 0 { "-" } else { class }, from, site)
                     }
                 ));
             }
