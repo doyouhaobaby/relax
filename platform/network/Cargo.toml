@@ -15,6 +15,8 @@ makepad-civil-time = { path = "../../libs/civil_time", version = "0.1.0" }
 makepad-error-log = { path = "../../libs/error_log", version = "1.0.0" }
 makepad-live-id = { path = "../../libs/live_id", version = "1.0.0" }
 makepad-micro-serde = { path = "../../libs/micro_serde", version = "1.0.0" }
+# STUN's FINGERPRINT (p2p::stun): the in-repo port.
+crc32fast = { path = "../../libs/crc32fast" }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
 makepad-apple-sys = { path = "../../libs/apple_sys", version = "1.0.0" }
