@@ -465,6 +465,15 @@ fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> boo
     hal
 }
 
+/// The manifest folders of the app's crates as the last build of this run knew them (the app scope's
+/// crates and the launched package's): empty until a build has its unit graph.
+static APP_DIRS: relax_session::sync::Mutex<Vec<std::path::PathBuf>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The folders in which a save can fix this run's build or app check: the held host watches them.
+pub fn app_dirs() -> Vec<std::path::PathBuf> {
+    APP_DIRS.lock().unwrap().clone()
+}
+
 /// The unit graph `hosted_program` resolved for the boot, taken by the boot's resolve.
 static BOOT_UNITS: relax_session::sync::Mutex<Option<(String, Vec<String>, unitgraph::Units)>> = relax_session::sync::Mutex::new(None);
 
@@ -772,6 +781,18 @@ pub(crate) fn resolve_package(
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only, options.allow_c)?;
+    // the app crates' folders, for the host that waits for a fix after a failed build or check
+    // (`app_dirs`), recorded before anything is parsed or compiled: the same crates as the app
+    // scope (`gandalf_app_roots`), each by its manifest folder, and the launched package's
+    if boot {
+        let root_dir = unitgraph::manifest_dir_of(&g.crates[g.root].src_path);
+        let mut dirs: Vec<std::path::PathBuf> = crate::reload::gandalf_app_roots(&resolved_units, &root_dir).iter()
+            .map(|r| unitgraph::manifest_dir_of(r)).chain(std::iter::once(root_dir)).filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from).collect();
+        dirs.sort();
+        dirs.dedup();
+        *APP_DIRS.lock().unwrap() = dirs;
+    }
     // cargo's `[env]` configuration of the workspace, for every crate's compile-time environment
     // and every build script (a build script's own run has it in its process environment)
     if std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
@@ -6227,6 +6248,7 @@ fn mem_budget_mode() -> bool {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     RUN_UNIT = std::ptr::null_mut();
+    reset(&APP_DIRS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PHASES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&MAIN_START_MS, AtomicU64::new(0));
     reset(&ERRORS_SEEN, AtomicU64::new(0));

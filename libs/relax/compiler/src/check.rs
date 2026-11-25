@@ -1393,14 +1393,7 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
             if crate::run::live_session() && crate::run::hosted_run() {
                 // the app crates' folders: the held host watches them for the fix's save, which can
                 // be in any of them, not only in the package's own folder
-                let sources: Vec<_> = {
-                    let read = jit::front_read("app check watch roots");
-                    let (prog, _) = read.unit(upn as *const Unit);
-                    app_crates(prog, crate::layout::root_crate()).into_iter()
-                        .map(|k| prog.crates[k as usize].root_path().to_owned()).collect()
-                };
-                let dirs: Vec<_> = sources.iter().map(|s| crate::unitgraph::manifest_dir_of(s))
-                    .filter(|dir| !dir.is_empty()).map(std::path::PathBuf::from).collect();
+                let dirs = crate::run::app_dirs();
                 if crate::run_end::check_failed(&errors, &dirs).is_ok() {
                     app_check_done(3);
                     return;
