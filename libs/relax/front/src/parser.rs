@@ -7029,6 +7029,13 @@ impl ParsedFile {
         })
     }
 
+    /// The line and column where rustc reports a diagnostic at `pos` (lint_pos; a whole-file
+    /// token input's own origins name its authored text): for the printers that make their own
+    /// `path:L:C` line.
+    pub fn error_line_col(&self, pos: u32) -> (usize, usize) {
+        self.line_col(if self.token_input { pos } else { self.lint_pos(pos) })
+    }
+
     /// The definition position of mark `m`'s macro (u32::MAX: another file).
     pub fn hyg_def_pos(&self, m: u32) -> u32 {
         self.rules_exp.get(m as usize).or_else(|| self.parts().find_map(|p| p.rules_exp.get(m.wrapping_sub(p.rules_base) as usize))).map_or(u32::MAX, |r| r.2)

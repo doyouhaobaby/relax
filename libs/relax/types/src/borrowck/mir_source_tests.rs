@@ -1084,6 +1084,22 @@ fn the_witness_of_another_fns_future_is_made_on_demand() {
     assert!(errors[0].contains("Rc<u8") && errors[0].contains("is used across an await at"), "{errors:?}");
 }
 
+/// Errors after the parse in a local macro's expansion are where rustc reports them: a type
+/// error on a token the body wrote at its place in the definition (1:43), with the call as a
+/// note (rustc's `in this macro invocation`, 3:21); one on a substituted argument at that
+/// argument (4:27), with no note. (The check's structured records hold the notes.)
+#[test]
+fn errors_in_a_local_macros_expansion_are_where_rustc_reports_them() {
+    crate::diag::enable();
+    let errors = typeck_errors_checked("macro_rules! body { () => {{ let v: u32 = \"text\"; v }} }\nmacro_rules! frag { ($e:expr) => {{ let v: u32 = $e; v }} }\npub fn a() -> u32 { body!() }\npub fn b() -> u32 { frag!(\"text\") }\n", 2021);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    let notes = |e: &String| crate::diag::recorded(e).map(|d| d.notes).unwrap_or_default();
+    let body = errors.iter().find(|e| e.contains(":1:43: ")).unwrap_or_else(|| panic!("the body's error at 1:43: {errors:?}"));
+    assert!(notes(body).iter().any(|n| n.starts_with("in this macro invocation: ") && n.ends_with(":3:21")), "{:?}", notes(body));
+    let arg = errors.iter().find(|e| e.contains(":4:27: ")).unwrap_or_else(|| panic!("the argument's error at 4:27: {errors:?}"));
+    assert!(!notes(arg).iter().any(|n| n.starts_with("in this macro invocation")), "{:?}", notes(arg));
+}
+
 #[test]
 fn a_nested_closures_erased_signature_regions_are_not_its_creators() {
     // the inner closure's erased output region is its own external region; it must not be the outer closure's erased input region

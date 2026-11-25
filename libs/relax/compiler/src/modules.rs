@@ -227,7 +227,7 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
 }
 
 fn site_of(prog: &crate::program::Program, f: u32, pos: u32) -> String {
-    let (l, c) = prog.files[f as usize].line_col(pos);
+    let (l, c) = prog.files[f as usize].error_line_col(pos);
     format!("{}:{}:{}", prog.file_paths[f as usize], l, c)
 }
 
@@ -449,7 +449,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
     for i in u.prog.open_reportable_imports(i0) {
         let im = &u.prog.imports[i];
         {
-            let (l, c) = u.prog.files[im.file as usize].line_col(im.pos);
+            let (l, c) = u.prog.files[im.file as usize].error_line_col(im.pos);
             errs.push(format!("{}:{}:{}: unresolved import -- name a crate the module depends on", u.prog.file_paths[im.file as usize], l, c));
         }
     }
@@ -696,7 +696,7 @@ pub(crate) unsafe fn load_in_module(up: *mut Unit, parent: u32, name: &str, v: c
     let mut errs: Vec<String> = u.prog.errors[e0..].iter().filter(|e| e.starts_with(path.as_str())).cloned().collect();
     for im in u.prog.imports.iter().skip(i0) {
         if !im.done {
-            let (l, c) = u.prog.files[im.file as usize].line_col(im.pos);
+            let (l, c) = u.prog.files[im.file as usize].error_line_col(im.pos);
             errs.push(format!("{}:{}:{}: unresolved import", u.prog.file_paths[im.file as usize], l, c));
         }
     }
