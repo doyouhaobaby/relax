@@ -2985,14 +2985,55 @@ pub fn _mm_or_ps(a: __m128, b: __m128) -> __m128 {
     }
 }
 
-// computed exactly; hardware returns a 12-bit approximation
+// RCP treats denormal inputs as zero and flushes tiny results to signed zero.
+#[inline(always)]
+fn rcp_f32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let sign = bits & 0x8000_0000;
+    let mag = bits & 0x7fff_ffff;
+    if mag > 0x7f80_0000 {
+        f32::from_bits(bits | 0x0040_0000)
+    } else if mag < 0x0080_0000 {
+        f32::from_bits(sign | 0x7f80_0000)
+    } else if mag == 0x7f80_0000 {
+        f32::from_bits(sign)
+    } else {
+        let r = 1.0 / x;
+        if (r.to_bits() & 0x7fff_ffff) < 0x0080_0000 {
+            f32::from_bits(sign)
+        } else {
+            r
+        }
+    }
+}
+
+// RSQRT treats denormals as signed zero before checking for negative operands.
+#[inline(always)]
+fn rsqrt_f32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let sign = bits & 0x8000_0000;
+    let mag = bits & 0x7fff_ffff;
+    if mag > 0x7f80_0000 {
+        f32::from_bits(bits | 0x0040_0000)
+    } else if mag < 0x0080_0000 {
+        f32::from_bits(sign | 0x7f80_0000)
+    } else if sign != 0 {
+        f32::from_bits(0xffc0_0000)
+    } else if mag == 0x7f80_0000 {
+        0.0
+    } else {
+        1.0 / x.sqrt()
+    }
+}
+
+// Compute the estimate exactly and preserve the hardware's special result classes.
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
 pub fn _mm_rsqrt_ps(a: __m128) -> __m128 {
     let mut r = [0f32; 4];
     let mut i = 0;
     while i < 4 {
-        r[i] = 1.0 / a.0[i].sqrt();
+        r[i] = rsqrt_f32(a.0[i]);
         i += 1;
     }
     __m128(r)
@@ -3001,8 +3042,7 @@ pub fn _mm_rsqrt_ps(a: __m128) -> __m128 {
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
 pub fn _mm_rsqrt_ss(a: __m128) -> __m128 {
-    let x = a.0[0];
-    with_low_ps(a, sse_result_f32(x, x, 1.0 / x.sqrt()))
+    with_low_ps(a, rsqrt_f32(a.0[0]))
 }
 
 #[inline]
@@ -6294,14 +6334,19 @@ pub fn _mm_mullo_epi32(a: __m128i, b: __m128i) -> __m128i {
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
 pub fn _mm_rcp_ps(a: __m128) -> __m128 {
-    __m128([1.0 / a.0[0], 1.0 / a.0[1], 1.0 / a.0[2], 1.0 / a.0[3]])
+    let mut r = [0f32; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = rcp_f32(a.0[i]);
+        i += 1;
+    }
+    __m128(r)
 }
 
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
 pub fn _mm_rcp_ss(a: __m128) -> __m128 {
-    let x = a.0[0];
-    with_low_ps(a, sse_result_f32(x, x, 1.0 / x))
+    with_low_ps(a, rcp_f32(a.0[0]))
 }
 
 #[inline]

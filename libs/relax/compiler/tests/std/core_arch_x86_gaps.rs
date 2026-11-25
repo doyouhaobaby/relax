@@ -1,6 +1,5 @@
-// On x86_64 hosts, agree.sh compares these digests from rustc's core::arch
-// with the digests Relax produces from its own intrinsics on the same CPU.
-#![cfg(target_arch = "x86_64")]
+// On x86_64 hosts, agree.sh compares Relax's digests with rustc's on the same CPU.
+// On Arm hosts, it compares Relax's digests with the real x86_64 digests in arch/x86_64_gaps_real.txt.
 #![allow(non_snake_case)]
 include!("arch/common.rs");
 use core::arch::x86_64 as real;
@@ -15,8 +14,42 @@ const EXTRA_FLOATS: &[f32] = &[
     2_147_483_647.0, 2_147_483_648.0, -2_147_483_649.0, 9.3e18,
     2_147_483_520.0, -2_147_483_904.0,
     0.0, -0.0, 0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -1.0, 1.0,
+    // Exercise denormal inputs, the reciprocal flush boundary and NaN payloads.
+    f32::from_bits(0x006C_E3EE), f32::from_bits(0x8001_16C2), f32::from_bits(0x0000_0001),
+    f32::from_bits(0x7F00_0000), f32::from_bits(0xFF00_0000), f32::from_bits(0x7E80_0000),
+    f32::from_bits(0x7E80_1000), f32::from_bits(0x7E7F_F000), f32::from_bits(0x7E90_0000),
+    f32::from_bits(0x0080_0000), f32::from_bits(0x0100_0000), f32::from_bits(0x7F7F_FFFF),
+    f32::from_bits(0x7F80_0001), f32::from_bits(0xFFC0_0001),
 ];
 const FLOAT_CASES: usize = CASES + EXTRA_FLOATS.len();
+
+const FMA_FIXED: &[[u32; 3]] = &[
+    [0x7F80_0000, 0x0000_0000, 0x3F80_0000], // infinity times zero
+    [0x0000_0000, 0xFF80_0000, 0x3F80_0000], // zero times negative infinity
+    [0x7F80_0000, 0x0000_0000, 0x7FC0_0003], // invalid product with a NaN addend
+    [0x3F80_0000, 0x7FC0_0001, 0xFFC0_0002], // NaNs in b and c
+    // NaN in a and c: a multiplicand's NaN beats the addend's in every instruction form. With NaN in
+    // both a and b no row is kept: which comes back follows the form the compiler picks (132, 213 or
+    // 231 multiply in different orders), and rustc's own code differs between intrinsics.
+    [0x7FC0_0004, 0x3F80_0000, 0xFFC0_0006],
+    [0x3F80_0000, 0x7F80_0001, 0x7FC0_0007], // signaling b and quiet c
+    [0x7F80_0000, 0x3F80_0000, 0xFF80_0000], // infinity minus infinity
+    [0x8000_0000, 0x3F80_0000, 0x8000_0000], // two negative zeros
+    [0x8000_0000, 0x3F80_0000, 0x0000_0000], // opposite signed zeros
+];
+const FMA_CASES: usize = CASES + FMA_FIXED.len();
+
+unsafe fn fma_args<T: Copy>(rng: &mut Rng, case: usize, arg: usize) -> T {
+    if case < CASES {
+        return sample(rng, case, arg);
+    }
+    let lane = |i: usize| FMA_FIXED[(case - CASES + i) % FMA_FIXED.len()][arg];
+    match size_of::<T>() / 4 {
+        4 => cast(core::array::from_fn::<_, 4, _>(lane)),
+        8 => cast(core::array::from_fn::<_, 8, _>(lane)),
+        _ => unreachable!(),
+    }
+}
 
 unsafe fn float_lanes<const LANES: usize>(rng: &mut Rng, case: usize, arg: usize) -> [f32; LANES] {
     if case < CASES {
@@ -38,37 +71,33 @@ unsafe fn floats8(rng: &mut Rng, case: usize, arg: usize) -> real::__m256 {
 }
 
 fn add_estimate(d: &mut Digest, x: f32, result: f32, rsqrt: bool) {
-    let magnitude = x.to_bits() & 0x7fff_ffff;
-    if magnitude == 0 || magnitude >= f32::INFINITY.to_bits() {
-        let class = match result.to_bits() {
-            0x0000_0000 => 0,
-            0x8000_0000 => 1,
-            0x7f80_0000 => 2,
-            0xff80_0000 => 3,
-            _ if result.is_nan() => 4,
-            _ => 5,
-        };
-        d.add(&[class]);
-        return;
-    }
-
-    let exponent = (magnitude >> 23) as i32 - 127;
-    if !(-120..=120).contains(&exponent) {
-        return;
-    }
-    if rsqrt && x < 0.0 {
-        d.add(&[result.is_nan() as u8]);
+    let bits = x.to_bits();
+    let mag = bits & 0x7fff_ffff;
+    let sign = bits & 0x8000_0000;
+    // The hardware specifies every result bit for special operands and guaranteed flushes.
+    if mag < 0x0080_0000
+        || mag >= 0x7f80_0000
+        || (rsqrt && sign != 0)
+        || (!rsqrt && mag >= 0x7e80_3001)
+    {
+        d.add(&result.to_bits().to_le_bytes());
         return;
     }
     let x = f64::from(x);
     let exact = if rsqrt { 1.0 / x.sqrt() } else { 1.0 / x };
     let accurate = (f64::from(result) - exact).abs() <= exact.abs() * (1.5 / 4096.0);
-    d.add(&[accurate as u8]);
+    if !rsqrt && mag > 0x7e7f_e800 {
+        // Either signed zero or an accurate estimate is valid at the flush boundary.
+        d.add(&[(result.to_bits() == sign || accurate) as u8]);
+    } else {
+        // Normal estimates may differ within the hardware's relative error bound.
+        d.add(&[accurate as u8]);
+    }
 }
 
 macro_rules! require_feature {
     ($name:ident, $feature:tt) => {
-        if !std::is_x86_feature_detected!($feature) {
+        if cfg!(target_arch = "x86_64") && !std::is_x86_feature_detected!($feature) {
             eprintln!("{}: {} unavailable", stringify!($name), $feature);
             return;
         }
@@ -975,42 +1004,42 @@ fn b124__mm_testnzc_si128() {
 
 #[test]
 fn b125__mm_fmadd_ss() {
-    sampled!(_mm_fmadd_ss, "fma", 125, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fmadd_ss, "fma", 125, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b126__mm_fmaddsub_ps() {
-    sampled!(_mm_fmaddsub_ps, "fma", 126, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fmaddsub_ps, "fma", 126, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b127__mm_fmsub_ss() {
-    sampled!(_mm_fmsub_ss, "fma", 127, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fmsub_ss, "fma", 127, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b128__mm_fmsubadd_ps() {
-    sampled!(_mm_fmsubadd_ps, "fma", 128, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fmsubadd_ps, "fma", 128, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b129__mm_fnmadd_ss() {
-    sampled!(_mm_fnmadd_ss, "fma", 129, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fnmadd_ss, "fma", 129, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b130__mm_fnmsub_ss() {
-    sampled!(_mm_fnmsub_ss, "fma", 130, CASES, sample, [0, 1, 2]);
+    sampled!(_mm_fnmsub_ss, "fma", 130, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b131__mm256_fmaddsub_ps() {
-    sampled!(_mm256_fmaddsub_ps, "fma", 131, CASES, sample, [0, 1, 2]);
+    sampled!(_mm256_fmaddsub_ps, "fma", 131, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 #[test]
 fn b132__mm256_fmsubadd_ps() {
-    sampled!(_mm256_fmsubadd_ps, "fma", 132, CASES, sample, [0, 1, 2]);
+    sampled!(_mm256_fmsubadd_ps, "fma", 132, FMA_CASES, fma_args, [0, 1, 2]);
 }
 
 // AVX
@@ -1424,4 +1453,26 @@ fn b187__mm256_undefined_si256() {
 #[test]
 fn b188__mm256_zextps128_ps256() {
     sampled!(_mm256_zextps128_ps256, "avx", 188, CASES, sample, [0]);
+}
+
+#[test]
+fn b189__mm_rcp_ps() {
+    cases!(_mm_rcp_ps, "sse", 189, FLOAT_CASES, "none", |rng, case, d| {
+        let input = float_lanes::<4>(rng, case, 0);
+        let output: [f32; 4] = cast(real::_mm_rcp_ps(cast(input)));
+        for i in 0..4 {
+            add_estimate(d, input[i], output[i], false);
+        }
+    });
+}
+
+#[test]
+fn b190__mm_rsqrt_ps() {
+    cases!(_mm_rsqrt_ps, "sse", 190, FLOAT_CASES, "none", |rng, case, d| {
+        let input = float_lanes::<4>(rng, case, 0);
+        let output: [f32; 4] = cast(real::_mm_rsqrt_ps(cast(input)));
+        for i in 0..4 {
+            add_estimate(d, input[i], output[i], true);
+        }
+    });
 }
