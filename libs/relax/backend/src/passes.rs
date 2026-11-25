@@ -2156,15 +2156,19 @@ pub static SINCOS: relax_session::sync::Mutex<[Option<(u32, u32, Sym)>; 2]> = re
 /// that reads its captured angle for a cos and again for a sin is paired as rustc pairs it, in its
 /// own build and inlined alike: unpaired in the one, paired in the other, a program's floats
 /// changed in the last bit when its code tiered up (a patchmatch normal on arm64). A store, an
-/// unknown call or an opaque value between the loads keeps them apart, as it does for LLVM.
+/// unknown call or an opaque value between the loads keeps them apart, as it does for LLVM. Only
+/// the float methods' calls pair (CSig::math): LLVM keeps a `sin` and a `cos` the program
+/// declares itself as calls, which may write errno, and pairs them nowhere.
 pub fn fuse_sincos(f: &mut Func) -> bool {
     let tab = *SINCOS.lock().unwrap_or_else(|e| e.into_inner());
     if tab.iter().all(|t| t.is_none()) {
         return false;
     }
+    // a float method's sin or cos (CSig::math): a C `sin` the program declares itself is a call
+    // that may write errno for LLVM, neither paired nor read through
     let kind = |i: &Inst| -> Option<(usize, bool, VReg, VReg)> {
-        let Inst::Call(Callee::CHost(s, _), args, rets) = i else { return None };
-        if args.len() != 1 || rets.len() != 1 {
+        let Inst::Call(Callee::CHost(s, sig), args, rets) = i else { return None };
+        if args.len() != 1 || rets.len() != 1 || !sig.math {
             return None;
         }
         (0..2).find_map(|w| {
@@ -9070,13 +9074,18 @@ mod tests {
         // calls two; inlined, the angle was one value and the calls one __sincos_stret, which
         // differs in the last bit: a patchmatch normal changed when its code tiered up (arm64).
         // rustc's LLVM reads the angle once (llvm.sin / llvm.cos write no memory) and pairs the
-        // calls; a store or an unknown call between the reads keeps them two values, unpaired.
+        // calls; a store or an unknown call between the reads keeps them two values, unpaired. A
+        // sin and a cos the program declares itself (`extern "C"`) are calls that may write
+        // errno for LLVM: never paired, never read through.
         let (sin, cos, both, other) = (Sym::new(u32::MAX - 20), Sym::new(u32::MAX - 21), Sym::new(u32::MAX - 22), Sym::new(u32::MAX - 23));
         SINCOS.lock().unwrap()[1] = Some((sin.id, cos.id, both));
-        let sig = || Box::new(CSig { conv: CConv::Host, args: vec![CArg::Scalar(Mem::F64)], ret: None, n_fixed: u32::MAX, ret_narrow: None, unwinds: false });
+        let user = |math: bool| Box::new(CSig { conv: CConv::Host, args: vec![CArg::Scalar(Mem::F64)], ret: None, n_fixed: u32::MAX, ret_narrow: None, unwinds: false, math });
+        // the float methods' calls (core's libm: CSig::math)
+        let sig = || user(true);
         // the angle at [env + 8] (nested: at [[env + 8]]), read for the cos, `between`, read again at
-        // `off2` for the sin: whether the two calls became one
-        let paired = |between: &dyn Fn(&mut Func, VReg, VReg) -> Vec<Inst>, nested: bool, off2: i32| -> bool {
+        // `off2` for the sin: whether the two calls became one. `math`: the calls are the float
+        // methods' (else the program's own `extern "C"` sin and cos)
+        let paired_as = |between: &dyn Fn(&mut Func, VReg, VReg) -> Vec<Inst>, nested: bool, off2: i32, math: bool| -> bool {
             let mut f = Func::new("sincos_reads".into(), 0);
             let env = f.vreg(Cls::I);
             f.params = vec![env];
@@ -9093,11 +9102,11 @@ mod tests {
             };
             let (mut insts, a) = read(&mut f, 8);
             let (c, s) = (f.vreg(Cls::F64), f.vreg(Cls::F64));
-            insts.push(Inst::Call(Callee::CHost(cos, sig()), vec![a], vec![c]));
+            insts.push(Inst::Call(Callee::CHost(cos, user(math)), vec![a], vec![c]));
             insts.extend(between(&mut f, env, c));
             let (second, b) = read(&mut f, off2);
             insts.extend(second);
-            insts.push(Inst::Call(Callee::CHost(sin, sig()), vec![b], vec![s]));
+            insts.push(Inst::Call(Callee::CHost(sin, user(math)), vec![b], vec![s]));
             f.blocks[0].pos = vec![0; insts.len()];
             f.blocks[0].insts = insts;
             f.blocks[0].term = Term::Ret(vec![c, s]);
@@ -9106,6 +9115,7 @@ mod tests {
             f.verify().unwrap();
             f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Call(Callee::Host(h), _, r) if *h == both && r.len() == 2))
         };
+        let paired = |between: &dyn Fn(&mut Func, VReg, VReg) -> Vec<Inst>, nested: bool, off2: i32| paired_as(between, nested, off2, true);
         let nothing = |_: &mut Func, _: VReg, _: VReg| Vec::new();
         // other reads and float work between: memory as it was
         let reads = |f: &mut Func, env: VReg, c: VReg| {
@@ -9123,7 +9133,14 @@ mod tests {
             assert!(!paired(&store, nested, 8), "a store between (nested {nested}): two values, as LLVM's, unpaired");
             assert!(!paired(&call, nested, 8), "an unknown call between (nested {nested}): two values, unpaired");
             assert!(!paired(&nothing, nested, 16), "two addresses (nested {nested}): unpaired");
+            assert!(!paired_as(&nothing, nested, 8, false), "the program's own extern \"C\" sin and cos (nested {nested}): calls, as LLVM keeps them, unpaired");
         }
+        // ... nor read through: one between two reads may write (errno, for LLVM)
+        let user_call = |f: &mut Func, _: VReg, c: VReg| {
+            let t = f.vreg(Cls::F64);
+            vec![Inst::Call(Callee::CHost(sin, user(false)), vec![c], vec![t])]
+        };
+        assert!(!paired(&user_call, false, 8), "the program's own sin between the reads: two values, unpaired");
     }
 
     #[test]

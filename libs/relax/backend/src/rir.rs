@@ -990,6 +990,12 @@ pub struct CSig {
     /// the call has an unwind edge, as a Rust call does. Other C-family ABIs abort a panic
     /// leaving their body.
     pub unwinds: bool,
+    /// a math function as Relax's core declares it for the float methods (`f64::sin` calls
+    /// core's libm `sin`), where rustc emits an LLVM math intrinsic (`llvm.sin`: no memory read
+    /// or written, so loads merge across it and a sin and a cos of one value pair:
+    /// passes::fuse_sincos). A C function the program declares itself (`extern "C" { fn sin }`)
+    /// stays a call that may write errno for LLVM, never paired.
+    pub math: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

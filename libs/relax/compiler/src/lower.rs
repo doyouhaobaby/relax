@@ -11747,7 +11747,11 @@ impl<'a> Lcx<'a> {
                     };
                     let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
                     rt_host_notes(u, &types, RtBoundary::Foreign, |name| self.rt_note(name));
-                    Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi)))
+                    let mut cs = crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi);
+                    // core's libm declarations, the float methods' math: LLVM intrinsics in rustc
+                    // (CSig::math); one the program declares is a plain C call
+                    cs.math = u.prog.def(d).krate == u.core_crate && u.prog.def_path(d).starts_with("core::libm::");
+                    Callee::CHost(address, Box::new(cs))
                 } else if sig.header.abi.is_c_like() {
                     let cs = crate::cabi::c_sig(self.u, &types, ret, None, sig.header.abi);
                     Callee::CFn(self.u.instance_fn_id(instance), Box::new(cs))

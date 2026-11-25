@@ -48,6 +48,19 @@ fn apart_store(a: &Cell<f64>, v: f64) -> (f64, f64) {
     (c, a.get().sin())
 }
 
+// the program's own C sin and cos: LLVM keeps them calls (they may write errno) and pairs them
+// nowhere, though the float methods' sin and cos of the same value pair
+mod c_math {
+    extern "C" {
+        pub fn sin(x: f64) -> f64;
+        pub fn cos(x: f64) -> f64;
+    }
+}
+
+fn own_pair(x: f64) -> (f64, f64) {
+    unsafe { (c_math::cos(x), c_math::sin(x)) }
+}
+
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 mod native {
     #[repr(C)]
@@ -63,9 +76,6 @@ mod native {
     extern "C" {
         pub fn __sincosf_stret(x: f32) -> Sc32;
         pub fn __sincos_stret(x: f64) -> Sc64;
-        // separate calls (opaque operands: neither compiler pairs these)
-        pub fn sin(x: f64) -> f64;
-        pub fn cos(x: f64) -> f64;
     }
 }
 
@@ -87,15 +97,19 @@ fn run() {
             let cell = Cell::new(angle);
             let (c1, s1) = apart_call(&cell, hook);
             let (c2, s2) = apart_store(&cell, black_box(angle));
+            let (c3, s3) = own_pair(angle);
             d = fold(d, n.iter().fold(c1.to_bits() ^ s1.to_bits().rotate_left(3) ^ c2.to_bits().rotate_left(11) ^ s2.to_bits().rotate_left(17), |h, v| fold(h, v.to_bits())));
+            d = fold(d, c3.to_bits() ^ s3.to_bits().rotate_left(23));
             #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
             {
                 let r = unsafe { native::__sincos_stret(angle) };
                 let want: [f64; 3] = std::array::from_fn(|k| axis[k] * 0.5 + 0.25 * (tangent[k] * r.cos + bitangent[k] * r.sin));
                 assert!(n.map(f64::to_bits) == want.map(f64::to_bits), "round {round}: the captured angle's sin and cos at {angle} are not __sincos_stret's");
-                let (sn, cs) = unsafe { (native::sin(black_box(angle)), native::cos(black_box(angle))) };
+                // separate calls (opaque operands: neither compiler pairs these)
+                let (sn, cs) = unsafe { (c_math::sin(black_box(angle)), c_math::cos(black_box(angle))) };
                 assert!(c1.to_bits() == cs.to_bits() && s1.to_bits() == sn.to_bits(), "round {round}: a call between the reads, yet sin and cos at {angle} were paired");
                 assert!(c2.to_bits() == cs.to_bits() && s2.to_bits() == sn.to_bits(), "round {round}: a store between the reads, yet sin and cos at {angle} were paired");
+                assert!(c3.to_bits() == cs.to_bits() && s3.to_bits() == sn.to_bits(), "round {round}: the program's own extern \"C\" sin and cos at {angle} were paired");
             }
             if round == 2 {
                 a = fold(a, co.to_bits() as u64 ^ (si.to_bits() as u64) << 32);
