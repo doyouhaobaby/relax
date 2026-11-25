@@ -1514,6 +1514,16 @@ fn cmd_jit(req: &Req, out: &mut Out) {
         all / 1_000_000,
         blocks
     ));
+    // PGO's counted windows: profiled picks that leave again and again are a queue and a pick that disagree
+    let (left, once, more) = crate::jit::profiled_left_counts();
+    out.line(&format!(
+        "PGO: {} counted builds, {} slots parked in their counted code now; profiled O3 picks that left: {} ({} slots once, {} more often)",
+        crate::jit::PGO_STATS[0].load(std::sync::atomic::Ordering::Relaxed),
+        crate::jit::tier_parked(crate::jit::wall_ns()).len(),
+        left,
+        once,
+        more
+    ));
     out.line(&crate::jit::queue_held_line());
     // a program that presents frames: its rate in the same window (0 = it draws nothing now)
     if f1 > 0 {

@@ -20985,13 +20985,31 @@ mod tier_cost_tests {
         // a handler: a few calls a second; a loop driver: the bar's work over the window, twice over
         let per_window = (2 * PGO_MIN_WORK * 2 * PGO_MS / 1000).div_ceil(4 * 8);
         let (handler, driver, untouched) = (u32::MAX - 1, u32::MAX - 2, u32::MAX - 3);
-        COUNTING.lock().unwrap().extend([window(handler, 3), window(driver, per_window), window(untouched, per_window)]);
+        // a parked slot whose PGO_WORK_NS window lands just over the bar (5% over)
+        let edge = u32::MAX - 6;
+        let edge_window = Counting { mark: (0, now - PGO_WORK_NS), ..window(edge, (PGO_MIN_WORK + PGO_MIN_WORK / 20).div_ceil(4 * 8)) };
+        COUNTING.lock().unwrap().extend([window(handler, 3), window(driver, per_window), window(untouched, per_window), edge_window]);
         assert!(pgo_credit(handler, true) && pgo_credit(driver, true), "both are lukewarm counting slots");
         pgo_poll_at(now);
         let left = |id: u32| COUNTING.lock().unwrap().iter().find(|e| e.id == id).map(|e| (e.parked, e.credited));
         assert_eq!(left(handler), Some((true, false)), "the handler stays parked in its counted code: a loop under it is not its work");
         assert_eq!(left(driver), None, "the driver's own work takes it to O3");
         assert_eq!(left(untouched), Some((true, false)), "a parked window no loop ran under waits for its PGO_WORK_NS look");
+        // Why: the pick read the record against the O3 threshold, which a window at the bar fills
+        // to about a quarter: the slot left at its pick, parked, and its next window queued it
+        // again (a CAD session's slot went round 106 times in 200 s, never at O3). The pick reads
+        // its counts: the window's promise holds in one round trip, and a slot whose code went
+        // cold while it waited leaves for good
+        assert_eq!(left(edge), None, "a window just over the bar queues the slot");
+        assert_eq!(profiled_pick_cold(edge, now + 1_000_000), None, "its pick builds what its window queued");
+        assert_eq!(profiled_pick_cold(driver, now + 1_000_000), None, "so does the driver's");
+        assert_eq!(profiled_pick_cold(edge, now + PGO_WORK_NS), Some(0), "a pick a window later, its code idle since: cold, it leaves");
+        {
+            let g = PROFILED_HEAT.lock().unwrap();
+            let e = g.iter().find(|e| e.id == edge).unwrap();
+            for c in e.counters { c.fetch_add(PGO_MIN_WORK.div_ceil(4 * 8), Ordering::Relaxed); }
+        }
+        assert_eq!(profiled_pick_cold(edge, now + PGO_WORK_NS), None, "its code still working at the bar: built");
         // `why-tier parked`: the parked slots with the work of their last look and of their window so far
         let parked = tier_parked(now);
         let row = |id: u32| parked.iter().find(|p| p.0 == id).copied();
@@ -22621,16 +22639,16 @@ enum Pick {
     Build,
     /// a calls entry under the threshold: its count stub goes back and it counts again, cost so far
     Recount(u64),
-    /// a loop or profiled entry under the threshold: its code went cold while it waited
+    /// a loop entry under the threshold: its code went cold while it waited
     Cold(u64),
 }
 
 /// The pick's decision for a queued slot's record `rec` queued for `why`. A calls entry's stub is
 /// out of the slot while it waits (queue_counting): its calls do not charge the record, so a cost
 /// under the threshold says nothing and it is counted again (its loops still charge it: at or
-/// over, it is built). Loop counters and counted code charge the record while it waits, so a loop
-/// or profiled entry under the threshold went cold. One that left to be counted again and queued
-/// itself again is built: its recount is the evidence.
+/// over, it is built). Loop counters charge the record while it waits, so a loop entry under the
+/// threshold went cold (a profiled entry's pick reads its counts: profiled_pick_cold). One that
+/// left to be counted again and queued itself again is built: its recount is the evidence.
 unsafe fn pick_decision(rec: *const AtomicU64, why: u8, threshold: u64, now: u64) -> Pick {
     if (*rec.add(5)).fetch_and(!PICK_RECOUNTED, Ordering::Relaxed) & PICK_RECOUNTED != 0 {
         return Pick::Build;
@@ -22657,8 +22675,9 @@ unsafe fn retier_decision(rec: *const AtomicU64, threshold: u64, now: u64) -> Pi
 /// The O3 entry a worker picked (run_o3): an entry queued by its calls, its loops or its counted
 /// window is built only on evidence at the pick, not at the queueing seconds before (a large app's
 /// cold start: 3k entries, most of them load code that had stopped running when a worker reached
-/// it 25 s later). Loop counters (rt_loop_hot) and counted code (profiled_heat) charge the record
-/// while it waits: under the threshold, the entry leaves. A calls entry's count stub is out of the
+/// it 25 s later). Loop counters (rt_loop_hot) charge the record while it waits: under the
+/// threshold, the entry leaves. A profiled entry is judged by its counts, in its window's units
+/// (profiled_pick_cold): it leaves only when its code went cold. A calls entry's count stub is out of the
 /// slot while it waits: under the threshold, its stub goes back and it counts again, and queued
 /// again it is built at its next pick (pick_decision). A slot queued by its calls or loops counts
 /// again in its count stub and queues itself again once it is hot; a profiled one stays in its
@@ -22695,6 +22714,23 @@ fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
             }
             return false;
         }
+        // a profiled entry: its window's evidence, in the window's units
+        if why == Q_PROFILED {
+            let Some(per_s) = profiled_pick_cold(id, wall_ns()) else { return false };
+            // its counted code stays, its window parked (its counters, as profiled_heat keeps
+            // them while the build runs; gone: built)
+            if !pgo_park_profiled(id) {
+                return false;
+            }
+            let waited = wall_ns().saturating_sub(at);
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::LEFT, why, waited, per_s);
+            TIER_LEFT.fetch_add(1, Ordering::Relaxed);
+            profiled_left(id);
+            if tier1_trace() {
+                eprintln!("O3q @{:.3} #{} left at its pick after {:.1} s: {} insts/s since it was queued, under {}", wall_ns() as f64 / 1e9, id, waited as f64 / 1e9, per_s, PGO_MIN_WORK);
+            }
+            return true;
+        }
         let (now, wall) = tier_clocks();
         let decision = if why == Q_RETIER { retier_decision(rec, threshold, now) } else { pick_decision(rec, why, threshold, now) };
         let (cost, recount) = match decision {
@@ -22703,13 +22739,7 @@ fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
             Pick::Cold(cost) => (cost, false),
         };
         let waited = wall_ns().saturating_sub(at);
-        if why == Q_PROFILED {
-            // its counted code stays, its window parked (its counters, as profiled_heat keeps
-            // them while the build runs; gone: built)
-            if !pgo_park_profiled(id) {
-                return false;
-            }
-        } else if why == Q_RETIER {
+        if why == Q_RETIER {
             if !owner::publish(|| (&mut *up).retier_recount(id, threshold, cost, now, wall)) {
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::KEPT, 0, waited, 0);
                 return false;
@@ -23285,6 +23315,8 @@ pub(crate) fn tier1_stats_report() {
         eprintln!("relax o3-stats: outline {event} ({reason}) n={n} part_cpu_ms={:.3} mean_ms={:.3} total_gap_bytes={}", ms(*cpu), ms(*cpu) / *n as f64, relax_backend::passes::OUTLINE_GAP_BYTES.load(Ordering::Relaxed));
     }
     eprintln!("relax o3-stats: pgo counted_builds={} parked={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} final_loop_unfinals={}", PGO_STATS[0].load(Ordering::Relaxed), PGO_PARKED.load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), PGO_LOOP_UNFINALS.load(Ordering::Relaxed));
+    let (left, once, more) = profiled_left_counts();
+    eprintln!("relax o3-stats: pgo profiled_left={left} left_once={once} left_more={more}");
     eprintln!("relax o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("relax o3-stats: backend_pass_ms {} (pass slots can overlap; RELAX_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -23974,12 +24006,9 @@ fn pgo_poll_at(now: u64) {
     }
     for (id, rate, counters, weights) in ready {
         // its counted code runs on until the O3 build: the work its counts show goes into the
-        // record, the queue's heat, a window's worth at the window's rate now and the rest as it
-        // comes (profiled_heat). Left to profiled_heat's next look, the window's worth came after
-        // the pick when an idle worker took the entry at once: the pick read the record as the
-        // slot's calls had left it, under the bar while its counted code ran hot, parked the slot
-        // as cold code, and each next window queued it for the same pick again (a hot loop's
-        // callee that had been lukewarm never reached O3)
+        // record, the queue's heat (its order among the builds), a window's worth at the window's
+        // rate now and the rest as it comes (profiled_heat). Its pick reads its counts, not the
+        // record (profiled_pick_cold)
         let total = counters.iter().zip(weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
         let window = rate.saturating_mul(PGO_MS) / 1000;
         let mut work = total.saturating_sub(window);
@@ -23995,7 +24024,7 @@ fn pgo_poll_at(now: u64) {
                 }
             }
         }
-        crate::zone_alloc::kept_with(|| PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).push(ProfiledHeat { id, counters, weights, work }));
+        crate::zone_alloc::kept_with(|| PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).push(ProfiledHeat { id, counters, weights, work, queued: (total, now) }));
         tier_push(id, Q_PROFILED, rate);
     }
 }
@@ -24007,6 +24036,9 @@ struct ProfiledHeat {
     counters: &'static [AtomicU64],
     weights: &'static [u32],
     work: u64,
+    /// its counts' work and wall_ns when its window queued it: its pick reads what it did since
+    /// (profiled_pick_cold)
+    queued: (u64, u64),
 }
 static PROFILED_HEAT: relax_session::sync::Mutex<Vec<ProfiledHeat>> = relax_session::sync::Mutex::new(Vec::new());
 /// RIR instructions of counted work per cost unit (a back edge's; a loop iteration is ~8 instructions)
@@ -24046,6 +24078,42 @@ fn profiled_heat() {
         e.work = work;
         true
     });
+}
+
+/// A profiled entry's pick (o3_pick_cold), in its window's units. pgo_poll_at queued it on a window
+/// of at least PGO_MIN_WORK of its own work a second, so it is built unless its counted code went
+/// cold while it waited: PGO_WORK_NS or more in the queue with less than PGO_MIN_WORK a second
+/// since. Some(work a second since it was queued): cold. (The pick read the record against the O3
+/// threshold: a window at the bar charges about a quarter of it, so such a slot left at its pick,
+/// parked, and its next window queued it again, for good -- a CAD session's slot went round 106
+/// times in 200 s and never reached O3.)
+fn profiled_pick_cold(id: u32, now: u64) -> Option<u64> {
+    let g = PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.iter().find(|e| e.id == id)?;
+    let waited = now.saturating_sub(e.queued.1);
+    if waited < PGO_WORK_NS {
+        return None;
+    }
+    let work = e.counters.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+    let per_s = (work.saturating_sub(e.queued.0) as u128 * 1_000_000_000 / waited as u128).min(u64::MAX as u128) as u64;
+    (per_s < PGO_MIN_WORK).then_some(per_s)
+}
+
+/// Profiled entries that left at their pick: (leaves, per slot its leaves). A slot that leaves
+/// again and again is queued by its windows and refused by its picks (`jit`: PGO line).
+static PROFILED_LEFT: relax_session::sync::Mutex<(u64, Option<HashMap<u32, u32>>)> = relax_session::sync::Mutex::new((0, None));
+fn profiled_left(id: u32) {
+    crate::zone_alloc::kept_with(|| {
+        let mut g = PROFILED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 += 1;
+        *g.1.get_or_insert_with(HashMap::new).entry(id).or_default() += 1;
+    });
+}
+/// (profiled entries that left at their pick, slots that left once, slots that left more often)
+pub(crate) fn profiled_left_counts() -> (u64, usize, usize) {
+    let g = PROFILED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    let once = g.1.iter().flatten().filter(|e| *e.1 == 1).count();
+    (g.0, once, g.1.as_ref().map_or(0, |m| m.len()) - once)
 }
 
 /// A profiled slot whose code went cold before its O3 build (o3_pick_cold): its counted code stays,
@@ -37471,6 +37539,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&COUNTING, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PGO_DECIDES, std::sync::atomic::AtomicBool::new(false));
     reset(&PGO_PARKED, AtomicU64::new(0));
+    reset(&PROFILED_LEFT, relax_session::sync::Mutex::new((0, None)));
     reset(&PGO_STATS, [const { AtomicU64::new(0) }; 4]);
     reset(&PGO_LOOP_UNFINALS, AtomicU64::new(0));
     reset(&PROFILED_HEAT, relax_session::sync::Mutex::new(Vec::new()));

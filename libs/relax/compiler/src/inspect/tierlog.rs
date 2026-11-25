@@ -285,6 +285,8 @@ pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
         ev::ARM => format!("count stub armed on {} ({})", code(e.b), ARM_WHY.get(e.why as usize).unwrap_or(&"?")),
         ev::CHECK => format!("cost check on {}: decayed cost {} under the threshold", code(e.b), e.a),
         ev::QUEUE => format!("queued for O3 by {}{}{}", Q_WHY.get(e.why as usize).unwrap_or(&"?"), if e.a > 0 { format!(" at {} cost/s", e.a) } else { String::new() }, if e.b != 0 { format!(" on {}", code(e.b)) } else { String::new() }),
+        // (a profiled entry's pick reads its counts: jit.rs profiled_pick_cold)
+        ev::LEFT if e.why == 4 => format!("left the O3 queue at its pick (profiled) after {}: {} instructions a second of its own work since it was queued, under {}", ms(e.a), e.b, crate::jit::PGO_MIN_WORK),
         ev::LEFT => format!("left the O3 queue at its pick ({}) after {}: cost {} under the threshold", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a), e.b),
         ev::KEPT => "O3 queue entry stays queued (other code was installed meanwhile)".into(),
         ev::POP => format!("taken by an O3 worker ({}) after {} in the queue", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a)),
