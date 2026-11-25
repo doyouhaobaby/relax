@@ -2149,6 +2149,14 @@ pub static SINCOS: relax_session::sync::Mutex<[Option<(u32, u32, Sym)>; 2]> = re
 /// by the time LLVM selects instructions. The call goes where the earlier of the two was; the
 /// later's result is defined there too, so it must be neither read nor written in between (RIR
 /// vregs are mutable).
+///
+/// The same value is the same as LLVM's GVN makes it: two loads of one address with nothing that
+/// may write memory between them read one value, and `llvm.sin` / `llvm.cos` write none (rustc
+/// emits them for f32/f64 `sin` / `cos`), where here the libm calls count as writes. So a closure
+/// that reads its captured angle for a cos and again for a sin is paired as rustc pairs it, in its
+/// own build and inlined alike: unpaired in the one, paired in the other, a program's floats
+/// changed in the last bit when its code tiered up (a patchmatch normal on arm64). A store, an
+/// unknown call or an opaque value between the loads keeps them apart, as it does for LLVM.
 pub fn fuse_sincos(f: &mut Func) -> bool {
     let tab = *SINCOS.lock().unwrap_or_else(|e| e.into_inner());
     if tab.iter().all(|t| t.is_none()) {
@@ -2166,7 +2174,7 @@ pub fn fuse_sincos(f: &mut Func) -> bool {
     };
     // the value an operand holds at instruction `at`: followed back through `Mov` copies within
     // the block to (vreg, index of its defining instruction or none for a value live into the block)
-    let ident = |insts: &[Inst], at: usize, v: VReg| -> (VReg, Option<usize>) {
+    let def = |insts: &[Inst], at: usize, v: VReg| -> (VReg, Option<usize>) {
         let (mut v, mut at) = (v, at);
         loop {
             let def = (0..at).rev().find(|&k| {
@@ -2186,6 +2194,31 @@ pub fn fuse_sincos(f: &mut Func) -> bool {
             }
         }
     };
+    // instructions that leave memory as it was: pure ones, loads, and the libm calls the pairing
+    // knows (memory(none) in LLVM), lone or already paired
+    let quiet = |i: &Inst| {
+        is_pure(i)
+            || kind(i).is_some()
+            || matches!(i, Inst::Call(Callee::Host(s), a, r) if a.len() == 1 && r.len() == 2 && tab.iter().flatten().any(|t| t.2.id == s.id))
+    };
+    // whether operand `a` at instruction `at_a` and `b` at `at_b` hold one value: one definition, or
+    // loads of one address (the same kind and offset from one base value) with only quiet
+    // instructions between them, the bases compared alike
+    let same = |insts: &[Inst], (mut at_a, mut a): (usize, VReg), (mut at_b, mut b): (usize, VReg)| -> bool {
+        loop {
+            let (da, db) = (def(insts, at_a, a), def(insts, at_b, b));
+            if da == db {
+                return true;
+            }
+            let (Some(ka), Some(kb)) = (da.1, db.1) else { return false };
+            let (Inst::Load(ma, _, base_a, off_a), Inst::Load(mb, _, base_b, off_b)) = (&insts[ka], &insts[kb]) else { return false };
+            let (lo, hi) = (ka.min(kb), ka.max(kb));
+            if ma != mb || off_a != off_b || !insts[lo + 1..hi].iter().all(|i| quiet(i)) {
+                return false;
+            }
+            (at_a, a, at_b, b) = (ka, *base_a, kb, *base_b);
+        }
+    };
     let mut changed = false;
     for bi in 0..f.blocks.len() {
         let mut n = 0;
@@ -2194,10 +2227,9 @@ pub fn fuse_sincos(f: &mut Func) -> bool {
                 let insts = &f.blocks[bi].insts;
                 let (w, is_sin, x, r1) = kind(&insts[n])?;
                 let both = tab[w]?.2;
-                let id1 = ident(insts, n, x);
                 for m in n + 1..insts.len() {
                     if let Some((w2, s2, x2, r2)) = kind(&insts[m]) {
-                        if w2 == w && s2 != is_sin && ident(insts, m, x2) == id1 {
+                        if w2 == w && s2 != is_sin && same(insts, (n, x), (m, x2)) {
                             let touched = |v: VReg| {
                                 insts[n + 1..m].iter().any(|i| {
                                     let mut t = false;
@@ -9030,6 +9062,69 @@ mod wasm_rt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sin_and_cos_of_one_address_read_twice_pair_unless_memory_may_change_between() {
+        // Why: a closure read its captured angle for a cos and again for a sin. The libm call
+        // counted as a write, so in the closure's own build the reads stayed two values and the
+        // calls two; inlined, the angle was one value and the calls one __sincos_stret, which
+        // differs in the last bit: a patchmatch normal changed when its code tiered up (arm64).
+        // rustc's LLVM reads the angle once (llvm.sin / llvm.cos write no memory) and pairs the
+        // calls; a store or an unknown call between the reads keeps them two values, unpaired.
+        let (sin, cos, both, other) = (Sym::new(u32::MAX - 20), Sym::new(u32::MAX - 21), Sym::new(u32::MAX - 22), Sym::new(u32::MAX - 23));
+        SINCOS.lock().unwrap()[1] = Some((sin.id, cos.id, both));
+        let sig = || Box::new(CSig { conv: CConv::Host, args: vec![CArg::Scalar(Mem::F64)], ret: None, n_fixed: u32::MAX, ret_narrow: None, unwinds: false });
+        // the angle at [env + 8] (nested: at [[env + 8]]), read for the cos, `between`, read again at
+        // `off2` for the sin: whether the two calls became one
+        let paired = |between: &dyn Fn(&mut Func, VReg, VReg) -> Vec<Inst>, nested: bool, off2: i32| -> bool {
+            let mut f = Func::new("sincos_reads".into(), 0);
+            let env = f.vreg(Cls::I);
+            f.params = vec![env];
+            f.rets = vec![Cls::F64, Cls::F64];
+            f.block();
+            let read = |f: &mut Func, off: i32| -> (Vec<Inst>, VReg) {
+                let v = f.vreg(Cls::F64);
+                if nested {
+                    let q = f.vreg(Cls::I);
+                    (vec![Inst::Load(Mem::Int(8, false), q, env, 8), Inst::Load(Mem::F64, v, q, off)], v)
+                } else {
+                    (vec![Inst::Load(Mem::F64, v, env, off)], v)
+                }
+            };
+            let (mut insts, a) = read(&mut f, 8);
+            let (c, s) = (f.vreg(Cls::F64), f.vreg(Cls::F64));
+            insts.push(Inst::Call(Callee::CHost(cos, sig()), vec![a], vec![c]));
+            insts.extend(between(&mut f, env, c));
+            let (second, b) = read(&mut f, off2);
+            insts.extend(second);
+            insts.push(Inst::Call(Callee::CHost(sin, sig()), vec![b], vec![s]));
+            f.blocks[0].pos = vec![0; insts.len()];
+            f.blocks[0].insts = insts;
+            f.blocks[0].term = Term::Ret(vec![c, s]);
+            f.verify().unwrap();
+            fuse_sincos(&mut f);
+            f.verify().unwrap();
+            f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Call(Callee::Host(h), _, r) if *h == both && r.len() == 2))
+        };
+        let nothing = |_: &mut Func, _: VReg, _: VReg| Vec::new();
+        // other reads and float work between: memory as it was
+        let reads = |f: &mut Func, env: VReg, c: VReg| {
+            let (x, y) = (f.vreg(Cls::F64), f.vreg(Cls::F64));
+            vec![Inst::Load(Mem::F64, x, env, 16), Inst::FBin(FOp::Mul, true, y, x, c)]
+        };
+        let store = |_: &mut Func, env: VReg, c: VReg| vec![Inst::Store(Mem::F64, env, 24, c)];
+        let call = |f: &mut Func, _: VReg, c: VReg| {
+            let t = f.vreg(Cls::F64);
+            vec![Inst::Call(Callee::CHost(other, sig()), vec![c], vec![t])]
+        };
+        for nested in [false, true] {
+            assert!(paired(&nothing, nested, 8), "one address read twice, nothing between (nested {nested}): one value, paired");
+            assert!(paired(&reads, nested, 8), "reads and float work between (nested {nested}): paired");
+            assert!(!paired(&store, nested, 8), "a store between (nested {nested}): two values, as LLVM's, unpaired");
+            assert!(!paired(&call, nested, 8), "an unknown call between (nested {nested}): two values, unpaired");
+            assert!(!paired(&nothing, nested, 16), "two addresses (nested {nested}): unpaired");
+        }
+    }
 
     #[test]
     fn sroa_preserves_memory_bytes_copied_through_a_slot_to_a_part_record() {
