@@ -10943,8 +10943,8 @@ pub struct MainCompile {
     /// its preparation's shape: ready candidates, deferred candidates, tail facts
     pub prep: [u32; 3],
     /// the back end on this thread: the memo key, its lookup, a hit's copies, a miss's copy of the
-    /// preparation, the signatures and notes after codegen, the store and the pc section (wall ns)
-    pub back: [u64; 6],
+    /// preparation, the signatures and notes after codegen, the memo store, the pc section (wall ns)
+    pub back: [u64; 7],
     /// the program's collect epoch at the compile's start and end (moved: a front write, such as a
     /// crate loaded on demand, ran inside it)
     pub epoch: [u64; 2],
@@ -10956,6 +10956,9 @@ pub struct MainCompile {
     pub gap: [u64; 5],
     /// (the owner's end of a request, for its hand-back)
     pub mark: u64,
+    /// the finish's own work: the deferred candidates' RIR and the end of the flight, the slot's
+    /// own optimised RIR, the install, and the cache record's deferral inside it (wall ns)
+    pub fin: [u64; 4],
     /// the owner's own work between requests when main's longest owner wait began and the owner
     /// served no request (owner::OWN_NOW; 0: none)
     pub behind_own: u8,
@@ -12121,11 +12124,13 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         startup_phase() && owner::for_main()
                     };
                     if foreground { crate::cache::trace_lookup(u, id, "fg-compile"); }
+                    let t = if main_compile_log() { wall_ns() } else { 0 };
                     let deferred = c.defer_record(u, id, code, relocs, &map, pc);
                     u.cache = Some(c);
                     if let Some(p) = deferred {
                         u.defer_cache_record(p);
                     }
+                    if t != 0 { main_rec(|r| r.fin[3] += wall_ns() - t); }
                 }
             }
             let u = &mut *up;
@@ -29651,7 +29656,7 @@ impl BackWork {
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
             let t0 = cpu_ns();
             let now = || if tm { wall_ns() } else { 0 };
-            let mut bt = [0u64; 6];
+            let mut bt = [0u64; 7];
             // the back-end memo (bmemo.rs): an earlier back end over the same preparation up to
             // slot names made this code; a miss keeps what the back end got for its entry
             let mut memo = None;
@@ -29678,10 +29683,12 @@ impl BackWork {
                         if !spec {
                             main_rec(|r| if r.how == 4 { r.how = 6 });
                         }
+                        let b2 = now();
                         let pc = crate::cache::pc_section(&map);
                         if tm {
-                            bt[2] += now() - c;
-                            main_rec(|r| for i in 0..6 { r.back[i] += bt[i] });
+                            bt[2] += b2 - c;
+                            bt[6] += now() - b2;
+                            main_rec(|r| for i in 0..7 { r.back[i] += bt[i] });
                         }
                         return Ok((opt, code, map, relocs, cg_ns, pc));
                     }
@@ -29745,10 +29752,12 @@ impl BackWork {
             if let Some((k, prep)) = memo {
                 bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0, lc.map(|x| x.0));
             }
+            let b = now();
             let pc = crate::cache::pc_section(&c.pc_map);
             if tm {
-                bt[5] += now() - a;
-                main_rec(|r| for i in 0..6 { r.back[i] += bt[i] });
+                bt[5] += b - a;
+                bt[6] += now() - b;
+                main_rec(|r| for i in 0..7 { r.back[i] += bt[i] });
             }
             Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1, pc))
         }));
@@ -29778,6 +29787,14 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
     let options = &session.options;
     let _cost_install = relax_codegen::fncost::phase(6);
     let stale = PATCH_EPOCH.load(Ordering::SeqCst) != epoch;
+    // (RELAX_MAIN_COMPILE_LOG: the finish's own work, by part)
+    let tm = !spec && main_compile_log();
+    let mut ft = if tm { wall_ns() } else { 0 };
+    let mut lap = |i: usize| if tm {
+        let e = wall_ns();
+        main_rec(|r| r.fin[i] += e - ft);
+        ft = e;
+    };
     {
         let _ph = rt_ph(3);
         // the deferred inline candidates' RIR; then the slots are no longer in flight
@@ -29798,6 +29815,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
         }
         end_flight(up, &slots);
     }
+    lap(0);
     if stale {
         // a live patch landed while this back end ran: start over from the new source
         return if spec { Split::Spec } else { Split::Restart };
@@ -29812,6 +29830,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                     store_rir(up, id, f, inl, ns, RIR_OWN);
                 }
             }
+            lap(1);
             let u = &mut *up;
             u.stats.codegen_ns += cg_ns;
             u.fns[id as usize].cg_ns = cg_ns;
@@ -29848,7 +29867,9 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 }
                 Split::Spec
             } else {
-                Split::Installed(install_compiled(up, id, &code, map, &relocs, true, Some(pc)))
+                let a = install_compiled(up, id, &code, map, &relocs, true, Some(pc));
+                lap(2);
+                Split::Installed(a)
             }
         }
         // a speculative build's error is reported when (if) the program calls it; a lazy
