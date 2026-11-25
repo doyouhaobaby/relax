@@ -1093,6 +1093,18 @@ impl<'a> Fcx<'a> {
         for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); }
     }
 
+    // Like rustc's commit_if_ok, keep inference changes and obligations only when the probe succeeds.
+    fn commit_if_some<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        let snap = self.start_snapshot();
+        let result = f(self);
+        if result.is_some() {
+            self.commit_from(snap);
+        } else {
+            self.rollback_to(snap);
+        }
+        result
+    }
+
     fn fresh(&mut self, kind: u8) -> TyId {
         match kind { 0 => self.infcx.next_ty_var(), 1 => self.infcx.next_int_var(), 2 => self.infcx.next_float_var(), _ => unreachable!() }
     }
@@ -1406,20 +1418,22 @@ impl<'a> Fcx<'a> {
     /// the pointee pair is unsized by the solver's `dyn A: Unsize<dyn B>` candidates (rustc
     /// consider_builtin_dyn_upcast_candidates); pointer shapes as for `dyn_coercion`.
     fn dyn_upcast(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
-        let (a, d, outer_a, outer_d) = self.unsize_pointee_pair(ka, kx, true)?;
-        let (a, d) = (self.shallow(a), self.shallow(d));
-        if a == d || !matches!(self.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
-        // the same object type up to lifetimes is subtyping, not an upcast
-        // (a pointer keeps the coercion: extending a trait object's lifetime must prove `'a: 'b`
-        // through the Unsize goal; a smart pointer's clone of the same type is plain subtyping)
-        if self.tcx.tys.erase_regions(a) == self.tcx.tys.erase_regions(d) && !matches!(ka, TyKind::Ref(..) | TyKind::Ptr(..)) { return None; }
-        let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
-        // through a struct tail the whole pointee pair must unsize (rustc: `S<dyn A>: Unsize<S<dyn B>>`,
-        // the last-field rule), not just the trait objects at its end
-        let (oa, od) = (self.shallow(outer_a), self.shallow(outer_d));
-        if oa != a { self.select_trait(unsize, oa, &[od]).ok()?; }
-        self.select_trait(unsize, a, &[d]).ok()?;
-        Some((a, d))
+        self.commit_if_some(|fcx| {
+            let (a, d, outer_a, outer_d) = fcx.unsize_pointee_pair(ka, kx, true)?;
+            let (a, d) = (fcx.shallow(a), fcx.shallow(d));
+            if a == d || !matches!(fcx.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(fcx.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
+            // the same object type up to lifetimes is subtyping, not an upcast
+            // (a pointer keeps the coercion: extending a trait object's lifetime must prove `'a: 'b`
+            // through the Unsize goal; a smart pointer's clone of the same type is plain subtyping)
+            if fcx.tcx.tys.erase_regions(a) == fcx.tcx.tys.erase_regions(d) && !matches!(ka, TyKind::Ref(..) | TyKind::Ptr(..)) { return None; }
+            let unsize = fcx.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
+            // through a struct tail the whole pointee pair must unsize (rustc: `S<dyn A>: Unsize<S<dyn B>>`,
+            // the last-field rule), not just the trait objects at its end
+            let (oa, od) = (fcx.shallow(outer_a), fcx.shallow(outer_d));
+            if oa != a { fcx.select_trait(unsize, oa, &[od]).ok()?; }
+            fcx.select_trait(unsize, a, &[d]).ok()?;
+            Some((a, d))
+        })
     }
 
     /// The pointee pair a pointer coercion unsizes: `&A` / `*A` / `P<..A..>` against `&B` / `*B` /
@@ -1490,19 +1504,21 @@ impl<'a> Fcx<'a> {
     }
 
     fn dyn_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
-        let (src, dy, _, _) = self.unsize_pointee_pair(ka, kx, false)?;
-        let src = self.shallow(src);
-        let dy = self.shallow(dy);
-        // An unresolved pointee may itself become `dyn Tr` (for example the `_`
-        // in `object_ref as *const _`). Let the deferred coercion decide after
-        // the cast resolves it; selecting Unsize now can unify it with `dy` and
-        // incorrectly record a thin-to-fat conversion for an already-fat value.
-        if !matches!(self.tcx.tys.kind(dy), TyKind::Dyn(..)) || matches!(self.tcx.tys.kind(src), TyKind::Dyn(..) | TyKind::Infer(_)) { return None; }
-        // coercion.rs:683-698: Unsize selection retains the object's binders,
-        // associated-type equalities and outlives obligations together.
-        let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
-        if self.select_trait(unsize, src, &[dy]).is_err() { return None; }
-        Some((src, dy))
+        self.commit_if_some(|fcx| {
+            let (src, dy, _, _) = fcx.unsize_pointee_pair(ka, kx, false)?;
+            let src = fcx.shallow(src);
+            let dy = fcx.shallow(dy);
+            // An unresolved pointee may itself become `dyn Tr` (for example the `_`
+            // in `object_ref as *const _`). Let the deferred coercion decide after
+            // the cast resolves it; selecting Unsize now can unify it with `dy` and
+            // incorrectly record a thin-to-fat conversion for an already-fat value.
+            if !matches!(fcx.tcx.tys.kind(dy), TyKind::Dyn(..)) || matches!(fcx.tcx.tys.kind(src), TyKind::Dyn(..) | TyKind::Infer(_)) { return None; }
+            // coercion.rs:683-698: Unsize selection retains the object's binders,
+            // associated-type equalities and outlives obligations together.
+            let unsize = fcx.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
+            if fcx.select_trait(unsize, src, &[dy]).is_err() { return None; }
+            Some((src, dy))
+        })
     }
 
     /// method/probe.rs:assemble_inherent_candidates_from_param: read the
