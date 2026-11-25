@@ -1751,13 +1751,16 @@ pub fn edits_ledger_stamp() -> Option<(std::time::SystemTime, u64)> {
 }
 
 /// The disk path of `path` in the edits folder when it is an edited file or folder there
-/// (removing or renaming an edited file).
+/// (removing or renaming an edited file). A symlink the run made there is one whether its target
+/// exists or not: removing a dangling one removes the link, as on the disk (it was NotFound, so a
+/// folder holding one could not be removed, 11-25).
 pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
+    let present = |p: &std::path::Path| p.symlink_metadata().is_ok();
     if let Some(disk) = folder_path(path) {
-        return disk.exists().then_some(disk);
+        return present(&disk).then_some(disk);
     }
     let (p, rel) = edit_path(path)?;
-    (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
+    (!rel.starts_with(".makepad-run-") && present(&p)).then_some(p)
 }
 
 /// The disk file a read-only open of the virtual `path` reads, so that it sees later writes as it

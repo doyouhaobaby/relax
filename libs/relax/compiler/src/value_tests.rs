@@ -595,6 +595,65 @@ pub fn values(out: &mut [usize; 12]) {{
     if cfg!(unix) { assert_eq!(&got[..6], [1, 1, 1, 1, 1, 0], "a folder opens for reading"); }
 }
 
+/// A test that keeps its scratch folder in its own source tree (an overlay run's sources, with an
+/// edits folder): show_control's preset bank makes a folder where a preset file was, removes it,
+/// puts a dangling symlink there, probes it, and removes the whole bank. In a virtual folder
+/// remove_dir went to rmdir(2) on the virtual path (NotFound for the folder create_dir had just
+/// made), the symlink went there too, its probe followed it (Missing), and the dangling link could
+/// not be removed (11-25). Each step answers as it does in a disk folder.
+#[cfg(unix)]
+#[test]
+fn folders_and_symlinks_made_in_a_virtual_folder_behave_as_on_the_disk() {
+    isolated_test!(folders_and_symlinks_made_in_a_virtual_folder_behave_as_on_the_disk);
+    let fixture = vfs_store::Fixture::new(&[("app/a.rs", b"a")]);
+    let root = "/relax-values-vfs-links/vfs/m";
+    crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+    let edits = std::env::temp_dir().join(format!("relax-values-vfs-links-edits-{}", std::process::id()));
+    crate::vfs::set_edits(Some(edits.clone()));
+    let disk = std::env::temp_dir().join(format!("relax-values-disk-links-{}", std::process::id()));
+    std::fs::create_dir_all(disk.join("app")).unwrap();
+    std::fs::write(disk.join("app/a.rs"), "a").unwrap();
+    let disk_root = disk.to_str().unwrap().to_string();
+    let src = format!(r#"
+use std::io::ErrorKind as K;
+fn code<T>(r: std::io::Result<T>) -> usize {{
+    match r {{
+        Ok(_) => 1,
+        Err(e) if e.kind() == K::NotFound => 2,
+        Err(e) if e.kind() == K::AlreadyExists => 3,
+        Err(e) if e.kind() == K::InvalidInput => 4,
+        Err(_) => 9,
+    }}
+}}
+pub fn values(out: &mut [usize; 22]) {{
+    for (k, root) in [{disk_root:?}, {root:?}].into_iter().enumerate() {{
+        let out = &mut out[k * 11..k * 11 + 11];
+        let app = std::path::Path::new(root).join("app");
+        let (dir, slot) = (app.join("t"), app.join("t/slot.ron"));
+        out[0] = code(std::fs::create_dir_all(&dir));
+        out[1] = code(std::fs::create_dir(&slot));
+        out[2] = code(std::fs::remove_dir(&slot));
+        out[3] = code(std::os::unix::fs::symlink(dir.join("missing.ron"), &slot));
+        out[4] = code(std::fs::read_to_string(&slot));
+        out[5] = std::fs::symlink_metadata(&slot).map_or(0, |m| 1 + m.file_type().is_symlink() as usize);
+        out[6] = (std::fs::read_link(&slot).ok() == Some(dir.join("missing.ron"))) as usize;
+        out[7] = code(std::os::unix::fs::symlink("x", &slot));
+        out[8] = code(std::os::unix::fs::symlink("x", app.join("a.rs")));
+        out[9] = code(std::fs::read_link(app.join("a.rs")));
+        out[10] = code(std::fs::remove_dir_all(&dir)) * 10 + std::fs::symlink_metadata(&dir).is_err() as usize;
+    }}
+}}
+"#);
+    let got = values::<22>(&src, "vfs_links");
+    crate::vfs::set_edits(None);
+    std::fs::remove_dir_all(&disk).unwrap();
+    let _ = std::fs::remove_dir_all(&edits);
+    // made, made, removed, linked, read NotFound, a symlink, its text, EEXIST over the link and
+    // over a file, a file is no link (EINVAL), the folder removed with the link in it
+    assert_eq!(&got[..11], [1, 1, 1, 1, 2, 2, 1, 3, 3, 4, 11], "the disk folder: {got:?}");
+    assert_eq!(&got[11..], &got[..11], "the virtual folder as the disk folder: {got:?}");
+}
+
 /// std::backtrace (it was a stub that printed "unsupported backtrace", so a lane learned who held a
 /// stale id only from a native run): a capture prints real std's frames from its caller on, each
 /// fn with the file and line it was at, innermost first. `mid` is `#[inline]`: where a tier
