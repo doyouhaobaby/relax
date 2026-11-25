@@ -680,6 +680,8 @@ impl Budget {
     fn end_run(&self) {
         for count in CLASS_REFUSALS.iter().flatten() { count.store(0, Relaxed); }
         REFUSALS_MARKED.store(false, Relaxed);
+        REFUSAL_GEN.fetch_add(1, Relaxed);
+        REFUSED_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mut s = self.lock();
         let now = self.now();
         for i in 0..s.slots.len() {
@@ -1329,10 +1331,16 @@ fn read_tokens(op: impl Fn(&mut [u8]) -> usize) -> Tokens {
 /// the JIT's wait registry, which registers those waits through this.
 #[relax_api]
 pub fn set_wait_hook(hook: extern "C" fn(u8)) { let _ = WAIT_HOOK.set(hook); }
-/// The class `set_thread_class` last gave the calling thread (the UI thread: Interactive); None: it
-/// set none, or a promotion failed. A job the thread waits for runs at its class meanwhile.
+/// The logical class last requested on this thread (Interactive on the UI thread). A job the
+/// thread waits for inherits this class even if the thread's OS priority could not change.
 #[relax_api]
-pub fn thread_class() -> Option<u8> { THREAD_CLASS.with(Cell::get).map(|class| match class { 3 => INTERACTIVE, IDLE | BACKGROUND_HOT | BACKGROUND_BEHIND => BACKGROUND, class => class }) }
+pub fn thread_class() -> Option<u8> { THREAD_CLASS.with(Cell::get).map(budget_class) }
+/// The class the OS was last set to on this thread, or None when a change failed or none was made.
+#[relax_api]
+pub fn applied_thread_class() -> Option<u8> { APPLIED_CLASS.with(Cell::get).map(budget_class) }
+fn budget_class(class: u8) -> u8 {
+    match class { 3 => INTERACTIVE, IDLE | BACKGROUND_HOT | BACKGROUND_BEHIND => BACKGROUND, class => class }
+}
 #[relax_api]
 pub fn queued(class: u8, client: u8, delta: i32) {
     BudgetHandle::process().queued(class, client, delta);
@@ -1372,6 +1380,8 @@ fn read_text(op: impl Fn(&mut [u8]) -> usize) -> String {
 
 thread_local! {
     static THREAD_CLASS: Cell<Option<u8>> = const { Cell::new(None) };
+    static APPLIED_CLASS: Cell<Option<u8>> = const { Cell::new(None) };
+    static THREAD_FLOOR: Cell<bool> = const { Cell::new(false) };
     /// this thread was admitted once: a thread that never was skips the budget's lock when it sleeps
     static ADMITTED: Cell<bool> = const { Cell::new(false) };
     /// the lends in progress on this thread: above 0 its tokens are lent
@@ -1419,11 +1429,17 @@ pub fn set_ui_thread() -> bool {
     applied
 }
 
+/// `true`: the calling thread's OS priority stays at Interactive or above on later requests (a
+/// Background or idle request changes only its logical class). `false`: it may go lower again, as a
+/// thread that goes back to a shared pool must.
+#[relax_api]
+pub fn set_thread_floor(on: bool) { THREAD_FLOOR.with(|floor| floor.set(on)); }
+
 /// The calling thread goes below every other thread: Linux SCHED_IDLE (a core runs it only when no
 /// other thread wants that core), elsewhere the Background class's priority. A thread without
 /// CAP_SYS_NICE (RLIMIT_NICE 0) cannot leave SCHED_IDLE again; Background work keeps it there.
 pub fn set_thread_idle() -> bool {
-    if UI_THREAD.with(Cell::get) { return false; }
+    if UI_THREAD.with(Cell::get) || THREAD_FLOOR.with(Cell::get) { return false; }
     apply_thread_class(IDLE)
 }
 /// The calling thread runs at the OS's idle policy (`set_thread_idle` took effect, and nothing
@@ -1522,16 +1538,46 @@ static REFUSALS_MARKED: AtomicBool = AtomicBool::new(false);
 pub fn mark_class_refusals() { REFUSALS_MARKED.store(true, Relaxed); }
 /// Counts by requested OS class, before and after the mark. Without a mark all are before.
 pub fn class_refusals() -> [[u64; 7]; 2] { CLASS_REFUSALS.each_ref().map(|row| row.each_ref().map(|n| n.load(Relaxed))) }
+/// The threads a refused change was counted on in this run, each once (at its first): the class
+/// asked, whether it came after the mark, the thread's id and name. A refused raise is not tried
+/// again, so the list stays as short as the threads that met one.
+static REFUSED_THREADS: Mutex<Vec<RefusedThread>> = Mutex::new(Vec::new());
+/// The run whose refusals a thread has named itself in (`end_run` starts the next).
+static REFUSAL_GEN: AtomicU64 = AtomicU64::new(1);
+thread_local! { static REFUSAL_NAMED: Cell<u64> = const { Cell::new(0) }; }
+/// A thread whose OS class change was refused ([`refused_threads`]).
+#[derive(Clone, Debug)]
+pub struct RefusedThread { pub class: u8, pub after_mark: bool, pub id: thread::ThreadId, pub name: String }
+fn count_refusal(class: u8) {
+    let after_mark = REFUSALS_MARKED.load(Relaxed);
+    CLASS_REFUSALS[after_mark as usize][class as usize].fetch_add(1, Relaxed);
+    let gen = REFUSAL_GEN.load(Relaxed);
+    if REFUSAL_NAMED.with(|named| named.replace(gen)) != gen {
+        let me = thread::current();
+        let name = me.name().unwrap_or("unnamed").to_owned();
+        REFUSED_THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(RefusedThread { class, after_mark, id: me.id(), name });
+    }
+}
+/// This run's threads that met a refused OS class change, each once.
+pub fn refused_threads() -> Vec<RefusedThread> { REFUSED_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
 
 fn apply_thread_class(class: u8) -> bool {
-    THREAD_CLASS.with(|current| {
+    apply_thread_class_with(class, os_class)
+}
+fn apply_thread_class_with(class: u8, set: impl FnOnce(u8) -> Option<bool>) -> bool {
+    THREAD_CLASS.with(|logical| logical.set(Some(class)));
+    let class = if THREAD_FLOOR.with(Cell::get) {
+        if class == BACKGROUND || class == IDLE { return true; }
+        if class == VISIBLE { INTERACTIVE } else { class }
+    } else { class };
+    APPLIED_CLASS.with(|current| {
         // Background work on a thread at the idle policy: it stays there, below Background (a
         // thread without CAP_SYS_NICE could not leave it anyway)
         if class == BACKGROUND && IDLE_NOW.with(Cell::get) { return true; }
         let class = if class == BACKGROUND { background_class() } else { class };
         if current.get() == Some(class) { return true; }
-        let applied = os_class(class);
-        if !applied { CLASS_REFUSALS[REFUSALS_MARKED.load(Relaxed) as usize][class as usize].fetch_add(1, Relaxed); }
+        let Some(applied) = set(class) else { return false };
+        if !applied { count_refusal(class); }
         // A failed call may have partially changed the OS state.
         current.set(if applied { Some(class) } else { None });
         // the tier-ups that hold a performance core: counted while this thread's class is theirs
@@ -1543,33 +1589,48 @@ fn apply_thread_class(class: u8) -> bool {
     })
 }
 #[cfg(target_os = "macos")]
-fn os_class(class: u8) -> bool {
+fn os_class(class: u8) -> Option<bool> {
     unsafe extern "C" { fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32; }
-    unsafe { pthread_set_qos_class_self_np([0x19, 0x15, 0x11, 0x21, 0x11, 0x15, 0x09][class as usize], 0) == 0 }
+    Some(unsafe { pthread_set_qos_class_self_np([0x19, 0x15, 0x11, 0x21, 0x11, 0x15, 0x09][class as usize], 0) == 0 })
+}
+/// None means a previous refusal already ruled out this nice on the calling thread.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn try_nice(nice: i32, set: impl FnOnce() -> (bool, bool)) -> Option<bool> {
+    thread_local! { static REFUSED: Cell<Option<i32>> = const { Cell::new(None) }; }
+    REFUSED.with(|refused| {
+        if refused.get().is_some_and(|limit| nice <= limit) { return None; }
+        let (applied, raise_refused) = set();
+        if raise_refused { refused.set(Some(nice)); }
+        Some(applied)
+    })
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn os_class(class: u8) -> bool {
+fn os_class(class: u8) -> Option<bool> {
     #[repr(C)]
     struct SchedParam { priority: i32 }
     unsafe extern "C" {
         fn getpid() -> i32;
         fn getpriority(which: i32, who: u32) -> i32;
         fn setpriority(which: i32, who: u32, priority: i32) -> i32;
+        fn sched_getscheduler(pid: i32) -> i32;
         fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
     }
     static BASE: OnceLock<i32> = OnceLock::new();
     let base = *BASE.get_or_init(|| unsafe { getpriority(0, getpid() as u32) }.clamp(0, 19));
-    let nice = (base + [1, 3, 8, 0, 8, 8, 8][class as usize]).min(19);
-    unsafe {
+    // Visible must not lower an Interactive thread to nice 3 for good.
+    let nice = (base + [1, 1, 8, 0, 8, 8, 8][class as usize]).min(19);
+    try_nice(nice, || unsafe {
         let priority = setpriority(0, 0, nice) == 0;
         // SCHED_IDLE 5, SCHED_BATCH 3, SCHED_OTHER 0; a refused change leaves the policy as it was
         let policy = sched_setscheduler(0, match class { IDLE => 5, BACKGROUND | BACKGROUND_HOT | BACKGROUND_BEHIND => 3, _ => 0 }, &SchedParam { priority: 0 }) == 0;
-        if policy { IDLE_NOW.with(|idle| idle.set(class == IDLE)); }
-        priority && policy && getpriority(0, 0) == nice
-    }
+        let idle = if policy { class == IDLE } else { sched_getscheduler(0) == 5 };
+        IDLE_NOW.with(|state| state.set(idle));
+        let actual = getpriority(0, 0);
+        (priority && policy && actual == nice, actual > nice || (!policy && idle && class != IDLE))
+    })
 }
 #[cfg(windows)]
-fn os_class(class: u8) -> bool {
+fn os_class(class: u8) -> Option<bool> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThread() -> *mut std::ffi::c_void;
@@ -1578,10 +1639,10 @@ fn os_class(class: u8) -> bool {
     // Background at Normal, not below: Windows priority is strict, so below another program's busy threads
     // it gets almost no time (tier-up all but stopped, the program stayed on its slow code); the budget
     // decides how much of the machine Background takes
-    unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, 0, 2, 0, 0, 0][class as usize]) != 0 }
+    Some(unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, 0, 2, 0, 0, 0][class as usize]) != 0 })
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
-fn os_class(_class: u8) -> bool { false }
+fn os_class(_class: u8) -> Option<bool> { Some(false) }
 
 #[cfg(test)]
 mod tests;

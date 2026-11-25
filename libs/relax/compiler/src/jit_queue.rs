@@ -140,17 +140,17 @@ impl Queue {
         Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_since: 0, ahead_len: 0,
             tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false, hold: None }
     }
-    /// Queues `job`; returns whether it can start now.
-    pub(super) fn push(&mut self, job: Job, at: u64) -> bool {
+    /// Queues `job` and identifies a drain for it if it can start now.
+    pub(super) fn push(&mut self, job: Job, at: u64) -> Option<Kind> {
         // A producer can finish discovering work after the settle rebuild retired its front.
-        if matches!(&job, Job::Ahead(front, _) if !front.alive.load(Ordering::Acquire)) { return false; }
+        if matches!(&job, Job::Ahead(front, _) if !front.alive.load(Ordering::Acquire)) { return None; }
         if !matches!(job, Job::Tick) && W0_IDLING.load(Ordering::Relaxed) { self.tick_at = Instant::now(); }
         self.sync_ahead();
         let now = HeatNow::take();
         let slot = job.slot();
         let wanted = slot.and_then(|slot| self.wanted(slot));
         // the run quits: a compile nobody waits for is speculative (`quit`)
-        if wanted.is_none() && self.quitting && quit_drops(&job) { return false; }
+        if wanted.is_none() && self.quitting && quit_drops(&job) { return None; }
         let promoted = wanted.is_some();
         let class = if job.tier() == 0 { budget::BACKGROUND } else { job_class(&job, &now) };
         let class = wanted.map_or(class, |w| w.min(self.bucket_class(job.tier(), class)));
@@ -169,7 +169,8 @@ impl Queue {
         self.entries.push(entry);
         budget::queued(class, budget::JIT, 1);
         let policy = self.policy();
-        self.blocked(&self.entries[self.entries.len() - 1], &policy).is_none()
+        let entry = self.entries.last().unwrap();
+        self.blocked(entry, &policy).is_none().then(|| DrainsNow::get().for_job(entry.job.tier(), class))
     }
     /// The class the waiters of `slot` ask for.
     fn wanted(&self, slot: (usize, u32)) -> Option<u8> {
@@ -247,14 +248,14 @@ impl Queue {
     /// The entry to start now, in rank order (head without its heat sample): the first class whose
     /// buckets hold one that can start, the best of their fronts.
     fn first(&self) -> Option<usize> {
-        self.first_for(Takes::All)
+        self.first_for(Takes::ALL)
     }
     /// `first` among the entries a worker that `takes` these may start.
     fn first_for(&self, takes: Takes) -> Option<usize> {
         let policy = self.policy();
         (0..3u8).find_map(|class| {
             self.plan.iter().enumerate().flat_map(|(tier, plan)| plan.iter().enumerate().map(move |(stored, bucket)| (tier, stored as u8, bucket)))
-                .filter(|&(tier, stored, bucket)| !bucket.is_empty() && takes.takes(tier) && self.bucket_class(tier, stored) == class
+                .filter(|&(tier, stored, bucket)| !bucket.is_empty() && takes.takes(tier, class) && self.bucket_class(tier, stored) == class
                     // (an unpromoted check ahead is stored Background: the promoted ones are Interactive)
                     && !(tier == 0 && stored != budget::INTERACTIVE && policy.ahead_full)
                     && self.class_blocked(class, tier, &policy).is_none())
@@ -265,9 +266,10 @@ impl Queue {
                 .min_by_key(|&(r, _)| r).map(|(_, i)| i)
         })
     }
-    /// Some job could start now (a worker woken for it would take it).
-    fn runnable(&self) -> bool {
-        self.first().is_some()
+    /// A worker to wake for the first runnable entry.
+    fn runnable(&self) -> Option<Kind> {
+        let e = &self.entries[self.first()?];
+        Some(DrainsNow::get().for_job(e.job.tier(), self.class_of(e)))
     }
     /// What the admission checks read of the running jobs and the phase, once per decision. The
     /// burst gate holds one build at a time below Interactive while the startup or the UI runs. The
@@ -354,7 +356,7 @@ impl Queue {
         let why = self.class_blocked(class, tier, &policy).or_else(|| self.entry_blocked(&self.entries[self.indices[&serial]]));
         let reason = match why {
             Some(why) => why,
-            None if !takes.takes(tier) => "idle lane",
+            None if !takes.takes(tier, class) => "idle lane",
             None if head_refused => "budget",
             None => return None,
         };
@@ -568,13 +570,18 @@ pub(super) fn held_line() -> String {
 static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
-/// `idle`: the worker runs at the OS's idle policy (idle_tiers): it takes tier-ups only.
 #[derive(Default)]
 struct Sleeper {
-    thread: OnceLock<budget::Wake>, waiting: AtomicBool, idle: AtomicBool,
+    thread: OnceLock<budget::Wake>, waiting: AtomicBool, kind: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    parked: AtomicBool,
     os_id: AtomicU64, jobs: [AtomicU64; 3], present_nice: OnceLock<Option<i32>>,
+    id: OnceLock<std::thread::ThreadId>,
 }
 impl Sleeper {
+    fn kind(&self) -> Kind {
+        match self.kind.load(Ordering::Relaxed) { 0 => Kind::Back, 1 => Kind::Idle, _ => Kind::Fore }
+    }
     fn nice(&self) -> Option<i32> {
         #[cfg(target_os = "linux")]
         if let tid @ 1.. = self.os_id.load(Ordering::Relaxed) {
@@ -602,7 +609,13 @@ impl super::Stats {
             format!("#{i} nice {} {a}/{v}/{b} jobs (first present {})", show(w.nice()), show(w.present_nice.get().copied().flatten()))
         }).collect();
         let [before, after] = budget::class_refusals();
-        format!("relax: {} drains, {} slots (I/V/B): {}; OS class refusals before first present {before:?}, after {after:?}", DRAINS.count.load(Ordering::Relaxed), threads.len(), rows.join(", "))
+        // each thread that met a refusal, once: a drain by its index, any other thread by its name
+        let refused: Vec<_> = budget::refused_threads().into_iter().map(|r| {
+            let who = threads.iter().position(|w| w.id.get() == Some(&r.id)).map_or(r.name, |i| format!("drain #{i}"));
+            format!("{who} (class {} {} first present)", r.class, if r.after_mark { "after" } else { "before" })
+        }).collect();
+        format!("relax: {} drains, {} slots (I/V/B): {}; {} bounces; OS class refusals before first present {before:?}, after {after:?}; refused on: {}",
+            DRAINS.count.load(Ordering::Relaxed), threads.len(), rows.join(", "), BOUNCES.load(Ordering::Relaxed), if refused.is_empty() { "none".to_string() } else { refused.join(", ") })
     }
 }
 /// While a real-time thread is live (jit::rt_live; Linux and Android, whose kernels have an idle
@@ -642,23 +655,48 @@ pub(super) fn waits_on_helpers() -> bool {
 }
 /// The workers of this run at the idle policy (idle_tiers).
 static IDLE_WORKERS: AtomicUsize = AtomicUsize::new(0);
-/// What a worker may start (idle_tiers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum Kind { Back, Idle, Fore }
+/// What a worker may start at this pick.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Takes { All, TierUps, NoTierUps }
+struct Takes { kind: Kind, split: bool, back_tiers: bool }
 impl Takes {
-    fn takes(self, tier: usize) -> bool {
-        match self { Takes::All => true, Takes::TierUps => is_tier_up(tier), Takes::NoTierUps => !is_tier_up(tier) }
-    }
-    /// A worker's, at its next pick: at the idle policy tier-ups only; else everything, or, once
-    /// enough workers are at the idle policy, everything but tier-ups (queue lock held: the count
-    /// a worker takes on going there is reserved under it).
-    fn of(idle: bool) -> Takes {
-        if idle { Takes::TierUps }
-        else if !idle_tiers() { Takes::All }
-        else if IDLE_WORKERS.load(Ordering::Relaxed) < budget::background_limit() as usize { Takes::All }
-        else { Takes::NoTierUps }
+    const ALL: Self = Self { kind: Kind::Back, split: false, back_tiers: true };
+    fn takes(self, tier: usize, class: u8) -> bool {
+        match self.kind {
+            Kind::Fore => class != budget::BACKGROUND,
+            Kind::Back => (!self.split || class == budget::BACKGROUND) && (self.back_tiers || !is_tier_up(tier)),
+            Kind::Idle => is_tier_up(tier),
+        }
     }
 }
+#[derive(Clone, Copy)]
+struct DrainsNow { cores: usize, started: usize, idle: usize, idle_limit: usize }
+impl DrainsNow {
+    fn get() -> Self {
+        Self { cores: budget::cores() as usize, started: NEXT_WORKER.load(Ordering::Relaxed),
+            idle: IDLE_WORKERS.load(Ordering::Relaxed), idle_limit: if idle_tiers() { budget::background_limit() as usize } else { 0 } }
+    }
+    fn takes(self, kind: Kind) -> Takes {
+        Takes { kind, split: self.started == 2 * self.cores, back_tiers: self.idle_limit == 0 || self.idle < self.idle_limit }
+    }
+    fn for_job(self, tier: usize, class: u8) -> Kind {
+        if class != budget::BACKGROUND && self.started > self.cores {
+            // On a short start Back may help if every Fore worker is busy.
+            if self.started == 2 * self.cores || THREADS.get().is_some_and(|w| w[self.cores..].iter().any(|s| s.waiting.load(Ordering::SeqCst))) {
+                return Kind::Fore;
+            }
+        }
+        if is_tier_up(tier) && self.idle > 0 && self.idle_limit > 0 && !self.go_idle(Kind::Back, tier) { Kind::Idle } else { Kind::Back }
+    }
+    fn go_idle(self, kind: Kind, tier: usize) -> bool {
+        kind == Kind::Back && is_tier_up(tier) && self.idle < self.idle_limit
+            && self.idle + 1 < self.started.min(self.cores)
+    }
+}
+static BOUNCES: AtomicUsize = AtomicUsize::new(0);
+static FLOOR_REFUSED: AtomicBool = AtomicBool::new(false);
 static THREADS: OnceLock<Vec<Sleeper>> = OnceLock::new();
 static NEXT_WORKER: AtomicUsize = AtomicUsize::new(0);
 /// The workers leave at their next pick (`stop_workers`).
@@ -666,7 +704,7 @@ static WORKERS_STOP: AtomicBool = AtomicBool::new(false);
 /// The workers' drains (`start`), and the drains that came back.
 static DRAINS: Drains = Drains::new();
 static DRAINS_BACK: AtomicUsize = AtomicUsize::new(0);
-/// The drains the first start asks the pool for, one per core. One the pool cannot start (no idle
+/// The drains the first start asks the pool for. One the pool cannot start (no idle
 /// worker, and the OS refused a thread: a limit on the process's memory counts each worker's stack)
 /// leaves the workers the start has, which take every job; with none the start fails, and the
 /// next one asks again. A failed start leaves nothing a later one trips over: a Once its refused
@@ -736,14 +774,17 @@ fn lock() -> QueueGuard {
 pub(super) fn start() {
     if FORKED.load(Ordering::Relaxed) || DRAINS.started.load(Ordering::Acquire) { return; }
     let _kept = crate::zone_alloc::kept();
-    let want = budget::cores() as usize;
+    let cores = budget::cores() as usize;
+    let want = if cfg!(any(target_os = "linux", target_os = "android")) { 2 * cores } else { cores };
     let init = || {
         crate::pool::thread_start(ensure_altstack);
-        THREADS.get_or_init(|| (0..want).map(|_| Sleeper::default()).collect());
+        THREADS.get_or_init(|| (0..want).map(|i| Sleeper {
+            kind: (if i < cores { Kind::Back } else { Kind::Fore } as u8).into(), ..Sleeper::default()
+        }).collect());
     };
     match DRAINS.start(want, init, || crate::pool::drain(&SOURCE)) {
         Ok(Started::Already | Started::All) => {}
-        Ok(Started::Short(have, e)) => eprintln!("relax: the JIT compiles on {have} of its {want} workers: the OS refused another thread ({e})"),
+        Ok(Started::Short(have, e)) => eprintln!("relax: the JIT compiles on {have} of its {want} workers: the OS refused another thread ({e}); Back workers take every class"),
         Err(e) => panic!("failed to start JIT pool worker: {e}"),
     }
 }
@@ -796,12 +837,12 @@ pub(super) fn wake() {
         }
     }
 }
-/// Wakes a parked worker at the idle policy (`idle`) or one that is not: work only that kind may
-/// start is runnable (idle_tiers).
-fn wake_kind(idle: bool) {
+/// Wake a parked drain that can start the entry.
+fn wake_kind(kind: Kind) {
     if let Some(threads) = THREADS.get() {
-        for worker in threads {
-            if worker.idle.load(Ordering::Relaxed) == idle && worker.waiting.load(Ordering::SeqCst) && worker.waiting.swap(false, Ordering::SeqCst) {
+        let (back, fore) = threads.split_at(budget::cores() as usize);
+        for worker in if kind == Kind::Fore { fore } else { back } {
+            if worker.kind() == kind && worker.waiting.load(Ordering::SeqCst) && worker.waiting.swap(false, Ordering::SeqCst) {
                 if let Some(thread) = worker.thread.get() { thread.unpark(); return; }
             }
         }
@@ -856,9 +897,9 @@ pub(super) fn fork_child() {
 pub(super) fn leave_child_for_test() { FORKED.store(false, Ordering::SeqCst); }
 pub(super) fn push(job: Job, at: u64) {
     if FORKED.load(Ordering::Relaxed) { return; }
-    let runnable = crate::zone_alloc::kept_with(|| { let mut q = lock(); q.push(job, at) || q.runnable() });
+    let runnable = crate::zone_alloc::kept_with(|| { let mut q = lock(); q.push(job, at).or_else(|| q.runnable()) });
     start();
-    if runnable { wake(); }
+    if let Some(kind) = runnable { wake_kind(kind); }
 }
 pub(super) fn o2(unit: usize, id: u32, kind: O2Kind, at: u64) {
     push(Job::O2(unit, id, kind), at);
@@ -914,7 +955,10 @@ fn push_ahead(front: &Arc<FrontShared>, work: impl Iterator<Item = AheadWork>) {
         AHEAD_PENDING.store(true, Ordering::Release);
     });
     start();
-    if !startup_phase() || RUNNING[0].load(Ordering::Relaxed) < startup_ahead() { wake(); }
+    let startup = startup_phase();
+    if !startup || RUNNING[0].load(Ordering::Relaxed) < startup_ahead() {
+        wake_kind(DrainsNow::get().for_job(0, if startup || ui_burst() { budget::INTERACTIVE } else { budget::BACKGROUND }));
+    }
 }
 /// AHEAD_INBOX into the queue (its lock held).
 fn drain_ahead_inbox(q: &mut Queue) {
@@ -998,11 +1042,10 @@ impl Queue {
         }
         gone
     }
-    /// Promotes slot `id`'s queued and running jobs to their waiters' class; returns whether a
-    /// queued one can start now.
-    fn promote(&mut self, unit: usize, id: u32) -> bool {
+    /// Promotes the slot's jobs and identifies a drain that can start one now.
+    fn promote(&mut self, unit: usize, id: u32) -> Option<Kind> {
         self.sync_ahead();
-        let Some(wanted) = self.wanted((unit, id)) else { return false };
+        let wanted = self.wanted((unit, id))?;
         let serials = self.by_slot.remove(&(unit, id)).unwrap_or_default();
         let now = wall_ns();
         for serial in serials.iter() {
@@ -1022,7 +1065,10 @@ impl Queue {
             if r.waits_for(unit, id) && wanted < r.class.class() { r.class.reclass(wanted); }
         }
         let policy = self.policy();
-        let runnable = serials.iter().any(|serial| self.blocked(&self.entries[self.indices[&serial]], &policy).is_none());
+        let runnable = serials.iter().find_map(|serial| {
+            let e = &self.entries[self.indices[&serial]];
+            self.blocked(e, &policy).is_none().then(|| DrainsNow::get().for_job(e.job.tier(), self.class_of(e)))
+        });
         if !serials.is_empty() { self.by_slot.insert((unit, id), serials); }
         runnable
     }
@@ -1083,7 +1129,7 @@ pub(super) fn promote(unit: usize, id: u32, class: u8) -> WaitPriority {
     q.waiters.entry((unit, id)).or_default()[class as usize] += 1;
     let runnable = q.promote(unit, id);
     drop(q);
-    if runnable { wake(); }
+    if let Some(kind) = runnable { wake_kind(kind); }
     WaitPriority { unit, id, class }
 }
 
@@ -1121,12 +1167,21 @@ impl Source for CompilerSource {
         let index = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
         let name = crate::zone_alloc::kept_with(|| std::thread::current().name().unwrap_or("run-jit").to_owned());
         crate::lifeline::run(&name, crate::lifeline::OnPanic::Restart, || worker_loop(index));
+        // the thread goes back to the shared pool, whose Background jobs must lower it again
+        budget::set_thread_floor(false);
         DRAINS_BACK.fetch_add(1, Ordering::SeqCst);
     }
 }
 fn worker_loop(index: usize) {
         let worker = &THREADS.get().unwrap()[index];
+        if worker.kind() == Kind::Fore {
+            budget::set_thread_floor(true);
+            if !budget::set_thread_class(budget::INTERACTIVE) && !FLOOR_REFUSED.swap(true, Ordering::Relaxed) {
+                eprintln!("relax: the OS refused Interactive priority on a Fore worker; foreground builds run at inherited priority");
+            }
+        }
         worker.os_id.store(crate::inspect::threads::self_os_id(), Ordering::Relaxed);
+        let _ = worker.id.set(std::thread::current().id());
         worker.thread.set(budget::Wake::current()).ok();
         let mut admission = budget::Admission::default();
         // the job this worker ran last, (serial, tier): it leaves `running` under the lock that
@@ -1138,7 +1193,8 @@ fn worker_loop(index: usize) {
         let mut held: Option<BudgetJob> = None;
         let me = std::thread::current().id();
         // (a worker restarted after a panic keeps its thread, and so its policy)
-        if budget::thread_idle() && !worker.idle.swap(true, Ordering::Relaxed) {
+        if budget::thread_idle() && worker.kind() == Kind::Back {
+            worker.kind.store(Kind::Idle as u8, Ordering::Relaxed);
             IDLE_WORKERS.fetch_add(1, Ordering::Relaxed);
         }
         loop {
@@ -1173,11 +1229,14 @@ fn worker_loop(index: usize) {
                 }
                 budget::set_jit_first(jit_first());
                 let now = HeatNow::take();
-                let takes = Takes::of(worker.idle.load(Ordering::Relaxed));
+                let drains = DrainsNow::get();
+                let kind = worker.kind();
+                let takes = drains.takes(kind);
                 let head = q.head(&now, takes);
                 if head.is_none() { admission = budget::Admission::default(); }
                 // what only the other kind of worker may start: wake one of those
-                let other = head.is_none() && takes != Takes::All && q.first().is_some();
+                // (never this worker's own kind: one of those would find what it found)
+                let other = if head.is_none() && takes != Takes::ALL { q.runnable().filter(|&k| k != kind) } else { None };
                 let picked = head.and_then(|i| {
                     let e = &q.entries[i];
                     let class = q.class_of(e);
@@ -1195,7 +1254,7 @@ fn worker_loop(index: usize) {
                     RUNNING[e.job.tier()].fetch_add(1, Ordering::Relaxed);
                     // a tier-up while a real-time thread is live: this worker goes to the idle
                     // policy for good (its place in the count reserved under the lock)
-                    let go_idle = idle_tiers() && is_tier_up(e.job.tier()) && !worker.idle.load(Ordering::Relaxed);
+                    let go_idle = drains.go_idle(kind, e.job.tier());
                     if go_idle { IDLE_WORKERS.fetch_add(1, Ordering::Relaxed); }
                     q.running.push(Running { serial: e.serial, promoted: e.promoted, slot: e.slot, tier: e.job.tier(), base_class: job_class(&e.job, &now), class: job.control() });
                     // another parked worker only for work this one leaves runnable: a wake per job
@@ -1228,10 +1287,11 @@ fn worker_loop(index: usize) {
                     worker.waiting.store(false, Ordering::SeqCst);
                     crate::lifeline::beat();
                     if go_idle {
-                        if budget::set_thread_idle() { worker.idle.store(true, Ordering::Relaxed); }
+                        budget::set_thread_idle();
+                        if budget::thread_idle() { worker.kind.store(Kind::Idle as u8, Ordering::Relaxed); }
                         else { IDLE_WORKERS.fetch_sub(1, Ordering::Relaxed); }
                     }
-                    if more { wake(); }
+                    if let Some(kind) = more { wake_kind(kind); }
                     let (serial, tier) = (entry.serial, entry.job.tier());
                     let queued_ns = wall_ns().saturating_sub(entry.since);
                     if matches!(entry.job, Job::Check(..)) && crate::check::check_waited() {
@@ -1258,13 +1318,20 @@ fn worker_loop(index: usize) {
                     // it and hands them back when it goes idle)
                 }
                 Err((timeout, other)) => {
-                    if other { wake_kind(!worker.idle.load(Ordering::Relaxed)); }
+                    if let Some(kind) = other {
+                        BOUNCES.fetch_add(1, Ordering::Relaxed);
+                        wake_kind(kind);
+                    }
                     // (an idle worker, or one the budget holds back, has no permit)
                     drop(held.take());
                     crate::zone_alloc::compiler_hand_back_idle();
                     if worker.waiting.load(Ordering::SeqCst) {
+                        #[cfg(test)]
+                        worker.parked.store(true, Ordering::SeqCst);
                         if let Some(timeout) = timeout { budget::park_for(timeout.as_nanos().min(u64::MAX as u128) as u64); }
                         else { budget::park(); }
+                        #[cfg(test)]
+                        worker.parked.store(false, Ordering::SeqCst);
                     }
                     worker.waiting.store(false, Ordering::SeqCst);
                 }
@@ -1410,12 +1477,12 @@ mod tests {
         let now = HeatNow { hu: None, wall: 100, tier: 0 };
         assert_eq!(job_class(&Job::O2(1, 7, O2Kind::Normal), &now), budget::BACKGROUND, "a tier-up runs below the app's visible work");
         assert_eq!(job_class(&Job::O3((7, 0, 0, 0)), &now), budget::BACKGROUND, "an O3 build runs below the app's visible work");
-        let first = q.head(&now, Takes::All).expect("queued waiter can run");
+        let first = q.head(&now, Takes::ALL).expect("queued waiter can run");
         assert_eq!(q.entries[first].class, budget::INTERACTIVE, "heat refresh preserves waiter promotion");
         assert_eq!(q.remove(first).job.slot(), Some((1, 11)), "queued waiter moves to the front");
-        let next = q.head(&now, Takes::All).expect("cold work can run after the waiter");
+        let next = q.head(&now, Takes::ALL).expect("cold work can run after the waiter");
         assert_eq!(q.remove(next).job.slot(), Some((1, 10)), "cold work remains queued after promotion");
-        assert!(q.head(&now, Takes::All).is_none(), "both jobs were removed exactly once");
+        assert!(q.head(&now, Takes::ALL).is_none(), "both jobs were removed exactly once");
         let front = Arc::new(FrontShared::new(&Arc::new(crate::Session::default())));
         front.alive.store(true, Ordering::Release);
         q.push(Job::Spec(1, 12), 1);
@@ -1500,13 +1567,68 @@ mod tests {
         let now = HeatNow { hu: None, wall: 100, tier: 0 };
         q.push(Job::Spec(1, 20), 1);
         q.push(Job::O2(1, 21, O2Kind::Normal), 2);
-        let tier_up = q.head(&now, Takes::TierUps).expect("an idle worker has a tier-up to start");
+        let drains = DrainsNow { cores: 2, started: 2, idle: 1, idle_limit: 1 };
+        let tier_up = q.head(&now, drains.takes(Kind::Idle)).expect("an idle worker has a tier-up to start");
         assert_eq!(q.entries[tier_up].job.tier(), 1, "an idle worker starts the O2 build");
-        let other = q.head(&now, Takes::NoTierUps).expect("a worker kept out of the idle policy has work");
+        let other = q.head(&now, drains.takes(Kind::Back)).expect("a worker kept out of the idle policy has work");
         assert_eq!(q.entries[other].job.tier(), 3, "it starts the speculative build, not the tier-up");
         q.remove(other);
-        assert!(q.head(&now, Takes::NoTierUps).is_none(), "the tier-up waits for an idle worker");
+        assert!(q.head(&now, drains.takes(Kind::Back)).is_none(), "the tier-up waits for an idle worker");
         assert!(q.first().is_some(), "which some worker may start: one of the other kind is woken");
+    }
+
+    #[test]
+    fn a_push_starts_each_class_with_every_worker_parked() {
+        isolated_test!(a_push_starts_each_class_with_every_worker_parked, cores = 2);
+        use std::time::Duration;
+        lock().tick_queued = true; // No periodic tick can rescue a missed wake.
+        start();
+        let workers = THREADS.get().unwrap();
+        let split = cfg!(any(target_os = "linux", target_os = "android"));
+        assert_eq!(workers.len(), budget::cores() as usize * if split { 2 } else { 1 });
+        assert_eq!(DRAINS.count.load(Ordering::Acquire), workers.len());
+        let until = |condition: &dyn Fn() -> bool, why: &str| {
+            let start = Instant::now();
+            while !condition() {
+                assert!(start.elapsed() < Duration::from_secs(5), "{why}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        for class in [budget::INTERACTIVE, budget::VISIBLE, budget::BACKGROUND] {
+            let id = u32::from(class);
+            let _wait = (class != budget::BACKGROUND).then(|| promote(0, id, class));
+            until(&|| workers.iter().all(|w| w.parked.load(Ordering::SeqCst)), "workers did not park");
+            spec(0, id); // No live unit. The job starts and finishes without a build.
+            let kind = if split && class != budget::BACKGROUND { Kind::Fore } else { Kind::Back };
+            until(&|| workers.iter().any(|w| w.kind() == kind && w.jobs[class as usize].load(Ordering::Acquire) == 1),
+                "the drain for the pushed class did not start");
+        }
+        stop_workers(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn every_entry_has_a_started_taker() {
+        for started in [1, 2, 3, 4] {
+            for idle_limit in [0, 1, 2] {
+                let mut d = DrainsNow { cores: 2, started, idle: 0, idle_limit };
+                assert!(!d.go_idle(Kind::Fore, 1) && !d.go_idle(Kind::Back, 0));
+                loop {
+                    assert!(d.idle < started.min(d.cores), "one Back drain stays out of idle");
+                    for class in [budget::INTERACTIVE, budget::VISIBLE, budget::BACKGROUND] {
+                        for tier in [0, 1] {
+                            let takes = |kind| d.takes(kind).takes(tier, class);
+                            assert_eq!(takes(Kind::Fore), class != budget::BACKGROUND);
+                            assert_eq!(takes(Kind::Idle), is_tier_up(tier));
+                            assert_eq!(takes(Kind::Back), (started < 4 || class == budget::BACKGROUND)
+                                && (!is_tier_up(tier) || idle_limit == 0 || d.idle < idle_limit));
+                            assert!(takes(Kind::Back) || (started > 2 && takes(Kind::Fore)) || (d.idle > 0 && takes(Kind::Idle)));
+                        }
+                    }
+                    if !d.go_idle(Kind::Back, 1) { break; }
+                    d.idle += 1;
+                }
+            }
+        }
     }
 
     /// At the quit the compiles queued and not started go, but one a thread waits for; the O3
@@ -1598,6 +1720,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&THREADS, OnceLock::new());
     reset(&NEXT_WORKER, AtomicUsize::new(0));
     reset(&IDLE_WORKERS, AtomicUsize::new(0));
+    reset(&BOUNCES, AtomicUsize::new(0));
+    reset(&FLOOR_REFUSED, AtomicBool::new(false));
     reset(&WORKERS_STOP, AtomicBool::new(false));
     reset(&DRAINS, Drains::new());
     reset(&DRAINS_BACK, AtomicUsize::new(0));

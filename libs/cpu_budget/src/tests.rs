@@ -765,6 +765,29 @@ fn a_waiter_raised_while_parked_takes_the_first_token_its_new_class_may_take() {
     assert_eq!(b.state.lock().unwrap().running, 0);
 }
 
+#[test]
+fn a_thread_floor_preserves_priority_and_a_refused_raise_is_not_retried() {
+    thread::spawn(|| {
+        set_thread_floor(true);
+        assert!(apply_thread_class_with(INTERACTIVE, |_| Some(true)));
+        assert!(set_thread_class(BACKGROUND));
+        assert_eq!((thread_class(), applied_thread_class()), (Some(BACKGROUND), Some(INTERACTIVE)));
+        assert!(!set_thread_idle(), "a floored thread refuses idle work");
+        set_thread_floor(false);
+        assert!(apply_thread_class_with(BACKGROUND, |_| Some(true)));
+        assert_eq!(applied_thread_class(), Some(BACKGROUND), "a thread whose floor is cleared goes to Background again");
+    }).join().unwrap();
+    thread::spawn(|| {
+        let request = |class, nice| apply_thread_class_with(class, |_| try_nice(nice, || (false, true)));
+        assert!(!request(VISIBLE, 1));
+        assert_eq!((thread_class(), applied_thread_class()), (Some(VISIBLE), None));
+        for nice in [1, 0] {
+            assert_eq!(try_nice(nice, || panic!("retry at nice {nice}")), None);
+        }
+        assert_eq!(try_nice(8, || (true, false)), Some(true), "a reachable nice still applies");
+    }).join().unwrap();
+}
+
 /// set_thread_idle: the thread runs at SCHED_IDLE, Background work leaves it there (it reads as
 /// Background), and UI protection refuses a later request to lower its policy.
 #[cfg(any(target_os = "linux", target_os = "android"))]
