@@ -1388,6 +1388,8 @@ thread_local! {
     static LENDS: Cell<u32> = const { Cell::new(0) };
     /// set_ui_thread's thread: its OS class stays the UI's
     static UI_THREAD: Cell<bool> = const { Cell::new(false) };
+    /// set_thread_keeps_priority: this thread's OS class stays what it is
+    static KEEPS_PRIORITY: Cell<bool> = const { Cell::new(false) };
     /// this thread runs at the OS's idle policy (Linux SCHED_IDLE): set_thread_idle
     static IDLE_NOW: Cell<bool> = const { Cell::new(false) };
     /// what the Background work this thread runs is to the program: set_thread_work
@@ -1413,9 +1415,18 @@ impl Drop for Marks {
 #[relax_api]
 pub fn set_thread_class(class: u8) -> bool {
     valid(class, APP);
-    if UI_THREAD.with(Cell::get) { return true; }
+    if UI_THREAD.with(Cell::get) || KEEPS_PRIORITY.with(Cell::get) { return true; }
     apply_thread_class(class)
 }
+
+/// While `on`, the calling thread keeps the OS priority it has: admission, checkpoints and
+/// `set_thread_class`, `set_thread_work` and `set_thread_idle` leave it, as on the UI thread.
+/// Returns the previous setting. A pool sets it on a thread it does not own for the time that
+/// thread takes part in its work (its share of a fan-out, a job it claimed), and restores it after:
+/// nothing would bring that thread's priority back (a Linux thread without CAP_SYS_NICE cannot climb
+/// back from Background).
+#[relax_api]
+pub fn set_thread_keeps_priority(on: bool) -> bool { KEEPS_PRIORITY.with(|keeps| keeps.replace(on)) }
 
 /// The UI thread, and the thread it waits on for its work (the JIT owner), are outside admission
 /// and keep the UI's OS priority, above pool jobs, for good: a job's class taken on later (a scope's
@@ -1439,7 +1450,7 @@ pub fn set_thread_floor(on: bool) { THREAD_FLOOR.with(|floor| floor.set(on)); }
 /// other thread wants that core), elsewhere the Background class's priority. A thread without
 /// CAP_SYS_NICE (RLIMIT_NICE 0) cannot leave SCHED_IDLE again; Background work keeps it there.
 pub fn set_thread_idle() -> bool {
-    if UI_THREAD.with(Cell::get) || THREAD_FLOOR.with(Cell::get) { return false; }
+    if UI_THREAD.with(Cell::get) || THREAD_FLOOR.with(Cell::get) || KEEPS_PRIORITY.with(Cell::get) { return false; }
     apply_thread_class(IDLE)
 }
 /// The calling thread runs at the OS's idle policy (`set_thread_idle` took effect, and nothing
@@ -1489,6 +1500,7 @@ pub const WORK_BEHIND: u8 = 2;
 pub fn set_thread_work(kind: u8) -> bool {
     assert!(kind <= WORK_BEHIND, "invalid kind of Background work {kind}");
     WORK.with(|w| w.set(kind));
+    if KEEPS_PRIORITY.with(Cell::get) { return true; }
     match THREAD_CLASS.with(Cell::get) {
         Some(BACKGROUND | BACKGROUND_HOT | BACKGROUND_BEHIND) => apply_thread_class(BACKGROUND),
         _ => true,
