@@ -430,25 +430,27 @@ fn renames_of(prog: &Program, mut names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     }
 }
 
+/// Include the names under which imports re-export these names, following chains of renames.
+fn through_imports(prog: &Program, mut names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    loop {
+        let before = names.len();
+        for im in &prog.imports {
+            let (Some(bind), Some(&(_, last))) = (im.bind, im.segs.last()) else { continue };
+            if im.glob || bind == last { continue; }
+            let (b, l) = (prog.syms.str(bind).as_bytes(), prog.syms.str(last).as_bytes());
+            if names.iter().any(|n| n == l) && !names.iter().any(|n| n == b) { names.push(b.to_vec()); }
+        }
+        if names.len() == before { return names; }
+    }
+}
+
 /// The definitions of the contexts `const_contexts_mention` counts; None: it cannot say.
 fn const_contexts_reading(prog: &Program, items: &[DefId]) -> Option<crate::fxhash::HashSet<DefId>> {
     use crate::def_collector::NodeId;
     let mut found = crate::fxhash::HashSet::default();
     let visible = prog.crates_seeing_files(items.iter().map(|d| prog.def(*d).file));
-    let alias_closure = |mut names: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
-        loop {
-            let mut grew = false;
-            for im in &prog.imports {
-                let (Some(bind), Some(&(_, last))) = (im.bind, im.segs.last()) else { continue };
-                if im.glob || bind == last { continue; }
-                let (b, l) = (prog.syms.str(bind).as_bytes().to_vec(), prog.syms.str(last).as_bytes().to_vec());
-                if names.contains(&l) && !names.contains(&b) { names.push(b); grew = true; }
-            }
-            if !grew { return names; }
-        }
-    };
-    let all = alias_closure(items.iter().map(|d| def_name(prog, *d).into_bytes()).collect());
-    let consts = alias_closure(items.iter().filter(|d| matches!(prog.def(**d).kind, DefKind::Const | DefKind::AssocConst | DefKind::Fn | DefKind::AssocFn)).map(|d| def_name(prog, *d).into_bytes()).collect());
+    let all = through_imports(prog, items.iter().map(|d| def_name(prog, *d).into_bytes()).collect());
+    let consts = through_imports(prog, items.iter().filter(|d| matches!(prog.def(**d).kind, DefKind::Const | DefKind::AssocConst | DefKind::Fn | DefKind::AssocFn)).map(|d| def_name(prog, *d).into_bytes()).collect());
     // the constant-evaluated contexts, per file: (lo, hi, whether static names count, whose); and the
     // ranges of every other item of those files (text there is not a context's, unless a
     // context range inside it holds it)
@@ -4866,6 +4868,71 @@ fn item_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> b
     toks(pf, it.lo, it.hi, &[]).iter().any(|t| names.contains(t))
 }
 
+/// Promotion reads the value-based qualifs of named consts. Find their readers even when
+/// the reader never ran (no lowering slot), or names another const that reads this one.
+fn const_qualif_readers(u: &Unit, edited: &[DefId], visible: &[bool], changed_bodies: &[DefId]) -> Vec<DefId> {
+    use crate::fxhash::HashSet;
+    use relax_types::mir::transform::qualifs::ConstQualifsProvider;
+    let prog = &u.prog;
+    let provider = relax_types::mir::build::driver::BuildProvider { prog, tcx: &u.tcx, memo: Default::default() };
+    let mut pending: HashSet<_> = edited.iter().copied().filter(|&d| !provider.mir_const_qualif(d)
+        .is_ok_and(|q| !q.has_mut_interior && !q.needs_drop && !q.needs_non_const_drop && !q.not_sync)).collect();
+    let mut readers = Vec::new();
+    if pending.is_empty() { return readers; }
+    let mut seen = pending.clone();
+    // Only these changed bodies have their own borrow check before installation.
+    if crate::jit::CHECK_FIRST.load(Ordering::Relaxed) {
+        seen.extend(changed_bodies.iter().copied().filter(|d| crate::borrowck::event::admit(prog, prog.def(*d).krate)));
+    }
+    while !pending.is_empty() {
+        // An import can rename a macro, and a macro can use a renamed const or macro.
+        let mut names = pending.iter().map(|&d| def_name(prog, d).into_bytes()).collect();
+        loop {
+            names = through_imports(prog, names);
+            let before = names.len();
+            let refs: Vec<_> = names.iter().map(Vec::as_slice).collect();
+            names = through_macros(prog, visible, &refs);
+            if names.len() == before { break; }
+        }
+        let names: HashSet<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let mut next = HashSet::default();
+        let mut scanned = 0;
+        let mut passed = 0;
+        let mut typechecked = 0;
+        for (i, def) in prog.defs.iter().enumerate() {
+            let d = DefId(i as u32);
+            if !visible[def.krate as usize] || !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst)
+                || seen.contains(&d) || !prog.is_current_version(def.file) || crate::borrowck::body::CheckedBody::item(prog, d).is_none() { continue; }
+            scanned += 1;
+            let pf = &prog.files[def.file as usize];
+            let it = pf.ast.item(def.item);
+            // Ordinary source has to spell the const, an alias or a macro that reaches it.
+            // Generated code and items that can inherit a block-local rename need resolution.
+            if it.hi <= pf.src_len && !prog.block_owner.contains_key(&def.scope) {
+                if let Ok(src) = std::str::from_utf8(pf.bytes(it.lo, it.hi)) {
+                    // Rust's whitespace includes the left-to-right and right-to-left marks.
+                    let separator = |c: char| c.is_ascii_punctuation() && c != '_' || c.is_whitespace() || matches!(c, '\u{200e}' | '\u{200f}');
+                    if !src.split(separator).any(|word| names.contains(word.as_bytes())) { continue; }
+                }
+                passed += 1;
+            }
+            typechecked += 1;
+            let body = u.tcx.typeck_unstored(prog, d);
+            if !body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values())
+                .any(|r| matches!(r, crate::typeck::Res::Def(c) if pending.contains(c))) { continue; }
+            seen.insert(d);
+            if matches!(def.kind, DefKind::Const | DefKind::AssocConst) { next.insert(d); } else { readers.push(d); }
+        }
+        trace_count("const_qualif_def_visits", prog.defs.len());
+        trace_count("const_qualif_defs_scanned", scanned);
+        trace_count("const_qualif_text_passed", passed);
+        trace_count("const_qualif_typechecked", typechecked);
+        pending = next;
+    }
+    trace_count("const_qualif_readers", readers.len());
+    readers
+}
+
 /// Where a mention of a name an edit adds can resolve to the added item.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum NameReach {
@@ -7765,6 +7832,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     let u = &mut *up;
     trace_stage("typecheck");
+    // A reader outside this patch may have no slot to check after installation. Check it
+    // against the candidate while its borrow error can still refuse the whole edit.
+    if errs.is_empty() && !const_defs.is_empty() && crate::borrowck::enabled(options) {
+        let readers = const_qualif_readers(u, &const_defs, &visible_crates, &out.bodies);
+        if !readers.is_empty() {
+            let check = crate::check::live_lints(&u.prog, &u.tcx, &readers);
+            errs.extend(check.borrows.into_iter().map(|(_, error)| error));
+            if !errs.is_empty() {
+                out.lines.push(format!("refused by the borrow checker ({} error(s))", errs.len()));
+            }
+        }
+        trace_stage("const_qualif");
+    }
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
     // instances are queued to Gandalf when their new code is installed (jit.rs install, RANK_EDIT).
     if errs.is_empty() && crate::borrowck::enabled(options) && crate::jit::CHECK_FIRST.load(std::sync::atomic::Ordering::Relaxed) {
