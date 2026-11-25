@@ -40,11 +40,13 @@ use crate::digest::sha256_hash;
 
 #[cfg(any(
     target_os = "linux",
+    target_os = "macos", target_os = "ios", target_os = "tvos",
 ))]
 #[path = "tls_engine.rs"]
 pub(crate) mod engine;
 #[cfg(any(
     target_os = "linux",
+    target_os = "macos", target_os = "ios", target_os = "tvos",
 ))]
 pub use engine::TlsEngine;
 
@@ -835,7 +837,7 @@ impl Write for TlsStream {
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "backend/apple/tls_server.rs"]
-mod platform;
+pub(crate) mod platform;
 
 #[cfg(target_os = "linux")]
 #[path = "backend/linux/tls_server.rs"]
