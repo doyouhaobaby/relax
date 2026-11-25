@@ -2324,9 +2324,9 @@ mod tests {
         if let Some(w) = waiter {
             w.join().unwrap();
         }
+        // (no wall-clock bound: a loaded box took 1.008 s; the 5 s `late` is the hang's mark)
         assert!(!TIMED_OUT.load(Ordering::SeqCst), "the nested constant waited for a query held up by the owner's own stack");
-        assert!(CANCELLED.load(Ordering::SeqCst) >= 1);
-        assert!(t0.elapsed().as_millis() < 1000, "{:?}", t0.elapsed());
+        assert!(CANCELLED.load(Ordering::SeqCst) >= 1, "the nested constant was cancelled, not waited out");
     }
 
     /// The owner-wait table's rows: a wait outside every request (the owner loop draining constants)
@@ -2383,12 +2383,15 @@ mod tests {
         while !ROW.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let t0 = std::time::Instant::now();
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(Class::Program, || pump_latch(RUNNER.load(Ordering::SeqCst), &|| DONE.load(Ordering::SeqCst)))));
+        // the wait's end: whether the runner's query had ended by then
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(Class::Program, || {
+            pump_latch(RUNNER.load(Ordering::SeqCst), &|| DONE.load(Ordering::SeqCst));
+            DONE.load(Ordering::SeqCst)
+        })));
         runner.join().unwrap();
         let msg = r.as_ref().err().map(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
         assert!(r.is_ok(), "the outermost request stopped: {msg:?}");
-        assert!(t0.elapsed().as_millis() < 1000, "{:?}", t0.elapsed());
+        assert_eq!(r.ok(), Some(true), "the outermost request waited until the runner's query ended");
     }
 
     #[test]
