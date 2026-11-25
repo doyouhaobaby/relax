@@ -6856,8 +6856,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     if !ok.iter().any(|x| *x) {
         return false;
     }
-    // one vreg per (slot, group cell inside the slot), zero at entry (a cell read before any
-    // write of it reads padding or an unwritten variant field: any value will do)
+    // one vreg per (slot, group cell inside the slot), reading zero until written. `init` holds
+    // each cell's zero, which `sroa_late_zeros` places where some read needs it (not at the
+    // entry), and then the escaped slots' addresses, which go at the entry.
     let mut slot_regs: Vec<Vec<u32>> = vec![Vec::new(); ns];
     let mut init: Vec<Inst> = Vec::new();
     for sl in 0..ns {
@@ -6896,6 +6897,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         }
         slot_regs[sl] = regs;
     }
+    let ncell = init.len();
     let esc_addr: Vec<(u32, VReg)> = esc_slots.iter().map(|&sl| (sl, f.vreg(Cls::I))).collect();
     for &(sl, v) in &esc_addr {
         init.push(Inst::SlotAddr(v, sl));
@@ -7196,12 +7198,213 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         }
         f.blocks[bi].term = Term::Invoke(targets[0], targets[1]);
     }
+    let zeros: Vec<Inst> = init.drain(..ncell).collect();
     let p0 = f.blocks[0].pos.first().copied().unwrap_or(0);
     let n0 = init.len();
     let b0 = &mut f.blocks[0];
     b0.insts.splice(0..0, init);
     b0.pos.splice(0..0, std::iter::repeat(p0).take(n0));
+    sroa_late_zeros(f, &zeros);
     true
+}
+
+/// sroa's cells read zero until written, as if zeroed at the entry, but each zero is defined only
+/// where it is needed: on the edges where a path that wrote the cell nowhere meets the cell live
+/// and written on another path (at the end of the unwritten predecessor), and right before a read
+/// that no write can reach on any path (on a vreg of its own). Every read sees what it saw with
+/// the zeros at the entry, and every path to a read still defines the cell, but its live range
+/// starts at its writes and those edges. Zeros at the entry kept each cell live from there to its
+/// last read: a guarded inline copy's slow call writes all of a result's cells and the error
+/// return copies them out whole, so every padding cell of every such result was live through
+/// the function, spilled, and zero-filled by each call's prologue (`KnotVector::find_span`: 80
+/// cells, 78 stack words). `zeros`: each cell's zero, in cell order.
+fn sroa_late_zeros(f: &mut Func, zeros: &[Inst]) {
+    let nc = zeros.len();
+    if nc == 0 {
+        return;
+    }
+    let nv = f.vregs.len();
+    let mut cell = vec![u32::MAX; nv];
+    let mut reg = Vec::with_capacity(nc);
+    for (k, z) in zeros.iter().enumerate() {
+        for_defs(z, |d| {
+            cell[d.0 as usize] = k as u32;
+            reg.push(d);
+        });
+    }
+    let nw = nc.div_ceil(64);
+    let nb = f.blocks.len();
+    let bit = |set: &mut [u64], k: u32| set[k as usize / 64] |= 1 << (k % 64);
+    let has = |set: &[u64], k: u32| set[k as usize / 64] & (1 << (k % 64)) != 0;
+    // (the zeros made below are on vregs past `cell`: not cells)
+    let cell_of = |x: VReg| cell.get(x.0 as usize).copied().unwrap_or(u32::MAX);
+    let each_cell = |i: &Inst, defs: bool, g: &mut dyn FnMut(u32)| {
+        let mut h = |x: VReg| {
+            let k = cell_of(x);
+            if k != u32::MAX {
+                g(k);
+            }
+        };
+        if defs { for_defs(i, &mut h) } else { for_uses(i, &mut h) }
+    };
+    let cells_of = |i: &Inst, defs: bool| -> Vec<u32> {
+        let mut v = Vec::new();
+        each_cell(i, defs, &mut |k| if !v.contains(&k) { v.push(k) });
+        v
+    };
+    let mut tu = Vec::new();
+    let mut term_cells = |t: &Term| -> Vec<u32> {
+        tu.clear();
+        term_uses(t, &mut tu);
+        let mut v: Vec<u32> = Vec::new();
+        for x in &tu {
+            let k = cell_of(*x);
+            if k != u32::MAX && !v.contains(&k) {
+                v.push(k);
+            }
+        }
+        v
+    };
+    // the cells each block writes, and those some write may reach at its start (forward, union)
+    let mut gen = vec![0u64; nb * nw];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let g = &mut gen[bi * nw..(bi + 1) * nw];
+        for i in &b.insts {
+            each_cell(i, true, &mut |k| bit(&mut *g, k));
+        }
+    }
+    let mut written_in = vec![0u64; nb * nw];
+    let mut queued = vec![true; nb];
+    let mut work: Vec<usize> = (0..nb).rev().collect();
+    while let Some(bi) = work.pop() {
+        queued[bi] = false;
+        let out: Vec<u64> = (0..nw).map(|w| written_in[bi * nw + w] | gen[bi * nw + w]).collect();
+        for t in f.blocks[bi].term.succs() {
+            let t = t as usize;
+            let mut grew = false;
+            for w in 0..nw {
+                let x = written_in[t * nw + w] | out[w];
+                grew |= x != written_in[t * nw + w];
+                written_in[t * nw + w] = x;
+            }
+            if grew && !queued[t] {
+                queued[t] = true;
+                work.push(t);
+            }
+        }
+    }
+    // A read no write reaches: a zero of its own right before it.
+    let fresh = |f: &mut Func, k: u32| -> (VReg, Inst) {
+        let v = f.vreg(f.vregs[reg[k as usize].0 as usize]);
+        let mut i = zeros[k as usize].clone();
+        i.vregs_mut(|x| *x = v);
+        (v, i)
+    };
+    let mut cur = vec![0u64; nw];
+    for bi in 0..nb {
+        let mut reads = false;
+        for i in &f.blocks[bi].insts {
+            each_cell(i, false, &mut |_| reads = true);
+        }
+        if !reads && term_cells(&f.blocks[bi].term).is_empty() {
+            continue;
+        }
+        cur.copy_from_slice(&written_in[bi * nw..(bi + 1) * nw]);
+        let b = std::mem::take(&mut f.blocks[bi].insts);
+        let pos = std::mem::take(&mut f.blocks[bi].pos);
+        let mut insts = Vec::with_capacity(b.len());
+        let mut npos = Vec::with_capacity(b.len());
+        for (ii, i) in b.into_iter().enumerate() {
+            let p = pos.get(ii).copied().unwrap_or(0);
+            let mut swap: Vec<(VReg, VReg)> = Vec::new();
+            for k in cells_of(&i, false) {
+                if !has(&cur, k) {
+                    let (v, z) = fresh(f, k);
+                    swap.push((reg[k as usize], v));
+                    insts.push(z);
+                    npos.push(p);
+                }
+            }
+            let i = if swap.is_empty() { i } else { rename(&i, &|u| swap.iter().find(|s| s.0 == u).map_or(u, |s| s.1)) };
+            each_cell(&i, true, &mut |k| bit(&mut cur, k));
+            insts.push(i);
+            npos.push(p);
+        }
+        let mut swap: Vec<(VReg, VReg)> = Vec::new();
+        for k in term_cells(&f.blocks[bi].term) {
+            if !has(&cur, k) {
+                let (v, z) = fresh(f, k);
+                swap.push((reg[k as usize], v));
+                insts.push(z);
+                npos.push(f.blocks[bi].term_pos);
+            }
+        }
+        if !swap.is_empty() {
+            crate::regalloc::term_vregs_mut(&mut f.blocks[bi].term, |x| {
+                if let Some(s) = swap.iter().find(|s| s.0 == *x) {
+                    *x = s.1;
+                }
+            });
+        }
+        f.blocks[bi].insts = insts;
+        f.blocks[bi].pos = npos;
+    }
+    // The cells live at each block's start (backward, over the reads left), then the zeros on the
+    // edges from a block no write reaches the end of into one some write reaches, the cell live.
+    let mut upward = vec![0u64; nb * nw];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for k in term_cells(&b.term) {
+            bit(&mut upward[bi * nw..(bi + 1) * nw], k);
+        }
+        // backwards: a write hides the reads after it
+        let up = &mut upward[bi * nw..(bi + 1) * nw];
+        for i in b.insts.iter().rev() {
+            each_cell(i, true, &mut |k| up[k as usize / 64] &= !(1 << (k % 64)));
+            each_cell(i, false, &mut |k| bit(&mut *up, k));
+        }
+    }
+    let mut live_in = upward.clone();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..nb).rev() {
+            for t in f.blocks[bi].term.succs() {
+                let t = t as usize;
+                for w in 0..nw {
+                    let x = live_in[t * nw + w] & !gen[bi * nw + w];
+                    let y = live_in[bi * nw + w] | x;
+                    if y != live_in[bi * nw + w] {
+                        live_in[bi * nw + w] = y;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for bi in 0..nb {
+        let mut need = vec![0u64; nw];
+        for t in f.blocks[bi].term.succs() {
+            let t = t as usize;
+            for w in 0..nw {
+                need[w] |= live_in[t * nw + w] & written_in[t * nw + w] & !(written_in[bi * nw + w] | gen[bi * nw + w]);
+            }
+        }
+        if need.iter().all(|w| *w == 0) {
+            continue;
+        }
+        let tp = f.blocks[bi].term_pos;
+        // before an invoked call, which ends its block
+        let at = if matches!(f.blocks[bi].term, Term::Invoke(..)) { f.blocks[bi].insts.len().saturating_sub(1) } else { f.blocks[bi].insts.len() };
+        let mut add: Vec<Inst> = Vec::new();
+        for k in 0..nc as u32 {
+            if has(&need, k) {
+                add.push(zeros[k as usize].clone());
+            }
+        }
+        let n = add.len();
+        f.blocks[bi].insts.splice(at..at, add);
+        f.blocks[bi].pos.splice(at..at, std::iter::repeat(tp).take(n));
+    }
 }
 
 pub fn mem_size(m: Mem) -> i32 {
