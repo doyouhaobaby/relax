@@ -551,9 +551,10 @@ impl Asm {
     fn sub_imm_lsl12(&mut self, d: u8, n: u8, imm: u32) {
         self.e(0xD140_0000 | imm << 10 | (n as u32) << 5 | d as u32);
     }
-    /// d = n + v for any v (n and d may be sp); uses IP1 when v does not fit.
+    /// d = n + v for any v; n and d may be sp. Large constants use IP1,
+    /// or the destination when IP1 holds the base. IP0 is preserved unless it is the destination.
     fn add_any(&mut self, d: u8, n: u8, v: i64) {
-        let (neg, a) = if v < 0 { (true, (-v) as u64) } else { (false, v as u64) };
+        let (neg, a) = (v < 0, v.unsigned_abs());
         if a < (1 << 24) {
             let lo = (a & 0xfff) as u32;
             let hi = (a >> 12) as u32;
@@ -573,10 +574,17 @@ impl Asm {
                     self.add_imm(d, src, lo);
                 }
             }
+        } else if n == IP1 && (d == IP1 || d == SP) {
+            self.e(0xF81F_0FF0); // str x16, [sp, #-16]!
+            self.mov_imm(IP0, v);
+            self.rrr(0x8B00_0000, IP1, IP1, IP0);
+            self.e(0xF841_07F0); // ldr x16, [sp], #16
+            if d == SP { self.mov_sp(SP, IP1); }
         } else {
-            self.mov_imm(IP1, v);
-            // add xd, xn, x17, uxtx (extended form accepts sp)
-            self.e(0x8B20_6000 | (IP1 as u32) << 16 | (n as u32) << 5 | d as u32);
+            let tmp = if n == IP1 { d } else { IP1 };
+            self.mov_imm(tmp, v);
+            // add xd, xn, xm, uxtx (extended form accepts sp)
+            self.e(0x8B20_6000 | (tmp as u32) << 16 | (n as u32) << 5 | d as u32);
         }
     }
     fn cmp(&mut self, n: u8, m: u8) {
@@ -1166,12 +1174,13 @@ impl<'a> Gen<'a> {
                 if off == 0 && (sh == 0 || scaled) {
                     return (rb, Some((ri, sh != 0)), 0);
                 }
+                // Fold the displacement while the original base and index
+                // are still in their own registers. IP1 is free for add_any.
+                let (rb, off) = if off.unsigned_abs() >= 256 {
+                    self.a.add_any(IP1, rb, i64::from(off));
+                    (IP1, 0)
+                } else { (rb, off) };
                 self.a.e(0x8B00_0000 | ((sh as u32) << 10) | ((ri as u32) << 16) | ((rb as u32) << 5) | IP1 as u32);
-                // ldst's large-offset form needs ip1 itself: fold big offsets in first
-                if (off as i64).abs() >= 256 {
-                    self.a.add_any(IP1, IP1, off as i64);
-                    return (IP1, None, 0);
-                }
                 (IP1, None, off as i64)
             }
         }
@@ -6391,6 +6400,77 @@ pub fn tls2_reader() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn large_offset_indexed_byte_load_and_store() {
+        const OFFSET: i32 = 1 << 25;
+        let mut f = Func::new("indexed_bytes".into(), 0);
+        let (src, dst, index, byte) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        // Independent bases keep both indexed accesses through instruction selection.
+        f.params.extend([src, dst, index]);
+        f.rets.push(Cls::I);
+        f.block();
+        let mem = Mem::Int(1, false);
+        f.blocks[0].insts = vec![Inst::LoadX(mem, byte, src, index, 1, OFFSET),
+            Inst::StoreX(mem, dst, index, 1, OFFSET, byte)];
+        f.blocks[0].pos = vec![0; 2];
+        f.blocks[0].term = Term::Ret(vec![byte]);
+        let compiled = compile(&Default::default(), &f, &Env::standalone(true)).unwrap();
+        assert!(compiled.relocs.is_empty());
+
+        // Run the emitted address calculations in a six-byte logical memory.
+        // Translate each byte access just before it executes. An out-of-range
+        // result selects guard byte zero and gives an ordinary assertion failure.
+        let mut bytes = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut guarded = Asm { w: Vec::new(), flags: None };
+        let mut accesses = Vec::new();
+        for instruction in compiled.code[..compiled.text_len as usize].chunks_exact(4) {
+            let w = u32::from_le_bytes(instruction.try_into().unwrap());
+            let op = w & 0xffff_fc00;
+            if matches!(op, LDRB | STRB) {
+                let base_reg = ((w >> 5) & 31) as u8;
+                assert_ne!(base_reg, IP0);
+                assert_ne!((w & 31) as u8, IP0);
+                guarded.mov_imm(IP0, bytes.len() as i64);
+                guarded.cmp(base_reg, IP0);
+                guarded.csel(IP1, base_reg, ZR, LO);
+                guarded.mov_imm(IP0, bytes.as_mut_ptr() as i64);
+                guarded.rrr(0x8B00_0000, IP1, IP0, IP1);
+                guarded.e(op | (u32::from(IP1) << 5) | (w & 31));
+                accesses.push(op);
+            } else {
+                guarded.e(w);
+            }
+        }
+        assert_eq!(accesses, [LDRB, STRB], "byte access encodings in {:08x?}", guarded.w);
+        let code = crate::exec::Code::new(&words_to_bytes(&guarded.w)).unwrap();
+        // SAFETY: both byte operations address the live buffer through the translation above.
+        let run: extern "C" fn(i64, i64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+        let base = -i64::from(OFFSET);
+        let loaded = run(base, base + 1, 2);
+        assert_eq!((loaded, bytes), (0x55, [0x11, 0x22, 0x33, 0x44, 0x55, 0x55]));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn large_offset_add_preserves_live_scratch() {
+        for (dst, offset) in [(IP1, 1 << 30), (0, i64::MIN)] {
+            let mut a = Asm { w: Vec::new(), flags: None };
+            a.mov(IP1, 0);
+            a.mov(IP0, 1);
+            a.add_any(dst, IP1, offset);
+            a.ldst(STRX, 8, IP0, 2, 0);
+            a.mov(0, dst);
+            a.ret();
+            let code = crate::exec::Code::new(&words_to_bytes(&a.w)).unwrap();
+            // SAFETY: the stub stores x16 in the single output word and returns the sum.
+            let run: extern "C" fn(u64, u64, &mut u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+            let mut saved = 0;
+            let sum = run(37, 0xabcd_1234, &mut saved);
+            assert_eq!((sum, saved), (37u64.wrapping_add(offset as u64), 0xabcd_1234));
+        }
+    }
 
     /// R13: a conditional branch over more than 1 MB of code (imm19) is relaxed into an
     /// inverted short branch over a `b` instead of being truncated into other code (Amp's
