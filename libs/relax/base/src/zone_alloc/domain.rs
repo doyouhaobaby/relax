@@ -255,6 +255,7 @@ unsafe fn owner(p: *mut u8) -> Owner {
     Owner::System
 }
 /// Whether `p` may be a domain heap's (the regions' conservative bounds).
+#[inline]
 fn in_heaps(p: *mut u8) -> bool {
     let address = p as usize;
     address >= compiler::HEAPS_LOW.load(Ordering::Acquire) && address < compiler::HEAPS_HIGH.load(Ordering::Acquire)
@@ -429,8 +430,10 @@ unsafe fn reallocate(heap: &Arena, p: *mut u8, size: usize) -> *mut u8 {
 pub unsafe extern "C" fn program_alloc(size: usize, align: usize) -> *mut u8 {
     compiler::domain_alloc(Layout::from_size_align_unchecked(size, align), system_alloc)
 }
-#[cold]
-#[inline(never)]
+/// `program_alloc` on a thread inside no domain: every allocation of a test's threads and of
+/// threads native code started comes here, so it is no cold path (inlined, it tail-calls the
+/// system heap; as a cold call it was 1 ms of a CAD test's 280 ms round)
+#[inline]
 unsafe extern "C" fn system_alloc(size: usize, align: usize) -> *mut u8 {
     let l = Layout::from_size_align_unchecked(size, align);
     if super::arenas_closed() { return child_alloc(l, false); }
@@ -490,11 +493,22 @@ unsafe fn dealloc_other(p: *mut u8, l: Layout) -> bool {
 pub unsafe extern "C" fn program_dealloc(p: *mut u8, size: usize, align: usize) {
     compiler::domain_free(p, Layout::from_size_align_unchecked(size, align), dealloc_shared)
 }
-/// `program_dealloc` of a block that is not of the current domain's heap: another heap's, or the
-/// system heap's.
+/// `program_dealloc` of a block that is not of the current domain arena's. A thread inside no
+/// domain (a test's, one native code started) frees every block here: a block outside every
+/// heap's bounds is the system heap's and goes straight to it, inlined, where the owner lookup
+/// said so three calls further on (6 ms of a CAD test's 280 ms round went to those hops). (A
+/// fork child's bounds take every address: its frees take the full path, which knows its blocks.)
+#[inline]
+unsafe extern "C" fn dealloc_shared(p: *mut u8, size: usize, align: usize) {
+    if !in_heaps(p) {
+        return System.dealloc(p, Layout::from_size_align_unchecked(size, align));
+    }
+    dealloc_owned(p, size, align)
+}
+/// `dealloc_shared` of a block inside the heaps' bounds: another heap's, or the system heap's.
 #[cold]
 #[inline(never)]
-unsafe extern "C" fn dealloc_shared(p: *mut u8, size: usize, align: usize) {
+unsafe extern "C" fn dealloc_owned(p: *mut u8, size: usize, align: usize) {
     let l = Layout::from_size_align_unchecked(size, align);
     let handled = if super::arenas_closed() { dealloc_layout(p, l) } else { dealloc_other(p, l) };
     if !handled {
