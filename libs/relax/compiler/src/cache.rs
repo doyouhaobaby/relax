@@ -7653,19 +7653,60 @@ pub fn start_deferred_front(after: &'static str) {
 /// and ending the process under the writer.
 static FRONT_GRAPH_WRITER: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
+/// The demand plans of the queued graph writes that are neither made nor failed (locks
+/// DEFERRED_FRONT, then FRONT_GRAPH_WRITES: the writer's order).
+fn unready_plans() -> Vec<std::sync::Arc<crate::preload::DemandPlan>> {
+    let deferred = DEFERRED_FRONT.lock().unwrap();
+    let writes = FRONT_GRAPH_WRITES.lock().unwrap();
+    deferred.iter().filter_map(|d| d.graph.as_ref()).chain(writes.iter())
+        .filter_map(|job| job.demand.as_ref())
+        .filter(|p| p.ready().is_none() && !p.failed()).cloned().collect()
+}
+
+/// A queued graph write waits for its demand plan.
+pub fn front_plans_pending() -> bool { !unready_plans().is_empty() }
+
+/// Off the owner thread, settle every queued graph write's demand plan, waiting on its
+/// condvar for completion or failure. Include plans queued during the wait.
+pub fn settle_front_plans() {
+    debug_assert!(!crate::owner::is_owner());
+    loop {
+        let plans = unready_plans();
+        if plans.is_empty() { break; }
+        for p in plans { let _ = p.settle(); }
+    }
+}
+
 fn flush_front_graphs() -> Result<(), String> {
+    // Discovery may need the owner to compile a macro. Writers wait for plans outside
+    // the writer lock, and the owner leaves unfinished plans queued.
+    if !crate::owner::is_owner() { settle_front_plans(); }
     // Only the cache-writer threads wait here; queueing and pending probes
     // keep their short lock. An empty queue does not mean a mid-run writer
     // has finished the jobs it took. Exit must wait for their demand parts
     // and graph commit before publishing the collected image or terminating.
     let _writer = FRONT_GRAPH_WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    for mut d in std::mem::take(&mut *DEFERRED_FRONT.lock().unwrap()) {
+    let deferred = {
+        let mut pending = DEFERRED_FRONT.lock().unwrap();
+        let mut writes = FRONT_GRAPH_WRITES.lock().unwrap();
+        let mut deferred = std::mem::take(&mut *pending);
+        writes.extend(deferred.iter_mut().filter_map(|d| d.graph.take()));
+        deferred
+    };
+    for mut d in deferred {
         if let Some(w) = d.writers.as_mut() { w.finish(); }
-        if let Some(job) = d.graph.take() { FRONT_GRAPH_WRITES.lock().unwrap().push(job); }
     }
-    let writes = std::mem::take(&mut *FRONT_GRAPH_WRITES.lock().unwrap());
+    let (writes, n) = {
+        let mut pending = FRONT_GRAPH_WRITES.lock().unwrap();
+        let writes: Vec<_> = pending.extract_if(.., |job| job.demand.as_ref().is_none_or(|p| p.ready().is_some() || p.failed())).collect();
+        (writes, pending.len())
+    };
     let mut writes = writes.into_iter();
     while let Some(job) = writes.next() {
+        if job.demand.as_ref().is_some_and(|p| p.failed()) {
+            if crate::preload::trace() { eprintln!("relax front: skipping graph write because its demand plan failed"); }
+            continue;
+        }
         let recorded = write_front_graph(&job).is_some();
         if job.profile { crate::load_profile::flush_current(); }
         if !recorded {
@@ -7676,6 +7717,7 @@ fn flush_front_graphs() -> Result<(), String> {
             return Err("front graph recording deferred: crate stores unavailable".into());
         }
     }
+    if n > 0 { return Err(format!("front graph deferred: {n} demand plan(s) still planning")); }
     Ok(())
 }
 
@@ -7726,7 +7768,10 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let (dir, recipe, fps) = (&job.dir, &job.recipe, &job.fps);
     let mut graph = crate::crate_image::GraphImage {
         identity: recipe.identity, crates: Vec::new(), inputs: Vec::new(), stamps: Vec::new(), probes: Vec::new(),
-        demand_image: job.demand.as_ref().map(|p| p.image.clone()),
+        demand_image: match &job.demand {
+            Some(plan) => Some(plan.ready()?.image.clone()),
+            None => None,
+        },
     };
     let mut inputs = std::collections::BTreeMap::new();
     let mut probes = std::collections::BTreeMap::new();
@@ -7841,7 +7886,9 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
         let parts: Vec<String> = marks.iter().map(|&(n, t)| { let d = t - prev; prev = t; format!("{}={:.0}", n, d) }).collect();
         eprintln!("relax front: graph recorded ({} crates, {} inputs) in {:.0} ms: {}", graph.crates.len(), graph.inputs.len(), prev, parts.join(" "));
     }
-    if let (Some(source), Some(written)) = (&job.demand, &graph.demand_image) { source.image.recording_written(written.parts.clone()); }
+    if let (Some(source), Some(written)) = (&job.demand, &graph.demand_image) {
+        source.ready()?.image.recording_written(written.parts.clone());
+    }
     Some(())
 }
 
@@ -7922,7 +7969,9 @@ pub(crate) fn record_added_crates(prog: &crate::program::Program, dir: &std::pat
 }
 
 pub fn front_graph_pending() -> bool {
-    !FRONT_GRAPH_WRITES.lock().unwrap().is_empty() || !DEFERRED_FRONT.lock().unwrap().is_empty()
+    // one lock at a time: the writer and `unready_plans` nest DEFERRED_FRONT, then FRONT_GRAPH_WRITES
+    let writes = !FRONT_GRAPH_WRITES.lock().unwrap().is_empty();
+    writes || !DEFERRED_FRONT.lock().unwrap().is_empty()
 }
 
 #[derive(Default)]
@@ -8962,8 +9011,12 @@ impl ColdFront {
             // A write that cannot record yet stays queued for the post-present or exit writer.
             if deferred {
                 DEFERRED_FRONT.lock().unwrap().push(DeferredFront { writers: deferred_writers.take(), graph: Some(job) });
+            } else {
+                if let Some(p) = &job.demand {
+                    if !crate::owner::is_owner() { let _ = p.settle(); }
+                }
+                write_front_graph(&job);
             }
-            else { write_front_graph(&job); }
         } else if let Some(w) = deferred_writers.take() {
             DEFERRED_FRONT.lock().unwrap().push(DeferredFront { writers: Some(w), graph: None });
         }
@@ -9230,6 +9283,71 @@ mod cold_tests {
     }
 
 
+
+    #[test]
+    fn owner_never_waits_for_a_plan_that_needs_it() {
+        isolated_test!(owner_never_waits_for_a_plan_that_needs_it);
+        use std::sync::{mpsc, Arc, Mutex};
+        let mut session = crate::Session::default();
+        session.options.rs_lazy = true;
+        let sess = &Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-owner-front-plan-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let package = dir.join("host");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"test_crate\"\nversion = \"0.1.0\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+        let root = package.join("lib.rs").to_string_lossy().into_owned();
+        std::fs::write(&root, "mod late; pub struct FxIn { pub t: f32, pub kick: f32 } pub fn host_scale(t: f32) -> f32 { t * 2.0 } pub fn main() {}").unwrap();
+        std::fs::write(package.join("late.rs"), "pub struct Later { pub value: u64 } pub fn later() -> u64 { 3 }").unwrap();
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let pre = vec![crate::preload::PreCrate { name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
+            deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
+        let store = dir.join("cache");
+        pack::ensure_private_dir(&store).unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&store));
+        prog.preload(pre.clone());
+        prog.load_crate(&pre[0].name, &pre[0].root, 2021, cfg, vec![]).unwrap();
+        prog.resolve_imports();
+        assert!(prog.errors.is_empty(), "the fixture must load cleanly: {:?}", prog.errors);
+        let mut cold = ColdFront::default();
+        cold.finish_in(&mut prog, store.clone());
+        let identity = prog.front_graph.as_ref().unwrap().identity;
+        let fps = cold.fps.clone();
+        std::fs::remove_file(front_graph_path(&store, identity)).expect("the fixture must have written its initial graph");
+
+        let contexts = crate::source_context::Context::for_crates(&pre, Arc::default(), sess);
+        let plan = Arc::new(crate::preload::DemandPlan::new(&pre, contexts, None, true));
+        assert!(plan.ready().is_none(), "the queued graph must start with an unmade plan");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let entered_tx = Mutex::new(entered_tx);
+        plan.on_early_publish(move || {
+            let _ = entered_tx.lock().unwrap().send(());
+            crate::owner::call(crate::owner::Class::Program, || ());
+        });
+        let mut job = FrontGraphWrite::capture(&prog, &store, &fps).unwrap();
+        job.demand = Some(plan.clone());
+        FRONT_GRAPH_WRITES.lock().unwrap().push(job);
+
+        let (first, planning) = crate::owner::call(crate::owner::Class::Program, || {
+            let p = plan.clone();
+            let planning = std::thread::spawn(move || p.complete());
+            entered_rx.recv().expect("the plan must reach its early publication");
+            (flush_front_graphs(), planning)
+        });
+        let error = first.expect_err("the owner must defer a graph whose plan needs the owner");
+        assert!(error.contains("still planning"), "the owner must report the unfinished demand plan: {error}");
+        assert!(front_graph_pending(), "the deferred graph must stay queued");
+
+        settle_front_plans();
+        assert!(plan.ready().is_some(), "settling off the owner must finish the plan");
+        flush_front_graphs().expect("the graph with its finished plan must be writable");
+        assert!(!front_graph_pending(), "the successful flush must empty the queue");
+        let graph = read_front_graph(&store, identity).expect("the flush must write a readable graph");
+        assert!(graph.demand_image.is_some(), "the stored graph must include its demand image");
+        planning.join().expect("the planning thread must finish normally");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn collected_boot_excludes_runtime_crates_and_later_boot_queries() {

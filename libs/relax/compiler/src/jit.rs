@@ -28055,8 +28055,12 @@ pub fn spec_drops_summary() -> String {
 /// O3, preemptible checks); from now on the owner serves only this thread's requests (and its
 /// exit helper's): every other thread asking for a compile waits until the process is gone.
 pub fn begin_exit() {
+    begin_exit_for(owner::current_thread());
+}
+
+pub fn begin_exit_for(tid: u64) {
     crate::preempt::stop_all();
-    owner::begin_exit();
+    owner::begin_exit_for(tid);
     SPEC_STOP.store(true, Ordering::SeqCst);
     crate::postframe::wake_image_window();
     TIER_STOP.store(true, Ordering::SeqCst);

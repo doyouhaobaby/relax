@@ -4701,7 +4701,8 @@ extern "C" fn at_exit() {
 }
 
 struct ExitSummary {
-    request: std::sync::mpsc::SyncSender<(&'static str, Option<i32>)>,
+    /// The thread to begin exit for after planning, or zero if it already began exit.
+    request: std::sync::mpsc::SyncSender<(&'static str, Option<i32>, u64)>,
     worker: std::thread::JoinHandle<()>,
     code: std::sync::OnceLock<i32>,
 }
@@ -4711,6 +4712,9 @@ static RUN_PANIC: std::sync::OnceLock<jit::PanicInfo> = std::sync::OnceLock::new
 /// it to begin and to end: a worker not yet scheduled when a fixed wait ran out lost the whole
 /// write (the quit's last code: an app's ~4,000 teardown fns, built again by every session).
 static EXIT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The exit worker waits for the boot's demand plans before exit begins.
+/// The hang guard in finish_run excludes this wait.
+static EXIT_PLAN_WAIT: AtomicBool = AtomicBool::new(false);
 /// How long the exit waits for background compiles to finish (they are abandoned
 /// at their next safe point). Not getting it means no cache write at all.
 const EXIT_QUIESCE_MS: u64 = 200;
@@ -4727,9 +4731,18 @@ fn exit_quiesce_ms() -> u64 {
 
 fn start_exit_summary() {
     let _k = crate::zone_alloc::kept();
-    let (request, receive) = std::sync::mpsc::sync_channel::<(&'static str, Option<i32>)>(1);
+    let (request, receive) = std::sync::mpsc::sync_channel::<(&'static str, Option<i32>, u64)>(1);
     let worker = std::thread::Builder::new().name("run-exit".into()).spawn(move || {
-        let Ok((why, code)) = receive.recv() else { return };
+        let Ok((why, code, exiting)) = receive.recv() else { return };
+        if exiting != 0 {
+            let t = Instant::now();
+            if crate::owner::call_within(crate::owner::Class::Program, EXIT_QUIESCE_MS, || ()).is_some() {
+                crate::cache::settle_front_plans();
+            }
+            EXIT_PLAN_WAIT.store(false, Ordering::SeqCst);
+            jit::begin_exit_for(exiting);
+            verbose!("relax: the exit waited {:.1} ms for the boot's demand plan before taking the owner thread", t.elapsed().as_secs_f64() * 1e3);
+        }
         EXIT_STAGE.store(1, Ordering::SeqCst);
         exit_mark("start");
         remove_present_report();
@@ -4795,20 +4808,33 @@ fn finish_run(why: &'static str, code: Option<i32>) {
     // ran after it kept the startup manifest of the run's first seconds (record_manifest), so the
     // next launch linked the rest of the session on the UI thread at each first call
     crate::borrowck::lazy::stop();
-    jit::begin_exit();
+    // A queued graph needs its finished plan. Discovery may need the owner, which serves
+    // only the exit once it begins. The worker waits on the plans' condvars before then
+    // because this thread may be the UI thread.
+    let plans = !exit_caller_holds_owner() && crate::cache::front_plans_pending();
+    if !plans { jit::begin_exit(); }
     jit::solver_work_report_at_exit();
     // a JIT thread that panicked during the run is said once more at its end (inspect threads has the rows)
     if let Some(l) = crate::lifeline::summary() {
         eprintln!("relax: {}", l);
     }
-    if exit.request.try_send((why, code)).is_err() { return; }
+    EXIT_PLAN_WAIT.store(plans, Ordering::SeqCst);
+    let exiting = if plans { crate::owner::current_thread() } else { 0 };
+    if exit.request.try_send((why, code, exiting)).is_err() {
+        if plans {
+            EXIT_PLAN_WAIT.store(false, Ordering::SeqCst);
+            jit::begin_exit();
+        }
+        return;
+    }
     // 100 ms for the cleanup, counted from the end of the cache write; the write (and the
     // worker's start before it) only has a hang guard (a store on a stalled disk must not keep
     // the process forever)
-    let start = Instant::now();
+    let mut start = Instant::now();
     let mut deadline = start + std::time::Duration::from_millis(100);
     while !exit.worker.is_finished() {
         let now = Instant::now();
+        if EXIT_PLAN_WAIT.load(Ordering::SeqCst) { start = now; }
         if EXIT_STAGE.load(Ordering::SeqCst) < 2 && now.duration_since(start).as_secs() < 30 {
             deadline = now + std::time::Duration::from_millis(100);
         }
@@ -6315,6 +6341,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&EXIT_SUMMARY, std::sync::OnceLock::new());
     reset(&RUN_PANIC, std::sync::OnceLock::new());
     reset(&EXIT_STAGE, std::sync::atomic::AtomicU8::new(0));
+    reset(&EXIT_PLAN_WAIT, AtomicBool::new(false));
     reset(&EXIT_CALLER_HOLDS, AtomicBool::new(false));
     reset(&DONE, AtomicBool::new(false));
     reset(&EXIT_MARKS, relax_session::sync::Mutex::new(Vec::new()));

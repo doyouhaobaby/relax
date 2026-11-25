@@ -875,6 +875,9 @@ fn me() -> u64 {
     crate::os::thread::current()
 }
 
+/// This thread's id as the owner's queue names requesters.
+pub(crate) fn current_thread() -> u64 { me() }
+
 /// Is this the owner thread (or the only thread of a forked child)?
 #[inline]
 /// On the owner, inside a request it serves (its panics resume in the requester).
@@ -1968,7 +1971,11 @@ pub fn wake() {
 /// exit helper's (and Job / Finish ones); other threads' requests stay queued until the process
 /// is gone.
 pub fn begin_exit() {
-    let _ = EXIT_TID.compare_exchange(0, me(), Ordering::AcqRel, Ordering::Acquire);
+    begin_exit_for(me());
+}
+
+pub fn begin_exit_for(tid: u64) {
+    let _ = EXIT_TID.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire);
     wake();
 }
 
