@@ -10036,6 +10036,14 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 }
             }
         }
+        // slots handed to a call returning in memory as its result buffer
+        let sret_use: Vec<bool> = (0..ns)
+            .map(|s2| {
+                sc.call_args[s2].iter().any(|&(bi, ii, k)| {
+                    k == 0 && matches!(&f.blocks[bi].insts[ii], Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) if f.sret_callees.contains(id))
+                })
+            })
+            .collect();
         // join the first good candidate per slot pair (slots may sit in several candidates)
         let mut used = vec![false; ns];
         let mut to: Vec<u32> = (0..ns as u32).collect();
@@ -10051,6 +10059,18 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             to[from as usize] = into;
             let al = f.slots[bs as usize].align.max(f.slots[cs as usize].align);
             f.slots[into as usize].align = al;
+            // The joined slot is a call's whole result buffer (`Slot::ret`: every call handed it as
+            // one writes all of it) when one side was and the other is no call's partial one: a
+            // call result moved on whole (`?` hands `rd(..)`'s result to `Try::branch` through
+            // a by-value argument copy, the slot that stays) keeps the flag that spares a guarded
+            // copy's slow call the flush of its result (sroa); a smaller result buffer that
+            // becomes the start of a larger slot is written only in part by its call.
+            let (fr, ir) = (f.slots[from as usize].ret, f.slots[into as usize].ret);
+            f.slots[into as usize].ret = if f.slots[from as usize].size == f.slots[into as usize].size {
+                (fr && (ir || !sret_use[into as usize])) || (ir && !sret_use[from as usize])
+            } else {
+                ir && !sret_use[from as usize]
+            };
             dels.push((cb, ci));
         }
         if dels.is_empty() {
