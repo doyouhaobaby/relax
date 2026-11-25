@@ -218,13 +218,35 @@ pub fn check_integrity(packet: &[u8], key: &[u8]) -> bool {
     difference == 0
 }
 
+/// CRC-32 as FINGERPRINT uses it (RFC 5389 section 15.5): IEEE 802.3, reflected, polynomial
+/// 0xEDB88320, initial value and final XOR all ones.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            bit += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |c, &b| CRC32_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8))
+}
+
 /// Checks the CRC-32 before FINGERPRINT, XOR 0x5354554e, as in RFC 5389.
 /// Returns false for a malformed message or an absent or nonfinal fingerprint.
 pub fn check_fingerprint(packet: &[u8]) -> bool {
     let Some((offset, value)) = find_attribute(packet, attr::FINGERPRINT) else {
         return false;
     };
-    value.len() == 4 && offset + 8 == packet.len() && value == (crc32fast::hash(&packet[..offset]) ^ 0x5354_554e).to_be_bytes()
+    value.len() == 4 && offset + 8 == packet.len() && value == (crc32(&packet[..offset]) ^ 0x5354_554e).to_be_bytes()
 }
 
 pub(crate) fn new_binding(transaction: &[u8; 12], class: Class, capacity: usize) -> Vec<u8> {
@@ -264,7 +286,7 @@ pub(crate) fn authenticate(packet: &mut Vec<u8>, key: &[u8]) {
 pub(crate) fn append_fingerprint(packet: &mut Vec<u8>) {
     let offset = packet.len();
     append_attribute(packet, attr::FINGERPRINT, &[0; 4]);
-    let fingerprint = crc32fast::hash(&packet[..offset]) ^ 0x5354_554e;
+    let fingerprint = crc32(&packet[..offset]) ^ 0x5354_554e;
     packet[offset + 4..offset + 8].copy_from_slice(&fingerprint.to_be_bytes());
 }
 
@@ -392,6 +414,7 @@ mod tests {
 
     #[test]
     fn rfc5769_request_and_ipv4_response() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "the standard CRC-32 check value");
         let request = hex("00 01 00 58 21 12 a4 42 b7 e7 a7 01 bc 34 d6 86 fa 87 df ae
              80 22 00 10 53 54 55 4e 20 74 65 73 74 20 63 6c 69 65 6e 74
              00 24 00 04 6e 00 01 ff
