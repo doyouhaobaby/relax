@@ -821,15 +821,32 @@ fn a_domain_worker_with_large_allocations_and_borrowed_field_matches() {
 // window). The test uses up the direct slots before anything creates the key, then runs JIT code
 // that reads its thread-local block on the calling thread and on a new one (whose
 // TlsExpansionSlots array is still null: the slow path). Elsewhere it runs the same fixture.
+// Everywhere: a thread-local's destructor at the new thread's end reads the environment as the
+// thread did before (the host's state for that read outlives every destructor: pmhost).
 const TLS_FIXTURE: &str = r#"
 use std::cell::Cell;
 thread_local! { static N: Cell<u64> = const { Cell::new(0) }; }
 fn bump(k: u64) -> u64 {
     N.with(|n| { n.set(n.get() + k); n.get() })
 }
+fn path_hash() -> u64 {
+    std::env::var("PATH").map_or(0, |v| v.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) | 1)
+}
+struct ReadsAtEnd(usize);
+impl Drop for ReadsAtEnd {
+    fn drop(&mut self) { unsafe { *(self.0 as *mut u64).add(3) = path_hash(); } }
+}
+thread_local! { static AT_END: std::cell::RefCell<Option<ReadsAtEnd>> = const { std::cell::RefCell::new(None) }; }
 fn tls_fixture(p: *mut u64) {
     let a = bump(3) + bump(4);
-    let b = std::thread::spawn(|| bump(5) + bump(6)).join().unwrap();
+    let at = p as usize;
+    let b = std::thread::spawn(move || {
+        // registered before the thread's first environment read: its drop comes after the
+        // host's own thread-locals of that read are destroyed
+        AT_END.with(|e| *e.borrow_mut() = Some(ReadsAtEnd(at)));
+        unsafe { *(at as *mut u64).add(2) = path_hash(); }
+        bump(5) + bump(6)
+    }).join().unwrap();
     unsafe { *p = a * 100 + b; *p.add(1) = bump(0); }
 }
 "#;
@@ -847,9 +864,12 @@ fn jit_tls_past_the_direct_slots() {
         }
     }
     let (mut u, entry, root) = fixture_of(TLS_FIXTURE, "tls_fixture");
-    let out = [0u64; 2];
-    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
-    assert_eq!(out, [10 * 100 + 16, 7]);
+    // (written by the JIT through the pointer: a `mut` array, or the reads below fold to zeros)
+    let mut out = [0u64; 4];
+    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_mut_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    assert_eq!(out[..2], [10 * 100 + 16, 7]);
+    assert_ne!(out[2], 0, "the new thread read PATH");
+    assert_eq!(out[3], out[2], "a thread-local's destructor at its thread's end reads the environment as the thread did");
     let _ = std::fs::remove_dir_all(root);
 }
 
