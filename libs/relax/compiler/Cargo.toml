@@ -28,6 +28,7 @@ test-tree = "its build script runs cargo metadata on the checkout"
 "corpus:tests/deep_clone_stack.rs" = "a deep recursion on an 8 MB thread: Windows' stack reserve and its probes"
 "corpus:tests/fp_env.rs" = "the floating-point control register across Windows' calling convention"
 "corpus:tests/os_str_path_cow_cmp.rs" = "OsStr and Path forms compared as Windows paths"
+"corpus:tests/import_library_dlls.rs" = "an import library's imports bound to the DLLs it names (mincore: API sets)"
 "lib" = "its Windows code: SEH, its memory, sockets and handles"
 
 [lib]

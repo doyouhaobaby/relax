@@ -1618,7 +1618,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let linked = {
         let read = crate::jit::front_read("domain link");
         let (prog, _) = read.unit(up);
-        crate::run::link_libraries(prog, &g.link_libs, g.native.as_ref(), Some(&domain_crates(prog, root)))
+        crate::run::link_libraries(prog, &g.link_libs, &g.link_search, g.native.as_ref(), Some(&domain_crates(prog, root)))
     };
     let (_, missing, callbacks) = match linked {
         Ok(linked) => linked,

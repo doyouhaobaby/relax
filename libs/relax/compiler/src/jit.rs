@@ -8905,6 +8905,10 @@ impl Unit {
             p = unsafe { os::proc::find(name.as_ptr()) };
         }
         if p.is_null() {
+            // an import library's binding (Windows): its DLL, loaded on this first use
+            p = unsafe { os::proc::find_imported(name.as_ptr()) };
+        }
+        if p.is_null() {
             p = unsafe { os::proc::find_system(name.as_ptr()) };
         }
         if !p.is_null() {

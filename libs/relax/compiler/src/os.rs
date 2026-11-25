@@ -12,6 +12,7 @@
 //! - [`tls`]: the OS key holding each thread's thread-local block and the fast path JIT code
 //!   reads it through.
 //! - [`proc`]: foreign symbols and libraries, power state, process arguments, private files.
+//! - `implib`: the DLL and export for each symbol in a COFF import library.
 //! - `progsig` (unix): the program's signal handlers, run on program threads outside compiles.
 //! - `progexc` (Windows): the program's exception handlers, run on program threads outside compiles.
 
@@ -19,6 +20,10 @@
 // modules would otherwise resolve next to it (the Win32 declarations are not here: relax_session::win32)
 #[path = "os/fault.rs"]
 pub mod fault;
+// read on Windows only (proc.rs `find_imported`); its tests run everywhere
+#[cfg(any(windows, test))]
+#[path = "os/implib.rs"]
+pub(crate) mod implib;
 #[path = "os/mem.rs"]
 pub mod mem;
 #[path = "os/proc.rs"]

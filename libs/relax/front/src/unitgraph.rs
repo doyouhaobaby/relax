@@ -89,6 +89,10 @@ pub struct Graph {
     /// libraries the build scripts link: (name, framework, named by a confined script: the run
     /// never finds it in the working folder, relax-compiler os/proc.rs `load_library_outside_cwd`)
     pub link_libs: Vec<(String, bool, bool)>,
+    /// Absolute folders from build scripts' `rustc-link-search` and `-L` in `rustc-flags`, in
+    /// declaration order. On Windows, os/proc.rs `load_library` searches them before LIB and the SDK, as
+    /// link.exe searches its /LIBPATH folders first.
+    pub link_search: Vec<String>,
     /// `--allow-c`: the shared library the native dependencies were linked into (native.rs)
     pub native: Option<crate::native::NativeLib>,
     pub raw: Vec<RawUnit>,
@@ -460,7 +464,7 @@ pub fn load(g: &Units, check_all_bins: bool, allow_c: bool) -> Result<Graph, Str
     if bins.is_empty() && test_crates.contains(&root) && crates[root].bin {
         bins.push(root);
     }
-    Ok(Graph { crates, root, build_scripts, pkg, cfgs, env, link_libs: Vec::new(), native: None, raw, bins })
+    Ok(Graph { crates, root, build_scripts, pkg, cfgs, env, link_libs: Vec::new(), link_search: Vec::new(), native: None, raw, bins })
 }
 
 /// cargo's per-package environment (CARGO_MANIFEST_DIR, CARGO_MANIFEST_PATH, CARGO_PKG_*): its
@@ -864,13 +868,14 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         if let (Some(job), Some(done)) = (&native_job, scripts_done) {
             if !job.is_finished() {
                 let (mut cfgs, mut env, mut libs) = (gr.cfgs.clone(), gr.env.clone(), gr.link_libs.clone());
+                let mut search = gr.link_search.clone();
                 let mut ok = true;
                 for (krates, r, out_dir, confined, host) in &results {
                     // a host side's run: its output is the macro world's own (apply_host_output),
                     // which these tables do not carry; the world starts once the scripts are done
                     let (Ok(stdout), false) = (r, *host) else { ok = false; break };
                     for &k in krates {
-                        if script_output_into(&mut cfgs, &mut env, &mut libs, &gr.pkg, k, stdout, out_dir.clone(), check_only, *confined).is_err() { ok = false; }
+                        if script_output_into(&mut cfgs, &mut env, &mut libs, &mut search, &gr.pkg, k, stdout, out_dir.clone(), check_only, *confined).is_err() { ok = false; }
                     }
                 }
                 if ok { _kept = done(gr, &native_krates, &cfgs, &env); }
@@ -1244,7 +1249,7 @@ fn apply_host_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, che
     let mut env = pkg_env(dir, name, ver);
     env.push(("CARGO_CRATE_NAME".to_string(), g.crates[k].name.clone()));
     let (mut cfgs, mut env) = (vec![Vec::new()], vec![env]);
-    script_output_into(&mut cfgs, &mut env, &mut g.link_libs, std::slice::from_ref(&g.pkg[k]), 0, stdout, out_dir, check_only, confined)?;
+    script_output_into(&mut cfgs, &mut env, &mut g.link_libs, &mut g.link_search, std::slice::from_ref(&g.pkg[k]), 0, stdout, out_dir, check_only, confined)?;
     if let (Some(h), Some(cfgs), Some(env)) = (g.crates[k].host.as_mut(), cfgs.pop(), env.pop()) {
         h.build_outputs = Some((cfgs, env));
     }
@@ -1261,7 +1266,7 @@ fn script_name(g: &Graph, bs: &BuildScript) -> String {
 /// One crate's share of a script's output (`stdout`, its OUT_DIR; `confined`: the script ran
 /// confined, its output checked: `confined_output_refusals`).
 fn apply_script_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
-    script_output_into(&mut g.cfgs, &mut g.env, &mut g.link_libs, &g.pkg, k, stdout, out_dir, check_only, confined)
+    script_output_into(&mut g.cfgs, &mut g.env, &mut g.link_libs, &mut g.link_search, &g.pkg, k, stdout, out_dir, check_only, confined)
 }
 
 /// A script's share of the graph: (its crates, its stdout or why it failed, its OUT_DIR, whether
@@ -1270,9 +1275,22 @@ type ScriptRun = (Vec<usize>, Result<String, String>, String, bool, bool);
 
 /// apply_script_output into these tables (the graph's, or copies of them).
 #[allow(clippy::too_many_arguments)]
-fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>], link_libs: &mut Vec<(String, bool, bool)>, pkg: &[(String, String, String)],
-    k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
+fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>], link_libs: &mut Vec<(String, bool, bool)>, link_search: &mut Vec<String>,
+    pkg: &[(String, String, String)], k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
     env[k].push(("OUT_DIR".to_string(), out_dir));
+    // Windows looks for an import library in the folders the script gave the linker.
+    let mut add_search = |value: &str| {
+        let path = match value.split_once('=') {
+            Some(("dependency" | "crate" | "native" | "framework" | "all", path)) => path,
+            _ => value,
+        };
+        if !path.is_empty() {
+            let path = std::path::Path::new(&pkg[k].0).join(path).to_string_lossy().into_owned();
+            if !link_search.contains(&path) {
+                link_search.push(path);
+            }
+        }
+    };
     for line in stdout.lines() {
         let rest = match line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) {
             Some(r) => r,
@@ -1298,6 +1316,17 @@ fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>
             let l = (name, kind == "framework", confined);
             if !link_libs.contains(&l) {
                 link_libs.push(l);
+            }
+        } else if let Some(path) = rest.strip_prefix("rustc-link-search=") {
+            add_search(path);
+        } else if let Some(flags) = rest.strip_prefix("rustc-flags=") {
+            let mut words = flags.split_whitespace();
+            while let Some(word) = words.next() {
+                if let Some(path) = word.strip_prefix("-L") {
+                    add_search(if path.is_empty() { words.next().unwrap_or("") } else { path });
+                } else if word == "-l" {
+                    let _ = words.next();
+                }
             }
         } else if let Some(e) = rest.strip_prefix("rustc-env=") {
             if let Some(i) = e.find('=') {

@@ -2392,7 +2392,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // static failed ("foreign static not found in the loaded libraries", relax#75) where the
         // run binds it.
         if selftest {
-            match link_libraries(&u.prog, &g.link_libs, g.native.as_ref(), None) {
+            match link_libraries(&u.prog, &g.link_libs, &g.link_search, g.native.as_ref(), None) {
                 Ok((_, missing, _)) => if !missing.is_empty() { verbose!("relax: libraries not found: {:?}", missing); },
                 Err(error) => {
                     eprintln!("relax: {error}");
@@ -2527,7 +2527,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), None) {
+    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, &g.link_search, g.native.as_ref(), None) {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("relax: {error}");
@@ -3428,13 +3428,15 @@ pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks, owner: Optio
 /// to bind once the unit is made). A native bundle's load failure is fatal, with the loader's
 /// diagnostic and the crates it carries, and so is a callback the program does not define.
 /// The native library's callbacks are the fns of `crates` (a domain's; None: any).
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool, bool)], native: Option<&crate::native::NativeLib>, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool, bool)], link_search: &[String], native: Option<&crate::native::NativeLib>, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
     if prog.session.options.no_codegen {
         return Ok((0, missing, NativeCallbacks::default()));
     }
+    // load_library looks for Windows import libraries in the build scripts' folders.
+    crate::os::proc::add_link_search(link_search);
     // `--allow-c`: the native dependencies' library (front native.rs), its symbols global
     let mut callbacks = NativeCallbacks::default();
     if let Some(n) = native {
