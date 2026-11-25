@@ -1354,7 +1354,9 @@ pub struct Slot {
     pub born: bool,
     /// made by lowering as a call's result buffer (a result returned in memory), of the result
     /// type's size: that call writes all of it (opt::slot_colors checks it is still passed to
-    /// one call only)
+    /// one call only). Every call handed the slot as its result buffer writes all of it: a slot
+    /// joined along a whole copy keeps the flag of either side, one that a smaller result buffer
+    /// becomes the start of loses it (opt::coalesce_slot_copies).
     pub ret: bool,
 }
 
