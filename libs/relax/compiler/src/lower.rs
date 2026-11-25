@@ -10617,6 +10617,36 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// Every local guard `g` declares, at any depth, in source order: its `let` chain's, and those
+    /// of the `let` statements, `match` arms, `if let`s and loops inside it. Not a closure's, an
+    /// async block's or an inline const's: those bodies are lowered on their own.
+    fn guard_binding_locals(&self, g: ExprId, out: &mut Vec<u32>) {
+        use relax_types::ast_visit::{walk_expr, Visitor};
+        struct Pats<'a> {
+            ast: &'a Ast,
+            pats: Vec<PatId>,
+        }
+        impl<'a> Visitor<'a> for Pats<'a> {
+            fn ast(&self) -> &'a Ast {
+                self.ast
+            }
+            // a binding pattern as a whole (pat_binding_locals walks into it)
+            fn pat(&mut self, p: PatId) {
+                self.pats.push(p);
+            }
+            fn expr(&mut self, e: ExprId) {
+                if !matches!(self.ast.expr(e).kind, ExprKind::Closure(_) | ExprKind::Async(..) | ExprKind::ConstBlock(_)) {
+                    walk_expr(self, e);
+                }
+            }
+        }
+        let mut v = Pats { ast: self.ast(), pats: Vec::new() };
+        v.expr(g);
+        for p in v.pats {
+            self.pat_binding_locals(p, out);
+        }
+    }
+
     /// Does an `if` condition bind (`let` alone or in a `&&` chain)?
     fn cond_has_let(&self, c: ExprId) -> bool {
         match &self.ast().expr(c).kind {
@@ -11103,6 +11133,15 @@ impl<'a> Lcx<'a> {
             // the guard's `let` bindings: a scope of their own, dropped before the guard's
             // temporaries and the pattern's bindings (rustc if-let guard scopes)
             self.push_scope();
+            // the storage of every local the guard declares too, here, where every candidate's
+            // path passes: a slot made while the first candidate's guard was lowered had its
+            // address computed on that path alone, and a later candidate's guard bound into an
+            // address never set
+            let mut guard_lis = Vec::new();
+            self.guard_binding_locals(g, &mut guard_lis);
+            for li in guard_lis {
+                self.local_place(li);
+            }
             let n = combos.len();
             for (ci, combo) in combos.into_iter().enumerate() {
                 let alt_fail = if ci + 1 == n { next } else { self.f.block() };
