@@ -1074,6 +1074,16 @@ impl CodeTables {
         self.refs.insert(start, refs);
     }
 
+    /// The starts of every slot's code bodies in the index, in one pass (for a walk that visits
+    /// many slots: `bodies_of` scans the whole index per slot).
+    pub(crate) fn starts_by_slot(&self) -> crate::fxhash::HashMap<u32, Vec<u64>> {
+        let mut m: crate::fxhash::HashMap<u32, Vec<u64>> = Default::default();
+        for e in &self.index {
+            m.entry(e.2).or_default().push(e.0);
+        }
+        m
+    }
+
     /// Every code body of slot `id` in the index: (start, len, kind), in address order.
     pub fn bodies_of(&self, id: u32) -> Vec<(u64, u32, CodeKind)> {
         self.index.iter().zip(&self.kinds).filter(|(e, _)| e.2 == id).map(|(e, k)| (e.0, e.1, CodeKind::unpack(*k))).collect()
@@ -2840,9 +2850,9 @@ pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
 }
 
 /// `relax_precompile` from the slots `roots`: up to FORK_PRECOMPILE_MAX functions, or with
-/// `exhaustive` all they reach. Each round walks compiled functions' lowered references or
-/// installed CodeRefs in one owner request, avoiding a round trip per function. Its uncompiled
-/// frontier builds on the calling thread, then the next round reads what those builds reference.
+/// `exhaustive` all they reach. Each round follows code references and the function pointers
+/// in referenced data and static initializers in one owner request. Its uncompiled frontier
+/// builds on the calling thread, then the next round reads what those builds reference.
 pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
     let up = cur_unit();
     if up.is_null() {
@@ -2851,11 +2861,17 @@ pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
     let limit = if exhaustive { usize::MAX } else { FORK_PRECOMPILE_MAX };
     let mut todo: Vec<_> = roots.iter().map(|&id| (id, false)).collect();
     let mut seen = std::collections::HashSet::new();
+    // data objects, statics, and the symbols the statics' walks went through: each walked once
+    let mut seen_data = crate::fxhash::HashSet::default();
+    let mut seen_statics = crate::fxhash::HashSet::default();
+    let mut seen_static_syms = crate::fxhash::HashSet::default();
     let mut built = 0u64;
     while !todo.is_empty() && seen.len() < limit {
         let frontier = owner::publish(|| unsafe {
             let u = &*up;
             let mut frontier = Vec::new();
+            // the slots' code bodies, once a round (the round's builds come after it)
+            let bodies = u.code.read().unwrap_or_else(|e| e.into_inner()).starts_by_slot();
             while let Some((id, revisit)) = todo.pop() {
                 if seen.len() >= limit {
                     break;
@@ -2873,22 +2889,40 @@ pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
                 // the lowered body's callees (before inlining: an inlined callee's own calls are
                 // among its callees') and its call / fn-address sites
                 let mut next: Vec<u32> = f.calls.iter().chain(f.rir_refs.iter()).copied().collect();
-                if next.is_empty() {
+                let mut data = Vec::new();
+                let mut statics = Vec::new();
+                {
                     // code linked from the disk cache or startup image has no lowered body here:
                     // every install records its references, including the image's resolved slots
+                    let use_slots = next.is_empty();
                     let code = u.code.read().unwrap_or_else(|e| e.into_inner());
-                    // interpreted and no-codegen redirects have refs at their entry, but no index body
-                    if let Some(refs) = code.refs_at(f.code) {
-                        next.extend_from_slice(refs.slots());
-                    }
-                    for (at, _, _) in code.bodies_of(id) {
-                        if at != f.code {
-                            if let Some(refs) = code.refs_at(at) {
+                    let mut collect = |at| {
+                        if let Some(refs) = code.refs_at(at) {
+                            if use_slots {
                                 next.extend_from_slice(refs.slots());
                             }
+                            data.extend_from_slice(refs.data());
+                            statics.extend_from_slice(refs.statics());
+                        }
+                    };
+                    // interpreted and no-codegen redirects have refs at their entry, but no index body
+                    collect(f.code);
+                    for &at in bodies.get(&id).into_iter().flatten() {
+                        if at != f.code {
+                            collect(at);
                         }
                     }
                 }
+                let mut through_data = Vec::new();
+                crate::syms::obj_thunks_seen(u, data, &mut through_data, true, &mut seen_data);
+                for d in statics {
+                    if seen_statics.insert(d) {
+                        crate::syms::static_initial_thunks_seen(u, DefId(d), None, true, &mut through_data, &mut seen_static_syms);
+                    }
+                }
+                // what data reaches goes on the stack first, so the code's own edges pop before it:
+                // a fork's bounded walk spends its budget on direct callees ahead of vtable methods
+                todo.extend(through_data.into_iter().filter(|c| (*c as usize) < u.fns.len() && !seen.contains(c)).map(|c| (c, false)));
                 todo.extend(next.into_iter().filter(|c| (*c as usize) < u.fns.len() && !seen.contains(c)).map(|c| (c, false)));
             }
             frontier
@@ -26787,6 +26821,8 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
     let dyn_on = spec_dyn() && depth + 1 < spec_hot_from(options);
     let mut dyn_refs: Vec<u32> = Vec::new();
     let mut seen_dyn = crate::fxhash::HashSet::default();
+    // the data objects walked for this function: one walk each, however many sites name them
+    let mut seen_objs = crate::fxhash::HashSet::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         if cold[bi] {
             SPEC_COLD_SKIPPED.fetch_add(b.insts.iter().filter(|i| matches!(i, Inst::Call(Callee::Fn(_), _, _))).count() as u64, Ordering::Relaxed);
@@ -26803,7 +26839,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
                 Inst::Addr(_, sym) if dyn_on => {
                     match u.syms.kind(sym.id) {
                         Some(crate::syms::SymKind::Thunk(c)) => dyn_refs.push(c),
-                        Some(crate::syms::SymKind::Data(_)) => crate::syms::data_thunks(u, u.syms.value(relax_backend::rir::Sym { id: sym.id, off: 0 }), &mut dyn_refs),
+                        Some(crate::syms::SymKind::Data(d)) => crate::syms::obj_thunks_seen(u, vec![d], &mut dyn_refs, true, &mut seen_objs),
                         _ => {}
                     }
                     None
@@ -34986,7 +35022,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 if with_rt(|rt| rt.statics.insert(d)) {
                     let u = &*up;
                     let d = DefId(d);
-                    let slots = crate::syms::static_initial_thunks(u, d, u.rt_static_initials.get(&d).copied());
+                    let slots = crate::syms::static_initial_thunks(u, d, u.rt_static_initials.get(&d).copied(), false);
                     realtime_index_candidates(u, &slots);
                     // (no static or thread-local is a crossing source: one names neither the
                     // direction nor the value. A handoff through one is marked where it is

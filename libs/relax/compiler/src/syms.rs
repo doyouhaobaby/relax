@@ -696,10 +696,12 @@ pub(crate) fn data_obj_vtables(u: &Unit, idx: u32, out: &mut Vec<u32>) {
     }
 }
 
-fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>, include_vtables: bool) {
-    let mut seen = crate::fxhash::HashSet::default();
+fn obj_thunks(u: &Unit, todo: Vec<u32>, out: &mut Vec<u32>, include_vtables: bool) {
+    obj_thunks_seen(u, todo, out, include_vtables, &mut crate::fxhash::HashSet::default());
+}
+
+pub(crate) fn obj_thunks_seen(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>, include_vtables: bool, seen: &mut crate::fxhash::HashSet<u32>) {
     while let Some(idx) = todo.pop() {
-        if include_vtables && seen.len() > 4096 { break; }
         if !seen.insert(idx) || (!include_vtables && u.syms.is_vtable_obj(idx)) { continue; }
         let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { continue };
         for (_, s) in ptrs.iter() {
@@ -713,20 +715,27 @@ fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>, include_vtables:
 }
 
 /// Indexes thunk words in the immutable initializer object or the captured initial bytes.
-/// Vtables have their own keys. Mutable storage is read from its declared initial image.
-pub(crate) fn static_initial_thunks(u: &Unit, d: DefId, initial: Option<u64>) -> Vec<u32> {
+/// Mutable storage is read from its declared initial image. `vtables`: the vtables it names are
+/// walked too (the real-time index keys them on their own and passes false).
+pub(crate) fn static_initial_thunks(u: &Unit, d: DefId, initial: Option<u64>, vtables: bool) -> Vec<u32> {
+    let mut slots = Vec::new();
+    static_initial_thunks_seen(u, d, initial, vtables, &mut slots, &mut crate::fxhash::HashSet::default());
+    slots
+}
+
+/// `static_initial_thunks` into `slots`, skipping the symbols in `seen` (data objects, statics,
+/// thunks): one set over many statics' walks, so a graph they share is walked once.
+pub(crate) fn static_initial_thunks_seen(u: &Unit, d: DefId, initial: Option<u64>, vtables: bool, slots: &mut Vec<u32>, seen: &mut crate::fxhash::HashSet<u32>) {
     let root = initial.and_then(|a| u.syms.data_at(a)).or_else(|| {
         u.statics.get(&d).and_then(|&a| u.static_sym_at(a))
     });
     let mut todo: Vec<_> = root.into_iter().collect();
-    let mut seen = crate::fxhash::HashSet::default();
-    let mut slots = Vec::new();
     while let Some(sym) = todo.pop() {
         if !seen.insert(sym.id) { continue; }
         match u.syms.kind(sym.id) {
             Some(SymKind::Thunk(id)) => { slots.push(id); continue; }
             Some(SymKind::Data(i)) => {
-                if u.syms.is_vtable_obj(i) { continue; }
+                if !vtables && u.syms.is_vtable_obj(i) { continue; }
                 if let Some((_, _, ptrs, _)) = obj_ptrs(u, i) {
                     todo.extend(ptrs.iter().filter_map(|(_, s)| *s));
                     continue;
@@ -748,7 +757,6 @@ pub(crate) fn static_initial_thunks(u: &Unit, d: DefId, initial: Option<u64>) ->
             }
         }
     }
-    slots
 }
 
 /// Thunk at one pointer-sized vtable word, if that word names a function.
