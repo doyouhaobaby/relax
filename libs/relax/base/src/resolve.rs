@@ -46,8 +46,9 @@
 //!   folders, a package's `target` folder or a nested repository), the root first, the first
 //!   `[package]` of that name; `workspace = true` fields inherit from the repository's own
 //!   workspace; a path dependency inside the repository is part of the same git source. Package
-//!   ids are cargo's `git+<url>[?<ref>]#<name>@<version>`.
-//! Unsupported (an error naming it): ssh and file git URLs, registry packages missing from the vendored
+//!   ids are cargo's `git+<url>[?<ref>]#<name>@<version>`. An `ssh://` source is read from
+//!   Cargo's checkout or bare db, or reused from the Relax store. Relax never connects over ssh.
+//! Unsupported (an error naming it): scp-style ssh and file git URLs, registry packages missing from the vendored
 //! directory (never looked up anywhere else, never fetched, then), registry packages that compile C
 //! (a cc/cmake build-dependency), unknown command-line flags.
 
@@ -209,9 +210,7 @@ fn git_src(st: &TomlTable, at: &str, key: &str) -> Result<Option<GitSrc>, String
     if refs.len() > 1 {
         return Err(format!("{}: dependency ({}) specification is ambiguous. Only one of `branch`, `tag` or `rev` is allowed.", at, key));
     }
-    if crate::git::fetch::check_url(&url).is_err() {
-        return Err(format!("{}: `{}` is a git dependency on {}: Relax fetches git repositories over https only", at, key, url));
-    }
+    crate::git::fetch::check_source_url(&url).map_err(|e| format!("{at}: `{key}` is a git dependency on {e}"))?;
     Ok(Some(GitSrc { url, reference: refs.pop().unwrap_or(GitRef::DefaultBranch) }))
 }
 
@@ -3956,7 +3955,12 @@ fn git_sources_as_cargo_spells_them() {
     let t = |text: &str| parse_toml(text).unwrap().root;
     assert!(git_src(&t("git = \"https://h/r\"\nbranch = \"a\"\ntag = \"b\"\n"), "x", "d").is_err());
     assert!(git_src(&t("git = \"https://h/r\"\npath = \"p\"\n"), "x", "d").is_err());
-    assert!(git_src(&t("git = \"git@github.com:a/b\"\n"), "x", "d").unwrap_err().contains("https only"));
+    let err = git_src(&t("git = \"git@github.com:a/b\"\n"), "x", "d").expect_err("scp-style dependency should be refused");
+    assert!(err.contains("git@github.com:a/b"), "scp-style refusal should name the URL: {err}");
+    let ssh = "ssh://git@relax.invalid/team/project.git";
+    let source = git_src(&t(&format!("git = \"{ssh}\"\n")), "x", "d").unwrap().unwrap();
+    assert_eq!(source.url, ssh, "ssh dependency should keep its URL as written");
+    assert!(git_src(&t("git = \"file:///a/b\"\n"), "x", "d").is_err(), "file dependency should be refused");
     assert_eq!(git_src(&t("git = \"https://h/r\"\ntag = \"v1\"\n"), "x", "d").unwrap().unwrap().reference, GitRef::Tag("v1".into()));
     // cargo's package discovery: root first, depth-first by name; hidden folders, target folders
     // beside a manifest and nested repositories skipped
