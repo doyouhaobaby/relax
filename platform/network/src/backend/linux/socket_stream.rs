@@ -31,6 +31,7 @@ const SSL_VERIFY_NONE: c_int = 0;
 const SSL_VERIFY_PEER: c_int = 1;
 const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
 const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
+const X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS: u32 = 0x4;
 
 const SSL_ERROR_WANT_READ: c_int = 2;
 const SSL_ERROR_WANT_WRITE: c_int = 3;
@@ -63,6 +64,10 @@ unsafe extern "C" {
     pub(crate) fn SSL_session_reused(ssl: *const SSL) -> c_int;
     pub(crate) fn SSL_CTX_set_verify(ctx: *mut SSL_CTX, mode: c_int, verify_callback: *mut c_void);
     pub(crate) fn SSL_CTX_set_default_verify_paths(ctx: *mut SSL_CTX) -> c_int;
+    fn SSL_set_hostflags(ssl: *mut SSL, flags: u32);
+    fn SSL_set1_host(ssl: *mut SSL, hostname: *const c_char) -> c_int;
+    fn SSL_get0_param(ssl: *mut SSL) -> *mut c_void;
+    fn X509_VERIFY_PARAM_set1_ip_asc(param: *mut c_void, ipasc: *const c_char) -> c_int;
     pub(crate) fn SSL_new(ctx: *mut SSL_CTX) -> *mut SSL;
     pub(crate) fn SSL_free(ssl: *mut SSL);
     fn SSL_set_bio(ssl: *mut SSL, r: *mut c_void, w: *mut c_void);
@@ -141,6 +146,7 @@ pub(crate) struct NativeEngine {
     input: *mut c_void,
     output: *mut c_void,
     strict: bool,
+    verified_name: Option<CString>,
 }
 
 // An SSL and its memory BIOs are owned by one worker at a time.
@@ -202,13 +208,29 @@ impl NativeEngine {
             }
             SSL_set_bio(ssl, input, output);
             if server { SSL_set_accept_state(ssl); } else { SSL_set_connect_state(ssl); }
-            Ok(Self { ssl, input, output, strict })
+            Ok(Self { ssl, input, output, strict, verified_name: None })
         }
     }
 
     fn client(host: Option<&str>, verify: bool, resume: Option<&Self>, strict: bool) -> io::Result<Self> {
+        Self::client_with_roots(host, verify, resume, strict, |ctx| unsafe {
+            SSL_CTX_set_default_verify_paths(ctx)
+        })
+    }
+
+    fn client_with_roots(
+        host: Option<&str>,
+        verify: bool,
+        resume: Option<&Self>,
+        strict: bool,
+        load_roots: impl FnOnce(*mut SSL_CTX) -> c_int,
+    ) -> io::Result<Self> {
         init_openssl()?;
-        let engine = unsafe {
+        let name = host.map(CString::new).transpose()?;
+        // OpenSSL restores the old verification result on resumption. A new
+        // name or a previously unverified session needs a full handshake.
+        let resume = resume.filter(|previous| !verify || (name.is_some() && previous.verified_name == name));
+        let mut engine = unsafe {
             if let Some(previous) = resume {
                 let engine = Self::from_context(SSL_get_SSL_CTX(previous.ssl), false, false)?;
                 let session = SSL_get1_session(previous.ssl);
@@ -221,14 +243,31 @@ impl NativeEngine {
                 let ctx = ClientContext(SSL_CTX_new(TLS_client_method()));
                 if ctx.0.is_null() { return Err(io_other(last_ssl_error())); }
                 SSL_CTX_set_verify(ctx.0, if verify { SSL_VERIFY_PEER } else { SSL_VERIFY_NONE }, ptr::null_mut());
-                if verify && SSL_CTX_set_default_verify_paths(ctx.0) != 1 { return Err(io_other(last_ssl_error())); }
+                if verify && load_roots(ctx.0) != 1 { return Err(io_other(last_ssl_error())); }
                 Self::from_context(ctx.0, false, strict)?
             }
         };
-        if let Some(host) = host {
-            let name = CString::new(host)?;
+        if let (Some(host), Some(name)) = (host, name) {
             let ok = unsafe { SSL_ctrl(engine.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, name.as_ptr() as *mut c_void) };
             if ok != 1 { return Err(io_other(last_ssl_error())); }
+            if verify {
+                // An empty reference disables name checks; a leading dot
+                // asks OpenSSL to match any subdomain.
+                if host.is_empty() || host.starts_with('.') {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a TLS host name"));
+                }
+                let ok = unsafe {
+                    if host.parse::<std::net::IpAddr>().is_ok() {
+                        let param = SSL_get0_param(engine.ssl);
+                        !param.is_null() && X509_VERIFY_PARAM_set1_ip_asc(param, name.as_ptr()) == 1
+                    } else {
+                        SSL_set_hostflags(engine.ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                        SSL_set1_host(engine.ssl, name.as_ptr()) == 1
+                    }
+                };
+                if !ok { return Err(io_other(format!("setting TLS peer name: {}", last_ssl_error()))); }
+                engine.verified_name = Some(name);
+            }
         }
         Ok(engine)
     }
@@ -518,11 +557,73 @@ fn connect_lan(host: &str, port: &str) -> io::Result<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::engine::tests::{handshake, identity};
+    use crate::tls::engine::tests::{deliver, handshake, identity};
     use crate::tls::platform::ServerConfig;
+    use crate::tls::SubjectName;
 
     extern "C" {
         fn SSL_renegotiate(ssl: *mut SSL) -> c_int;
+        fn SSL_get_certificate(ssl: *const SSL) -> *mut c_void;
+        fn SSL_CTX_get_cert_store(ctx: *const SSL_CTX) -> *mut c_void;
+        fn X509_STORE_add_cert(store: *mut c_void, cert: *mut c_void) -> c_int;
+        fn SSL_get_verify_result(ssl: *const SSL) -> c_long;
+    }
+
+    #[test]
+    fn tls_verified_client_checks_dns_and_ip_names() {
+        const DNS: &str = "server.example";
+        const IP: &str = "192.0.2.7";
+        const HOSTNAME_MISMATCH: c_long = 62;
+        const IP_ADDRESS_MISMATCH: c_long = 64;
+        let names = [SubjectName::Dns(DNS.into()), SubjectName::Ip(IP.parse().unwrap())];
+        let mut nonce = [0u8; 16];
+        crate::tls::os_random(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("makepad-tls-names-{}", crate::tls::to_hex(&nonce)));
+        let id = TlsIdentity::load_or_create_for_names(&dir, DNS, &names).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let config = ServerConfig::new(&id.cert_der, &id.key).unwrap();
+
+        let connect = |host: &str, verify: bool, previous: Option<&TlsEngine>, expected_error: Option<c_long>| {
+            let server = config.engine(false).unwrap();
+            let native = NativeEngine::client_with_roots(Some(host), verify, previous.map(|p| &p.native), false, |ctx| unsafe {
+                // The new context's only trust anchor is this server's certificate.
+                let cert = SSL_get_certificate(server.ssl);
+                let store = SSL_CTX_get_cert_store(ctx);
+                assert!(!cert.is_null() && !store.is_null());
+                X509_STORE_add_cert(store, cert)
+            }).unwrap();
+            // TLS 1.2 gives the same-name control a ticket during the handshake.
+            assert_eq!(unsafe { SSL_ctrl(native.ssl, 124, 0x0303, ptr::null_mut()) }, 1);
+            let mut client = TlsEngine::start(native, None, false, None).unwrap();
+            let mut server = TlsEngine::start(server, None, false, None).unwrap();
+            let result = loop {
+                let sent = deliver(&mut client, &mut server, 1024).unwrap();
+                match deliver(&mut server, &mut client, 1024) {
+                    Err(e) => break Err(e),
+                    Ok(n) if sent + n == 0 => break Ok(()),
+                    Ok(_) => {}
+                }
+            };
+            if let Some(code) = expected_error {
+                assert!(result.is_err(), "verified handshake accepted {host}");
+                assert_eq!(unsafe { SSL_get_verify_result(client.native.ssl) }, code, "verification error for {host}");
+            } else {
+                result.unwrap();
+                assert!(client.handshake_done() && server.handshake_done());
+            }
+            client
+        };
+
+        let verified = connect(DNS, true, None, None);
+        connect(IP, true, None, None);
+        connect("other.example", true, None, Some(HOSTNAME_MISMATCH));
+        connect("192.0.2.8", true, None, Some(IP_ADDRESS_MISMATCH));
+        connect("2001:db8::1", true, None, Some(IP_ADDRESS_MISMATCH));
+        let resumed = connect(DNS, true, Some(&verified), None);
+        assert_eq!(unsafe { SSL_session_reused(resumed.native.ssl) }, 1);
+        connect("other.example", true, Some(&verified), Some(HOSTNAME_MISMATCH));
+        let unchecked = connect("other.example", false, None, None);
+        connect("other.example", true, Some(&unchecked), Some(HOSTNAME_MISMATCH));
     }
 
     fn tls12_client(previous: Option<&TlsEngine>) -> TlsEngine {
