@@ -1323,6 +1323,7 @@ pub mod obligations {
     /// impl's self type are the impl's own distinct parameters (E0366), and every predicate of the impl
     /// holds in the environment of the type's definition (E0367).
     fn always_applicable(prog: &Program, tcx: &Tcx, imp: DefId, item: &ast::Item, file: u32, adt: DefId, args: crate::types::TyList, regions: crate::types::RegionArgsId) -> Vec<String> {
+        use crate::tcx::outlives::OutlivesPredicate;
         use crate::types::RegionKind;
         let tys = &tcx.tys;
         // uses_unique_generic_params(adt_to_impl_args, CheckRegions::OnlyParam)
@@ -1350,7 +1351,16 @@ pub mod obligations {
         // the predicates of the type, at the impl's arguments
         let adt_args = tcx.complete_args(prog, adt, tys.list(args), regions);
         let adt_env = tcx.param_env_id(prog, adt);
-        let clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
+        let mut clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
+        // rustc's `predicates_of` of an ADT includes its `inferred_outlives_of` (RFC 2093).
+        for p in crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, prog, adt) {
+            let kind = match p {
+                OutlivesPredicate::Region(a, b) => ClauseKind::RegionOutlives(a, b),
+                OutlivesPredicate::Type(t, r) => ClauseKind::TypeOutlives(t, r),
+            };
+            let clause = tcx.instantiate_predicate(prog, adt, &adt_args, &Predicate::dummy(PredicateKind::Clause(kind)));
+            if !clauses.contains(&clause) { clauses.push(clause); }
+        }
         let env = tcx.intern_param_env(crate::next_solver::ParamEnv { clauses: clauses.into() });
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
         let mut ocx = ObligationCtxt::new(&infcx, prog);
