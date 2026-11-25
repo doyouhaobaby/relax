@@ -738,8 +738,8 @@ impl MacroTable {
                 set.insert(r.clone());
             }
         }
-        // a package's bin after its lib (cargo names both after the package): the lib stays
-        // reachable under `<name>\u{1}lib`, for the bin's `<name>::..` paths (Res::extern_crate)
+        // When a bin takes a lib's crate name, keep the lib under `<name>\u{1}lib`
+        // so Res::extern_crate can find it for every dependent.
         if let Some(old) = self.crates.get(&name) {
             if !old.src.is_empty() && !cm.src.is_empty() && old.src != cm.src {
                 let old = old.clone();
@@ -1124,12 +1124,10 @@ impl<'a> Res<'a> {
             return Some(self.crate_root(c));
         }
         if let Some(c) = self.table.crates.get(k).and_then(|c| c.externs.get(n)) {
-            // a bin naming its own package's lib (same crate name): the lib, not itself
-            if c == k {
-                let lib = format!("{}\u{1}lib", c);
-                if let Some((lib, _)) = self.table.crates.get_key_value(&lib) {
-                    return Some(self.crate_root(lib));
-                }
+            // A bin cannot be a dependency, so every extern naming a shadowed lib refers to the lib.
+            let lib = format!("{}\u{1}lib", c);
+            if let Some((lib, _)) = self.table.crates.get_key_value(&lib) {
+                return Some(self.crate_root(lib));
             }
             return Some(self.crate_root(c));
         }
@@ -4416,6 +4414,27 @@ mod replay_tests {
             table.add_crate(name.into(), std::sync::Arc::new(cm));
         }
         table
+    }
+
+    #[test]
+    fn all_dependents_resolve_a_shadowed_lib() {
+        let mut table = MacroTable::default();
+        for (name, src, deps) in [
+            ("alpha", "alpha/src/lib.rs", &[][..]),
+            ("beta", "beta/src/lib.rs", &["alpha"][..]),
+            ("alpha", "beta/src/main.rs", &["alpha", "beta"][..]),
+        ] {
+            let mut cm = CrateMods { root: name.into(), src: src.into(), ..Default::default() };
+            cm.mods.insert(name.into());
+            for &dep in deps { cm.externs.insert(dep.into(), dep.into()); }
+            table.add_crate(name.into(), std::sync::Arc::new(cm));
+        }
+
+        let r = Res { table: &table };
+        let (lib, _) = r.extern_crate("beta", "alpha").expect("beta should resolve its alpha dependency");
+        assert_eq!(table.crates[lib].src, "alpha/src/lib.rs", "beta should resolve alpha to the library source");
+        assert_eq!(r.extern_crate("alpha", "alpha").map(|(key, _)| key), Some(lib), "the alpha bin should resolve alpha to the same library key");
+        assert_eq!(r.extern_crate("alpha", "beta").map(|(key, _)| key), Some("beta"), "the alpha bin should resolve the unshadowed beta dependency by its name");
     }
 
     #[test]
