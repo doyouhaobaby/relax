@@ -145,7 +145,17 @@ impl PendingPlan {
     /// The plan for a caller off the compiler's owner thread that needs it made (a graph writer):
     /// made here when no thread is making it, as a dereference would; else waited for on the
     /// plan's condvar (never polled). None: its planning failed.
-    pub fn settle(&self) -> Option<&Plan> {
+    pub fn settle(&self) -> Option<&Plan> { self.settle_with(None) }
+    /// `settle`, calling `report` with the time waited so far each `every` it waits for another
+    /// thread's planning (an exit says it waits instead of hanging silently). A report never ends
+    /// the wait.
+    pub fn settle_reporting(&self, every: std::time::Duration, report: &mut dyn FnMut(std::time::Duration)) -> Option<&Plan> {
+        self.settle_with(Some((every, report)))
+    }
+    fn settle_with(&self, mut report: Option<(std::time::Duration, &mut dyn FnMut(std::time::Duration))>) -> Option<&Plan> {
+        let start = std::time::Instant::now();
+        // a deadline, not each wait's timeout: the early publications wake the condvar often
+        let mut next = report.as_ref().map(|(every, _)| start + *every);
         loop {
             if let Some(plan) = self.ready() { return Some(plan); }
             if self.failed() { return None; }
@@ -163,7 +173,21 @@ impl PendingPlan {
             }
             let mut g = self.early.wake.0.lock().unwrap_or_else(|e| e.into_inner());
             while self.ready().is_none() && !self.failed() {
-                g = self.early.wake.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                let Some(at) = next else {
+                    g = self.early.wake.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                let now = std::time::Instant::now();
+                if now >= at {
+                    // reported without the condvar's lock, then checked again from the top
+                    drop(g);
+                    if let Some((every, report)) = report.as_mut() {
+                        report(start.elapsed());
+                        next = Some(at + *every);
+                    }
+                    break;
+                }
+                g = self.early.wake.1.wait_timeout(g, at - now).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
             }
         }
     }

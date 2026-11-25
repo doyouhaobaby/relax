@@ -7668,19 +7668,34 @@ pub fn front_plans_pending() -> bool { !unready_plans().is_empty() }
 
 /// Off the owner thread, settle every queued graph write's demand plan, waiting on its
 /// condvar for completion or failure. Include plans queued during the wait.
-pub fn settle_front_plans() {
+/// With `report`, it is called with the plan and the time waited for it each period the wait goes on.
+pub fn settle_front_plans(mut report: Option<(std::time::Duration, &mut dyn FnMut(&crate::preload::DemandPlan, std::time::Duration))>) {
     debug_assert!(!crate::owner::is_owner());
     loop {
         let plans = unready_plans();
         if plans.is_empty() { break; }
-        for p in plans { let _ = p.settle(); }
+        for p in plans {
+            let _ = match report.as_mut() {
+                Some((every, report)) => p.settle_reporting(*every, &mut |waited| report(&*p, waited)),
+                None => p.settle(),
+            };
+        }
     }
+}
+
+/// What an exit waiting for a queued graph write's demand plan says: the plan's program crate
+/// and how far its selection got.
+pub fn front_plan_wait_line(plan: &crate::preload::DemandPlan, waited: std::time::Duration) -> String {
+    let crates = plan.crates();
+    let name = crates.last().map_or("?", |c| c.name.as_str());
+    format!("the exit is waiting for the demand plan of `{name}` ({} of {} crates selected so far, {:.0} s); the run's front graph is written once it is made",
+        plan.early_prefix().min(crates.len()), crates.len(), waited.as_secs_f64())
 }
 
 fn flush_front_graphs() -> Result<(), String> {
     // Discovery may need the owner to compile a macro. Writers wait for plans outside
     // the writer lock, and the owner leaves unfinished plans queued.
-    if !crate::owner::is_owner() { settle_front_plans(); }
+    if !crate::owner::is_owner() { settle_front_plans(None); }
     // Only the cache-writer threads wait here; queueing and pending probes
     // keep their short lock. An empty queue does not mean a mid-run writer
     // has finished the jobs it took. Exit must wait for their demand parts
@@ -9329,17 +9344,25 @@ mod cold_tests {
         job.demand = Some(plan.clone());
         FRONT_GRAPH_WRITES.lock().unwrap().push(job);
 
-        let (first, planning) = crate::owner::call(crate::owner::Class::Program, || {
+        let (first, planning, settling, said) = crate::owner::call(crate::owner::Class::Program, || {
             let p = plan.clone();
             let planning = std::thread::spawn(move || p.complete());
             entered_rx.recv().expect("the plan must reach its early publication");
-            (flush_front_graphs(), planning)
+            let first = flush_front_graphs();
+            // the exit's wait, off the owner: it says what it waits for while the plan waits for the owner
+            let (said_tx, said_rx) = mpsc::channel();
+            let settling = std::thread::spawn(move || settle_front_plans(Some((std::time::Duration::from_millis(5),
+                &mut |p: &crate::preload::DemandPlan, waited: std::time::Duration| { let _ = said_tx.send(front_plan_wait_line(p, waited)); }))));
+            let said = said_rx.recv().expect("a settle that waits for the plan must report each period");
+            assert!(plan.ready().is_none(), "the report must come while the plan still waits for the owner");
+            (first, planning, settling, said)
         });
         let error = first.expect_err("the owner must defer a graph whose plan needs the owner");
         assert!(error.contains("still planning"), "the owner must report the unfinished demand plan: {error}");
-        assert!(front_graph_pending(), "the deferred graph must stay queued");
+        assert!(said.contains("demand plan of `test_crate`") && said.contains("of 1 crates"), "the wait's line must name the plan it waits for: {said}");
 
-        settle_front_plans();
+        settling.join().expect("the reporting settle must end once the plan is made");
+        assert!(front_graph_pending(), "the deferred graph must stay queued until it is flushed");
         assert!(plan.ready().is_some(), "settling off the owner must finish the plan");
         flush_front_graphs().expect("the graph with its finished plan must be writable");
         assert!(!front_graph_pending(), "the successful flush must empty the queue");

@@ -4715,6 +4715,9 @@ static EXIT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// The exit worker waits for the boot's demand plans before exit begins.
 /// The hang guard in finish_run excludes this wait.
 static EXIT_PLAN_WAIT: AtomicBool = AtomicBool::new(false);
+/// While the exit waits for a demand plan, it says so this often: a plan that never finishes
+/// shows at quit instead of a silent hang (the wait itself has no limit).
+const EXIT_PLAN_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long the exit waits for background compiles to finish (they are abandoned
 /// at their next safe point). Not getting it means no cache write at all.
 const EXIT_QUIESCE_MS: u64 = 200;
@@ -4737,7 +4740,9 @@ fn start_exit_summary() {
         if exiting != 0 {
             let t = Instant::now();
             if crate::owner::call_within(crate::owner::Class::Program, EXIT_QUIESCE_MS, || ()).is_some() {
-                crate::cache::settle_front_plans();
+                crate::cache::settle_front_plans(Some((EXIT_PLAN_REPORT, &mut |plan: &crate::preload::DemandPlan, waited: std::time::Duration| {
+                    eprintln!("relax: {}", crate::cache::front_plan_wait_line(plan, waited));
+                })));
             }
             EXIT_PLAN_WAIT.store(false, Ordering::SeqCst);
             jit::begin_exit_for(exiting);
