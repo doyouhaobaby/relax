@@ -930,7 +930,8 @@ mod imp {
         search: Vec::new(), libs: Vec::new(), dlls: Vec::new(),
     });
 
-    pub(super) unsafe fn reset_import_libs() {
+    /// What this module holds of a run, as a fresh process has it (the parent's `reset_statics`).
+    pub(super) unsafe fn reset_statics() {
         relax_session::reset_static(&IMPORT_LIBS, Mutex::new(ImportLibs::default()));
     }
 
@@ -1477,7 +1478,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&EMBEDDED_FAILURE, std::sync::atomic::AtomicI32::new(0));
     reset(&PROGRAM_ATEXIT, std::sync::Mutex::new(Vec::new()));
     #[cfg(windows)]
-    imp::reset_import_libs();
+    imp::reset_statics();
 }
 
 #[cfg(all(test, windows))]
