@@ -76,6 +76,23 @@ fn match_by_ref_in_guard(e: Ev, v: Option<String>) -> usize {
     }
 }
 
+// two sibling blocks, each with an address-taken `let`, and locals after them: every one gets its
+// storage at the arm's entry, and none may share it with another the guard still uses
+#[inline(never)]
+fn sibling_blocks_in_guard(e: Ev, n: u32) -> u32 {
+    match e {
+        Ev::Move | Ev::Release if {
+            let a = { let s = n.to_string(); let mut x = s.clone(); x.push('x'); x };
+            let b = { let t = (n * 7).to_string(); len_of(&t) };
+            let c = len_of(&a) * 10 + b;
+            let r = &c;
+            println!("| sibling blocks: {a} {b} {}", *r);
+            *r > 30
+        } => n,
+        _ => 0,
+    }
+}
+
 #[inline(never)]
 fn closure_in_guard(e: Ev, n: u32) -> u32 {
     let k = n + 1;
@@ -170,4 +187,17 @@ fn a05_nested_bindings_in_the_guard() {
     ];
     println!("| closure in guard: {r:?}");
     assert_eq!(r, [0, 31, 0, 0]);
+}
+
+#[test]
+fn a06_sibling_blocks_in_the_guard() {
+    let r = [
+        sibling_blocks_in_guard(Ev::Move, 5),
+        sibling_blocks_in_guard(Ev::Release, 50),
+        sibling_blocks_in_guard(Ev::Release, 2),
+        sibling_blocks_in_guard(Ev::Move, 20),
+        sibling_blocks_in_guard(Ev::Press, 50),
+    ];
+    println!("| sibling blocks in guard: {r:?}");
+    assert_eq!(r, [0, 50, 0, 20, 0]);
 }
