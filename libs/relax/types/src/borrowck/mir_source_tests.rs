@@ -86,22 +86,31 @@ pub(super) fn borrowck_source_checked(source: &str, edition: u16) -> (Vec<String
 }
 
 fn borrowck_source_checked_named(source: &str, edition: u16, crate_name: &str, validate: bool) -> (Vec<String>, Vec<String>) {
+    let (type_errors, errors, unchecked) = borrowck_source_with_typeck_errors(source, edition, crate_name, validate);
+    assert!(type_errors.is_empty(), "typeck: {type_errors:?}");
+    (errors, unchecked)
+}
+
+fn borrowck_source_with_typeck_errors(source: &str, edition: u16, crate_name: &str, validate: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (mut prog, tcx, user) = load_source(source, edition, crate_name);
     prog.crates[user as usize].validate = validate;
-    let (mut errors, mut unchecked) = (vec![], vec![]);
+    let (mut type_errors, mut errors, mut unchecked) = (vec![], vec![], vec![]);
     for owner in crate::borrowck::body::owners(&prog) {
         if prog.def(owner.owner).krate != user { continue; }
         let state = EvalState::new();
         let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
         let body = tcx.typeck(&prog, owner.owner);
-        assert!(body.errors.is_empty(), "typeck: {:?}", body.errors);
+        if !body.errors.is_empty() {
+            type_errors.extend(body.errors.iter().cloned());
+            continue;
+        }
         if std::env::var_os("PROBE").is_some() { for (ce, c) in body.min_captures.iter() { eprintln!("PROBE closure {ce:?} kind {:?} captures {:?}", c.kind, c.captures.iter().map(|c| (c.info.kind, c.place.projections.len())).collect::<Vec<_>>()); } }
         let v = crate::borrowck::driver::check_root(&cx, &prog, &tcx, &body, None);
         errors.extend(v.errors.iter().map(|e| format!("{} {} {}:{} {:?} {:?}", e.code, e.message, e.line, e.col, e.labels, e.notes)));
         unchecked.extend(v.unchecked);
     }
     let _ = DefId(0);
-    (errors, unchecked)
+    (type_errors, errors, unchecked)
 }
 
 #[test]
@@ -329,6 +338,15 @@ fn bodies_naming_constants_are_checked_with_their_qualifs() {
         pub fn g() -> &'static P { &EMPTY }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+
+    let (type_errors, errors, unchecked) = borrowck_source_with_typeck_errors(r#"
+        pub const LIMIT: u32 = "three";
+        pub struct Buffer(pub [u8; LIMIT as usize]);
+        pub fn f() -> u32 { LIMIT }
+        pub fn h() -> &'static u32 { &LIMIT }"#, 2021, "repro", true);
+    assert!(unchecked.is_empty(), "ill-typed LIMIT left readers unchecked: {unchecked:?}");
+    assert!(errors.is_empty(), "ill-typed LIMIT caused reader borrow errors: {errors:?}");
+    assert!(type_errors.len() == 1 && type_errors[0].contains("E0308"), "ill-typed LIMIT initializer: {type_errors:?}");
 }
 
 #[test]
