@@ -523,8 +523,9 @@ fn site_of(frames: &[u64]) -> String {
 static ANSWERS: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The faults the handler recorded so far, as (thread, retired range's name): signal-safe stores
-/// made before any report line, so a test sees its fault however long the report takes.
-#[cfg(test)]
+/// made before any report line, so a test sees its fault however long the report takes. (Its
+/// one test runs on the Apple OSes and Linux: elsewhere it was an unused-function warning.)
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 pub(crate) fn recorded() -> Vec<(u64, String)> {
     REC.iter()
         .filter(|r| r.state.load(Ordering::Acquire) >= 2)
