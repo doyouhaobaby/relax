@@ -437,7 +437,7 @@ impl LoadFixture {
         let n = names.len();
         let graph = crate::unitgraph::Graph {
             crates, root: n - 1, build_scripts: vec![], pkg, cfgs: vec![vec![]; n],
-            env: vec![vec![]; n], link_libs: vec![], link_search: Vec::new(), native: None, raw: vec![], bins: vec![],
+            env: vec![vec![]; n], link_libs: vec![], link_search: Vec::new(), workspace_root: String::new(), native: None, raw: vec![], bins: vec![],
         };
         let order = crate::crates::topo_order(&graph.crates);
         let cfgs = vec![self.cfg.clone(); n];

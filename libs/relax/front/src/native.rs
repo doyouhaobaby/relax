@@ -2088,6 +2088,7 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
         env: vec![Vec::new()],
         link_libs: Vec::new(),
         link_search: Vec::new(),
+        workspace_root: String::new(),
         native: None,
         raw: vec![
             unit(root, at(root), &[], &[1, 5], true),

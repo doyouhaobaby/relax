@@ -2573,6 +2573,9 @@ pub struct GraphUnit {
 pub struct Units {
     pub units: Vec<GraphUnit>,
     pub roots: Vec<usize>,
+    /// The workspace root cargo runs rustc in for path targets under it (unitgraph.rs rustc_dir).
+    /// Empty when unknown.
+    pub workspace_root: String,
     /// binary target names of the root package when building integration tests (`CARGO_BIN_EXE_<name>`)
     pub bins: Vec<String>,
     /// a build script's units: its parent confined its run, with these folders (`relax_script`)
@@ -2664,7 +2667,7 @@ impl Units {
         }
         let roots = j.get("roots").map(|r| r.arr().iter().map(|x| x.num() as usize).collect()).unwrap_or_default();
         let script = j.get("relax_script").map(|r| ScriptFolders { read: list(r.get("read")), excluded: list(r.get("excluded")), cwd: s(r.get("cwd")) });
-        Ok(Units { units, roots, bins: Vec::new(), script, unified: Vec::new() })
+        Ok(Units { units, roots, workspace_root: s(j.get("workspace_root")), bins: Vec::new(), script, unified: Vec::new() })
     }
 }
 
@@ -3292,7 +3295,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if u.host { "host" } else { "target" }, u.name, u.mode, u.features.join(","), deps.join(","));
         }
     }
-    Ok(Units { units: out, roots, bins, script: None, unified: Vec::new() })
+    Ok(Units { units: out, roots, workspace_root: r.ws.root.clone(), bins, script: None, unified: Vec::new() })
 }
 
 #[cfg(test)]
