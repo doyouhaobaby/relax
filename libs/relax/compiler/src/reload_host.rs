@@ -49,6 +49,45 @@ pub fn wait_for_save(dirs: Vec<PathBuf>, since: std::time::SystemTime) -> Result
     SAVE_WAIT.get().ok_or("no runner registered to wait for a save")?(dirs, since)
 }
 
+pub(crate) enum TestSave {
+    Tree(std::time::SystemTime),
+    Overlay { ledger: PathBuf, before: Option<crate::vfs::FileStat> },
+}
+
+impl TestSave {
+    pub(crate) fn at_boot(since: std::time::SystemTime) -> Self {
+        if let Some(ledger) = crate::vfs::edits_record().filter(|_| crate::vfs::in_store(&crate::run::workspace_dir())) {
+            // The ledger's identity changes at rename, even if the staged file predates this boot.
+            let before = crate::vfs::file_stat(&ledger.to_string_lossy());
+            Self::Overlay { ledger, before }
+        } else {
+            Self::Tree(since)
+        }
+    }
+
+    pub(crate) fn wait(&self, dirs: Vec<PathBuf>) -> Result<(), String> {
+        let (ledger, before) = match self {
+            Self::Tree(since) => return wait_for_save(dirs, *since),
+            Self::Overlay { ledger, before } => (ledger, before),
+        };
+        let path = ledger.to_string_lossy();
+        let arm = || super::watch_events::Watch::new(std::iter::once(path.as_ref()));
+        let mut watch = arm();
+        // Arm before checking for a publication made during the failed compile. A staged source,
+        // a whiteout or a watcher kick leaves the published ledger in place.
+        while !crate::vfs::file_stat(&path).is_some_and(|now| Some(now) != *before) {
+            if let Some(w) = &mut watch {
+                w.wait(None);
+                if w.changed().is_none() { watch = arm(); }
+            } else {
+                // The live watcher's fallback on hosts without native events.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Snapshot the loader file at runtime startup, after the launcher has set its path and
 /// before a later build can replace the file this process runs ([`loader_replaced`]).
 pub fn snapshot_loader() {

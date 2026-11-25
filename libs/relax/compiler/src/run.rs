@@ -1340,6 +1340,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("RELAX_PROGRESS") };
     if (live_tests && (!harness || no_live || check)) || (test_restart.is_some() && !live_tests) { return usage(); }
+    let test_save = live_tests.then(|| crate::reload::host::TestSave::at_boot(boot_start));
     if live_tests {
         if let Err(e) = crate::harness::live::start(test_restart) {
             eprintln!("relax test: {e}");
@@ -1614,10 +1615,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if let Ok(dir) = crate::resolve::package_dir(sess, &workspace, &package) { watch_test_package(&dir); }
     }
     let compile_failure = |code, errors: &[String]| {
-        if live_tests {
+        if let Some(save) = &test_save {
             let dirs = app_dirs();
-            if dirs.is_empty() { return code; } // No package or graph was resolved by this harness.
-            crate::harness::live::hold(dirs, boot_start, errors);
+            if dirs.is_empty() && matches!(save, crate::reload::host::TestSave::Tree(_)) { return code; }
+            crate::harness::live::hold(dirs, save, errors);
         }
         code
     };

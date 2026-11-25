@@ -61,12 +61,12 @@ pub(crate) fn another_waits() -> bool {
     HELD_BY.get().is_some_and(|owner| *owner != std::thread::current().id())
 }
 
-pub(crate) fn hold(dirs: Vec<std::path::PathBuf>, since: std::time::SystemTime, errors: &[String]) {
+pub(crate) fn hold(dirs: Vec<std::path::PathBuf>, save: &crate::reload::host::TestSave, errors: &[String]) {
     HELD_BY.set(std::thread::current().id()).expect("one held boot per harness process");
     crate::reload::inputs_wake();
     crate::hot_failure::check_refused("the tests did not compile", errors);
     eprintln!("relax test: held: the tests did not compile; the next save starts the next run");
-    if let Err(e) = crate::reload::host::wait_for_save(dirs, since) {
+    if let Err(e) = save.wait(dirs) {
         eprintln!("relax test: watching for a save: {e}");
         return;
     }
