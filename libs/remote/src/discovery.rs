@@ -391,7 +391,23 @@ pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
 
 /// Whether a target names an endpoint file (a path) rather than a pid, a name or a socket.
 pub fn is_endpoint_file(spec: &str) -> bool {
-    spec.contains('/') || spec.contains('\\')
+    (spec.contains('/') || spec.contains('\\')) && !is_socket_path(spec)
+}
+
+/// Whether a target is an endpoint's socket: a path ending in `.sock` (as [`crate::carrier::unix`]
+/// names them), or one that is a socket on disk.
+pub fn is_socket_path(spec: &str) -> bool {
+    if spec.ends_with(".sock") {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = std::fs::metadata(spec) {
+            return meta.file_type().is_socket();
+        }
+    }
+    false
 }
 
 /// Writes `path`, a file naming this process's endpoint (its pid, app and start time), for an app
@@ -454,6 +470,7 @@ mod published_tests {
         std::fs::write(&file, &written).unwrap();
         let spec = file.to_str().unwrap();
         assert!(is_endpoint_file(spec) && !is_endpoint_file("42") && !is_endpoint_file("create"), "paths only");
+        assert!(!is_endpoint_file("/run/user/x/makepad-remote-42.sock"), "a socket path is not an endpoint file");
         assert_eq!(published(&file, &list).map(|a| a.pid), Ok(42), "the instance that wrote it");
         let reused = vec![parse(&line(42, 3000)).unwrap()];
         assert!(published(&file, &reused).unwrap_err().contains("not running"), "a reused pid is not that instance");

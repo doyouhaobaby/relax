@@ -148,15 +148,16 @@ impl Client {
         Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), failed: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None), ping_limit: Mutex::new(Duration::ZERO) }))
     }
 
-    /// Dials a local endpoint: `spec` is a socket path, a discovery file's `tcp:` socket (Windows),
-    /// a pid or the name of an app this program's lease started.
+    /// Dials a local endpoint: `spec` is a socket path, an endpoint file an app published
+    /// ([`crate::discovery::publish`]), a discovery file's `tcp:` socket (Windows), a pid or the
+    /// name of an app this program's lease started.
     pub fn connect(spec: &str) -> Result<Client, Error> {
         Client::connect_as(spec, &crate::discovery::Caller::program())
     }
 
     /// [`Client::connect`], with what an app name reaches decided for `caller`.
     pub fn connect_as(spec: &str, caller: &crate::discovery::Caller) -> Result<Client, Error> {
-        let target = if spec.contains('/') || spec.ends_with(".sock") {
+        let target = if crate::discovery::is_socket_path(spec) {
             Target::Unix(PathBuf::from(spec))
         } else {
             let app = crate::discovery::find(spec, caller).map_err(|why| Error::Refused(CLOSE_LINK_LOST, why))?;

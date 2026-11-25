@@ -444,6 +444,14 @@ fn unix_end_to_end_with_discovery_and_reconnect() {
     assert_eq!(app.text("extra").as_deref(), Some("x"));
     let client = Client::connect(&std::process::id().to_string()).unwrap();
     assert!(client.caps().contains(&"cmd/1".to_string()));
+    // an endpoint file the app published reaches the same instance (it is a path, not a socket)
+    let file = crate::carrier::unix::test_root().join(format!("endpoint-{me}"));
+    crate::discovery::publish(&file).unwrap();
+    let by_file = Client::connect(file.to_str().unwrap()).expect("an endpoint file dials the instance that wrote it");
+    assert!(by_file.cmd("ping").unwrap().next().unwrap().unwrap().starts_with("{\"pong\":1"), "the endpoint file's instance answers");
+    by_file.conn().unwrap().close("test drop");
+    let _ = std::fs::remove_file(&file);
+    assert!(crate::discovery::is_socket_path(&app.socket), "the instance's own socket is still dialled as a socket");
     let mut lines = client.cmd("ping").unwrap();
     assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
     assert!(lines.next().is_none() && lines.end().unwrap().starts_with("{\"end\":\"ping\""));
