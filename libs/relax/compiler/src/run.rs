@@ -1065,6 +1065,34 @@ fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::S
 }
 
 
+/// The cold start's one line: why the disk cache did not give a warm start, by level -- the
+/// front (the resolved program: `restore_collected`'s refusal), the crates' code stores (each
+/// store's name holds its crate's key: a missing one is a key that changed) and the startup
+/// manifest (its key: the worktree, the codegen configuration and the root crate's view).
+fn cold_start_line(c: &crate::cache::Cache, crates: usize, restored: usize, front_why: Option<&str>) -> String {
+    let mut why = Vec::new();
+    match front_why {
+        Some(w) => why.push(format!("front: not restored ({w})")),
+        None if restored < crates => why.push(format!("front: {restored} of {crates} crates restored")),
+        None => {}
+    }
+    if (c.stats.packs as usize) < crates {
+        why.push(format!("code: {} of {} crates have a store under their current key", c.stats.packs, crates));
+    }
+    if c.stats.packs_rejected > 0 {
+        why.push(format!("code: {} stores rejected (their inputs changed, or their crate's front did not restore)", c.stats.packs_rejected));
+    }
+    if !c.has_startup_manifest() {
+        why.push("startup manifest: none under this key (a first run, or the worktree, the codegen configuration or the root crate's view changed)".to_string());
+    } else if c.manifest_missing > 0 {
+        why.push(format!("startup manifest: stale ({} of its {} slots' entries are gone)", c.manifest_missing, c.manifest.len()));
+    }
+    if why.is_empty() {
+        why.push("the front records were not all restored".to_string());
+    }
+    format!("relax cache: cold start: {}", why.join("; "))
+}
+
 /// std's folder in one spelling, its canonical one, set back at the loader's start, after the
 /// inherited mounts are installed and before any thread runs (a set_var races every thread that
 /// reads the environment; a run's compile thread runs beside its host's). std's source paths --
@@ -1818,6 +1846,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         Some(images) => warm_front(images, sess, &pre, check_restore),
         None => Err("this run keeps no front images".to_string()),
     };
+    // why the front image did not restore (the cold start's line names it)
+    let front_why = restored.as_ref().err().cloned();
     let restored = if verify_collected {
         // (why there is none: the check that refused it, said on every run)
         let why = match &restored {
@@ -2619,6 +2649,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     warm_start = Some((c.manifest.len(), c.manifest_present, c.manifest_uncached));
                 } else if c.has_startup_manifest() && c.manifest_missing > 0 {
                     verbose!("relax cache: startup manifest stale: {} of its {} slots' entries are gone", c.manifest_missing, c.manifest.len());
+                }
+                if !warm {
+                    verbose!("{}", cold_start_line(&c, u.prog.crates.len(), restored_crates, front_why.as_deref()));
                 }
                 verbose!("relax cache: {:?}, {} packs ({} rejected), {} code stores, {} entries, opened in {:.1} ms (interfaces {:.1} ms)", mode, c.stats.packs, c.stats.packs_rejected, c.stats.code_stores, c.stats.index_entries, c.stats.open_ns as f64 / 1e6, c.stats.iface_ns as f64 / 1e6);
                 // warm: this program ran with this cache before (its startup manifest, recorded
