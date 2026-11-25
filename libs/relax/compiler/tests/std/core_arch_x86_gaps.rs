@@ -187,13 +187,81 @@ const SHIFT_COUNTS: &[u64] = &[
 
 macro_rules! shifts {
     ($name:ident, $seed:literal) => {
-        cases!($name, "sse2", $seed, CASES, "none", |rng, case, d| {
+        shifts!($name, "sse2", $seed);
+    };
+    ($name:ident, $feature:tt, $seed:literal) => {
+        cases!($name, $feature, $seed, CASES, "none", |rng, case, d| {
             let a = sample(rng, case, 0);
             let mut count: [u64; 2] = sample(rng, case, 1);
             d.add(bytes(&real::$name(a, cast(count))));
             // Only the low quadword selects the shift distance.
             count[0] = SHIFT_COUNTS[case % SHIFT_COUNTS.len()];
             d.add(bytes(&real::$name(a, cast(count))));
+        });
+    };
+}
+
+macro_rules! lane_shifts {
+    ($name:ident, $seed:literal, [$lane:ty; $lanes:literal]) => {
+        cases!($name, "avx2", $seed, CASES, "none", |rng, case, d| {
+            let a = sample(rng, case, 0);
+            let mut counts: [$lane; $lanes] = sample(rng, case, 1);
+            let width = <$lane>::BITS as $lane;
+            for (i, count) in counts.iter_mut().enumerate() {
+                // Rotate the boundaries so adjacent lanes can shift by different amounts.
+                let choices = [
+                    0, 1, width - 1, width, width + 1, 1 << (width - 1), *count, *count % width,
+                ];
+                *count = choices[(case + i) % choices.len()];
+            }
+            d.add(bytes(&real::$name(a, cast(counts))));
+        });
+    };
+}
+
+macro_rules! gathers {
+    ($name:ident, $seed:literal, $indices:ty $(, $src:ident, $mask:ident)?) => {
+        cases!($name, "avx2", $seed, CASES, "1,2,4,8", |rng, case, d| {
+            let memory: Buffer = sample(rng, case, 0);
+            let base = memory.0.as_ptr().add(memory.0.len() / 2).cast();
+            let mut indices: $indices = sample(rng, case, 1);
+            // From byte 96, indices -12..=11 keep even an 8-byte read at scale 8 in bounds.
+            for index in &mut indices {
+                *index = index.rem_euclid(24) - 12;
+            }
+            let offsets = cast(indices);
+            $(
+                let $src = sample(rng, case, 2);
+                let $mask = sample(rng, case, 3);
+            )?
+            gathers!(@scales [1, 2, 4, 8], d, $name, ($($src,)? base, offsets $(, $mask)?));
+        });
+    };
+    (@scales [$($scale:literal),+], $d:ident, $name:ident, $args:tt) => {
+        $($d.add(bytes(&real::$name::<$scale> $args));)+
+    };
+}
+
+macro_rules! masked_loads {
+    ($name:ident, $seed:literal) => {
+        cases!($name, "avx2", $seed, CASES, "none", |rng, case, d| {
+            let src: Buffer = sample(rng, case, 0);
+            let ptr = src.0.as_ptr().add(case % 16).cast();
+            let mask = sample(rng, case, 1);
+            d.add(bytes(&real::$name(ptr, mask)));
+        });
+    };
+}
+
+macro_rules! masked_stores {
+    ($name:ident, $seed:literal) => {
+        cases!($name, "avx2", $seed, CASES, "none", |rng, case, d| {
+            let mut dst = Buffer([0; 192]);
+            let ptr = dst.0.as_mut_ptr().add(case % 16).cast();
+            let mask = sample(rng, case, 1);
+            let a = sample(rng, case, 2);
+            real::$name(ptr, mask, a);
+            d.add(&dst.0);
         });
     };
 }
@@ -1475,4 +1543,556 @@ fn b190__mm_rsqrt_ps() {
             add_estimate(d, input[i], output[i], true);
         }
     });
+}
+
+// AVX2
+
+#[test]
+fn b191__mm_i32gather_epi32() {
+    gathers!(_mm_i32gather_epi32, 191, [i32; 4]);
+}
+
+#[test]
+fn b192__mm_i32gather_epi64() {
+    gathers!(_mm_i32gather_epi64, 192, [i32; 4]);
+}
+
+#[test]
+fn b193__mm_i32gather_ps() {
+    gathers!(_mm_i32gather_ps, 193, [i32; 4]);
+}
+
+#[test]
+fn b194__mm_i64gather_epi32() {
+    gathers!(_mm_i64gather_epi32, 194, [i64; 2]);
+}
+
+#[test]
+fn b195__mm_i64gather_epi64() {
+    gathers!(_mm_i64gather_epi64, 195, [i64; 2]);
+}
+
+#[test]
+fn b196__mm_i64gather_ps() {
+    gathers!(_mm_i64gather_ps, 196, [i64; 2]);
+}
+
+#[test]
+fn b197__mm_mask_i32gather_epi32() {
+    gathers!(_mm_mask_i32gather_epi32, 197, [i32; 4], src, mask);
+}
+
+#[test]
+fn b198__mm_mask_i32gather_epi64() {
+    gathers!(_mm_mask_i32gather_epi64, 198, [i32; 4], src, mask);
+}
+
+#[test]
+fn b199__mm_mask_i32gather_ps() {
+    gathers!(_mm_mask_i32gather_ps, 199, [i32; 4], src, mask);
+}
+
+#[test]
+fn b200__mm_mask_i64gather_epi32() {
+    gathers!(_mm_mask_i64gather_epi32, 200, [i64; 2], src, mask);
+}
+
+#[test]
+fn b201__mm_mask_i64gather_epi64() {
+    gathers!(_mm_mask_i64gather_epi64, 201, [i64; 2], src, mask);
+}
+
+#[test]
+fn b202__mm_mask_i64gather_ps() {
+    gathers!(_mm_mask_i64gather_ps, 202, [i64; 2], src, mask);
+}
+
+#[test]
+fn b203__mm256_i32gather_epi32() {
+    gathers!(_mm256_i32gather_epi32, 203, [i32; 8]);
+}
+
+#[test]
+fn b204__mm256_i32gather_epi64() {
+    gathers!(_mm256_i32gather_epi64, 204, [i32; 4]);
+}
+
+#[test]
+fn b205__mm256_i32gather_ps() {
+    gathers!(_mm256_i32gather_ps, 205, [i32; 8]);
+}
+
+#[test]
+fn b206__mm256_i64gather_epi32() {
+    gathers!(_mm256_i64gather_epi32, 206, [i64; 4]);
+}
+
+#[test]
+fn b207__mm256_i64gather_epi64() {
+    gathers!(_mm256_i64gather_epi64, 207, [i64; 4]);
+}
+
+#[test]
+fn b208__mm256_i64gather_ps() {
+    gathers!(_mm256_i64gather_ps, 208, [i64; 4]);
+}
+
+#[test]
+fn b209__mm256_mask_i32gather_epi32() {
+    gathers!(_mm256_mask_i32gather_epi32, 209, [i32; 8], src, mask);
+}
+
+#[test]
+fn b210__mm256_mask_i32gather_epi64() {
+    gathers!(_mm256_mask_i32gather_epi64, 210, [i32; 4], src, mask);
+}
+
+#[test]
+fn b211__mm256_mask_i32gather_ps() {
+    gathers!(_mm256_mask_i32gather_ps, 211, [i32; 8], src, mask);
+}
+
+#[test]
+fn b212__mm256_mask_i64gather_epi32() {
+    gathers!(_mm256_mask_i64gather_epi32, 212, [i64; 4], src, mask);
+}
+
+#[test]
+fn b213__mm256_mask_i64gather_epi64() {
+    gathers!(_mm256_mask_i64gather_epi64, 213, [i64; 4], src, mask);
+}
+
+#[test]
+fn b214__mm256_mask_i64gather_ps() {
+    gathers!(_mm256_mask_i64gather_ps, 214, [i64; 4], src, mask);
+}
+
+#[test]
+fn b215__mm_maskload_epi32() {
+    masked_loads!(_mm_maskload_epi32, 215);
+}
+
+#[test]
+fn b216__mm_maskload_epi64() {
+    masked_loads!(_mm_maskload_epi64, 216);
+}
+
+#[test]
+fn b217__mm_maskstore_epi32() {
+    masked_stores!(_mm_maskstore_epi32, 217);
+}
+
+#[test]
+fn b218__mm_maskstore_epi64() {
+    masked_stores!(_mm_maskstore_epi64, 218);
+}
+
+#[test]
+fn b219__mm256_maskload_epi32() {
+    masked_loads!(_mm256_maskload_epi32, 219);
+}
+
+#[test]
+fn b220__mm256_maskload_epi64() {
+    masked_loads!(_mm256_maskload_epi64, 220);
+}
+
+#[test]
+fn b221__mm256_maskstore_epi32() {
+    masked_stores!(_mm256_maskstore_epi32, 221);
+}
+
+#[test]
+fn b222__mm256_maskstore_epi64() {
+    masked_stores!(_mm256_maskstore_epi64, 222);
+}
+
+#[test]
+fn b223__mm_blend_epi32() {
+    immediates!(4, _mm_blend_epi32, "avx2", 223, CASES, sample,
+        [a: real::__m128i = 0, b: real::__m128i = 1]);
+}
+
+#[test]
+fn b224__mm_broadcastb_epi8() {
+    sampled!(_mm_broadcastb_epi8, "avx2", 224, CASES, sample, [0]);
+}
+
+#[test]
+fn b225__mm_broadcastd_epi32() {
+    sampled!(_mm_broadcastd_epi32, "avx2", 225, CASES, sample, [0]);
+}
+
+#[test]
+fn b226__mm_broadcastq_epi64() {
+    sampled!(_mm_broadcastq_epi64, "avx2", 226, CASES, sample, [0]);
+}
+
+#[test]
+fn b227__mm_broadcastsi128_si256() {
+    sampled!(_mm_broadcastsi128_si256, "avx2", 227, CASES, sample, [0]);
+}
+
+#[test]
+fn b228__mm_broadcastss_ps() {
+    sampled!(_mm_broadcastss_ps, "avx2", 228, CASES, sample, [0]);
+}
+
+#[test]
+fn b229__mm_broadcastw_epi16() {
+    sampled!(_mm_broadcastw_epi16, "avx2", 229, CASES, sample, [0]);
+}
+
+#[test]
+fn b230__mm_sllv_epi64() {
+    lane_shifts!(_mm_sllv_epi64, 230, [u64; 2]);
+}
+
+#[test]
+fn b231__mm_srav_epi32() {
+    lane_shifts!(_mm_srav_epi32, 231, [u32; 4]);
+}
+
+#[test]
+fn b232__mm_srlv_epi32() {
+    lane_shifts!(_mm_srlv_epi32, 232, [u32; 4]);
+}
+
+#[test]
+fn b233__mm_srlv_epi64() {
+    lane_shifts!(_mm_srlv_epi64, 233, [u64; 2]);
+}
+
+#[test]
+fn b234__mm256_abs_epi16() {
+    sampled!(_mm256_abs_epi16, "avx2", 234, CASES, sample, [0]);
+}
+
+#[test]
+fn b235__mm256_abs_epi32() {
+    sampled!(_mm256_abs_epi32, "avx2", 235, CASES, sample, [0]);
+}
+
+#[test]
+fn b236__mm256_abs_epi8() {
+    sampled!(_mm256_abs_epi8, "avx2", 236, CASES, sample, [0]);
+}
+
+#[test]
+fn b237__mm256_adds_epi16() {
+    sampled!(_mm256_adds_epi16, "avx2", 237, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b238__mm256_adds_epi8() {
+    sampled!(_mm256_adds_epi8, "avx2", 238, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b239__mm256_adds_epu16() {
+    sampled!(_mm256_adds_epu16, "avx2", 239, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b240__mm256_adds_epu8() {
+    sampled!(_mm256_adds_epu8, "avx2", 240, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b241__mm256_avg_epu16() {
+    sampled!(_mm256_avg_epu16, "avx2", 241, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b242__mm256_avg_epu8() {
+    sampled!(_mm256_avg_epu8, "avx2", 242, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b243__mm256_blend_epi16() {
+    immediates!(8, _mm256_blend_epi16, "avx2", 243, CASES, sample,
+        [a: real::__m256i = 0, b: real::__m256i = 1]);
+}
+
+#[test]
+fn b244__mm256_broadcastb_epi8() {
+    sampled!(_mm256_broadcastb_epi8, "avx2", 244, CASES, sample, [0]);
+}
+
+#[test]
+fn b245__mm256_broadcastq_epi64() {
+    sampled!(_mm256_broadcastq_epi64, "avx2", 245, CASES, sample, [0]);
+}
+
+#[test]
+fn b246__mm256_broadcastss_ps() {
+    sampled!(_mm256_broadcastss_ps, "avx2", 246, CASES, sample, [0]);
+}
+
+#[test]
+fn b247__mm256_broadcastw_epi16() {
+    sampled!(_mm256_broadcastw_epi16, "avx2", 247, CASES, sample, [0]);
+}
+
+#[test]
+fn b248__mm256_bslli_epi128() {
+    immediates!(8, _mm256_bslli_epi128, "avx2", 248, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b249__mm256_bsrli_epi128() {
+    immediates!(8, _mm256_bsrli_epi128, "avx2", 249, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b250__mm256_cmpeq_epi64() {
+    sampled!(_mm256_cmpeq_epi64, "avx2", 250, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b251__mm256_cmpgt_epi64() {
+    sampled!(_mm256_cmpgt_epi64, "avx2", 251, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b252__mm256_cvtepi16_epi32() {
+    sampled!(_mm256_cvtepi16_epi32, "avx2", 252, CASES, sample, [0]);
+}
+
+#[test]
+fn b253__mm256_cvtepi16_epi64() {
+    sampled!(_mm256_cvtepi16_epi64, "avx2", 253, CASES, sample, [0]);
+}
+
+#[test]
+fn b254__mm256_cvtepi32_epi64() {
+    sampled!(_mm256_cvtepi32_epi64, "avx2", 254, CASES, sample, [0]);
+}
+
+#[test]
+fn b255__mm256_cvtepi8_epi16() {
+    sampled!(_mm256_cvtepi8_epi16, "avx2", 255, CASES, sample, [0]);
+}
+
+#[test]
+fn b256__mm256_cvtepi8_epi64() {
+    sampled!(_mm256_cvtepi8_epi64, "avx2", 256, CASES, sample, [0]);
+}
+
+#[test]
+fn b257__mm256_cvtepu16_epi32() {
+    sampled!(_mm256_cvtepu16_epi32, "avx2", 257, CASES, sample, [0]);
+}
+
+#[test]
+fn b258__mm256_cvtepu16_epi64() {
+    sampled!(_mm256_cvtepu16_epi64, "avx2", 258, CASES, sample, [0]);
+}
+
+#[test]
+fn b259__mm256_cvtepu32_epi64() {
+    sampled!(_mm256_cvtepu32_epi64, "avx2", 259, CASES, sample, [0]);
+}
+
+#[test]
+fn b260__mm256_cvtepu8_epi32() {
+    sampled!(_mm256_cvtepu8_epi32, "avx2", 260, CASES, sample, [0]);
+}
+
+#[test]
+fn b261__mm256_cvtepu8_epi64() {
+    sampled!(_mm256_cvtepu8_epi64, "avx2", 261, CASES, sample, [0]);
+}
+
+#[test]
+fn b262__mm256_extract_epi16() {
+    immediates!(4, _mm256_extract_epi16, "avx2", 262, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b263__mm256_extract_epi8() {
+    immediates!(5, _mm256_extract_epi8, "avx2", 263, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b264__mm256_hadd_epi16() {
+    sampled!(_mm256_hadd_epi16, "avx2", 264, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b265__mm256_hadd_epi32() {
+    sampled!(_mm256_hadd_epi32, "avx2", 265, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b266__mm256_hadds_epi16() {
+    sampled!(_mm256_hadds_epi16, "avx2", 266, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b267__mm256_hsub_epi16() {
+    sampled!(_mm256_hsub_epi16, "avx2", 267, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b268__mm256_hsub_epi32() {
+    sampled!(_mm256_hsub_epi32, "avx2", 268, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b269__mm256_hsubs_epi16() {
+    sampled!(_mm256_hsubs_epi16, "avx2", 269, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b270__mm256_max_epi32() {
+    sampled!(_mm256_max_epi32, "avx2", 270, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b271__mm256_max_epi8() {
+    sampled!(_mm256_max_epi8, "avx2", 271, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b272__mm256_min_epi32() {
+    sampled!(_mm256_min_epi32, "avx2", 272, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b273__mm256_min_epi8() {
+    sampled!(_mm256_min_epi8, "avx2", 273, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b274__mm256_mpsadbw_epu8() {
+    immediates!(8, _mm256_mpsadbw_epu8, "avx2", 274, CASES, sample,
+        [a: real::__m256i = 0, b: real::__m256i = 1]);
+}
+
+#[test]
+fn b275__mm256_mul_epi32() {
+    sampled!(_mm256_mul_epi32, "avx2", 275, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b276__mm256_mulhi_epi16() {
+    sampled!(_mm256_mulhi_epi16, "avx2", 276, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b277__mm256_mulhrs_epi16() {
+    sampled!(_mm256_mulhrs_epi16, "avx2", 277, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b278__mm256_packs_epi16() {
+    sampled!(_mm256_packs_epi16, "avx2", 278, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b279__mm256_shufflehi_epi16() {
+    immediates!(8, _mm256_shufflehi_epi16, "avx2", 279, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b280__mm256_shufflelo_epi16() {
+    immediates!(8, _mm256_shufflelo_epi16, "avx2", 280, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b281__mm256_sign_epi32() {
+    sampled!(_mm256_sign_epi32, "avx2", 281, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b282__mm256_sign_epi8() {
+    sampled!(_mm256_sign_epi8, "avx2", 282, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b283__mm256_sll_epi16() {
+    shifts!(_mm256_sll_epi16, "avx2", 283);
+}
+
+#[test]
+fn b284__mm256_sll_epi32() {
+    shifts!(_mm256_sll_epi32, "avx2", 284);
+}
+
+#[test]
+fn b285__mm256_sll_epi64() {
+    shifts!(_mm256_sll_epi64, "avx2", 285);
+}
+
+#[test]
+fn b286__mm256_slli_si256() {
+    immediates!(8, _mm256_slli_si256, "avx2", 286, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b287__mm256_sllv_epi64() {
+    lane_shifts!(_mm256_sllv_epi64, 287, [u64; 4]);
+}
+
+#[test]
+fn b288__mm256_sra_epi16() {
+    shifts!(_mm256_sra_epi16, "avx2", 288);
+}
+
+#[test]
+fn b289__mm256_sra_epi32() {
+    shifts!(_mm256_sra_epi32, "avx2", 289);
+}
+
+#[test]
+fn b290__mm256_srav_epi32() {
+    lane_shifts!(_mm256_srav_epi32, 290, [u32; 8]);
+}
+
+#[test]
+fn b291__mm256_srl_epi32() {
+    shifts!(_mm256_srl_epi32, "avx2", 291);
+}
+
+#[test]
+fn b292__mm256_srl_epi64() {
+    shifts!(_mm256_srl_epi64, "avx2", 292);
+}
+
+#[test]
+fn b293__mm256_srli_si256() {
+    immediates!(8, _mm256_srli_si256, "avx2", 293, CASES, sample,
+        [a: real::__m256i = 0]);
+}
+
+#[test]
+fn b294__mm256_stream_load_si256() {
+    cases!(_mm256_stream_load_si256, "avx2", 294, CASES, "none", |rng, case, d| {
+        let src: Buffer = sample(rng, case, 0);
+        let ptr = src.0.as_ptr().add((case % (src.0.len() / 32)) * 32).cast();
+        d.add(bytes(&real::_mm256_stream_load_si256(ptr)));
+    });
+}
+
+#[test]
+fn b295__mm256_subs_epi16() {
+    sampled!(_mm256_subs_epi16, "avx2", 295, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b296__mm256_subs_epi8() {
+    sampled!(_mm256_subs_epi8, "avx2", 296, CASES, sample, [0, 1]);
+}
+
+#[test]
+fn b297__mm256_subs_epu16() {
+    sampled!(_mm256_subs_epu16, "avx2", 297, CASES, sample, [0, 1]);
 }
