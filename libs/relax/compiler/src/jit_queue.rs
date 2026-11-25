@@ -566,8 +566,19 @@ pub(super) fn held_line() -> String {
     };
     format!("tier-ups held while a worker was free: before the first present {}; after {}", phase(false), phase(true))
 }
-/// The same per slot for its O2 and O3 jobs: O2 ns, O2 jobs, O3 ns, O3 jobs.
-static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
+/// The same per slot for its O2 and O3 jobs: O2 ns, O2 jobs, O3 ns, O3 jobs, then its O3 jobs that
+/// made a counted build (PGO) instead: ns, jobs.
+static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 6]>>> = relax_session::sync::Mutex::new(None);
+/// The O3 jobs that made a counted build instead (PGO's counted code, counted_build): ns, jobs.
+static COUNTED_CPU: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+thread_local! {
+    /// The job this thread runs made a counted build (`job_counted`).
+    static JOB_COUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// The running job made a counted build: `jit spent` keeps its CPU apart from the O3 builds'.
+pub(super) fn job_counted() {
+    let _ = JOB_COUNTED.try_with(|c| c.set(true));
+}
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
 #[derive(Default)]
@@ -987,11 +998,18 @@ pub(super) fn tiers_where(keep: impl Fn(&TierEntry) -> bool) -> Vec<TierEntry> {
     drain_tier_inbox();
     lock().entries.iter().filter_map(|e| if let Job::O3(t) = e.job { keep(&t).then_some(t) } else { None }).collect()
 }
-fn note_job(tier: usize, slot: Option<u32>, ns: u64) {
-    JOB_CPU[tier].fetch_add(ns, Ordering::Relaxed);
-    JOB_RUNS[tier].fetch_add(1, Ordering::Relaxed);
+/// `counted`: an O3 job that made a counted build instead (job_counted).
+fn note_job(tier: usize, slot: Option<u32>, ns: u64, counted: bool) {
+    let counted = counted && tier == 2;
+    if counted {
+        COUNTED_CPU[0].fetch_add(ns, Ordering::Relaxed);
+        COUNTED_CPU[1].fetch_add(1, Ordering::Relaxed);
+    } else {
+        JOB_CPU[tier].fetch_add(ns, Ordering::Relaxed);
+        JOB_RUNS[tier].fetch_add(1, Ordering::Relaxed);
+    }
     if let (true, Some(slot)) = (is_tier_up(tier), slot) {
-        let at = (tier - 1) * 2;
+        let at = if counted { 4 } else { (tier - 1) * 2 };
         crate::zone_alloc::kept_with(|| {
             let mut g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
             let row = g.get_or_insert_with(Default::default).entry(slot).or_default();
@@ -1000,18 +1018,21 @@ fn note_job(tier: usize, slot: Option<u32>, ns: u64) {
         });
     }
 }
-/// What the jobs took by tier, then the `n` slots whose O2 and O3 jobs took the most.
+/// What the jobs took by tier (the counted builds apart from the O3 builds), then the `n` slots
+/// whose O2, O3 and counted jobs took the most.
 pub(super) fn spent(n: usize) -> Vec<String> {
-    let mut rows = vec![TIER_NAMES.iter().enumerate()
+    let mut tiers: Vec<String> = TIER_NAMES.iter().enumerate()
         .map(|(i, name)| format!("{name} {:.1} s x{}", JOB_CPU[i].load(Ordering::Relaxed) as f64 / 1e9, JOB_RUNS[i].load(Ordering::Relaxed)))
-        .collect::<Vec<_>>().join(", ")];
+        .collect();
+    tiers.insert(3, format!("counted {:.1} s x{}", COUNTED_CPU[0].load(Ordering::Relaxed) as f64 / 1e9, COUNTED_CPU[1].load(Ordering::Relaxed)));
+    let mut rows = vec![tiers.join(", ")];
     let g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
-    let mut slots: Vec<(&u32, &[u64; 4])> = g.iter().flatten().collect();
-    slots.sort_by_key(|(id, r)| (std::cmp::Reverse(r[0] + r[2]), **id));
-    rows.push(format!("{} slots had an O2 or O3 job", slots.len()));
+    let mut slots: Vec<(&u32, &[u64; 6])> = g.iter().flatten().collect();
+    slots.sort_by_key(|(id, r)| (std::cmp::Reverse(r[0] + r[2] + r[4]), **id));
+    rows.push(format!("{} slots had an O2, O3 or counted job", slots.len()));
     rows.extend(slots.into_iter().take(n).map(|(id, r)| {
         let name = slot_name(*id).unwrap_or_default();
-        format!("S{id} O2 {:.1} ms x{} O3 {:.1} ms x{} {name}", r[0] as f64 / 1e6, r[1], r[2] as f64 / 1e6, r[3])
+        format!("S{id} O2 {:.1} ms x{} O3 {:.1} ms x{} counted {:.1} ms x{} {name}", r[0] as f64 / 1e6, r[1], r[2] as f64 / 1e6, r[3], r[4] as f64 / 1e6, r[5])
     }));
     rows
 }
@@ -1304,9 +1325,11 @@ fn worker_loop(index: usize) {
                     } else { None };
                     let (slot, cpu) = (entry.slot.map(|s| s.1), cpu_ns());
                     budget::set_thread_work(work);
+                    let _ = JOB_COUNTED.try_with(|c| c.set(false));
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(entry.job)));
                     budget::set_thread_work(budget::WORK_PLAIN);
-                    note_job(tier, slot, cpu_ns().saturating_sub(cpu));
+                    let counted = JOB_COUNTED.try_with(|c| c.replace(false)).unwrap_or(false);
+                    note_job(tier, slot, cpu_ns().saturating_sub(cpu), counted);
                     drop(active);
                     if let Err(payload) = result {
                         let (message, bail) = panic_payload(&*payload);
@@ -1412,18 +1435,22 @@ mod tests {
         let slot = u32::MAX - 11;
         let of_slot = || SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&slot).copied()).unwrap_or_default();
         let tiers = || [1, 2].map(|t| (JOB_CPU[t].load(Ordering::Relaxed), JOB_RUNS[t].load(Ordering::Relaxed)));
-        let (slot0, tiers0) = (of_slot(), tiers());
-        note_job(2, Some(slot), 5_000_000);
-        note_job(2, Some(slot), 5_000_000);
-        note_job(1, Some(slot), 1_000_000);
-        let (slot1, tiers1) = (of_slot(), tiers());
-        assert_eq!([0, 1, 2, 3].map(|i| slot1[i] - slot0[i]), [1_000_000, 1, 10_000_000, 2], "the slot's O2 and O3 time and runs");
+        let counted = || (COUNTED_CPU[0].load(Ordering::Relaxed), COUNTED_CPU[1].load(Ordering::Relaxed));
+        let (slot0, tiers0, counted0) = (of_slot(), tiers(), counted());
+        note_job(2, Some(slot), 5_000_000, false);
+        note_job(2, Some(slot), 5_000_000, false);
+        note_job(1, Some(slot), 1_000_000, false);
+        // an O3 job that made a counted build instead: counted, not O3
+        note_job(2, Some(slot), 3_000_000, true);
+        let (slot1, tiers1, counted1) = (of_slot(), tiers(), counted());
+        assert_eq!([0, 1, 2, 3, 4, 5].map(|i| slot1[i] - slot0[i]), [1_000_000, 1, 10_000_000, 2, 3_000_000, 1], "the slot's O2, O3 and counted time and runs");
         for (t, (ns, runs)) in [(0, (1_000_000, 1)), (1, (10_000_000, 2))] {
             assert!(tiers1[t].0 - tiers0[t].0 >= ns && tiers1[t].1 - tiers0[t].1 >= runs, "tier {} totals hold the jobs", t + 1);
         }
+        assert!(counted1.0 - counted0.0 >= 3_000_000 && counted1.1 - counted0.1 >= 1, "the counted total holds the counted job");
         let rows = spent(usize::MAX);
-        assert!(rows[0].contains("O3 "), "by tier first: {}", rows[0]);
-        let row = format!("S{slot} O2 {:.1} ms x{} O3 {:.1} ms x{}", slot1[0] as f64 / 1e6, slot1[1], slot1[2] as f64 / 1e6, slot1[3]);
+        assert!(rows[0].contains("O3 ") && rows[0].contains("counted "), "by tier first, counted builds apart: {}", rows[0]);
+        let row = format!("S{slot} O2 {:.1} ms x{} O3 {:.1} ms x{} counted {:.1} ms x{}", slot1[0] as f64 / 1e6, slot1[1], slot1[2] as f64 / 1e6, slot1[3], slot1[4] as f64 / 1e6, slot1[5]);
         assert!(rows.iter().any(|r| r.starts_with(&row)), "{row} in {rows:?}");
     }
 
@@ -1714,6 +1741,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RUNNING, [const { AtomicUsize::new(0) }; TIERS]);
     reset(&JOB_CPU, [const { AtomicU64::new(0) }; TIERS]);
     reset(&JOB_RUNS, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&COUNTED_CPU, [const { AtomicU64::new(0) }; 2]);
     reset(&HELD_NS, [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2]);
     reset(&HELD_QUEUED_NS, [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2]);
     reset(&SLOT_CPU, relax_session::sync::Mutex::new(None));

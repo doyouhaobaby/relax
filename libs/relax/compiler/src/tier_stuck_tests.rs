@@ -980,6 +980,7 @@ fn a_hot_fn_edited_mid_run_returns_to_o3() {
     assert!(u.fns[id as usize].rir.is_some(), "hot's patch left its RIR for the counted build");
     assert!(unsafe { counted_build(up, id, false) }, "hot gets its counted build");
     assert!(COUNTING.lock().unwrap().iter().any(|e| e.id == id), "hot's counted window is open");
+    assert_eq!(crate::inspect::codever::kind_at(&u, u.fns[id as usize].code).tier_name(), "counted", "its counted code says so (a profile's tier, versions), not O1");
     edit("= 9;", "= 10;");
     assert!(!COUNTING.lock().unwrap().iter().any(|e| e.id == id), "the counted window of hot's old body is closed");
     counting("in its counted window, then edited");
