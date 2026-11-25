@@ -1,13 +1,13 @@
 //! Hot call sites of counted code's O3 build call through the callee's body word (`Reloc::Body`)
-//! when the slots' table words name entry wrappers (a live test session's reach marks): a block
-//! that ran at least as often as the body's entry, its tail calls too. Every other site calls the
+//! when the slots' table words name entry wrappers (a live test session's reach marks): any block
+//! that ran (count above 0), its tail calls too. Every other site calls the
 //! thunk (`Reloc::Call`), as does every site without counts, without wrappers or with
 //! RELAX_OPT=-bypass. The host's backend, code generation only.
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use relax_backend::rir::*;
 
 /// `f(n) = if n == 0 { k(g(n)) } else { h(n) }`: slots g 1, k 2, h 3; entry and the `g` block ran
-/// `hot` times (negative: no counts), the `h` block once.
+/// `hot` times (negative: no counts), the `h` block never.
 fn caller(hot: f32) -> Func {
     let mut f = Func::new("caller".into(), 0);
     let n = f.vreg(Cls::I);
@@ -24,7 +24,7 @@ fn caller(hot: f32) -> Func {
     };
     block(vec![Inst::ICmpI(Cond::Eq, false, z, n, 0)], Term::Branch(z, 1, 2), hot);
     block(vec![Inst::Call(Callee::Fn(1), vec![n], vec![r]), Inst::Call(Callee::Fn(2), vec![r], vec![s])], Term::Ret(vec![s]), hot);
-    block(vec![Inst::Call(Callee::Fn(3), vec![n], vec![t])], Term::Ret(vec![t]), if hot < 0.0 { hot } else { 1.0 });
+    block(vec![Inst::Call(Callee::Fn(3), vec![n], vec![t])], Term::Ret(vec![t]), if hot < 0.0 { hot } else { 0.0 });
     f.verify().unwrap();
     f
 }
@@ -64,7 +64,7 @@ fn hot_sites_of_counted_code_call_through_the_body_word_only_past_entry_wrappers
     let wrapped = SlotTable::new(32, 32, 16, 48);
     let single = SlotTable::new(32, 32, 8, 48);
     let thunks = vec![(1, false), (2, false), (3, false)];
-    assert_eq!(calls(&plain, &caller(10.0), &wrapped), vec![(1, true), (2, true), (3, false)], "the hot call and the hot tail call through the body word, the cold one through the thunk");
+    assert_eq!(calls(&plain, &caller(10.0), &wrapped), vec![(1, true), (2, true), (3, false)], "the calls that ran, the tail call too, through the body word; the one that never ran through the thunk");
     // the call through the word and k's sibling call as a jump through it
     let (code, _) = compile(&plain, &caller(10.0), &wrapped);
     #[cfg(target_arch = "x86_64")]

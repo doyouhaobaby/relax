@@ -1151,7 +1151,7 @@ struct Gen<'a> {
     /// `Env::near`: host and runtime calls are `call rel32` (the embedder places veneers)
     near: bool,
     /// the slots' table words name entry wrappers (a live test session's reach marks) and this
-    /// is counted code's O3 build: calls of a block that ran at least once per entry go through
+    /// is counted code's O3 build: calls of a block that ran at all (its count above 0) go through
     /// the callee's body word, past its wrapper (`Reloc::Body`; RELAX_OPT=-bypass: never)
     bypass: bool,
     /// `bypass` for the block being emitted
@@ -1941,7 +1941,7 @@ impl<'a> Gen<'a> {
             }
             let b = &self.f.blocks[bi];
             let n = b.insts.len();
-            self.bypass_here = self.bypass && b.count >= self.f.blocks[0].count;
+            self.bypass_here = self.bypass && b.count > 0.0;
             // the compare the branch reads (fused into cmp + jcc): the instructions before it
             let (bcmp, ne) = regalloc::branch_compare(b, &self.al.uses);
             let fused = bcmp.is_some();
@@ -3057,7 +3057,7 @@ impl<'a> Gen<'a> {
         }
         self.frame_exit();
         match c {
-            // a hot site: through the callee's body word (`bypass`)
+            // a site that ran: through the callee's body word (`bypass`)
             Callee::Fn(id) if self.bypass_here => {
                 self.mov_reloc(R11, Reloc::Body(*id));
                 self.a.jmp_mem(R11, 0);
@@ -6491,7 +6491,7 @@ impl<'a> Gen<'a> {
             self.a.vzeroupper();
         }
         match c {
-            // a hot site: through the callee's body word (`bypass`; r11 is no argument register)
+            // a site that ran: through the callee's body word (`bypass`; r11 is no argument register)
             Callee::Fn(id) if self.bypass_here => {
                 self.mov_reloc(R11, Reloc::Body(*id));
                 self.a.call_mem(R11, 0);
