@@ -680,12 +680,13 @@ fn a_macro_world_crate_resolves_macros_through_its_host_dependencies() {
     let mut reg = Reg { units: vec![unit("shared", false, &[1]), unit("wrapper", false, &[2]), unit("inner", false, &[3]), unit("rate_derive", true, &[])], ..Default::default() };
     reg.target_deps.insert(0, Vec::new());
     reg.derives.push(("Rate".to_string(), Entry { unit: 3, fname: "derive_rate".to_string(), kind: Kind::Derive }));
-    let saved = REG.with(|r| r.borrow_mut().replace(reg));
-    let program = derive_entry("shared", "Rate").map(|e| e.unit);
+    // the lookup derive_entry makes, on this registry: REG is the process's, and another test's
+    // load replaces it (register_and_strip) whenever it runs, between a swap here and a lookup too
+    // (a tests bucket of 11-26: the lookup ran on another test's registry)
+    let program = resolve_entry(&mut reg, "shared", "Rate", Kind::Derive).map(|e| e.unit);
     set_world_builder(true);
-    let world = derive_entry("shared", "Rate").map(|e| e.unit);
+    let world = resolve_entry(&mut reg, "shared", "Rate", Kind::Derive).map(|e| e.unit);
     set_world_builder(false);
-    REG.with(|r| *r.borrow_mut() = saved);
     assert_eq!(program, None, "the program's shared has no derive crate in reach");
     assert_eq!(world, Some(3), "the macro world's shared reaches the derive through its host dependencies");
 }
