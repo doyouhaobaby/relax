@@ -23018,6 +23018,13 @@ static TIER_RATE_TOP_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 const SETTLED_MS: u64 = 32;
 /// The sampler is settled: sources sample every SETTLED_MS (os::sample::set_period)
 static SAMPLER_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The JIT has had SETTLED_AFTER of quiet (update_sampler_settled), for inspect cpu's jit pool line.
+/// Report only: no scheduling reads it. A run that drives no budget (check, test, build scripts)
+/// reads settled.
+static UNSETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn jit_settled() -> bool {
+    !UNSETTLED.load(Ordering::Relaxed)
+}
 // Only program runs drive the budget, never check/test or compiler build scripts.
 static BUDGET_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SAMPLER_ACTIVITY: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
@@ -23119,7 +23126,7 @@ fn sampler_activity() -> u64 {
 pub(crate) fn start_cpu_budget() {
     let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
     *activity = Some((sampler_activity(), std::time::Instant::now()));
-    makepad_cpu_budget::set_jit_settled(false);
+    UNSETTLED.store(true, Ordering::Relaxed);
     SAMPLER_SETTLED.store(false, Ordering::Relaxed);
     BUDGET_RUN.store(true, Ordering::Release);
 }
@@ -23150,7 +23157,7 @@ fn update_sampler_settled() -> bool {
         busy::QUIET_AT.store(crate::clock::ms_since_start() as u64, Ordering::Relaxed);
     }
     if BUDGET_RUN.load(Ordering::Acquire) {
-        makepad_cpu_budget::set_jit_settled(quiet >= SETTLED_AFTER);
+        UNSETTLED.store(quiet < SETTLED_AFTER, Ordering::Relaxed);
     }
     let settled = settle_on && quiet >= SETTLED_AFTER;
     if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {

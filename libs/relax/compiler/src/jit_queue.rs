@@ -1375,7 +1375,7 @@ pub(super) fn pool_line() -> String {
     };
     let grant = outside.map(|outside| format!(", granted: {outside} cores in use outside the JIT")).unwrap_or_default();
     format!("{drains} drains, {sections} section workers  running {} / {} / {} ({tier_ups} tier-ups)  queued {} / {} / {}  settled: {}{grant}",
-        running[0], running[1], running[2], queued[0], queued[1], queued[2], if budget::jit_settled() { "yes" } else { "no" })
+        running[0], running[1], running[2], queued[0], queued[1], queued[2], if super::jit_settled() { "yes" } else { "no" })
 }
 
 fn class_name(class: u8) -> &'static str {

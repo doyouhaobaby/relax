@@ -1341,13 +1341,13 @@ fn cmd_cpu(out: &mut Out) {
     name_handles(&mut list);
     let tokens = makepad_cpu_budget::tokens();
     const CLASSES: [&str; 3] = ["interactive", "visible", "background"];
-    const CLIENTS: [&str; 3] = ["app", "jit", "hal"];
+    let client = |c| match c { makepad_cpu_budget::APP => "app", makepad_cpu_budget::HAL => "hal", _ => "?" };
     for h in &tokens.holders {
         let wait = crate::waits::of(h.thread).map(|w| format!(" -- waits: {}", wait_text(&w, &list))).unwrap_or_default();
-        out.line(&format!("{POOL}{} {} {} {:?} on {} for {:.1} s{}", if h.lent { "lent" } else if h.above { "above" } else { "token" }, CLASSES[h.class as usize], CLIENTS[h.client as usize], h.label, thread_label(h.thread, &list), h.held_ns as f64 / 1e9, wait));
+        out.line(&format!("{POOL}{} {} {} {:?} on {} for {:.1} s{}", if h.lent { "lent" } else { "token" }, CLASSES[h.class as usize], client(h.client), h.label, thread_label(h.thread, &list), h.held_ns as f64 / 1e9, wait));
     }
     for w in &tokens.waiting {
-        out.line(&format!("{POOL}wanted {} {} by {}", CLASSES[w.class as usize], CLIENTS[w.client as usize], thread_label(w.thread, &list)));
+        out.line(&format!("{POOL}wanted {} {} by {}", CLASSES[w.class as usize], client(w.client), thread_label(w.thread, &list)));
     }
     let waits = crate::waits::snapshot();
     out.line(&format!("jit pool   {}  {} asleep on other JIT work", crate::jit::queue_pool_line(), hang::jit_asleep(&waits)));
