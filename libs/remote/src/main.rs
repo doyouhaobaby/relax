@@ -68,7 +68,7 @@ fn run_app(spec: &str, argv: &[String]) -> ExitCode {
         }
     };
     let argv = if argv.is_empty() { vec!["help".to_string()] } else { argv.to_vec() };
-    match makepad_remote::app::run(&client, &argv, &mut |l| {
+    match makepad_remote::app::run_printed(&client, &argv, &mut |l| {
         println!("{l}");
         true
     }) {

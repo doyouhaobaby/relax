@@ -184,8 +184,9 @@ pub(crate) fn ask(app: &App, line: &str, each: &mut dyn FnMut(&str) -> bool) -> 
     }
     let client = makepad_remote::Client::connect(&app.socket).map_err(to_io)?;
     // the commands that are images (`grab`, `gseq`, `gq`) are answered client side from the
-    // `frames` service, like `makepad-remote app` does: the same library function
-    makepad_remote::app::run_line(&client, line, each).map_err(to_io)
+    // `frames` service, like `makepad-remote app` does: the same library function, in the printed
+    // form (a tool result's pictures as files)
+    makepad_remote::app::run_line_printed(&client, line, each).map_err(to_io)
 }
 
 /// `all`: every app of `caller` now and every one that starts while this runs.

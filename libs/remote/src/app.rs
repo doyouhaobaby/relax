@@ -143,6 +143,21 @@ fn get<'a>(kv: &'a [(String, String)], keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| kv.iter().find(|x| x.0 == *k).map(|x| x.1.as_str()))
 }
 
+/// [`run`] as a command line prints it: a tool result's inline pictures are written to files in
+/// the app's grab folder and the line names them instead (`image_files`, [`call_image_line`]), so
+/// a shell or a coding agent reads paths, not megabytes of base64. A library caller of [`run`]
+/// (a test, the MCP bridge) keeps the inline `images`.
+pub fn run_printed(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    let dir = std::cell::LazyCell::new(|| grab_dir(client));
+    run(client, argv, &mut |l| each(&call_image_line(l, || (*dir).clone())))
+}
+
+/// [`run_line`] as a command line prints it ([`run_printed`]).
+pub fn run_line_printed(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    let dir = std::cell::LazyCell::new(|| grab_dir(client));
+    run_line(client, line, &mut |l| each(&call_image_line(l, || (*dir).clone())))
+}
+
 /// Like [`run`] for a request typed as one line (words split on spaces).
 pub fn run_line(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
     // a JSON request goes as it is (its values keep their spaces and `=`)
@@ -243,7 +258,8 @@ fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mu
     Ok((err, lines.end().map(str::to_string)))
 }
 
-/// Replace a tool result's inline pictures with paths. Only a result with pictures needs a folder.
+/// The printed form of a tool result: its inline pictures replaced with paths ([`run_printed`]).
+/// Only a result with pictures needs a folder.
 fn call_image_line(line: &str, dir: impl FnOnce() -> Result<PathBuf, String>) -> Cow<'_, str> {
     let Ok(Value::Obj(mut envelope)) = json::parse_depth(line.as_bytes(), json::TOOL_JSON_DEPTH) else { return Cow::Borrowed(line) };
     let result = envelope.iter_mut().find(|(key, _)| key == "Result").and_then(|(_, value)| match value {
@@ -343,13 +359,12 @@ fn app_request(client: &Client, args: &str, each: &mut dyn FnMut(&str) -> bool) 
         }
         Err(e) => return Err(e),
     };
-    let dir = std::cell::LazyCell::new(|| grab_dir(client));
     let mut err = false;
     while let Some(ev) = ch.recv() {
         match ev {
             Event::Data(d) => {
                 for line in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
-                    if !each(&call_image_line(line, || (*dir).clone())) {
+                    if !each(line) {
                         return Ok((err, None));
                     }
                 }

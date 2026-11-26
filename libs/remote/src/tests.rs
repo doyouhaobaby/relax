@@ -832,11 +832,20 @@ fn fake_frames() -> Factory {
     })
 }
 
+/// A tool result with one inline picture (a 1x1 PNG).
+const PICTURE_RESULT: &str = "{\"Result\":{\"images\":[\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==\"]}}";
+
 /// An `app` service that answers each request with the request it was asked, then ends.
 fn fake_app() -> Factory {
     Arc::new(|_, open| {
         std::thread::spawn(move || {
-            let _ = open.channel.send(format!("{{\"asked\":{}}}\n", crate::json_str(&open.args)).into_bytes());
+            // a tool whose result carries a picture, as a render's does
+            let answer = if open.args.starts_with("call demo.picture") {
+                PICTURE_RESULT.to_string()
+            } else {
+                format!("{{\"asked\":{}}}", crate::json_str(&open.args))
+            };
+            let _ = open.channel.send(format!("{answer}\n").into_bytes());
             open.channel.close(crate::conn::CLOSE_NORMAL, "");
         });
         Ok(())
@@ -851,6 +860,8 @@ fn call_and_tools_ask_the_app_service() {
     assert_eq!((lines, err), (vec![r#"{"asked":"call demo.support plate\n{\"at\": [1, 2]}"}"#.to_string()], false));
     assert_eq!(run_app(&["tools"]).0, vec![r#"{"asked":"list"}"#.to_string()]);
     assert_eq!(run_app(&["call"]), (vec![r#"{"err":"call <service>.<tool> [<instance>] [<json args>]"}"#.to_string()], true));
+    assert_eq!(run_app(&["call", "demo.picture"]), (vec![PICTURE_RESULT.to_string()], false),
+        "a library call keeps the result's inline images: only the printed form writes them to files");
     assert_eq!(crate::app::app_request_of("call demo.x {\"a\": \"b c\"}"), Some(Ok("call demo.x\n{\"a\": \"b c\"}".to_string())));
     assert_eq!(crate::app::app_request_of("call demo.x"), Some(Ok("call demo.x\n{}".to_string())));
     assert_eq!(crate::app::app_request_of("ui tree"), None);
