@@ -270,7 +270,7 @@ mod tests {
                 choice = choice.with_simulated_grant(grant);
             }
             if let Some(addr) = choice.address {
-                let invite = Invite { addr, nat: choice.hint, commit: TEST_COMMITMENT };
+                let invite = Invite { addr, nat: choice.hint, commit: TEST_COMMITMENT, lan: None };
                 self.invite = Some(Invite::from_words(&invite.to_words().join(" ")).unwrap().0);
                 self.words_at = now;
             }
