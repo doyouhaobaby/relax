@@ -28,12 +28,18 @@ use std::sync::Arc;
 
 use makepad_cpu_budget as budget;
 use std::cell::RefCell;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU32, AtomicU8};
 
 static THREAD_START: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Installed by the compiler before front-end scopes start.
 pub fn thread_start(start: fn()) { let _ = THREAD_START.set(start); }
+
+static JOB_SLEEPS: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Installed by the JIT's queue in a granted run: called when a job falls asleep on other work
+/// (`suspend`). It must not wait or lock: the sleeper may hold the lock it waits under.
+pub fn on_job_sleep(sleeps: fn()) { let _ = JOB_SLEEPS.set(sleeps); }
 
 /// Compiler-owned queue policy; cache threads drain it alongside start-at-once scopes.
 pub trait Source: Sync {
@@ -55,11 +61,15 @@ pub fn drain(source: &'static dyn Source) -> std::io::Result<()> {
 /// A waiter can change the class of a job and its section tasks.
 pub struct JobClass {
     desired: AtomicU8,
+    /// the job's threads asleep on other work now (`suspend`)
+    asleep: AtomicU32,
     label: &'static str,
     children: Mutex<Vec<std::sync::Weak<JobClass>>>,
 }
 impl JobClass {
     pub fn class(&self) -> u8 { self.desired.load(Ordering::Acquire) }
+    /// The job waits for other work (`suspend`): it uses no CPU meanwhile.
+    pub fn asleep(&self) -> bool { self.asleep.load(Ordering::Acquire) != 0 }
     pub fn reclass(&self, class: u8) {
         let _kept = zone_alloc::kept();
         self.desired.store(class, Ordering::Release);
@@ -104,7 +114,7 @@ pub struct CurrentJob { old: Option<Arc<JobClass>>, job: Arc<JobClass> }
 impl CurrentJob {
     pub fn new(class: u8, label: &'static str) -> Self {
         let job = zone_alloc::kept_with(|| Arc::new(JobClass {
-            desired: AtomicU8::new(class), label, children: Mutex::new(Vec::new()),
+            desired: AtomicU8::new(class), asleep: AtomicU32::new(0), label, children: Mutex::new(Vec::new()),
         }));
         let old = CURRENT.with(|c| c.replace(Some(job.clone())));
         budget::set_thread_class(class);
@@ -114,7 +124,7 @@ impl CurrentJob {
     fn inherited(parent: Arc<JobClass>, label: &'static str) -> Self {
         let _kept = zone_alloc::kept();
         let job = Arc::new(JobClass {
-            desired: AtomicU8::new(parent.class()), label, children: Mutex::new(Vec::new()),
+            desired: AtomicU8::new(parent.class()), asleep: AtomicU32::new(0), label, children: Mutex::new(Vec::new()),
         });
         {
             let mut children = parent.children.lock().unwrap_or_else(|e| e.into_inner());
@@ -141,16 +151,27 @@ pub fn checkpoint() {
     }
 }
 
-pub struct Suspended { lent: bool }
+pub struct Suspended { lent: bool, job: Option<Arc<JobClass>> }
 
-/// Around a wait for other work. A JIT job holds no token, so it has nothing to give up; a program
-/// thread asleep on the JIT lends its app token (`budget::lend`), so its pool's next job runs
-/// meanwhile, and takes it back without a wait when the guard drops. Neither waits for anything.
+/// Around a wait for other work. A JIT job holds no token, so it has nothing to give up: it is
+/// asleep (`JobClass::asleep`, which a granted run's queue counts out of its width) until the guard
+/// drops. A program thread asleep on the JIT lends its app token (`budget::lend`), so its pool's
+/// next job runs meanwhile, and takes it back without a wait when the guard drops. Neither waits
+/// for anything.
 pub fn suspend() -> Suspended {
-    Suspended { lent: current_job().is_none() && budget::lend() }
+    match current_job() {
+        Some(job) => {
+            if job.asleep.fetch_add(1, Ordering::AcqRel) == 0 {
+                if let Some(sleeps) = JOB_SLEEPS.get() { sleeps(); }
+            }
+            Suspended { lent: false, job: Some(job) }
+        }
+        None => Suspended { lent: budget::lend(), job: None },
+    }
 }
 impl Drop for Suspended {
     fn drop(&mut self) {
+        if let Some(job) = self.job.take() { job.asleep.fetch_sub(1, Ordering::AcqRel); }
         if self.lent { budget::take_back(); }
     }
 }
@@ -163,7 +184,8 @@ pub fn wait<'a, T>(cv: &Condvar, mutex: &'a Mutex<T>, guard: relax_session::sync
     // wakeup
     if let Some(task) = refused_here() {
         drop(guard);
-        let paused = suspend();
+        // (the thread runs the task: a JIT job stays awake, a program thread lends its token)
+        let paused = Suspended { lent: current_job().is_none() && budget::lend(), job: None };
         run_refused(task);
         drop(paused);
         return mutex.lock();

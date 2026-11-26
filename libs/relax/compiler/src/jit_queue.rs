@@ -70,14 +70,17 @@ impl Serials {
 const GRANT_SPAN_NS: u64 = 100_000_000;
 /// A granted run (`MAKEPAD_CPU_GRANT=1`: devhub's test shards, told N cores of a shared box): the
 /// cores in use outside the JIT's drains, per span the process's CPU time less the drains' running
-/// time, so unwaited builds fit what the run's own threads leave of the grant. Section workers'
-/// CPU reads as outside: the JIT narrows itself, never the app. Rolled under the queue lock at each
-/// pick, the only place `running` changes.
+/// time, so the JIT's jobs, waited ones too, fit what the run's own threads leave of the grant: the
+/// cores the box was promised. A job asleep on other JIT work (`pool::suspend`) uses none and
+/// leaves its place, so what it waits for can start, and one job always runs: slow, never
+/// deadlocked. Section workers' CPU reads as outside: the JIT narrows itself, never the app.
+/// Rolled under the queue lock at each pick, the only place `running` changes.
 struct Grant {
     /// the span's start (wall ns) and the process's CPU time then
     span_at: u64,
     span_cpu: u64,
-    /// running drain jobs times ns, summed; its value at the span's start; when it was advanced to
+    /// awake running drain jobs times ns, summed; its value at the span's start; when it was
+    /// advanced to
     area: u64,
     span_area: u64,
     area_at: u64,
@@ -128,8 +131,10 @@ struct Policy {
     ahead_full: bool,
     limit: usize,
     background_limit: usize,
-    /// the granted cores left for unwaited builds after outside work
+    /// the granted cores left for the JIT's jobs after outside work (usize::MAX: not a granted run)
     grant_width: usize,
+    /// running jobs but the tick that are not asleep on other JIT work: what the grant counts
+    awake: usize,
     /// an O3 job is queued or running
     o3_pending: bool,
     /// before the first present: the startup's tier widths apply
@@ -324,6 +329,7 @@ impl Queue {
             limit: budget::limit() as usize,
             background_limit: budget::background_limit() as usize,
             grant_width: self.grant.as_ref().map_or(usize::MAX, |g| (budget::cores() as usize).saturating_sub(g.outside)),
+            awake: 0,
             o3_pending: COUNTS[2].load(Ordering::Relaxed) + RUNNING[2].load(Ordering::Relaxed) > 0,
             widths: !FIRST_PRESENT.load(Ordering::Acquire) && !HEADLESS.load(Ordering::Acquire),
             o3_stopped: TIER_STOP.load(Ordering::Acquire),
@@ -335,6 +341,7 @@ impl Queue {
             let class = r.class.class();
             if r.tier != 4 && class != budget::INTERACTIVE { policy.noninteractive += 1; }
             if r.tier < 4 && class != budget::INTERACTIVE { policy.builds += 1; }
+            if r.tier != 4 && !r.class.asleep() { policy.awake += 1; }
             if class == budget::BACKGROUND {
                 policy.background += 1;
                 if is_breadth(r.tier) { policy.breadth += 1; }
@@ -347,11 +354,9 @@ impl Queue {
     }
     fn class_blocked(&self, class: u8, tier: usize, policy: &Policy) -> Option<&'static str> {
         if tier < 4 && !eligible(class, policy.burst, policy.builds) { return Some("UI burst"); }
+        if tier != 4 && policy.awake >= policy.grant_width.max(1) { return Some("grant"); }
         if class != budget::INTERACTIVE {
             if let Some(why) = drain_blocked(class, tier, policy) { return Some(why); }
-            if class == budget::BACKGROUND && tier != 4 && policy.background >= policy.grant_width {
-                return Some("grant");
-            }
             if policy.widths {
                 let width = match tier { 1 => 1, 2 | 3 => 2, _ => usize::MAX };
                 if policy.tiers[tier] >= width { return Some("startup tier width"); }
@@ -778,7 +783,19 @@ impl Drains {
 struct CompilerSource;
 static SOURCE: CompilerSource = CompilerSource;
 pub(super) fn queue() -> &'static relax_session::sync::Mutex<Queue> {
-    QUEUE.get_or_init(|| crate::zone_alloc::kept_with(|| relax_session::sync::Mutex::new(Queue::new())))
+    QUEUE.get_or_init(|| crate::zone_alloc::kept_with(|| {
+        let q = Queue::new();
+        if q.grant.is_some() { crate::pool::on_job_sleep(granted_job_sleeps); }
+        relax_session::sync::Mutex::new(q)
+    }))
+}
+/// A granted run's job fell asleep on other JIT work: its place in the width is free, so a parked
+/// drain that takes waited work wakes for what is queued. Lock-free: the sleeper may hold the lock
+/// it waits under.
+fn granted_job_sleeps() {
+    if COUNTS.iter().any(|c| c.load(Ordering::Relaxed) != 0) {
+        wake_kind(DrainsNow::get().for_job(0, budget::INTERACTIVE));
+    }
 }
 static LOCK_MAX_NS: AtomicU64 = AtomicU64::new(0);
 struct QueueGuard {
@@ -1238,9 +1255,10 @@ fn worker_loop(index: usize) {
             let next = {
                 let _kept = crate::zone_alloc::kept();
                 let mut q = lock();
-                let running = q.running.len();
+                // (a job asleep on other JIT work uses no CPU: the drains' area counts awake ones)
+                let awake = if q.grant.is_some() { q.running.iter().filter(|r| !r.class.asleep()).count() } else { 0 };
                 if let Some(grant) = &mut q.grant {
-                    grant.roll(wall_ns(), running, crate::first_frame::process_cpu_ns);
+                    grant.roll(wall_ns(), awake, crate::first_frame::process_cpu_ns);
                 }
                 // (this worker parked as the tick's timer: the next idle one takes it again)
                 if q.timer == Some(me) { q.timer = None; }
@@ -1445,7 +1463,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_granted_run_narrows_only_the_unwaited_width() {
+    fn a_granted_run_caps_its_awake_jobs_and_finishes_past_its_width() {
         assert_eq!(outside_reading(1_000_000_000, 400_000_000, 100_000_000), 6000, "drain time leaves six cores of outside work");
         assert_eq!(outside_reading(100_000_000, 400_000_000, 100_000_000), 0, "drain time above process CPU time leaves zero outside work");
 
@@ -1464,6 +1482,8 @@ mod tests {
         grant.roll(100_000_000, 2, || 500_000_000);
         assert_eq!(grant.outside, 3, "two drains across both half-spans leave three cores outside");
 
+        // the width counts every job but the tick that is awake, waited ones too, and one job
+        // always runs: with every granted core in use outside, one starts
         let mut q = Queue::new();
         let cores = budget::cores() as usize;
         grant.outside = cores;
@@ -1473,16 +1493,55 @@ mod tests {
         q.waiters.insert((1, 41), [1, 0]);
         q.promote(1, 41);
         let now = HeatNow { hu: None, wall: 100, tier: 0 };
-        let first = q.head(&now, Takes::ALL).expect("a waiter can use the full grant");
-        assert_eq!(q.remove(first).job.slot(), Some((1, 41)), "the Interactive compile starts with no spare cores");
-        assert!(q.head(&now, Takes::ALL).is_none(), "the speculative compile waits with no spare cores");
+        let start = |q: &mut Queue, i: usize, label: &'static str| {
+            let e = q.remove(i);
+            // (made on a thread of its own, which CurrentJob gives the job's OS class; the guard
+            // goes at once, the job's control lives on in its running row)
+            let job_class_now = e.class;
+            let class = std::thread::scope(|s| s.spawn(|| crate::pool::CurrentJob::new(job_class_now, label).control()).join().unwrap());
+            q.running.push(Running { serial: e.serial, promoted: e.promoted, slot: e.slot, tier: e.job.tier(), base_class: job_class(&e.job, &now), class });
+            e.job.slot()
+        };
+        let first = q.head(&now, Takes::ALL).expect("one job runs with no spare cores");
+        assert_eq!(start(&mut q, first, "waited compile"), Some((1, 41)), "the waited compile goes first");
+        assert!(q.head(&now, Takes::ALL).is_none(), "a second job waits while one runs awake at the grant's floor");
         let policy = q.policy();
         assert_eq!(q.blocked(&q.entries[0], &policy), Some("grant"), "the grant accounts for the hold");
-        assert_eq!(q.class_blocked(budget::VISIBLE, 3, &policy), None, "Visible compiles can use the full grant");
-        assert_eq!(q.class_blocked(budget::BACKGROUND, 4, &policy), None, "the tick can run with no spare cores");
-        q.grant.as_mut().unwrap().outside = cores - 1;
-        let next = q.head(&now, Takes::ALL).expect("one spare core admits a speculative compile");
-        assert_eq!(q.remove(next).job.slot(), Some((1, 40)), "the queued Background compile resumes");
+        assert_eq!(q.class_blocked(budget::VISIBLE, 3, &policy), Some("grant"), "waited work counts against the grant too");
+        assert_eq!(q.class_blocked(budget::BACKGROUND, 4, &policy), None, "the tick runs with no spare cores");
+        // the running job falls asleep on other JIT work (pool::suspend, on its thread): its place
+        // is free, so what it waits for starts, and when it wakes it runs on
+        let sleeper = q.running[0].class.clone();
+        let asleep = { let _on = crate::pool::enter_job(Some(sleeper.clone())); crate::pool::suspend() };
+        assert!(sleeper.asleep(), "suspend marks the job asleep");
+        let next = q.head(&now, Takes::ALL).expect("a job asleep on other JIT work leaves its place");
+        assert_eq!(start(&mut q, next, "the build it waits for"), Some((1, 40)), "what it waits for starts");
+        drop(asleep);
+        assert!(!sleeper.asleep(), "the job wakes when its guard drops");
+        q.running.clear();
+
+        // more waited jobs than the width all run, never more of them awake at once than the width
+        // (waited: only the grant holds them, whatever the process's other queues hold)
+        let width = 2;
+        q.grant.as_mut().unwrap().outside = cores - width;
+        for id in 50..56 {
+            q.push(Job::Spec(1, id), id as u64);
+            q.waiters.insert((1, id), [1, 0]);
+            q.promote(1, id);
+        }
+        let (mut started, mut widest) = (0, 0);
+        loop {
+            while let Some(i) = q.head(&now, Takes::ALL) {
+                start(&mut q, i, "build");
+                started += 1;
+            }
+            widest = widest.max(q.running.len());
+            if q.running.is_empty() { break; }
+            q.running.remove(0);
+        }
+        assert_eq!(started, 6, "every job past the width runs");
+        assert_eq!(widest, width, "the run never had more awake jobs than its grant leaves");
+        assert!(q.entries.is_empty(), "nothing is left queued");
     }
 
     #[test]
