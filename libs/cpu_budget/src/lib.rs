@@ -1183,8 +1183,8 @@ pub const WORK_TIER_UP: u8 = 1;
 /// install. Nothing waits for it, and it never takes a core from the person's work: while any of
 /// that runs (`fast_room`'s demand, a deadline thread) it runs at QoS BACKGROUND, on the
 /// efficiency cores of Apple silicon; else as plain work. (At UTILITY a live simulation's re-plan
-/// ran 95 % of its units on a base M4's 4 performance cores beside the realtime round, which ran
-/// 13 % slower and gapped, 11-22.)
+/// ran 95 % of its units on a base M-series Mac's 4 performance cores beside the realtime round,
+/// which ran 13 % slower and gapped, 11-22.)
 pub const WORK_BEHIND: u8 = 2;
 
 /// The Background work the calling thread runs is `kind` from now on (`WORK_PLAIN`,

@@ -230,7 +230,7 @@ fn checkpoint_under_lock_keeps_permit_and_reports_frequent_sites() {
 
 /// On a machine with two kinds of core the person's work takes the performance cores and
 /// Background work is placed on the others (`fast_room`): a live run's sound gapped while hot
-/// builds shared a base M4's 4 (11-22).
+/// builds shared a base M-series Mac's 4 performance cores (11-22).
 #[test]
 fn the_persons_work_takes_the_performance_cores() {
     let b = Budget::new(16, 16).with_fast(4);
