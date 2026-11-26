@@ -7703,13 +7703,18 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // rebound, or an old-key closure of a parent this patch rebuilds (superseded once this patch
     // installs, I1, whatever the pairing below decides for it). It keeps its code; whether that
     // code may still run is the K checks' question, not a rebuild from text the program no longer
-    // has (a const's new type, a field gone: old text never checked against them).
+    // has (a const's new type, a field gone: old text never checked against them). Nor does code
+    // of a fn that is no longer the program's (in_flight_only, asked after the commit unbound it),
+    // or its twin: a fn returning an opaque type is replaced when it is rebuilt (`moving`), and an
+    // old closure of it that inlined a changed fn is reached as that fn's host. Lowered now, it
+    // would read its frozen body's field indices in a struct's new layout.
     {
         let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().chain(fresh.iter()).copied().collect();
+        let base = |c: u32| match u.fns[c as usize].key { FnKey::Plain(b) | FnKey::Sandbox(b) | FnKey::Ctfe(b) => b, _ => c };
         let superseded = |c: u32| match u.fns[c as usize].key {
             FnKey::Closure(_, _, p) => u.superseded(c) || (rebuilt.contains(&p) && !lowered_now(u, c)),
             _ => false,
-        };
+        } || in_flight_only(u, base(c), &removed_all);
         let before = slots.len() + fresh.len();
         slots.retain(|&c| !superseded(c));
         fresh.retain(|&c| !superseded(c));
