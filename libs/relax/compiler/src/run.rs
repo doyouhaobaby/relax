@@ -1755,7 +1755,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let mut image_deps: Vec<_> = (0..std_count).collect();
         image_deps.extend(c.deps.iter().map(|(d, _)| pre_index[*d]));
         pre_index[ci] = pre.len();
-        pre.push(crate::preload::PreCrate { name: c.name.clone(), root: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps,  proc_macro: c.proc_macro, image_deps, image_dep_names });
+        pre.push(crate::preload::PreCrate { is_bin: c.bin, harness: c.harness, name: c.name.clone(), root: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps,  proc_macro: c.proc_macro, image_deps, image_dep_names });
     }
     let front_images = crate::cache::FrontImages::open(options);
     // `makepad check` of an app (not a watch or warm session, a selftest or a workspace check):

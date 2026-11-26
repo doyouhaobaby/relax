@@ -1380,6 +1380,7 @@ impl Program {
             // runtime entry names. Keep that boundary eager; a complete preload
             // graph (the run/makepad drivers) can safely close demand first.
             self.start_preload(vec![crate::preload::PreCrate {
+                is_bin: false, harness: false,
                 name: kname.clone(),
                 root: root.to_string(),
                 edition,
@@ -7360,6 +7361,7 @@ mod deferred_load_tests {
             let mut p = Program::new(&session);
             if lazy {
                 p.preload(vec![crate::preload::PreCrate {
+                    is_bin: false, harness: false,
                     name: "load_test".into(),
                     root: root.clone(),
                     edition: 2021,

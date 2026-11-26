@@ -645,7 +645,7 @@ fn world_std_crates(std_dir: &str, cfg: &crate::cfg::CfgSet) -> Vec<crate::prelo
     let mut v: Vec<crate::preload::PreCrate> = [("core", format!("{}/core/lib.rs", std_dir)), ("alloc", alloc.clone()), ("std", format!("{}/std/lib.rs", std_dir)), ("proc_macro", format!("{}/proc_macro/lib.rs", std_dir))]
         .into_iter()
         .filter(|(n, _)| *n != "alloc" || crate::vfs::exists(&alloc))
-        .map(|(name, root)| crate::preload::PreCrate { name: name.to_string(), root, edition: 2021, cfg: cfg.clone(), deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() })
+        .map(|(name, root)| crate::preload::PreCrate { is_bin: false, harness: false, name: name.to_string(), root, edition: 2021, cfg: cfg.clone(), deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() })
         .collect();
     for i in 0..v.len() {
         v[i].image_dep_names = (0..i).map(|d| (v[d].name.clone(), v[d].name.clone())).collect();

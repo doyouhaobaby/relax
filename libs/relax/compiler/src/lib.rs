@@ -1161,6 +1161,7 @@ fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_
 pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> Vec<preload::PreCrate> {
     let dir = std_dir();
     let mut v = vec![preload::PreCrate {
+        is_bin: false, harness: false,
         
         name: "core".to_string(),
         root: format!("{}/core/lib.rs", dir),
@@ -1174,6 +1175,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflo
     let alloc_root = format!("{}/alloc/lib.rs", dir);
     if crate::vfs::exists(&alloc_root) {
         v.push(preload::PreCrate {
+            is_bin: false, harness: false,
             
             name: "alloc".to_string(),
             root: alloc_root,
@@ -1186,6 +1188,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflo
         });
     }
     v.push(preload::PreCrate {
+        is_bin: false, harness: false,
         
         name: "std".to_string(),
         root: format!("{}/std/lib.rs", dir),

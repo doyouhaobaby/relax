@@ -25,6 +25,7 @@ fn settle_rebuild_segregates_slot_lifetimes() {
     let session = std::sync::Arc::new(session);
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "slot_lifetimes".into(), root: path.to_string_lossy().into_owned(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -201,6 +202,7 @@ fn settle_rebuild_covers_a_crate_added_at_run_time() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = host.join("lib.rs").to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_host".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -294,6 +296,7 @@ fn settle_rebuild_keeps_coroutines() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = path.to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_coroutines".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -389,6 +392,7 @@ fn settle_rebuild_takes_another_instances_image_once() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = path.to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_instances".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];

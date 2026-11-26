@@ -1235,7 +1235,7 @@ mod tests {
     fn reordered_load_carries_demand_plan() {
         let sess = std::sync::Arc::new(crate::Session::default());
         let cfg = crate::cfg::CfgSet::host(&sess, &[]);
-        let krate = |name: &str| crate::preload::PreCrate { name: name.into(), root: format!("/w/{name}/lib.rs"), edition: 2021, cfg: cfg.clone(),
+        let krate = |name: &str| crate::preload::PreCrate { is_bin: false, harness: false, name: name.into(), root: format!("/w/{name}/lib.rs"), edition: 2021, cfg: cfg.clone(),
             deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() };
         let base = vec![krate("a"), krate("b"), krate("c")];
         let pre = vec![krate("a"), krate("c"), krate("b")];

@@ -9268,7 +9268,7 @@ mod cold_tests {
         // the load before it takes
         let record_at = |ns: u64| RECORD_NOW_NS.store(ns, std::sync::atomic::Ordering::Relaxed);
         let epoch_ns = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        let pre = vec![crate::preload::PreCrate {  name: "quiet".into(), root, edition: 2021, cfg,
+        let pre = vec![crate::preload::PreCrate { is_bin: false, harness: false,  name: "quiet".into(), root, edition: 2021, cfg,
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let store = std::env::temp_dir().join(format!("relax-stat-graph-cache-{}-{}", std::process::id(), crate::clock::wall_ns()));
         // `sink`: the files' images are written (a load from images maps them anyway)
@@ -9336,7 +9336,7 @@ mod cold_tests {
         std::fs::write(&root, "mod late; pub struct FxIn { pub t: f32, pub kick: f32 } pub fn host_scale(t: f32) -> f32 { t * 2.0 } pub fn main() {}").unwrap();
         std::fs::write(package.join("late.rs"), "pub struct Later { pub value: u64 } pub fn later() -> u64 { 3 }").unwrap();
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
-        let pre = vec![crate::preload::PreCrate { name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
+        let pre = vec![crate::preload::PreCrate { is_bin: false, harness: false, name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let store = dir.join("cache");
         pack::ensure_private_dir(&store).unwrap();
@@ -9408,7 +9408,7 @@ mod cold_tests {
         std::fs::write(&root, "mod late; pub struct FxIn { pub t: f32, pub kick: f32 } pub fn host_scale(t: f32) -> f32 { t * 2.0 } pub fn main() {}").unwrap();
         std::fs::write(package.join("late.rs"), "pub struct Later { pub value: u64 } pub fn later() -> u64 { 3 }").unwrap();
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
-        let pre = vec![crate::preload::PreCrate { name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
+        let pre = vec![crate::preload::PreCrate { is_bin: false, harness: false, name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
             deps: vec![],  proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let store = dir.join("cache");
         // made as a run makes its cache folder, owner-only: a missing one comes from the first
@@ -9526,7 +9526,7 @@ mod cold_tests {
         let root = package.join("lib.rs").to_string_lossy().into_owned();
         std::fs::write(&root, "pub struct Pair { pub a: u32, pub b: u64 } pub fn sum(p: &Pair) -> u64 { p.a as u64 + p.b } pub fn main() {}").unwrap();
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
-        let pre = vec![crate::preload::PreCrate { name: "capture".into(), root, edition: 2021, cfg: cfg.clone(),
+        let pre = vec![crate::preload::PreCrate { is_bin: false, harness: false, name: "capture".into(), root, edition: 2021, cfg: cfg.clone(),
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let store = dir.join("cache");
         pack::ensure_private_dir(&store).unwrap();
@@ -9604,6 +9604,7 @@ mod cold_tests {
         // bin shares its name
         let crates: [(&str, &[usize]); 8] = [("pad0", &[]), ("pad1", &[]), ("pad2", &[]), ("app", &[]), ("lib", &[]), ("user", &[3]), ("other", &[4]), ("app", &[4])];
         let pre: Vec<crate::preload::PreCrate> = crates.iter().enumerate().map(|(i, (name, deps))| crate::preload::PreCrate {
+            is_bin: false, harness: false,
             name: name.to_string(), root: dir.join(format!("c{i}/lib.rs")).to_string_lossy().into_owned(), edition: 2021, cfg: cfg.clone(),
             deps: deps.iter().map(|&d| (crates[d].0.to_string(), crates[d].0.to_string())).collect(), proc_macro: false,
             image_deps: deps.to_vec(), image_dep_names: deps.iter().map(|&d| (crates[d].0.to_string(), crates[d].0.to_string())).collect(),
@@ -9645,7 +9646,7 @@ mod cold_tests {
                 _ => (format!("pub fn f{i}() -> u32 {{ {i} }}"), vec![]),
             };
             std::fs::write(&root, text).unwrap();
-            pre.push(crate::preload::PreCrate {  name: name.to_string(), root, edition: 2021, cfg: cfg.clone(),
+            pre.push(crate::preload::PreCrate { is_bin: false, harness: false,  name: name.to_string(), root, edition: 2021, cfg: cfg.clone(),
                 deps: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect(), proc_macro: false,
                 image_deps: deps.clone(), image_dep_names: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect() });
         }
@@ -9688,6 +9689,15 @@ mod cold_tests {
         assert_eq!(whole.crates.len(), names.len());
         assert!(proof.is_some());
         assert!(!images.reload_current(), "a whole restore loads nothing again");
+        // the flags a load sets on a crate (run.rs: a bin, a `--test` build) are the recipe's: a
+        // restored program has them as the cold load does (check.rs reads them for the entry point)
+        let mut flagged = pre.clone();
+        flagged[5].is_bin = true;
+        flagged[6].harness = true;
+        let (flags, _, _) = images.restore_collected(sess, &flagged).expect("flags do not change the image");
+        let got: Vec<(bool, bool)> = flags.crates.iter().map(|c| (c.is_bin, c.harness)).collect();
+        let want: Vec<(bool, bool)> = flagged.iter().map(|c| (c.is_bin, c.harness)).collect();
+        assert_eq!(got, want, "a restore keeps each crate's is_bin and harness as the recipe has them");
         // a test's subject loads again for its lints (reload_crates): with nothing changed, what it
         // loads is what the image holds, so the run records nothing again (run.rs COLLECTED_CURRENT);
         // after an edit of it, the image must be recorded again
@@ -9747,7 +9757,7 @@ mod cold_tests {
                 _ => (format!("pub fn f{i}() -> u32 {{ {i} }}"), vec![]),
             };
             std::fs::write(&root, text).unwrap();
-            pre.push(crate::preload::PreCrate {  name: name.to_string(), root, edition: 2021, cfg: cfg.clone(),
+            pre.push(crate::preload::PreCrate { is_bin: false, harness: false,  name: name.to_string(), root, edition: 2021, cfg: cfg.clone(),
                 deps: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect(), proc_macro: false,
                 image_deps: deps.clone(), image_dep_names: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect() });
         }
@@ -10005,8 +10015,8 @@ mod cold_tests {
         std::fs::write(&b, "pub fn b() -> u32 { 9 }").unwrap();
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
         let pre = || vec![
-            crate::preload::PreCrate {  name: "a".into(), root: a.clone(), edition: 2021, cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] },
-            crate::preload::PreCrate {  name: "b".into(), root: b.clone(), edition: 2021, cfg: cfg.clone(), deps: vec![("alias".into(), "a".into())], proc_macro: true, image_deps: vec![0], image_dep_names: vec![("alias".into(), "a".into())] },
+            crate::preload::PreCrate { is_bin: false, harness: false,  name: "a".into(), root: a.clone(), edition: 2021, cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] },
+            crate::preload::PreCrate { is_bin: false, harness: false,  name: "b".into(), root: b.clone(), edition: 2021, cfg: cfg.clone(), deps: vec![("alias".into(), "a".into())], proc_macro: true, image_deps: vec![0], image_dep_names: vec![("alias".into(), "a".into())] },
         ];
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
@@ -11909,6 +11919,7 @@ mod data_tests {
             std::fs::write(&path, "pub fn value() -> u32 { 7 }").unwrap();
             let deps: Vec<(String, String)> = if ci == 0 { vec![] } else { vec![(pre[ci - 1].name.clone(), pre[ci - 1].name.clone())] };
             pre.push(crate::preload::PreCrate {
+                is_bin: false, harness: false,
                 name: name.into(), root: path, edition: 2021, cfg: cfg.clone(), deps: deps.clone(), proc_macro: ci == 1,
                 image_deps: if ci == 0 { vec![] } else { vec![ci - 1] }, image_dep_names: deps,
             });

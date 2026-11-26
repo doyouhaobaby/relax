@@ -1840,6 +1840,7 @@ pub(crate) mod failure_tests {
                 let cfg = crate::cfg::CfgSet::host(&session, &[]);
                 let mut p = crate::program::Program::new(&session);
                 p.preload(vec![crate::preload::PreCrate {
+                    is_bin: false, harness: false,
                     name: "outline_panic".into(), root: load_root.clone(), edition: 2021, cfg: cfg.clone(), deps: Vec::new(),
                     proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new(),
                 }]);

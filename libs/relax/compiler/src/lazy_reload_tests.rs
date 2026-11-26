@@ -31,6 +31,7 @@ fn deferred_reexport_signatures() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let mut prog = Program::new(&session);
     prog.preload(vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "lazy_reexport".into(), root: root.clone(), edition: 2021, cfg: cfg.clone(),
         deps: Vec::new(),  proc_macro: false,
         image_deps: Vec::new(), image_dep_names: Vec::new(),
