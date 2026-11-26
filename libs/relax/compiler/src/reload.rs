@@ -9139,6 +9139,8 @@ pub(crate) struct DockGate {
     revision: std::path::PathBuf,
     applied: String,
     warned: bool,
+    /// how long files seen before their revision are given to be a sync's (`held`)
+    grace: std::time::Duration,
 }
 
 impl DockGate {
@@ -9149,7 +9151,7 @@ impl DockGate {
     /// The gate of a checkout whose revision file is `revision`, open for what it says now.
     pub(crate) fn new(revision: std::path::PathBuf) -> DockGate {
         let applied = std::fs::read_to_string(&revision).unwrap_or_default();
-        DockGate { revision, applied, warned: false }
+        DockGate { revision, applied, warned: false, grace: std::time::Duration::from_secs(10) }
     }
 
     /// The checkout's revision moved since the last applied one (taken now): this round applies.
@@ -9171,7 +9173,7 @@ impl DockGate {
         if self.warned {
             return false;
         }
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let until = std::time::Instant::now() + self.grace;
         while std::time::Instant::now() < until {
             let now = std::fs::read_to_string(&self.revision).unwrap_or_default();
             if !now.is_empty() && now != self.applied {
@@ -13689,9 +13691,11 @@ mod dock_gate_tests {
         let rev = dir.join("FLEET-REVISION.txt");
         std::fs::write(&rev, "makepad aaaa\nsynced 1 (devhub sync)\n").unwrap();
         let mut gate = DockGate::new(rev.clone());
+        // (no sync comes: the grace a sync's revision is given would only be waited out)
+        gate.grace = std::time::Duration::ZERO;
         // files changed, no new revision: a lane's write into the tree
         assert!(!gate.synced(), "a change without a sync is held");
-        gate.held(["apps/tool-a/src/main.rs"].into_iter());
+        assert!(!gate.held(["apps/tool-a/src/main.rs"].into_iter()), "held, and no sync came");
         assert!(!gate.synced());
         // the sync moved the files, then wrote the revision: this round applies, once
         std::fs::write(&rev, "makepad bbbb\nsynced 2 (devhub sync)\n").unwrap();

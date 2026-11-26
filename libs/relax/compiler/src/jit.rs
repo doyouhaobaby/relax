@@ -33877,42 +33877,65 @@ mod allocator_swap_tests {
     /// the tests below pause the process's compile jobs: one at a time
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The swap waits for a running compile job however long it runs. A job that outlives the
-    /// old 5 s cap (a slow machine, a big O3 build) must still be finished when the swap goes on;
-    /// a job that starts during the swap waits for its end, however long that takes.
+    /// The swap waits for a running compile job however long it runs, and a job that starts during
+    /// the swap waits for its end, however long that takes: no time lets either go on (a job that
+    /// outlived the old 5 s cap, on a slow machine or in a big O3 build, had to be finished when the
+    /// swap went on). Shown by the order of events: the job ends only once the swap has looked at it
+    /// and not gone on, and the late job is seen held at the gate before the swap ends.
     #[test]
-    fn the_swap_waits_for_a_job_longer_than_five_seconds() {
-        isolated_test!(the_swap_waits_for_a_job_longer_than_five_seconds);
+    fn the_swap_waits_for_a_running_job_and_holds_a_new_one_to_its_end() {
+        isolated_test!(the_swap_waits_for_a_running_job_and_holds_a_new_one_to_its_end);
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *PAUSE_LOOKS.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         let job_over = std::sync::Arc::new(AtomicBool::new(false));
+        let swapped = std::sync::Arc::new(AtomicBool::new(false));
         let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
         let flag = job_over.clone();
         let job = std::thread::spawn(move || {
             let guard = compile_job();
             running_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(5600));
+            end_rx.recv().unwrap();
             flag.store(true, Ordering::SeqCst);
             drop(guard);
         });
         running_rx.recv().unwrap();
-        let begun = std::time::Instant::now();
+        // the job ends once the swap has looked twice with it running (or once the swap went on)
+        let went_on = swapped.clone();
+        let ender = std::thread::spawn(move || {
+            let (looks, wake) = &PAUSE_LOOKS;
+            drop(wake.wait_while(looks.lock().unwrap_or_else(|e| e.into_inner()), |n| *n < 2 && !went_on.load(Ordering::SeqCst)).unwrap_or_else(|e| e.into_inner()));
+            let early = went_on.load(Ordering::SeqCst);
+            end_tx.send(()).unwrap();
+            early
+        });
         allocator_swap(0);
-        let waited = begun.elapsed();
-        assert!(job_over.load(Ordering::SeqCst), "the swap went ahead with a compile job still running ({waited:?})");
-        assert!(waited.as_millis() >= 5000, "it did not wait the job out ({waited:?})");
-        // a job that starts during the swap is held until the swap ends, however long
+        {
+            let _looks = PAUSE_LOOKS.0.lock().unwrap_or_else(|e| e.into_inner());
+            swapped.store(true, Ordering::SeqCst);
+            PAUSE_LOOKS.1.notify_all();
+        }
+        assert!(!ender.join().unwrap(), "the swap went on before the job it looked at ended");
+        assert!(job_over.load(Ordering::SeqCst), "the swap went on with a compile job still running");
+        job.join().unwrap();
+        // a job that starts during the swap is held at the gate until the swap ends
         let started = std::sync::Arc::new(AtomicBool::new(false));
         let s2 = started.clone();
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
         let late = std::thread::spawn(move || {
+            id_tx.send(crate::waits::me()).unwrap();
             let _guard = compile_job();
             s2.store(true, Ordering::SeqCst);
         });
-        std::thread::sleep(std::time::Duration::from_millis(2600));
-        assert!(!started.load(Ordering::SeqCst), "a job started inside the swap after 2 s");
+        let late_id = id_rx.recv().unwrap();
+        while !crate::waits::of(late_id).is_some_and(|w| w.label == "job gate") {
+            assert!(!started.load(Ordering::SeqCst), "a job started inside the swap");
+            std::thread::yield_now();
+        }
+        assert!(!started.load(Ordering::SeqCst), "a job started inside the swap");
         allocator_swap(1);
         late.join().unwrap();
         assert!(started.load(Ordering::SeqCst));
-        job.join().unwrap();
     }
 
     /// Two pauses take turns: a unit retired (or a program's fork) while an allocator swap is in
