@@ -455,6 +455,7 @@ pub(crate) fn main_compile(name: &str, r: &MainCompile) {
         let _ = f.lock().unwrap().write_all(line.as_bytes());
     }
     MAIN_COMPILE_NS.fetch_add(dt, Relaxed);
+    MAIN_COMPILES.fetch_add(1, Relaxed);
     if in_window(r.start) {
         COMPILES[0].fetch_add(1, Relaxed);
         COMPILES[1].fetch_add(dt, Relaxed);
@@ -571,9 +572,15 @@ pub(crate) fn rt_compile(t0: u64, dt: u64) {
 
 /// Frames the program presented (the `jit` answer's fps).
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
-/// frames that ended after a frame at or after the first present
-static FRAMES_AFTER_PRESENT: AtomicU64 = AtomicU64::new(0);
-/// How long after the first present the startup image's window stays open at most
+/// The startup image's window has closed (image_window_open): at the first frame after the first
+/// present in which the main thread made no lazy compile, or past IMAGE_WINDOW_NS
+static IMAGE_WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
+/// The main thread's lazy compiles after the first present (main_compile), and their count when
+/// the last frame ended: a frame that ends with the same count reached no new code on main
+static MAIN_COMPILES: AtomicU64 = AtomicU64::new(0);
+static MAIN_COMPILES_AT_FRAME: AtomicU64 = AtomicU64::new(0);
+/// How long after the first present the startup image's window stays open at most (an app that
+/// reaches new code on main in every frame: past it the slots stay lazy, or the manifest's tail)
 const IMAGE_WINDOW_NS: u64 = 1_000_000_000;
 /// Only the manifest seed thread waits here. An unpark's permit covers a close racing its park;
 /// the frame/present hooks take no lock and never wait for the installer.
@@ -609,14 +616,16 @@ pub fn in_first_frames() -> bool {
     fp != 0 && (wall_ns() < fp + 1_000_000_000 || crate::jit::ui_burst() && wall_ns() < fp + 10_000_000_000)
 }
 
-/// The startup image's window: until the first present, and then until the frame after it is
-/// presented (at most IMAGE_WINDOW_NS). The slots installed in it are the next start's image
-/// (jit.rs ORDER_PRESENT_LEN): the first frames after the present call hundreds of fns no earlier
-/// frame did (a large app: ~270 back to back right at the present, 50-90 ms of cached links on the
-/// UI thread, enough for the JIT indicator), and those are prelinked at the next start instead.
+/// The startup image's window: until the first present, and then until the first frame after it
+/// in which the main thread made no lazy compile (at most IMAGE_WINDOW_NS). The slots a call
+/// reached in it are the next start's image (jit.rs ORDER_PRESENT_LEN, startup_set_called): the
+/// first frames after the present call hundreds of fns no earlier frame did, and those are
+/// prelinked at the next start instead. A window that closed at the frame after the present (by
+/// count, not by quiet) left the burst out: a large app's 157-500 cache loads on main came after
+/// that frame, +1 to +19 ms after the present, and every start linked them again on the UI thread.
 pub fn image_window_open() -> bool {
     let fp = present_ns();
-    fp == 0 || FRAMES_AFTER_PRESENT.load(Relaxed) == 0 && wall_ns() < fp + IMAGE_WINDOW_NS
+    fp == 0 || !IMAGE_WINDOW_CLOSED.load(Relaxed) && wall_ns() < fp + IMAGE_WINDOW_NS
 }
 
 /// The live patches the newest window frame on the glass was built with (makepad-platform calls
@@ -645,10 +654,16 @@ pub(crate) extern "C" fn relax_frame_done() {
         episode_at(EP_SUM.load(Relaxed) + dt, now);
     }
     let last = LAST_FRAME.swap(now, Relaxed);
-    if fp != 0 && last >= fp && FRAMES_AFTER_PRESENT.fetch_add(1, Relaxed) == 0 {
+    let lazy = MAIN_COMPILES.load(Relaxed);
+    let lazy_before = MAIN_COMPILES_AT_FRAME.swap(lazy, Relaxed);
+    // a frame that ended after the present's frame: the window closes once main reached no new
+    // code in a whole frame (its bound closes it too: image_window_open)
+    let bound = now >= fp + IMAGE_WINDOW_NS;
+    if fp != 0 && last >= fp && (lazy == lazy_before || bound) && !IMAGE_WINDOW_CLOSED.swap(true, Relaxed) {
         wake_image_window();
         if crate::run::VERBOSE.load(Relaxed) {
-            eprintln!("relax startup image window closed at +{:.0} ms after the first present ({} startup slots)", ms(now - fp), crate::jit::ORDER_PRESENT_LEN.load(Relaxed));
+            eprintln!("relax startup image window closed at +{:.0} ms after the first present ({} startup slots; {}, {} main-thread lazy compiles after the present)",
+                ms(now - fp), crate::jit::ORDER_PRESENT_LEN.load(Relaxed), if bound { "its bound" } else { "a frame without one" }, lazy);
         }
     }
     episode_end();
@@ -778,7 +793,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&EP_BLOCKED_AT, AtomicU64::new(0));
     reset(&LOG_KEY, std::sync::Mutex::new(String::new()));
     reset(&FRAMES, AtomicU64::new(0));
-    reset(&FRAMES_AFTER_PRESENT, AtomicU64::new(0));
+    reset(&IMAGE_WINDOW_CLOSED, AtomicBool::new(false));
+    reset(&MAIN_COMPILES, AtomicU64::new(0));
+    reset(&MAIN_COMPILES_AT_FRAME, AtomicU64::new(0));
     reset(&IMAGE_WINDOW_WAITER, std::sync::OnceLock::new());
     reset(&FRAME_PATCH, AtomicU64::new(0));
     reset(&COMPILED_AT_LAST, AtomicU64::new(0));

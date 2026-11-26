@@ -2191,9 +2191,26 @@ const TIER1_CACHE_FRAME_MAX_FLAT: u32 = 256 * 1024;
 /// Installs before this wall time go to the startup manifest (run.rs sets it at main), as do
 /// all installs before the first present.
 pub static ORDER_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
-/// How many of those installs came while the startup image's window was open (the first present
-/// and the frame after it: postframe::image_window_open): the next start prelinks them.
+/// How many of those installs came while the startup image's window was open (until the first
+/// present and the burst after it: postframe::image_window_open): the next start prelinks them.
 pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The position in that order of the first install after the first present: from there on, an
+/// install no call reached (first_by_call: a seeded or speculative install, a worker's link
+/// ahead) is not a startup slot (startup_set_called), however long the window stays open.
+static ORDER_AT_PRESENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Slot `id` joins the session's install order (Unit::start_order); while the startup image's
+/// window is open, the order's startup part ends with it (ORDER_PRESENT_LEN).
+fn order_install(u: &mut Unit, id: u32) {
+    crate::zone_alloc::kept_with(|| u.start_order.push(id));
+    let len = u.start_order.len();
+    if FIRST_PRESENT.load(Ordering::Acquire) {
+        ORDER_AT_PRESENT.fetch_min(len - 1, Ordering::Relaxed);
+    }
+    if crate::postframe::image_window_open() {
+        ORDER_PRESENT_LEN.store(len, Ordering::Relaxed);
+    }
+}
 /// The positions in the install order (Unit::start_order) of the slots this run's startup image
 /// installed (prelink_startup): [start, end).
 static PRELINKED_ORDER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
@@ -2267,12 +2284,15 @@ fn take_not_called(u: &Unit) {
 /// stub is out of the slot) or without a count stub (glue, shims) -- stays only if the loaded
 /// manifest had it in its startup set (Cache::was_startup_slot); the image's callees among them
 /// go behind it (a warm start kept ~18,000 such slots, ~12,000 of them callees no startup code
-/// called, and each next image prelinked them before main).
+/// called, and each next image prelinked them before main). A slot first installed after the
+/// first present stays only if a call reached it (first_by_call): the window stays open through
+/// the burst after the present, and an install ahead in it (seeded, speculative) is no call.
 fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
     take_not_called(u);
     let late: crate::fxhash::HashSet<u32> = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(Default::default, |v| v.iter().copied().collect());
     let (p0, p1) = (PRELINKED_ORDER[0].load(Ordering::Relaxed), PRELINKED_ORDER[1].load(Ordering::Relaxed));
-    if late.is_empty() && p0 == p1 {
+    let at_present = ORDER_AT_PRESENT.load(Ordering::Relaxed);
+    if late.is_empty() && p0 == p1 && at_present >= present {
         return (order, present);
     }
     let cache = u.cache.as_ref();
@@ -2290,7 +2310,7 @@ fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, u
             if !unsafe { not_called_since_armed(u, id) } {
                 later.push(id);
             }
-        } else if unseen(i, id) {
+        } else if unseen(i, id) || i >= at_present && !u.fns[id as usize].first_by_call.load(Ordering::Acquire) {
             later.push(id);
         } else {
             out.push(id);
@@ -2477,10 +2497,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     // the startup set of the next manifest (install_compiled's rule: before the first present;
     // startup_set_called keeps it there only if a call reaches it while the image's window is open)
     if u.fns[s.id as usize].patch_gen == 0 && (!FIRST_PRESENT.load(Ordering::Acquire) || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) {
-        crate::zone_alloc::kept_with(|| u.start_order.push(s.id));
-        if crate::postframe::image_window_open() {
-            ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
-        }
+        order_install(u, s.id);
     }
     {
         let t = if tier1 { tier::O3 } else if s.base { tier::BASELINE } else if s.o2 { tier::O2 } else { tier::O1 };
@@ -12163,16 +12180,13 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             // at its first call (a Play's ~30,000 lazy links in the click frame)
             let before_present = !FIRST_PRESENT.load(Ordering::Acquire);
             if !ctfe && u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
-                crate::zone_alloc::kept_with(|| u.start_order.push(id));
+                order_install(u, id);
                 // RELAX_PRESENT_FILES=1: the source file of every fn installed before the first
                 // present (what startup executes, per file)
                 if before_present && present_files() {
                     if let FnKey::Inst(d, _) = &u.fns[id as usize].key {
                         eprintln!("pre-present-fn: {:?}", u.prog.file_paths[u.prog.def(*d).file as usize]);
                     }
-                }
-                if crate::postframe::image_window_open() {
-                    ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
                 }
             }
             let linked_from_cache = !record && !ctfe && !u.fns[id as usize].compiled && !u.fns[id as usize].o3.load(Ordering::Relaxed);
@@ -37659,6 +37673,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&ORDER_UNTIL_NS, AtomicU64::new(0));
     reset(&MAIN_HELD, AtomicU64::new(0));
     reset(&ORDER_PRESENT_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&ORDER_AT_PRESENT, std::sync::atomic::AtomicUsize::new(usize::MAX));
     for p in &PRELINKED_ORDER {
         p.store(0, Ordering::Relaxed);
     }

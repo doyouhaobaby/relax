@@ -1,5 +1,5 @@
 //! Fleet identity: the one identity system of every networked service we run
-//! (the AI hub, Desk Link, relaxhub, the asset store's sync, Sandbox rooms).
+//! (the AI hub, Desk Link, relaxhub, the asset store's sync, game rooms).
 //! Operator guide: tools/fleet-identity.md.
 //!
 //! **Keys.** Every machine has its own P-256 key, `<fleet dir>/id.key`
