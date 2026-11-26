@@ -18,6 +18,14 @@
 //!   move is only a candidate: the channel on top must see authenticated traffic from the new
 //!   address before trusting it, since anyone who knows the tag can answer a probe.
 //!
+//! - **Several tags, and a quiet pace.** A caller whose tag rotates (a reconnect, which must not
+//!   hand an observer one handle to follow across networks) sends one tag and accepts a short list
+//!   ([`Config::accepting`], [`Punch::set_tags`]): an ack echoes the tag of the probe it answers, so
+//!   each side's own rotation never matters to the other. A caller that probes for as long as a
+//!   device is wanted can add a third pace ([`Config::idle`]): after `idle_after_ms` without any
+//!   sign of the peer, one probe every `idle_interval_ms`, which also keeps the NAT mapping alive.
+//!   A tagged datagram from the peer returns the pace to the fast one. Without it nothing changes.
+//!
 //! The wire: `0xE0 | type (1 probe, 2 ack) | tag (8) | nonce (8)`, 18 bytes. The first byte keeps it
 //! apart from STUN (0..=3) and from the layers above ([`KIND`]). The tag names this pairing (both
 //! sides derive it from both invites), so stray probes of other pairings are ignored; it is not a
@@ -32,10 +40,16 @@ const PROBE: u8 = 1;
 const ACK: u8 = 2;
 pub const LEN: usize = 18;
 
+/// How many further tags a [`Config`] accepts.
+pub const MAX_ACCEPTED: usize = 4;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// This pairing's tag.
+    /// This pairing's tag, the one the probes carry.
     pub tag: [u8; 8],
+    /// Tags besides `tag` that a datagram may carry (the first `accepted_len`).
+    pub accepted: [[u8; 8]; MAX_ACCEPTED],
+    pub accepted_len: usize,
     /// Probes this often for the first `burst_ms` of punching (and of a quiet path).
     pub burst_interval_ms: u64,
     pub burst_ms: u64,
@@ -47,11 +61,41 @@ pub struct Config {
     pub keepalive_ms: u64,
     /// An open path with nothing heard for this long is quiet.
     pub quiet_ms: u64,
+    /// Punching for this long (since the burst began, or since a sign of the peer) moves to
+    /// `idle_interval_ms`. `u64::MAX` never does.
+    pub idle_after_ms: u64,
+    pub idle_interval_ms: u64,
 }
 
 impl Config {
     pub fn new(tag: [u8; 8]) -> Config {
-        Config { tag, burst_interval_ms: 100, burst_ms: 2_000, slow_interval_ms: 1_000, prefer_ms: 1_500, keepalive_ms: 15_000, quiet_ms: 45_000 }
+        Config {
+            tag, accepted: [[0; 8]; MAX_ACCEPTED], accepted_len: 0,
+            burst_interval_ms: 100, burst_ms: 2_000, slow_interval_ms: 1_000, prefer_ms: 1_500, keepalive_ms: 15_000, quiet_ms: 45_000,
+            idle_after_ms: u64::MAX, idle_interval_ms: 1_000,
+        }
+    }
+
+    /// Also accepts datagrams carrying any of `tags` (the first [`MAX_ACCEPTED`]).
+    pub fn accepting(mut self, tags: &[[u8; 8]]) -> Config {
+        self.set_accepted(tags);
+        self
+    }
+
+    /// After `after_ms` of punching with no sign of the peer, probes only every `interval_ms`.
+    pub fn idle(mut self, after_ms: u64, interval_ms: u64) -> Config {
+        (self.idle_after_ms, self.idle_interval_ms) = (after_ms, interval_ms);
+        self
+    }
+
+    fn set_accepted(&mut self, tags: &[[u8; 8]]) {
+        self.accepted_len = tags.len().min(MAX_ACCEPTED);
+        self.accepted[..self.accepted_len].copy_from_slice(&tags[..self.accepted_len]);
+    }
+
+    /// Whether a datagram carrying `tag` belongs to this pairing.
+    pub fn accepts(&self, tag: &[u8]) -> bool {
+        tag == self.tag || self.accepted[..self.accepted_len].iter().any(|t| t == tag)
     }
 }
 
@@ -171,11 +215,25 @@ impl Punch {
     }
 
     fn probe_interval(&self, now: u64) -> u64 {
-        if now.saturating_sub(self.burst_from) < self.config.burst_ms {
+        let since = now.saturating_sub(self.burst_from);
+        if since < self.config.burst_ms {
             self.config.burst_interval_ms
-        } else {
+        } else if since < self.config.idle_after_ms {
             self.config.slow_interval_ms
+        } else {
+            self.config.idle_interval_ms
         }
+    }
+
+    /// Replaces the tag the probes carry and the others accepted (a rotation).
+    pub fn set_tags(&mut self, tag: [u8; 8], accepted: &[[u8; 8]]) {
+        self.config.tag = tag;
+        self.config.set_accepted(accepted);
+    }
+
+    /// Whether a datagram carrying `tag` belongs to this punch.
+    pub fn accepts(&self, tag: &[u8]) -> bool {
+        self.config.accepts(tag)
     }
 
     /// The datagrams due at `now`, as (to, bytes), and any transition due.
@@ -226,16 +284,22 @@ impl Punch {
 
     /// Answers a probe at its source and considers a path open only after an ack of our nonce.
     pub fn handle(&mut self, from: SocketAddr, packet: &[u8], now: u64) -> (Vec<(SocketAddr, Vec<u8>)>, Option<Event>) {
-        if !is_punch(packet) || packet[2..10] != self.config.tag || !matches!(packet[1], PROBE | ACK) {
+        if !is_punch(packet) || !self.config.accepts(&packet[2..10]) || !matches!(packet[1], PROBE | ACK) {
             return (Vec::new(), None);
         }
+        // A peer that returns after a long silence gets the fast pace back at once.
+        if !matches!(self.state, State::Open { .. }) && now.saturating_sub(self.burst_from) >= self.config.idle_after_ms {
+            self.burst_from = now;
+            self.next_probe_at = now;
+        }
         self.first_heard.get_or_insert(now);
+        let tag: [u8; 8] = packet[2..10].try_into().unwrap();
         let mut nonce = [0u8; 8];
         nonce.copy_from_slice(&packet[10..18]);
         match packet[1] {
             PROBE => {
                 self.add_target(from);
-                let mut out = vec![(from, datagram(ACK, &self.config.tag, &nonce))];
+                let mut out = vec![(from, datagram(ACK, &tag, &nonce))];
                 match self.peer() {
                     Some(peer) if peer == from => {
                         self.last_heard = now;
@@ -712,5 +776,51 @@ mod tests {
         assert!(matches!(punch.state(), State::Quiet { .. }), "a silent peer makes the path quiet, never closed");
         let (sent, _) = punch.poll(punch.next_wake());
         assert_eq!(sent.len(), 2, "quiet: probing every known address again");
+    }
+    #[test]
+    fn a_rotating_tag_is_sent_one_way_and_accepted_in_a_list() {
+        let peer: SocketAddr = "198.51.100.23:51820".parse().unwrap();
+        let (now_tag, old_tag, next_tag, far_tag) = ([2; 8], [1; 8], [3; 8], [4; 8]);
+        let mut punch = Punch::new(Config::new(now_tag).accepting(&[old_tag, next_tag]), peer, [9; 8], 0);
+        assert_eq!(punch.poll(0).0, vec![(peer, datagram(PROBE, &now_tag, &[9; 8]))], "probes carry only the current tag");
+        for (tag, accepted) in [(now_tag, true), (old_tag, true), (next_tag, true), (far_tag, false)] {
+            let (out, _) = punch.handle(peer, &datagram(PROBE, &tag, &[5; 8]), 10);
+            assert_eq!(!out.is_empty(), accepted, "a probe with tag {tag:?}: accepted is {accepted}");
+            if accepted {
+                assert_eq!(out[0], (peer, datagram(ACK, &tag, &[5; 8])), "the ack echoes the probe's own tag, whatever hour its sender is in");
+            }
+        }
+        // An ack of our nonce under a neighbouring hour's tag opens, one under a far tag doesn't.
+        assert_eq!(punch.handle(peer, &datagram(ACK, &far_tag, &[9; 8]), 20).1, None, "an ack under an unknown tag is ignored");
+        assert_eq!(punch.handle(peer, &datagram(ACK, &old_tag, &[9; 8]), 30).1, Some(Event::Opened(peer)), "an ack under an accepted tag opens");
+        punch.set_tags(next_tag, &[now_tag]);
+        assert!(punch.accepts(&now_tag) && punch.accepts(&next_tag) && !punch.accepts(&old_tag), "a rotation replaces both the sent and the accepted tags");
+    }
+
+    #[test]
+    fn the_idle_pace_follows_the_burst_and_a_sign_of_the_peer_ends_it() {
+        let peer: SocketAddr = "198.51.100.23:51820".parse().unwrap();
+        let mut punch = Punch::new(Config::new([1; 8]).idle(10_000, 17_000), peer, [9; 8], 0);
+        let mut times = Vec::new();
+        let mut t = 0;
+        while t < 60_000 {
+            if !punch.poll(t).0.is_empty() {
+                times.push(t);
+            }
+            t = punch.next_wake().max(t + 1);
+        }
+        assert!(times.iter().filter(|t| **t < 2_000).count() >= 19, "the burst runs first: {times:?}");
+        let slow: Vec<u64> = times.iter().copied().filter(|t| (2_000..10_000).contains(t)).collect();
+        assert!(slow.windows(2).all(|w| w[1] - w[0] == 1_000), "then the slow pace until the idle time: {slow:?}");
+        let idle: Vec<u64> = times.iter().copied().filter(|t| *t >= 10_000).collect();
+        assert!(idle.len() >= 3 && idle.windows(2).all(|w| w[1] - w[0] == 17_000), "then one probe every 17 s: {idle:?}");
+        // A tagged probe from the peer returns to the fast pace; one under another tag does not.
+        let last = *times.last().unwrap();
+        let (out, _) = punch.handle(peer, &datagram(PROBE, &[2; 8], &[7; 8]), last + 1_000);
+        assert!(out.is_empty() && punch.next_wake() == last + 17_000, "an unknown tag changes nothing");
+        punch.handle(peer, &datagram(PROBE, &[1; 8], &[7; 8]), last + 1_000);
+        assert_eq!(punch.next_wake(), last + 1_000, "a sign of the peer brings the next probe at once");
+        assert_eq!(punch.poll(last + 1_000).0.len(), 1, "that probe goes out");
+        assert_eq!(punch.next_wake(), last + 1_100, "and the fast pace is back");
     }
 }
