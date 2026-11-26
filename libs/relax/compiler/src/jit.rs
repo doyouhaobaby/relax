@@ -27905,17 +27905,21 @@ const SPLIT_TRIES: u8 = 2;
 /// An O3 snapshot leaves inline candidate `c` of root `id` out of this build (SPLIT_TRIES tries that
 /// made no new front; `wanted`: the fronts its last try bailed on): said on every run, not only
 /// under a trace, unless it has RIR by now. Those fronts were made and it still needs them, or
-/// they cannot be made off the owner (`unmade`, by why): the build keeps a call there, which is a
-/// bug, not a policy (a warm launch kept quicksort's stable_partition a call this way: sort_by_key
-/// 2.8x slower than with the disk cache off). The build waits for what it is missing (left_out_wait):
-/// the items its fronts asked the owner's drain for that the drain has not made yet (`noted`,
-/// wanted_key), and is queued again once, when the drain makes the first of them. A build that
-/// waits on no such item (its fronts need the owner itself, or what they asked for is made and
-/// they still failed) has the slots it needed built on the owner, each slot once in the run, and
-/// is queued again once after that. Neither repeats for the same item or slot: a build queued
-/// again after every drain that made anything was built hundreds of times in a run, leaving the
-/// same candidate out each time (a large app: one decoder's O3 build 480 times, while its
-/// allocator calls' fronts needed a static the drain was never asked for).
+/// they cannot be made off the owner (`unmade`, by why). Left out for the run, the build keeps a
+/// call there, which is a bug, not a policy (a warm launch kept quicksort's stable_partition a call
+/// this way: sort_by_key 2.8x slower than with the disk cache off): only that line asks for a
+/// report. One that waits is a note: its build is queued again once what it waits for is made,
+/// and inlines the candidate then. The waits had said "Relax bug" too, and were nearly always
+/// wrong: the test runs kept 11-13..11-26 said 977 owner waits on a front that needs the unit, and
+/// 1 of their roots left that candidate out for the run after. The build waits for what it is
+/// missing (left_out_wait): the items its fronts asked the owner's drain for that the drain has
+/// not made yet (`noted`, wanted_key), and is queued again once, when the drain makes the first of
+/// them. A build that waits on no such item (its fronts need the owner itself, or what they asked
+/// for is made and they still failed) has the slots it needed built on the owner, each slot once
+/// in the run, and is queued again once after that. Neither repeats for the same item or slot: a
+/// build queued again after every drain that made anything was built hundreds of times in a run,
+/// leaving the same candidate out each time (a large app: one decoder's O3 build 480 times, while
+/// its allocator calls' fronts needed a static the drain was never asked for).
 /// False: `c` has RIR by now (the build's install keeps it for a rebuild once it turns hot), or
 /// nothing is left to wait for (it stays a call for this run).
 fn o3_left_out(up: *mut Unit, id: u32, c: u32, wanted: &[u32], unmade: &HashMap<u32, u8>, noted: &[u64]) -> bool {
@@ -27935,7 +27939,8 @@ fn o3_left_out(up: *mut Unit, id: u32, c: u32, wanted: &[u32], unmade: &HashMap<
             LeftOutWait::Owner => "until the owner builds what it needs",
             LeftOutWait::Never => "for this run (the owner built what it needs already)",
         };
-        eprintln!("relax: the O3 build of {} leaves inline candidate {} out {}: it needs {} -- Relax bug, report it", name(id), name(c), until, why);
+        let report = if wait == LeftOutWait::Never { " -- Relax bug, report it" } else { "" };
+        eprintln!("relax: the O3 build of {} leaves inline candidate {} out {}: it needs {}{}", name(id), name(c), until, why, report);
         wait != LeftOutWait::Never
     })
 }
