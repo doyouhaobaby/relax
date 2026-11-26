@@ -782,34 +782,48 @@ impl ImageTables {
     /// they are: `link_sym` reads them).
     fn sym(&mut self, d: &mut D) -> Option<u32> {
         let s = d.p;
-        match d.u8()? {
-            1 | 5 | 9 | 19 => {
-                d.str()?;
-            }
-            2 | 10 => {
-                d.u128()?;
-            }
-            3 | 4 => skip_def(d, &mut no_atoms)?,
-            6 => {
-                skip_file(d, &mut no_atoms)?;
-                d.u32()?;
-                d.str()?;
-            }
-            7 | 12 => skip_fnkey(d, 0, &mut no_atoms)?,
-            13 => {
-                skip_fnkey(d, 0, &mut no_atoms)?;
-                for _ in 0..d.u32()? { skip_fnkey(d, 0, &mut no_atoms)?; }
-            }
-            8 => {
-                d.u64()?;
-                d.u64()?;
-                d.u32()?;
-            }
-            _ => return None,
-        }
-        d.u64()?;
+        skip_sym(d, false)?;
         Some(self.syms.id(&d.b[s..d.p]))
     }
+}
+
+/// Reads past one encoded symbol (`enc_sym`). None: a kind the image does not hold, and the slot
+/// naming it stays out of the image (linked from the cache instead). `inner`: the symbol a made
+/// cell names (a vtable's, never another made cell).
+fn skip_sym(d: &mut D, inner: bool) -> Option<()> {
+    match d.u8()? {
+        1 | 5 | 9 | 19 => {
+            d.str()?;
+        }
+        2 | 10 => {
+            d.u128()?;
+        }
+        3 | 4 => skip_def(d, &mut no_atoms)?,
+        6 => {
+            skip_file(d, &mut no_atoms)?;
+            d.u32()?;
+            d.str()?;
+        }
+        7 | 12 => skip_fnkey(d, 0, &mut no_atoms)?,
+        13 => {
+            skip_fnkey(d, 0, &mut no_atoms)?;
+            for _ in 0..d.u32()? { skip_fnkey(d, 0, &mut no_atoms)?; }
+        }
+        8 => {
+            d.u64()?;
+            d.u64()?;
+            d.u32()?;
+        }
+        // a vtable's made cell, by the vtable's own symbol: the load links the vtable and takes
+        // its cell (link_symbol), as a link from the cache does. Code that makes a trait object
+        // names one, so it was most of the slots an image build left out (11-26: 496-543 of
+        // 688-742 per build of a large app, three in four of a warm start's links before the
+        // first frame).
+        28 if !inner => skip_sym(d, true)?,
+        _ => return None,
+    }
+    d.u64()?;
+    Some(())
 }
 
 /// A data object's pointer word in an image: another data object of the image (index, addend),
@@ -2480,6 +2494,28 @@ impl super::Cache {
             payload[end - 8..end - 4].fill(0);
             crate::store::append(path, vec![NewEntry { key, kind, payload }], false).unwrap();
         }
+    }
+
+    /// The symbols slot `id`'s code names in the startup image, each linked as the prelink
+    /// links it (img_sym; None: it did not link). None: the image has no such slot.
+    pub(super) fn image_slot_syms(&mut self, u: &mut Unit, id: u32) -> Option<Vec<Option<relax_backend::rir::Sym>>> {
+        let (img, store) = self.image.as_ref().map(|i| (i.bytes(), i._store.clone()))?;
+        let mut im = {
+            let c = &*self;
+            parse_image(img, store, |ident, fp| c.crate_by_ident.get(&ident).map_or(false, |&k| c.fp_now(k as usize) == Some(fp)))?
+        };
+        let want = self.slot_bytes(u, id)?;
+        let rel = im.slots.iter().find(|s| im.keys[s.key as usize] == &want[..])?.rel;
+        let mut linker = unsafe { Linker::new(self) };
+        let mut rw = Vec::new();
+        let mut out = Vec::new();
+        for ri in (rel.0..rel.1).step_by(REL_SIZE) {
+            let (_, _, t, ix) = im.rel_at(ri)?;
+            if t == IMG_SYM {
+                out.push(linker.img_sym(u, &mut im, ix, ri, &mut rw));
+            }
+        }
+        Some(out)
     }
 
     /// The digests of the image slot, with its context keys mapped to this run's slots.

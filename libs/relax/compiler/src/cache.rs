@@ -10587,6 +10587,51 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A slot whose code makes a trait object names its vtable's made cell. The startup image
+    /// holds it: the image's symbol table takes the made cell by the vtable's own symbol, and the
+    /// next run's load links that to a made cell of the vtable it links, as a cache link does.
+    #[test]
+    fn an_image_holds_a_slot_that_makes_a_trait_object() {
+        isolated_test!(an_image_holds_a_slot_that_makes_a_trait_object);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-image-made-cell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "#![no_std] pub fn maker() -> u32 { 1 } pub fn plain() -> u32 { 2 }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        let root = prog.load_crate("a", dir.join("a.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let def = |u: &Unit, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
+        let (maker, plain) = (u.fn_id(FnKey::Inst(def(&u, "maker"), vec![])), u.fn_id(FnKey::Inst(def(&u, "plain"), vec![])));
+        let vtable = u.data(&[0u8; 24], 8, DataKind::Relocs(vec![]));
+        u.syms.set_data_name(vtable, format!("{}a::S#00000000:dyn a::T#00000000:-", crate::syms::VTABLE_NAME));
+        let vt = u.data_sym(vtable);
+        assert!(u.syms.is_vtable_sym(vt), "the fixture's object is a vtable");
+        let made = u.syms.made_sym(vt);
+        let cache_dir = dir.join("cache");
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.record(&u, maker, &[0, 0, 0, 0, 0, 0, 0, 0, 0xc3], &[RelocAt { at: 0, kind: RelocKind::Pool64, target: Reloc::Sym(made) }], &[]);
+        cache.record(&u, plain, &[0xc3], &[], &[]);
+        assert!(cache.record_manifest(&u, root, &[maker, plain], 2, &|| false));
+        assert_eq!(cache.image_built.as_ref().map(|b| b.1), Some(2), "both slots are placed, the maker with them");
+        cache.flush().unwrap();
+        drop(cache);
+        // the next run loads the manifest as a start does and links the maker's symbols from the image
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.load_manifest(root);
+        assert!(cache.has_startup_image(), "the manifest wrote a startup image");
+        let syms = cache.image_slot_syms(&mut u, maker).expect("the image holds the maker's slot");
+        assert_eq!(syms.len(), 1, "the maker's code names one symbol: {syms:?}");
+        let linked = syms[0].expect("the made cell links from the image");
+        assert!(matches!(u.syms.kind(linked.id), Some(SymKind::Made(v)) if u.syms.is_vtable_sym(Sym::new(v))), "it links to a vtable's made cell: {:?}", u.syms.kind(linked.id));
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     impl Cache {
         fn pending_manifest_payload(&self, root: u32) -> Option<&[u8]> {
             let key = self.manifest_key(root)?;
