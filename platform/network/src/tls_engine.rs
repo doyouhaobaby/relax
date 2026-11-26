@@ -199,6 +199,43 @@ pub(crate) struct SocketPump {
     shut_down: bool,
 }
 
+#[cfg(windows)]
+fn wait_writable(socket: &TcpStream, deadline: Instant) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct WSAPOLLFD {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAPoll(fds: *mut WSAPOLLFD, count: u32, timeout_ms: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    const POLLWRNORM: i16 = 0x0010;
+    let mut fd = WSAPOLLFD { fd: socket.as_raw_socket() as usize, events: POLLWRNORM, revents: 0 };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Ok(false); }
+        let millis = remaining.as_nanos().div_ceil(1_000_000);
+        let timeout = millis.min(i32::MAX as u128) as i32;
+        match unsafe { WSAPoll(&mut fd, 1, timeout) } {
+            // With one socket, writability and POLLERR/HUP/NVAL all call for
+            // another send, which reports the actual byte count or socket error.
+            1 => return Ok(true),
+            0 if millis <= i32::MAX as u128 => return Ok(false),
+            0 => continue, // Only the longest representable poll interval expired.
+            _ => {
+                let err = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+                if err.kind() != io::ErrorKind::Interrupted { return Err(err); }
+            }
+        }
+    }
+}
+
 impl SocketPump {
     pub(crate) fn handshake(tcp: TcpStream, engine: TlsEngine, deadline: Option<Instant>) -> io::Result<Self> {
         let mut pump = Self { tcp, engine, output: Vec::new(), sent: 0, control_pending: false, shut_down: false };
@@ -236,6 +273,11 @@ impl SocketPump {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => self.sent += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                #[cfg(windows)]
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && deadline.is_some() => {
+                    if !wait_writable(&self.tcp, deadline.unwrap())? { return Err(e); }
+                }
+                #[cfg(not(windows))]
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock && deadline.is_some() => {
                     let remaining = deadline.unwrap().saturating_duration_since(Instant::now());
                     if remaining.is_zero() { return Err(e); }

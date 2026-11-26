@@ -41,12 +41,14 @@ use crate::digest::sha256_hash;
 #[cfg(any(
     target_os = "linux",
     target_os = "macos", target_os = "ios", target_os = "tvos",
+    target_os = "windows",
 ))]
 #[path = "tls_engine.rs"]
 pub(crate) mod engine;
 #[cfg(any(
     target_os = "linux",
     target_os = "macos", target_os = "ios", target_os = "tvos",
+    target_os = "windows",
 ))]
 pub use engine::TlsEngine;
 
