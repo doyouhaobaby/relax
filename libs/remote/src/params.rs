@@ -101,6 +101,7 @@ pub fn inspect(words: &str) -> Option<&'static str> {
         "gpu diff" => "",
         "gpu path" => "",
         "hal pump" => "",
+        "hal stats" => "",
         "hal pace" => "",
         "hal shell" => "",
         "hal lose" => "",
