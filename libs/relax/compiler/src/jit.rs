@@ -10978,6 +10978,10 @@ pub struct MainCompile {
     /// the preparation's rest by part: the digest gate's digest, a baseline body's copy of its
     /// lowering (wall ns)
     pub prest: [u64; 2],
+    /// install_compiled's work after the install by part: up to the speculative builds' queueing
+    /// (the counter, the tier verdict, O2's queueing), that queueing, and the completed body's drop
+    /// (wall ns)
+    pub aft: [u64; 3],
     /// the owner's own work between requests when main's longest owner wait began and the owner
     /// served no request (owner::OWN_NOW; 0: none)
     pub behind_own: u8,
@@ -12236,12 +12240,22 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 }
             }
             note_entered(&*up, id);
+            let ts = if ti != 0 { wall_ns() } else { 0 };
             if !INSTALLING_MANIFEST.with(|f| f.get()) {
                 let _ph = rt_ph(6);
                 spec_enqueue(up, id, 0);
             }
+            let td = if ti != 0 { wall_ns() } else { 0 };
             drop_completed_body(&mut *up, id);
-            if ti != 0 { let e = wall_ns(); main_rec(|r| r.inst[7] += e - ti); }
+            if ti != 0 {
+                let e = wall_ns();
+                main_rec(|r| {
+                    r.inst[7] += e - ti;
+                    r.aft[0] += ts - ti;
+                    r.aft[1] += td - ts;
+                    r.aft[2] += e - td;
+                });
+            }
             a
         }
     }
