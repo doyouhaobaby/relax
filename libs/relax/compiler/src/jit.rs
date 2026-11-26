@@ -23448,8 +23448,6 @@ pub(crate) fn queue_held_line() -> String { queue::held_line() }
 /// The JIT pool's line of `inspect cpu` (`queue::pool_line`).
 pub(crate) fn queue_pool_line() -> String { queue::pool_line() }
 
-/// The UI must be quiet this long before concurrent non-Interactive builds resume.
-const BURST_UI_QUIET_NS: u64 = 1_000_000_000;
 
 /// Opt-in only: no extra clocks, pass timing, allocations or statistics locks when off.
 /// A live session's O3 builds outline their patched path into a private part only with

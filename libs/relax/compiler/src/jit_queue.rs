@@ -114,7 +114,8 @@ impl Grant {
 }
 /// The admission checks' view of the running jobs and the phase (`Queue::policy`).
 struct Policy {
-    /// the burst gate: one build at a time below Interactive while the startup or the UI runs
+    /// the burst gate: one build at a time below Interactive while the startup runs or the UI is
+    /// blocked on the JIT (postframe::ui_in_episode)
     burst: bool,
     /// running builds below Interactive (the burst gate's count: a check beside the program is none)
     builds: usize,
@@ -313,13 +314,15 @@ impl Queue {
         Some(DrainsNow::get().for_job(e.job.tier(), self.class_of(e)))
     }
     /// What the admission checks read of the running jobs and the phase, once per decision. The
-    /// burst gate holds one build at a time below Interactive while the startup or the UI runs. The
-    /// tick is housekeeping beside the builds, not one of them: it neither counts nor waits (the O2
-    /// worker and the first O3 worker's polls ran side by side; a tick that waited for the owner held
-    /// the one slot the startup's O2 builds had, and half as many ran).
+    /// burst gate holds one build at a time below Interactive while the startup runs or the UI thread
+    /// is in a JIT block episode: its hold ends with the episode (a frame, or no wait for
+    /// EPISODE_GAP_NS), not after a span of quiet. The tick is housekeeping beside the builds, not
+    /// one of them: it neither counts nor waits (the O2 worker and the first O3 worker's polls ran
+    /// side by side; a tick that waited for the owner held the one slot the startup's O2 builds had,
+    /// and half as many ran).
     fn policy(&self) -> Policy {
         let mut policy = Policy {
-            burst: !past_startup() || crate::postframe::ui_idle_ns() < BURST_UI_QUIET_NS,
+            burst: !past_startup() || crate::postframe::ui_in_episode(),
             builds: 0,
             noninteractive: 0,
             background: 0,

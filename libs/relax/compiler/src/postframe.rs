@@ -187,6 +187,16 @@ pub fn ui_idle_ns() -> u64 {
     wall_ns().saturating_sub(UI_WAIT_END.load(Relaxed).max(fp))
 }
 
+/// The UI thread is in a JIT block episode (the JIT ring's rule above): a wait is open, or the last
+/// one ended less than EPISODE_GAP_NS ago with no frame since (a load's compiles back to back).
+/// Atomics and a clock read.
+pub fn ui_in_episode() -> bool {
+    in_episode(UI_WAITING.load(Relaxed), UI_WAIT_END.load(Relaxed), LAST_FRAME.load(Relaxed), wall_ns())
+}
+fn in_episode(waiting: u64, wait_end: u64, last_frame: u64, now: u64) -> bool {
+    waiting > 0 || (wait_end > last_frame && now.saturating_sub(wait_end) < EPISODE_GAP_NS)
+}
+
 /// Functions built ahead since the first present, and those still queued or building (the
 /// speculative / prepare queue).
 pub fn ahead_progress() -> (u64, u64) {
@@ -336,6 +346,18 @@ mod tests {
         assert_eq!(short_fn("main"), "main");
         assert_eq!(short_fn("<<T as Tr>::X>::f"), "T::f");
         assert!(!short_fn("<{closure}> [unverified]").starts_with(' '));
+    }
+
+    #[test]
+    fn a_ui_episode_lasts_while_its_waits_run_back_to_back() {
+        use super::{in_episode, EPISODE_GAP_NS as GAP};
+        let (frame, end) = (1_000_000_000, 2_000_000_000);
+        assert!(!in_episode(0, 0, 0, end), "no wait yet: no episode");
+        assert!(in_episode(1, 0, frame, end), "an open wait is an episode");
+        assert!(in_episode(1, end, end + 1, end + 10 * GAP), "an open wait is one after a frame too");
+        assert!(in_episode(0, end, frame, end + GAP - 1), "a wait that just ended, no frame since, goes on");
+        assert!(!in_episode(0, end, frame, end + GAP), "a gap of EPISODE_GAP_NS ends it");
+        assert!(!in_episode(0, end, end + 1, end + 2), "a frame since the last wait ends it at once");
     }
 }
 
