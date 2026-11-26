@@ -7,15 +7,26 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-/// The lock file in the loader root. Opened, never written and never deleted: deleting a lock file
-/// splits the lock across two files.
+/// The permanent switch lock file in the loader root. Deleting it splits the lock across two files.
 pub const LOCK_FILE: &str = "switch.lock";
+/// The permanent prepare lock file in the same root, shared by all loader versions.
+pub const PREPARE_LOCK: &str = "prepare.lock";
 
 /// The switch lock, held until dropped.
 #[derive(Debug)]
 pub struct Lock {
     root: PathBuf,
     _file: Option<File>,
+}
+
+/// Protects the loader being prepared or offered, until its trial ends or the offer is dropped.
+#[derive(Debug)]
+pub struct Prepare(Lock);
+
+impl Prepare {
+    pub fn try_hold(root: &Path) -> io::Result<Option<Prepare>> {
+        Ok(try_hold(root, PREPARE_LOCK)?.map(Prepare))
+    }
 }
 
 #[derive(Debug)]
@@ -27,8 +38,8 @@ pub enum TryLock {
     Unsupported(io::Error),
 }
 
-fn open(root: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).write(true).truncate(false).open(root.join(LOCK_FILE))
+fn open(root: &Path, name: &str) -> io::Result<File> {
+    OpenOptions::new().create(true).write(true).truncate(false).open(root.join(name))
 }
 
 // Some filesystems return these OS codes without std mapping them to Unsupported.
@@ -38,44 +49,51 @@ fn locks_unsupported(error: &io::Error) -> bool {
         || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50))) // INVALID_FUNCTION, NOT_SUPPORTED
 }
 
+fn try_acquire(root: &Path, name: &str) -> io::Result<TryLock> {
+    let file = open(root, name)?;
+    match file.try_lock() {
+        Ok(()) => Ok(TryLock::Held(Lock { root: root.into(), _file: Some(file) })),
+        Err(TryLockError::WouldBlock) => Ok(TryLock::Busy),
+        Err(TryLockError::Error(e)) if locks_unsupported(&e) => Ok(TryLock::Unsupported(e)),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+// On a filesystem without locking, retain the original single-Runner behaviour.
+fn unsupported(root: &Path, name: &str, error: io::Error) -> Lock {
+    static WARN: std::sync::Once = std::sync::Once::new();
+    WARN.call_once(|| {
+        let kind = name.trim_end_matches(".lock");
+        let _ = writeln!(io::stderr(), "makepad: loader {kind} lock unsupported: {error}");
+    });
+    Lock { root: root.into(), _file: None }
+}
+
+fn try_hold(root: &Path, name: &str) -> io::Result<Option<Lock>> {
+    match try_acquire(root, name)? {
+        TryLock::Held(lock) => Ok(Some(lock)),
+        TryLock::Busy => Ok(None),
+        TryLock::Unsupported(e) => Ok(Some(unsupported(root, name, e))),
+    }
+}
+
 impl Lock {
     pub fn root(&self) -> &Path { &self.root }
 
-
-    /// Takes the lock if it is free; never waits.
-    pub fn try_acquire(root: &Path) -> io::Result<TryLock> {
-        let file = open(root)?;
-        match file.try_lock() {
-            Ok(()) => Ok(TryLock::Held(Lock { root: root.into(), _file: Some(file) })),
-            Err(TryLockError::WouldBlock) => Ok(TryLock::Busy),
-            Err(TryLockError::Error(e)) if locks_unsupported(&e) => Ok(TryLock::Unsupported(e)),
-            Err(TryLockError::Error(e)) => Err(e),
-        }
-    }
-    // On a filesystem without locking, retain the original single-watcher behaviour.
-    fn unsupported(root: &Path, error: io::Error) -> Lock {
-        static WARN: std::sync::Once = std::sync::Once::new();
-        WARN.call_once(|| {
-            let _ = writeln!(io::stderr(), "makepad: loader switch lock unsupported: {error}");
-        });
-        Lock { root: root.into(), _file: None }
-    }
+    /// Takes the switch lock if it is free; never waits.
+    pub fn try_acquire(root: &Path) -> io::Result<TryLock> { try_acquire(root, LOCK_FILE) }
 
     /// A switch owner, or None while another watcher holds the lock.
     pub fn try_hold(root: &Path) -> io::Result<Option<Lock>> {
-        match Self::try_acquire(root)? {
-            TryLock::Held(lock) => Ok(Some(lock)),
-            TryLock::Busy => Ok(None),
-            TryLock::Unsupported(e) => Ok(Some(Self::unsupported(root, e))),
-        }
+        try_hold(root, LOCK_FILE)
     }
 
     /// Takes the lock, waiting while another holds it.
     pub fn acquire(root: &Path) -> io::Result<Lock> {
-        let file = open(root)?;
+        let file = open(root, LOCK_FILE)?;
         match file.lock() {
             Ok(()) => Ok(Lock { root: root.into(), _file: Some(file) }),
-            Err(e) if locks_unsupported(&e) => Ok(Self::unsupported(root, e)),
+            Err(e) if locks_unsupported(&e) => Ok(unsupported(root, LOCK_FILE, e)),
             Err(e) => Err(e),
         }
     }
@@ -313,6 +331,68 @@ pub fn check_real_dir(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+fn checked_target_root(root: &Path) -> io::Result<PathBuf> {
+    let targets = target_root(root);
+    // A link at target or target/loader would take cleanup outside the install.
+    for dir in [targets.parent().unwrap(), targets.as_path()] {
+        match check_real_dir(dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            result => result?,
+        }
+    }
+    Ok(targets)
+}
+
+/// Create a clean source directory for a build under the installation's prepare lock.
+pub fn prepare_version(prepare: &Prepare, name: &str) -> io::Result<PathBuf> {
+    let root = prepare.0.root();
+    if !commit_name(name) { return Err(invalid("Invalid loader version")); }
+    if root.join("pending").exists() { return Err(invalid("A loader switch is pending")); }
+    if active(root).name == name || pointer(root, "previous").as_deref() == Some(name) { return Err(invalid("Cannot replace an active or previous loader")); }
+    let source = match checked_dir(root, name) {
+        Ok(dir) if dir.join(".built").exists() => return Err(invalid("This loader version is already built with a different pin")),
+        Ok(dir) => Some(dir),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    match checked_dir(&checked_target_root(root)?, name) {
+        Ok(dir) => fs::remove_dir_all(dir)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(dir) = source { fs::remove_dir_all(dir)?; }
+    let path = root.join(name);
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+/// Sweep only when both locks are held. A preparer may be about to try the switch lock.
+pub fn prune(lock: &Lock, running: Option<&Path>) -> io::Result<()> {
+    let root = lock.root();
+    let Some(_prepare) = Prepare::try_hold(root)? else { return Ok(()) };
+    if root.join("pending").try_exists()? { return Ok(()); }
+    let selected = active(root);
+    // A directly started older loader can still be using its folder.
+    if running.is_some_and(|dir| dir != selected.dir) { return Ok(()); }
+    let previous = pointer(root, "previous");
+    let targets = checked_target_root(root)?;
+    // Sweep each root so an interruption between the two deletions leaves nothing stranded.
+    for parent in [root, targets.as_path()] {
+        let entries = match fs::read_dir(parent) { Err(e) if e.kind() == io::ErrorKind::NotFound => continue, result => result? };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == selected.name || previous.as_deref() == Some(name) { continue; }
+            if !(folder_name(name) || (parent == root && name == ".unpack")) { continue; }
+            if !entry.file_type()?.is_dir() { continue; }
+            fs::remove_dir_all(checked_dir(parent, name)?)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod switch_tests;
 
@@ -358,6 +438,18 @@ mod tests {
         let wait_stdin = || { let _ = io::stdin().read_line(&mut String::new()); };
         match role {
             "hold" => { let _lock = Lock::acquire(root).unwrap(); writeln!(out, "role: held").unwrap(); out.flush().unwrap(); wait_stdin(); }
+            "prepare" => {
+                let version = super::switch_tests::B;
+                let prepare = Prepare::try_hold(root).unwrap().unwrap();
+                let source = prepare_version(&prepare, version).unwrap();
+                let target = target_root(root).join(version);
+                fs::create_dir_all(&target).unwrap();
+                fs::write(source.join("source"), b"unpacked").unwrap();
+                fs::write(target.join("partial"), b"building").unwrap();
+                writeln!(out, "role: preparing").unwrap();
+                out.flush().unwrap();
+                wait_stdin();
+            }
             "wait" => { let _lock = Lock::acquire(root).unwrap(); writeln!(out, "role: acquired").unwrap(); }
             "idle" => { writeln!(out, "role: idle").unwrap(); out.flush().unwrap(); wait_stdin(); }
             "probe" => writeln!(out, "role: {}", state(root)).unwrap(),
@@ -365,10 +457,10 @@ mod tests {
         }
         out.flush().unwrap();
     }
-    fn free_after_exit(root: &Path, what: &str) {
+    pub(super) fn free_after_exit(what: &str, free: impl Fn() -> bool) {
         // Windows releases a dead process's locks soon after it ends, not at once (LockFileEx).
         for _ in 0..1000 {
-            if state(root) == "free" { return; }
+            if free() { return; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the lock stayed held after {what} ended");
@@ -408,7 +500,7 @@ mod tests {
             assert_eq!(state(&root), "busy", "a lock another process holds must be busy here");
             if end == "kill" { holder.kill().unwrap(); } else { drop(holder.stdin.take()); }
             let _ = holder.wait().unwrap();
-            free_after_exit(&root, &format!("its holder's {end}"));
+            free_after_exit(&format!("its holder's {end}"), || state(&root) == "free");
         }
 
         // A blocking take waits while the lock is held here and returns once it is dropped.

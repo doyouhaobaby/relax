@@ -1,7 +1,9 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub(super) const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
 struct Temp { home: PathBuf, root: PathBuf }
 impl Temp {
     fn new() -> Self {
@@ -138,7 +140,7 @@ fn files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         let path = entry.unwrap().path();
         if path.is_dir() {
             snapshot.extend(files(&path));
-        } else if path.file_name().unwrap() == LOCK_FILE {
+        } else if path.file_name().unwrap() == LOCK_FILE || path.file_name().unwrap() == PREPARE_LOCK {
             // Windows can refuse a read on a locked range, even in the holding process.
             assert_eq!(path.metadata().unwrap().len(), 0);
             snapshot.insert(path, Vec::new());
@@ -287,4 +289,98 @@ fn recover_command_waits_for_the_watcher_before_rolling_back() {
     assert_eq!(fs::read_to_string(t.root.join("current")).unwrap(), A);
     assert_eq!(active(&t.root), previous);
     assert_eq!(fs::read_to_string(t.root.join("rolled-back")).unwrap(), "The update did not confirm its first frame.");
+}
+
+#[test]
+fn prune_keeps_active_and_previous_and_never_prunes_pending() {
+    let t = Temp::new();
+    let lock = Lock::acquire(&t.root).unwrap();
+    let targets = t.home.join("target/loader");
+    fs::create_dir_all(&targets).unwrap();
+    for name in ["src", A, B, C] {
+        let loader = t.built(name);
+        fs::rename(loader.dir.join("target"), targets.join(name)).unwrap();
+    }
+    fs::create_dir(targets.join(D)).unwrap(); // an orphan target with no source
+    fs::create_dir(targets.join("unrelated")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(targets.join(A), t.root.join(C).join("target")).unwrap();
+    fs::create_dir(t.root.join(".unpack")).unwrap(); fs::create_dir(t.root.join("unrelated")).unwrap();
+    atomic_write(&t.root.join("current"), A).unwrap(); begin_switch(&lock, B, "record b\n").unwrap(); prune(&lock, None).unwrap();
+    for name in ["src", A, B, C, ".unpack"] { assert!(t.root.join(name).exists()); }
+    for name in ["src", A, B, C, D] { assert!(targets.join(name).is_dir(), "pending keeps target {name}"); }
+    confirm_boot(&lock).unwrap(); prune(&lock, None).unwrap();
+    for name in [A, B, "unrelated"] { assert!(t.root.join(name).exists()); }
+    for name in ["src", C, ".unpack"] { assert!(!t.root.join(name).exists()); }
+    for name in [A, B] { assert!(targets.join(name).join(HOST_BINARY).is_file(), "kept loader {name} survives"); }
+    for name in ["src", C, D] { assert!(!targets.join(name).exists(), "stale target {name} goes"); }
+    assert!(targets.join("unrelated").is_dir());
+}
+#[test]
+fn retry_removes_only_an_incomplete_valid_version() {
+    let t = Temp::new(); t.built("src"); fs::create_dir(t.root.join(A)).unwrap(); fs::write(t.root.join(A).join("partial"), b"partial").unwrap();
+    let targets = t.home.join("target/loader");
+    fs::create_dir_all(targets.join(A)).unwrap();
+    let prepare = Prepare::try_hold(&t.root).unwrap().unwrap();
+    prepare_version(&prepare, A).unwrap(); assert!(!t.root.join(A).join("partial").exists());
+    assert!(!targets.join(A).exists(), "a retry clears the incomplete build");
+    fs::create_dir(targets.join(B)).unwrap();
+    assert!(prepare_version(&prepare, "../escape").is_err()); t.built(B); assert!(prepare_version(&prepare, B).is_err());
+    assert!(targets.join(B).is_dir(), "refusing to replace a built loader keeps its target");
+}
+
+#[test]
+fn another_runner_cannot_prune_a_build_or_offer_until_its_owner_exits() {
+    use super::tests::{answer, free_after_exit, spawn};
+
+    let t = Temp::new();
+    t.built(A);
+    t.built("src");
+    fs::write(t.root.join("current"), A).unwrap();
+    fs::write(t.root.join("previous"), "src").unwrap();
+    let source = t.root.join(B);
+    let target = target_root(&t.root).join(B);
+    let binary = target.join(HOST_BINARY);
+
+    for end in ["exit", "kill"] {
+        t.built(C); // An unrelated obsolete loader detects a partial sweep.
+        let (mut child, mut lines) = spawn(&t.root, "prepare");
+        assert_eq!(answer(&mut lines, "prepare"), "preparing");
+        let switch = Lock::try_hold(&t.root).unwrap().expect("preparation leaves switch.lock free");
+        for offered in [false, true] {
+            if offered {
+                fs::create_dir_all(binary.parent().unwrap()).unwrap();
+                fs::write(&binary, b"built binary").unwrap();
+                fs::write(source.join(".built"), B).unwrap();
+            }
+            assert!(Prepare::try_hold(&t.root).unwrap().is_none(), "the child owns prepare.lock");
+            let before = files(&t.home);
+            prune(&switch, None).unwrap();
+            assert_eq!(files(&t.home), before, "prune must skip the whole sweep, offered={offered}");
+        }
+        if end == "kill" { child.kill().unwrap(); } else { drop(child.stdin.take()); }
+        let status = child.wait().unwrap();
+        if end == "exit" { assert!(status.success()); }
+        free_after_exit(&format!("the preparer's {end}"), || Prepare::try_hold(&t.root).unwrap().is_some());
+        prune(&switch, None).unwrap();
+        assert!(!source.exists() && !target.exists(), "the abandoned loader can be pruned after {end}");
+        assert!(!t.root.join(C).exists(), "the sweep resumes after {end}");
+        assert!(t.root.join(PREPARE_LOCK).is_file(), "the lock file survives a sweep");
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cleanup_does_not_follow_symlinks() {
+    let t = Temp::new(); let lock = Lock::acquire(&t.root).unwrap(); let outside = Temp::new(); t.built("src");
+    let prepare = |name| prepare_version(&Prepare::try_hold(&t.root).unwrap().unwrap(), name);
+    std::os::unix::fs::symlink(&outside.root, t.root.join(A)).unwrap();
+    assert!(prepare(A).is_err()); prune(&lock, None).unwrap(); assert!(outside.root.exists()); assert!(t.root.join(A).is_symlink());
+    let targets = t.home.join("target/loader");
+    fs::create_dir_all(&targets).unwrap();
+    std::os::unix::fs::symlink(&outside.root, targets.join(B)).unwrap();
+    assert!(prepare(B).is_err()); prune(&lock, None).unwrap(); assert!(targets.join(B).is_symlink());
+    fs::rename(&targets, t.home.join("saved-targets")).unwrap();
+    std::os::unix::fs::symlink(&outside.root, &targets).unwrap();
+    outside.built(C);
+    assert!(prune(&lock, None).is_err()); assert!(prepare(C).is_err()); assert!(outside.root.join(C).is_dir());
 }
