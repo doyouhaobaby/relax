@@ -8,12 +8,13 @@
 //!   shows up as a source the words didn't name). A burst first, then about one a second. Probing
 //!   never gives up by itself: the two people type each other's words at different moments, so the
 //!   caller decides when to stop and what to tell them ([`Punch::state`] carries how long).
-//! - **Open** when the peer acknowledges one of our probes: both directions work.
+//! - **Open** when the peer acknowledges one of our probes: both directions work. With a preferred
+//!   address, an ack from another address waits up to [`Config::prefer_ms`] from first contact.
 //! - **Keepalives** after that keep the NATs' mappings alive; traffic of the layers above counts
 //!   ([`Punch::note_sent`], [`Punch::note_heard`]). A peer silent for [`Config::quiet_ms`] makes the
 //!   path quiet, never closed: probing resumes, and the path reopens, possibly from a new address
-//!   when the peer's NAT rebound it. A probe from an address that isn't the open peer's is probed
-//!   straight back, so a rebound peer is followed within one round trip of its next packet. Such a
+//!   when the peer's NAT rebound it. With a preferred address the open path stays put until quiet.
+//!   Otherwise a new source is probed straight back to follow a rebound within one round trip. Such a
 //!   move is only a candidate: the channel on top must see authenticated traffic from the new
 //!   address before trusting it, since anyone who knows the tag can answer a probe.
 //!
@@ -40,6 +41,8 @@ pub struct Config {
     pub burst_ms: u64,
     /// Then this often, for as long as the caller lets it run.
     pub slow_interval_ms: u64,
+    /// How long after first hearing the peer to wait for a preferred address to acknowledge.
+    pub prefer_ms: u64,
     /// An open path with nothing sent for this long gets a keepalive probe.
     pub keepalive_ms: u64,
     /// An open path with nothing heard for this long is quiet.
@@ -48,13 +51,13 @@ pub struct Config {
 
 impl Config {
     pub fn new(tag: [u8; 8]) -> Config {
-        Config { tag, burst_interval_ms: 100, burst_ms: 2_000, slow_interval_ms: 1_000, keepalive_ms: 15_000, quiet_ms: 45_000 }
+        Config { tag, burst_interval_ms: 100, burst_ms: 2_000, slow_interval_ms: 1_000, prefer_ms: 1_500, keepalive_ms: 15_000, quiet_ms: 45_000 }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Probing since `since`, nothing acknowledged yet.
+    /// Probing since `since`, still choosing a path.
     Punching { since: u64 },
     /// Both directions work, to and from `peer`.
     Open { peer: SocketAddr, since: u64 },
@@ -74,6 +77,10 @@ pub struct Punch {
     config: Config,
     nonce: [u8; 8],
     targets: Vec<SocketAddr>,
+    preferred: Option<SocketAddr>,
+    held: Option<SocketAddr>,
+    /// Arrival of the first tagged datagram in this round of path selection.
+    first_heard: Option<u64>,
     state: State,
     /// When the current burst began (punching, or going quiet).
     burst_from: u64,
@@ -104,6 +111,9 @@ impl Punch {
             config,
             nonce,
             targets: vec![peer],
+            preferred: None,
+            held: None,
+            first_heard: None,
             state: State::Punching { since: now },
             burst_from: now,
             next_probe_at: now,
@@ -124,9 +134,40 @@ impl Punch {
         }
     }
 
-    /// Every address probed: the words' one, then those learned from the peer's probes.
+    /// Every target, including addresses learned from the peer.
     pub fn targets(&self) -> &[SocketAddr] {
         &self.targets
+    }
+
+    fn add_target(&mut self, addr: SocketAddr) {
+        if !self.targets.contains(&addr) {
+            self.targets.push(addr);
+        }
+    }
+
+    /// Probes `addr` alongside the other targets and gives it priority when choosing a path.
+    pub fn prefer(&mut self, addr: SocketAddr) {
+        self.add_target(addr);
+        self.preferred = Some(addr);
+    }
+
+    /// Opens the path the layer above saw the peer choose.
+    pub fn select(&mut self, addr: SocketAddr, now: u64) -> Option<Event> {
+        let event = match self.state {
+            State::Punching { .. } => Some(Event::Opened(addr)),
+            State::Quiet { peer, .. } => Some(Event::Reopened { peer: addr, moved: peer != addr }),
+            State::Open { peer, .. } if peer != addr => Some(Event::Reopened { peer: addr, moved: true }),
+            State::Open { .. } => None,
+        };
+        self.add_target(addr);
+        self.state = State::Open { peer: addr, since: now };
+        self.last_heard = now;
+        self.held = None;
+        event
+    }
+
+    fn held_candidate(&self) -> Option<(SocketAddr, u64)> {
+        Some((self.held?, self.first_heard?.saturating_add(self.config.prefer_ms)))
     }
 
     fn probe_interval(&self, now: u64) -> u64 {
@@ -137,15 +178,21 @@ impl Punch {
         }
     }
 
-    /// The datagrams due at `now`, as (to, bytes); and the quiet transition when it is due.
+    /// The datagrams due at `now`, as (to, bytes), and any transition due.
     pub fn poll(&mut self, now: u64) -> (Vec<(SocketAddr, Vec<u8>)>, Option<Event>) {
         let mut event = None;
         if let State::Open { peer, .. } = self.state {
             if now.saturating_sub(self.last_heard) >= self.config.quiet_ms {
                 self.state = State::Quiet { peer, since: self.last_heard };
+                self.held = None;
+                self.first_heard = None;
                 self.burst_from = now;
                 self.next_probe_at = now;
                 event = Some(Event::Quiet(peer));
+            }
+        } else if let Some((addr, deadline)) = self.held_candidate() {
+            if now >= deadline {
+                event = self.select(addr, now);
             }
         }
         let mut out = Vec::new();
@@ -173,47 +220,49 @@ impl Punch {
     pub fn next_wake(&self) -> u64 {
         match self.state {
             State::Open { .. } => (self.last_sent + self.config.keepalive_ms).min(self.last_heard + self.config.quiet_ms),
-            State::Punching { .. } | State::Quiet { .. } => self.next_probe_at,
+            State::Punching { .. } | State::Quiet { .. } => self.held_candidate().map_or(self.next_probe_at, |(_, deadline)| self.next_probe_at.min(deadline)),
         }
     }
 
-    /// Takes a punch datagram from `from`: answers a probe (an ack, and a probe of ours when `from`
-    /// isn't the open peer), to send now, and opens on an ack of ours. Datagrams of other pairings,
-    /// and anything malformed, change nothing.
+    /// Answers a probe at its source and considers a path open only after an ack of our nonce.
     pub fn handle(&mut self, from: SocketAddr, packet: &[u8], now: u64) -> (Vec<(SocketAddr, Vec<u8>)>, Option<Event>) {
-        if !is_punch(packet) || packet[2..10] != self.config.tag {
+        if !is_punch(packet) || packet[2..10] != self.config.tag || !matches!(packet[1], PROBE | ACK) {
             return (Vec::new(), None);
         }
+        self.first_heard.get_or_insert(now);
         let mut nonce = [0u8; 8];
         nonce.copy_from_slice(&packet[10..18]);
         match packet[1] {
             PROBE => {
-                if !self.targets.contains(&from) {
-                    self.targets.push(from);
-                }
+                self.add_target(from);
                 let mut out = vec![(from, datagram(ACK, &self.config.tag, &nonce))];
-                if self.peer() == Some(from) {
-                    self.last_heard = now;
-                } else {
-                    out.push((from, datagram(PROBE, &self.config.tag, &self.nonce)));
+                match self.peer() {
+                    Some(peer) if peer == from => {
+                        self.last_heard = now;
+                        self.last_sent = now;
+                    }
+                    // Answer other paths without restarting their probes or delaying our keepalive.
+                    Some(_) if self.preferred.is_some() => {}
+                    _ => {
+                        out.push((from, datagram(PROBE, &self.config.tag, &self.nonce)));
+                        self.last_sent = now;
+                    }
                 }
-                self.last_sent = now;
                 (out, None)
             }
             ACK if nonce == self.nonce => {
-                self.last_heard = now;
-                let event = match self.state {
-                    State::Punching { .. } => Some(Event::Opened(from)),
-                    State::Quiet { peer, .. } => Some(Event::Reopened { peer: from, moved: peer != from }),
-                    State::Open { peer, .. } if peer != from => Some(Event::Reopened { peer: from, moved: true }),
-                    State::Open { .. } => None,
-                };
-                if event.is_some() {
-                    self.state = State::Open { peer: from, since: now };
-                    if !self.targets.contains(&from) {
-                        self.targets.push(from);
+                let event = match self.peer() {
+                    Some(peer) if peer == from => {
+                        self.last_heard = now;
+                        None
                     }
-                }
+                    Some(_) if self.preferred.is_some() => None,
+                    None if self.preferred.is_some_and(|addr| addr != from) => {
+                        self.held.get_or_insert(from);
+                        None
+                    }
+                    _ => self.select(from, now),
+                };
                 (Vec::new(), event)
             }
             _ => (Vec::new(), None),
@@ -527,6 +576,75 @@ mod tests {
             retry = (retry * 2).min(reflect::MAX_RETRY_MS);
         }
         assert_eq!(received, [true; 2], "{case}: each side receives application data from its open peer by the deadline");
+    }
+
+    #[test]
+    fn preferred_private_path_stays_open_when_the_public_mapping_also_answers() {
+        let link = LinkConfig { latency_ms: 10, jitter_ms: 0, loss_per_mille: 0 };
+        let mut net = Net::new(1, link);
+        let mut router = NatConfig::new(NatKind::FullCone);
+        router.hairpin = true;
+        let nat = net.add_nat(PUBLICS[0], router);
+        let private = [2, 3].map(|host| {
+            let ip = Ipv4Addr::new(10, 77, 0, host);
+            net.add_host(ip, Some(nat));
+            SocketAddr::new(ip.into(), 51820)
+        });
+        let public = [0, 1].map(|i| {
+            let port = 41000 + i as u16;
+            net.forward(nat, port, private[i], true);
+            SocketAddr::new(PUBLICS[0].into(), port)
+        });
+        let mut punches = [0, 1].map(|i| {
+            let mut punch = Punch::new(Config::new([0x5a; 8]), public[1 - i], [i as u8 + 1; 8], 0);
+            punch.prefer(private[1 - i]);
+            punch
+        });
+
+        let mut events = [Vec::new(), Vec::new()];
+        let mut public_ack = [false; 2];
+        let mut keepalive_ack = [false; 2];
+        let first_ack_at = 2 * link.latency_ms;
+        let until = first_ack_at + 30_000;
+        loop {
+            let now = net.now();
+            for (i, punch) in punches.iter_mut().enumerate() {
+                let (out, event) = punch.poll(now);
+                events[i].extend(event);
+                if now == 0 {
+                    for addr in [public[1 - i], private[1 - i]] {
+                        assert!(out.iter().any(|(to, bytes)| *to == addr && bytes[1] == PROBE), "side {i} probes {addr} on its first poll");
+                    }
+                }
+                for (to, bytes) in out {
+                    net.send(private[i], to, bytes);
+                }
+            }
+            if now == until {
+                break;
+            }
+            let next = punches.iter().map(Punch::next_wake).chain(net.next_at()).min().unwrap().min(until);
+            assert!(next > now, "handling the deliveries and polling both punches advances virtual time");
+            for delivery in net.advance_to(next) {
+                let i = private.iter().position(|addr| *addr == delivery.to).expect("packet reaches one of the two hosts");
+                if delivery.bytes[1] == ACK {
+                    public_ack[i] |= delivery.from == public[1 - i];
+                    keepalive_ack[i] |= delivery.from == private[1 - i] && next >= punches[i].config.keepalive_ms;
+                }
+                let (out, event) = punches[i].handle(delivery.from, &delivery.bytes, next);
+                events[i].extend(event);
+                for (to, bytes) in out {
+                    net.send(private[i], to, bytes);
+                }
+            }
+        }
+        for (i, punch) in punches.iter().enumerate() {
+            let peer = private[1 - i];
+            assert!(public_ack[i], "side {i} also receives an ack through the public mapping");
+            assert_eq!(events[i], [Event::Opened(peer)], "side {i} opens only once, on its preferred address");
+            assert_eq!(punch.state(), State::Open { peer, since: first_ack_at }, "side {i} stays open for 30 s from the first private ack");
+            assert!(keepalive_ack[i], "side {i} receives a keepalive ack on its private path");
+        }
     }
 
     #[test]
