@@ -124,6 +124,35 @@ fn budget_chain(stuck: &[u64], waits: &[Wait], tokens: &Tokens, list: &[super::t
     Some(steps.join(" -> "))
 }
 
+/// What a program thread asleep on the JIT waits for: a first call's request to the owner, a build,
+/// a query another thread runs, the check beside the program (the owner's pump is the JIT's own).
+fn on_jit(kind: Kind) -> bool {
+    matches!(kind, Kind::Owner | Kind::Build | Kind::Query | Kind::Check | Kind::Pump)
+}
+
+/// The boundary between the app's pool and the JIT's, one line of `inspect cpu`: the waits for an
+/// app token on the JIT's own threads so far (`waits::jit_token_waits`), and the program's threads
+/// asleep on the JIT now, by what they wait for, with the oldest wait. Asleep on the JIT is the one
+/// way the pools meet; a token wait on a JIT thread is a wait the other way, and with it a cycle.
+pub(crate) fn boundary_line(token_waits: u64, waits: &[Wait], now_ns: u64) -> String {
+    let asleep: Vec<&Wait> = waits.iter().filter(|w| !w.jit && on_jit(w.kind)).collect();
+    let mut line = format!("token waits on JIT threads: {token_waits}   program threads asleep on the JIT: {}", asleep.len());
+    if !asleep.is_empty() {
+        let by: Vec<String> = [Kind::Owner, Kind::Build, Kind::Query, Kind::Check, Kind::Pump].into_iter().filter_map(|kind| {
+            let n = asleep.iter().filter(|w| w.kind == kind).count();
+            (n > 0).then(|| format!("{} {n}", crate::waits::KIND_NAMES[kind as usize]))
+        }).collect();
+        let oldest = asleep.iter().map(|w| now_ns.saturating_sub(w.since_ns)).max().unwrap_or(0);
+        line += &format!(" ({}), oldest {} ms", by.join(", "), oldest / 1_000_000);
+    }
+    line
+}
+
+/// The JIT's own threads asleep on other JIT work now: its suspended jobs, and the owner's pump.
+pub(crate) fn jit_asleep(waits: &[Wait]) -> usize {
+    waits.iter().filter(|w| w.jit && on_jit(w.kind)).count()
+}
+
 /// (tests) The chain of a deadlock through the CPU budget now, of waits at least `min_age_ns` old.
 #[cfg(test)]
 pub(crate) fn budget_deadlock(min_age_ns: u64) -> Option<String> {
@@ -430,8 +459,9 @@ mod tests {
     use super::*;
     use makepad_cpu_budget::{Holder, Waiting, APP, BACKGROUND, VISIBLE};
 
+    /// (the owner and the build's drain are the JIT's own threads)
     fn wait(thread: u64, kind: Kind, object: u64, holder: u64, label: &'static str) -> Wait {
-        Wait { thread, kind, object, holder, since_ns: 0, label }
+        Wait { thread, kind, object, holder, since_ns: 0, label, jit: thread == OWNER || thread == BUILD }
     }
     /// `holders` hold the budget's tokens (the first is a compile job), `BUILD` waits for one.
     fn tokens(holders: &[u64], lent: bool) -> Tokens {
@@ -476,5 +506,12 @@ mod tests {
         let row = [wait(1, Kind::Build, 1, 0, "f")];
         assert!(stuck_threads(&row, &[], &tokens(&[], false), 0, NOW).is_empty());
         assert!(stuck_threads(&waits, &e, &tokens(&[1, 2], false), NOW + 1, NOW).is_empty());
+        // the boundary: the build's drain waits for an app token (the counter has it), and the
+        // program's two threads are asleep on the JIT, one on the owner and one on the build;
+        // the owner's pump is the JIT's own
+        let line = boundary_line(1, &waits, NOW);
+        assert_eq!(line, "token waits on JIT threads: 1   program threads asleep on the JIT: 2 (owner 1, build 1), oldest 5000 ms", "{line}");
+        assert_eq!(jit_asleep(&waits), 1, "the owner pumps for the build");
+        assert_eq!(boundary_line(0, &waits[3..], NOW), "token waits on JIT threads: 0   program threads asleep on the JIT: 0");
     }
 }

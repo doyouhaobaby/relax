@@ -23368,6 +23368,8 @@ pub(crate) fn queue_view(n: usize) -> Vec<String> {
 pub(crate) fn queue_spent(n: usize) -> Vec<String> { queue::spent(n) }
 /// The queue's hold ledger, one line (`queue::held_line`).
 pub(crate) fn queue_held_line() -> String { queue::held_line() }
+/// The JIT pool's line of `inspect cpu` (`queue::pool_line`).
+pub(crate) fn queue_pool_line() -> String { queue::pool_line() }
 
 /// The UI must be quiet this long before concurrent non-Interactive builds resume.
 const BURST_UI_QUIET_NS: u64 = 1_000_000_000;

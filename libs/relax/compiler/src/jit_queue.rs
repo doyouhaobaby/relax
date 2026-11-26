@@ -1265,7 +1265,11 @@ fn worker_loop(index: usize) {
                         Some(job) if job.keeps(class, e.job.label()) => job,
                         other => {
                             drop(other);
-                            let p = admission.poll(class, budget::JIT, e.job.label())?;
+                            let Some(p) = admission.poll(class, budget::JIT, e.job.label()) else {
+                                // a drain waits for an app token: the boundary's count
+                                crate::waits::count_jit_token_wait();
+                                return None;
+                            };
                             BudgetJob::from_permit(p, class, e.job.label())
                         }
                     };
@@ -1360,6 +1364,31 @@ fn worker_loop(index: usize) {
                 }
             }
         }
+}
+
+/// The JIT pool's line of `inspect cpu`: its drains and the section workers beside them on the
+/// same thread cache, its jobs running per class (Interactive / Visible / Background, the tier-ups
+/// among them), queued per class. One hold of the queue's lock, a few counts (a bucket's length).
+pub(super) fn pool_line() -> String {
+    let _kept = crate::zone_alloc::kept();
+    let drains = DRAINS.count.load(Ordering::Relaxed).saturating_sub(DRAINS_BACK.load(Ordering::Relaxed));
+    let sections = crate::pool::stats().1.saturating_sub(drains);
+    let (running, tier_ups, queued) = {
+        let q = lock();
+        let (mut running, mut tier_ups, mut queued) = ([0usize; 3], 0, [0usize; 3]);
+        for r in &q.running {
+            running[r.class.class() as usize] += 1;
+            tier_ups += usize::from(is_tier_up(r.tier));
+        }
+        for (tier, plan) in q.plan.iter().enumerate() {
+            for (stored, bucket) in plan.iter().enumerate() {
+                queued[q.bucket_class(tier, stored as u8) as usize] += bucket.len();
+            }
+        }
+        (running, tier_ups, queued)
+    };
+    format!("{drains} drains, {sections} section workers  running {} / {} / {} ({tier_ups} tier-ups)  queued {} / {} / {}  settled: {}",
+        running[0], running[1], running[2], queued[0], queued[1], queued[2], if budget::jit_settled() { "yes" } else { "no" })
 }
 
 fn class_name(class: u8) -> &'static str {

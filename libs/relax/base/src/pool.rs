@@ -389,6 +389,7 @@ impl Worker {
 
 fn worker_main(w: Arc<Worker>) {
     let _z = zone_alloc::compiler_thread();
+    crate::waits::mark_jit_thread();
     if let Some(start) = THREAD_START.get() { start(); }
     loop {
         let task = {

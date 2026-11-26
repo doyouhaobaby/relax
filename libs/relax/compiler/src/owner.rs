@@ -1038,7 +1038,8 @@ pub fn start() {
                 let _z = crate::zone_alloc::compiler_thread();
                 IS_OWNER.with(|o| o.set(true));
                 OWNER_TID.store(me(), Ordering::SeqCst);
-                crate::waits::register();
+                // (one of the JIT's own threads: it claims its row of the wait registry marked so)
+                crate::waits::mark_jit_thread();
                 let _ = OWNER_THREAD.set(std::thread::current());
                 crate::jit::ensure_altstack();
                 // the UI thread waits on this thread for every lazy compile: it runs in the UI's

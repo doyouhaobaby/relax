@@ -263,7 +263,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), whether the live watcher is on a save (editing: 1 from the change it saw to its verdict) and the patch groups that run while their check has not reported (unverified), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
-    ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings, who holds and waits for the tokens"),
+    ("cpu", "", "one block per pool and the boundary between them: the app pool's CPU budget (running and queued jobs per class, waits and checkpoint warnings, who holds and waits for the tokens), the JIT pool (drains, section workers, jobs running and queued per class, its threads asleep on its own work, settled), and the boundary (waits for an app token on JIT threads, 0 by design; the program's threads asleep on the JIT)"),
     ("jit", "[ms=250] | spent [n=20]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty; spent: the CPU the compile jobs took so far by tier, and the slots whose O2 and O3 jobs took the most"),
     ("jit queue", "[n=10]","running JIT jobs, then the unified queue in admission order: class, heat, UI path, wait, function"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
@@ -1330,10 +1330,12 @@ fn lifeline_fields(r: &crate::lifeline::Row) -> String {
     f
 }
 
-/// The budget's report, and who has its tokens (and what those threads wait for).
+/// One block per pool: the app's (the budget's report, who has its tokens and what those threads
+/// wait for), the JIT's; then the boundary between them.
 fn cmd_cpu(out: &mut Out) {
-    for line in makepad_cpu_budget::report_string().lines() {
-        out.line(line);
+    const POOL: &str = "           ";
+    for (i, line) in makepad_cpu_budget::report_string().lines().enumerate() {
+        out.line(&format!("{}{line}", if i == 0 { "app pool   " } else { POOL }));
     }
     let mut list = threads::list();
     name_handles(&mut list);
@@ -1342,11 +1344,14 @@ fn cmd_cpu(out: &mut Out) {
     const CLIENTS: [&str; 3] = ["app", "jit", "hal"];
     for h in &tokens.holders {
         let wait = crate::waits::of(h.thread).map(|w| format!(" -- waits: {}", wait_text(&w, &list))).unwrap_or_default();
-        out.line(&format!("{} {} {} {:?} on {} for {:.1} s{}", if h.lent { "lent" } else if h.above { "above" } else { "token" }, CLASSES[h.class as usize], CLIENTS[h.client as usize], h.label, thread_label(h.thread, &list), h.held_ns as f64 / 1e9, wait));
+        out.line(&format!("{POOL}{} {} {} {:?} on {} for {:.1} s{}", if h.lent { "lent" } else if h.above { "above" } else { "token" }, CLASSES[h.class as usize], CLIENTS[h.client as usize], h.label, thread_label(h.thread, &list), h.held_ns as f64 / 1e9, wait));
     }
     for w in &tokens.waiting {
-        out.line(&format!("wanted {} {} by {}", CLASSES[w.class as usize], CLIENTS[w.client as usize], thread_label(w.thread, &list)));
+        out.line(&format!("{POOL}wanted {} {} by {}", CLASSES[w.class as usize], CLIENTS[w.client as usize], thread_label(w.thread, &list)));
     }
+    let waits = crate::waits::snapshot();
+    out.line(&format!("jit pool   {}  {} asleep on other JIT work", crate::jit::queue_pool_line(), hang::jit_asleep(&waits)));
+    out.line(&format!("boundary   {}", hang::boundary_line(crate::waits::jit_token_waits(), &waits, crate::clock::wall_ns())));
 }
 
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
