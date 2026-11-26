@@ -5207,6 +5207,16 @@ impl Cache {
             if self.verbose { eprintln!("relax cache: startup manifest waits for the stores a spill wrote since this write began"); }
             return false;
         }
+        // an exit whose image could not replace the loaded one makes neither the keys nor the
+        // image: it leaves what the guard after the build leaves (a test binary's children: 556 of
+        // a suite's 571 exits built an image of the slots they keyed and dropped it, a median
+        // 135 ms each)
+        if let Some(k) = self.exit_image_bound() {
+            if self.verbose { eprintln!("relax cache: startup manifest kept: at exit an image could cover at most the {} slots this run keyed of the {} the loaded one has", k, self.image_slots); }
+            self.manifest_done = true; self.manifest_len = order.len();
+            self.discard_image_resume();
+            return true;
+        }
         crate::run::yield_section("manifest keys");
         let mut list: Vec<(Vec<u8>, u128)> = Vec::with_capacity(order.len());
         let mut before_present = 0;
@@ -5406,6 +5416,23 @@ impl Cache {
         self.image_rewrite = false;
         self.discard_image_resume();
         true
+    }
+
+    /// At exit: how many slots this run keyed, when that is under the 98% of the loaded image's
+    /// slots an exit's image must cover (record_manifest's guard after build_image), so no image
+    /// record_manifest builds can replace the loaded one. Stopped and outside a record
+    /// (recording_pending), slot_key returns only its memo, and build_image takes only slots
+    /// slot_key names (its first phase, add_called): its image holds at most the memo's keyed
+    /// slots. A build resumed from a try that gave way, and an image kept from one, were made
+    /// mid-run, where a key is not always memoised (key_waits): no bound then (None), nor without
+    /// a loaded image.
+    fn exit_image_bound(&self) -> Option<usize> {
+        if !crate::preempt::is_stopped() || self.recording_pending || self.image_resume.is_some() || self.image_kept.is_some() || self.image_slots == 0 {
+            return None;
+        }
+        // (one pass over the memo: a median 18 us for a test child's ~10,000 keys)
+        let keyed = self.slot_keys.values().filter(|k| k.is_some()).count();
+        (keyed * 50 < self.image_slots * 49).then_some(keyed)
     }
 
     /// The quit's record of the session (on the owner thread): the slots of this run's install
@@ -10672,6 +10699,39 @@ mod data_tests {
             }
         }
         assert!(resumed > 0 && restarted > 0, "both cases ran: {resumed} went on, {restarted} started over");
+        // At exit (the preemption stop) a slot's key is its memo, so the image an exit builds
+        // holds only the slots its run keyed. One that keyed 2 of the 40 slots its loaded image
+        // has makes no keys and no image, and ends as the guard after a build would; an image
+        // kept from a try that gave way mid-run, where a key is not always memoised, is no such
+        // bound: it is written though the exit has no key memoised at all.
+        // (its 40 entries recorded, the keys their records made forgotten: a run that linked them)
+        let mut few = fresh("exit-few");
+        few.slot_keys.clear();
+        few.image_slots = ids.len();
+        for &id in &ids[..2] {
+            assert!(few.slot_key(&u, id).is_some(), "a key made before the exit");
+        }
+        let mut kept = (1..=calls.get()).find_map(|g| {
+            let mut cache = fresh(&format!("exit-kept-{g}"));
+            let checked = Cell::new(0usize);
+            let (done, _) = record(&mut cache, &|| { checked.set(checked.get() + 1); checked.get() == g });
+            (!done && cache.image_kept.as_ref().is_some_and(|k| k.1 as usize == ids.len())).then_some(cache)
+        }).expect("a try that gives way after its build keeps its image of all 40 slots");
+        kept.slot_keys.clear();
+        kept.image_slots = ids.len();
+        // (this test's process is this test alone: isolated_test)
+        crate::preempt::stop_all();
+        let reads = few.image_reads.load(Relaxed);
+        assert!(few.record_manifest(&u, root, &ids, ids.len(), &|| false), "the exit's record ends");
+        assert_eq!(few.image_reads.load(Relaxed), reads, "an exit that keyed 2 of the loaded image's 40 slots builds no image");
+        assert!(few.manifest_done && few.manifest_len == ids.len(), "it is done with the manifest, as the guard leaves it");
+        assert!(few.image_kept.is_none() && few.image_resume.is_none(), "it keeps no image and no resume, as the guard leaves them");
+        assert!(few.pending_manifest_payload(root).is_none(), "the loaded manifest stays");
+        assert!(kept.record_manifest(&u, root, &ids, ids.len(), &|| false), "the exit's record with a kept image ends");
+        assert!(kept.image_kept.is_none(), "the kept image was taken");
+        assert!(kept.pending_manifest_payload(root).is_some(), "the kept image of 40 slots is written though the exit keyed none");
+        drop(kept);
+        drop(few);
         drop(replaced_ref);
         drop(repeat);
         drop(reference);
