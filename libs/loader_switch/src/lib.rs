@@ -401,13 +401,15 @@ pub fn prepare_version(prepare: &Prepare, name: &str) -> io::Result<PathBuf> {
 }
 
 /// Sweep only when both locks are held. A preparer may be about to try the switch lock.
-pub fn prune(lock: &Lock, running: Option<&Path>) -> io::Result<()> {
+/// Return `false` only when `prepare.lock` is busy and the sweep must wait for a later start.
+/// Return `true` even when a pending switch or an older running loader keeps the folders in place.
+pub fn prune(lock: &Lock, running: Option<&Path>) -> io::Result<bool> {
     let root = lock.root();
-    let Some(_prepare) = Prepare::try_hold(root)? else { return Ok(()) };
-    if root.join("pending").try_exists()? { return Ok(()); }
+    let Some(_prepare) = Prepare::try_hold(root)? else { return Ok(false) };
+    if root.join("pending").try_exists()? { return Ok(true); }
     let selected = active(root);
     // A directly started older loader can still be using its folder.
-    if running.is_some_and(|dir| dir != selected.dir) { return Ok(()); }
+    if running.is_some_and(|dir| dir != selected.dir) { return Ok(true); }
     let previous = pointer(root, "previous");
     let targets = checked_target_root(root)?;
     // Sweep each root so an interruption between the two deletions leaves nothing stranded.
@@ -423,7 +425,7 @@ pub fn prune(lock: &Lock, running: Option<&Path>) -> io::Result<()> {
             fs::remove_dir_all(checked_dir(parent, name)?)?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

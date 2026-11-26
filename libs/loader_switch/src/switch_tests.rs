@@ -355,10 +355,14 @@ fn prune_keeps_active_and_previous_and_never_prunes_pending() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(targets.join(A), t.root.join(C).join("target")).unwrap();
     fs::create_dir(t.root.join(".unpack")).unwrap(); fs::create_dir(t.root.join("unrelated")).unwrap();
-    atomic_write(&t.root.join("current"), A).unwrap(); begin_switch(&lock, B, "record b\n").unwrap(); prune(&lock, None).unwrap();
+    atomic_write(&t.root.join("current"), A).unwrap(); begin_switch(&lock, B, "record b\n").unwrap();
+    assert!(prune(&lock, None).unwrap(), "a pending switch retains its folders with both locks available");
     for name in ["src", A, B, C, ".unpack"] { assert!(t.root.join(name).exists()); }
     for name in ["src", A, B, C, D] { assert!(targets.join(name).is_dir(), "pending keeps target {name}"); }
-    confirm_boot(&lock).unwrap(); prune(&lock, None).unwrap();
+    confirm_boot(&lock).unwrap();
+    assert!(prune(&lock, Some(&t.root.join(C))).unwrap(), "an older running loader retains its folders with both locks available");
+    assert!(t.root.join(C).is_dir(), "the running loader survives");
+    assert!(prune(&lock, None).unwrap(), "the sweep runs after confirmation");
     for name in [A, B, "unrelated"] { assert!(t.root.join(name).exists()); }
     for name in ["src", C, ".unpack"] { assert!(!t.root.join(name).exists()); }
     for name in [A, B] { assert!(targets.join(name).join(HOST_BINARY).is_file(), "kept loader {name} survives"); }
@@ -406,19 +410,58 @@ fn another_runner_cannot_prune_a_build_or_offer_until_its_owner_exits() {
             }
             assert!(Prepare::try_hold(&t.root).unwrap().is_none(), "the child owns prepare.lock");
             let before = files(&t.home);
-            prune(&switch, None).unwrap();
+            assert!(!prune(&switch, None).unwrap(), "a busy prepare lock defers the sweep, offered={offered}");
             assert_eq!(files(&t.home), before, "prune must skip the whole sweep, offered={offered}");
         }
         if end == "kill" { child.kill().unwrap(); } else { drop(child.stdin.take()); }
         let status = child.wait().unwrap();
         if end == "exit" { assert!(status.success()); }
         free_after_exit(&format!("the preparer's {end}"), || Prepare::try_hold(&t.root).unwrap().is_some());
-        prune(&switch, None).unwrap();
+        assert!(prune(&switch, None).unwrap(), "the sweep runs after {end}");
         assert!(!source.exists() && !target.exists(), "the abandoned loader can be pruned after {end}");
         assert!(!t.root.join(C).exists(), "the sweep resumes after {end}");
         assert!(t.root.join(PREPARE_LOCK).is_file(), "the lock file survives a sweep");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn an_inherited_lock_file_defers_the_sweep_until_the_child_exits() {
+    let _alone = super::tests::alone();
+    use super::tests::free_after_exit;
+    use std::process::{Child, Command, Stdio};
+
+    fn inherit(lock: Lock) -> Child {
+        let file = lock._file.as_ref().unwrap().try_clone().unwrap();
+        let child = Command::new("/bin/sh").args(["-c", "read line"])
+            .stdin(Stdio::piped()).stderr(Stdio::from(file)).spawn().unwrap();
+        drop(lock); // Only the child's stderr keeps the lock held.
+        child
+    }
+    fn finish(mut child: Child) {
+        writeln!(child.stdin.as_mut().unwrap()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    let t = Temp::new();
+    let stale = t.built(A);
+    let child = inherit(Lock::acquire(&t.root).unwrap());
+    assert!(Lock::try_hold(&t.root).unwrap().is_none(), "the child's copy still holds switch.lock");
+    finish(child);
+    free_after_exit("the child with switch.lock", || Lock::try_hold(&t.root).unwrap().is_some());
+
+    let switch = Lock::acquire(&t.root).unwrap();
+    let child = inherit(Prepare::try_hold(&t.root).unwrap().unwrap().0);
+    assert!(Prepare::try_hold(&t.root).unwrap().is_none(), "the child's copy still holds prepare.lock");
+    let before = files(&t.home);
+    assert!(!prune(&switch, None).unwrap(), "the inherited prepare lock defers the sweep");
+    assert_eq!(files(&t.home), before, "the deferred sweep leaves every file in place");
+    finish(child);
+    free_after_exit("the child with prepare.lock", || Prepare::try_hold(&t.root).unwrap().is_some());
+    assert!(prune(&switch, None).unwrap(), "the sweep can run after the child exits");
+    assert!(!stale.dir.exists(), "the resumed sweep removes the obsolete loader");
+}
+
 #[cfg(unix)]
 #[test]
 fn cleanup_does_not_follow_symlinks() {
@@ -426,11 +469,11 @@ fn cleanup_does_not_follow_symlinks() {
     let t = Temp::new(); let lock = Lock::acquire(&t.root).unwrap(); let outside = Temp::new(); t.built("src");
     let prepare = |name| prepare_version(&Prepare::try_hold(&t.root).unwrap().unwrap(), name);
     std::os::unix::fs::symlink(&outside.root, t.root.join(A)).unwrap();
-    assert!(prepare(A).is_err()); prune(&lock, None).unwrap(); assert!(outside.root.exists()); assert!(t.root.join(A).is_symlink());
+    assert!(prepare(A).is_err()); assert!(prune(&lock, None).unwrap()); assert!(outside.root.exists()); assert!(t.root.join(A).is_symlink());
     let targets = t.home.join("target/loader");
     fs::create_dir_all(&targets).unwrap();
     std::os::unix::fs::symlink(&outside.root, targets.join(B)).unwrap();
-    assert!(prepare(B).is_err()); prune(&lock, None).unwrap(); assert!(targets.join(B).is_symlink());
+    assert!(prepare(B).is_err()); assert!(prune(&lock, None).unwrap()); assert!(targets.join(B).is_symlink());
     fs::rename(&targets, t.home.join("saved-targets")).unwrap();
     std::os::unix::fs::symlink(&outside.root, &targets).unwrap();
     outside.built(C);
