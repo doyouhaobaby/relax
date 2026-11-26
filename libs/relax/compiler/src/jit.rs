@@ -37021,16 +37021,49 @@ fn want_body_consts(u: &Unit, body: &Body) {
     want_missing_body_consts(u, body);
 }
 
-/// Notes all missing free constants; true means lowering would need the owner.
+/// Notes all missing constants the body names, free and associated; true means lowering would need
+/// the owner. A path's key is the one its lowering asks const_addr_shared for (lower_def_value, a
+/// constant pattern): the path's recorded generic arguments, without regions. One whose arguments
+/// need normalizing (or name a parameter) is left to the lowering. Associated constants were all
+/// left to it, one front and drain each: a body matching on a type's constants (a script VM's
+/// dispatch on `Opcode::ADD`, ...) named more than a front's WANT_ROUNDS, never got its front
+/// off the owner (needs unit), and its hot caller's O3 build left it out until the owner built it.
 fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
+    use crate::types::TypeFlags;
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-    let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
+    let mut seen: crate::fxhash::HashSet<(DefId, Vec<TyId>)> = Default::default();
     let mut missing = false;
-    for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
+    let mut note = |d: DefId, args: Vec<TyId>| {
+        if u.front.consts.get(&(d, args.clone())).is_none() && seen.insert((d, args.clone())) {
+            want(Wanted::Const(d, args), epoch);
+            missing = true;
+        }
+    };
+    // (a path's recorded arguments as its lowering's key: mono_list, here only where that is erasing
+    // regions)
+    let key_args = |k: u32| -> Option<Vec<TyId>> {
+        let Some(&l) = body.res_args.get(&k) else { return Some(Vec::new()) };
+        let tys = u.tcx.tys.list(l);
+        if tys.iter().any(|&t| u.tcx.tys.flags(t).intersects(TypeFlags::HAS_PARAM | TypeFlags::HAS_ALIAS | TypeFlags::HAS_INFER)) {
+            return None;
+        }
+        Some(tys.iter().map(|&t| u.tcx.tys.erase_regions(t)).collect())
+    };
+    let constant = |d: DefId| matches!(u.prog.def(d).kind, DefKind::Const | DefKind::AssocConst);
+    let paths = body.res.as_slice().iter().map(|&(k, r)| (k, r)).chain(body.pat_res.as_slice().iter().map(|&(k, r)| (k | crate::typeck::PAT_KEY, r)));
+    for (k, r) in paths {
         if let Res::Def(d) = r {
-            if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
-                want(Wanted::Const(*d, Vec::new()), epoch);
-                missing = true;
+            if constant(d) {
+                if let Some(args) = key_args(k) {
+                    note(d, args);
+                }
+            }
+        }
+    }
+    for r in body.fmt_named.values() {
+        if let Res::Def(d) = r {
+            if u.prog.def(*d).kind == DefKind::Const {
+                note(*d, Vec::new());
             }
         }
     }

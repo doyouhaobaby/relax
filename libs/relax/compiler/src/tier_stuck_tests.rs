@@ -1206,6 +1206,79 @@ fn a_left_out_build_is_built_again_once_per_thing_it_waited_on() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+const ASSOC_SOURCE: &str = r#"
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Op(pub u8);
+impl Op {
+    pub const A: Op = Op(1);
+    pub const B: Op = Op(2);
+    pub const C: Op = Op(3);
+    pub const D: Op = Op(4);
+    pub const E: Op = Op(5);
+    pub const F: Op = Op(6);
+    pub const G: Op = Op(7);
+    pub const H: Op = Op(8);
+    pub const I: Op = Op(9);
+    pub const J: Op = Op(10);
+    pub const K: Op = Op(11);
+    pub const L: Op = Op(12);
+    pub const M: Op = Op(13);
+    pub const N: Op = Op(14);
+    pub const O: Op = Op(15);
+    pub const P: Op = Op(16);
+}
+pub fn pick(x: u8) -> Op {
+    match x { 0 => Op::A, 1 => Op::B, 2 => Op::C, 3 => Op::D, 4 => Op::E, 5 => Op::F, 6 => Op::G, 7 => Op::H, 8 => Op::I, 9 => Op::J, 10 => Op::K, 11 => Op::L, 12 => Op::M, 13 => Op::N, 14 => Op::O, _ => Op::P }
+}
+pub fn code(o: Op) -> u8 {
+    match o { Op::A => 1, Op::B => 2, Op::C => 3, Op::D => 4, Op::E => 5, Op::F => 6, Op::G => 7, Op::H => 8, Op::I => 9, Op::J => 10, Op::K => 11, Op::L => 12, Op::M => 13, Op::N => 14, Op::O => 15, _ => 0 }
+}
+fn main() {
+    let _ = code(pick(1));
+}
+"#;
+
+/// A front off the owner notes every associated constant its body names at once, as it notes free
+/// ones, in expressions and in patterns. The lowering stops at the first constant nobody evaluated
+/// yet, and a front makes WANT_ROUNDS lowerings around the owner's drain: a body naming more
+/// associated constants than that never got its front off the owner ("needs unit"), and its hot
+/// caller's O3 build left it out until the owner built it (a script VM's opcode dispatch on its
+/// `Opcode::*` constants, its parser's step and operator table, a shader compiler's opcode: the
+/// most common left-out of the test runs of 11-22..11-26).
+#[test]
+fn a_front_naming_many_associated_constants_is_made_off_the_owner() {
+    isolated_test!(a_front_naming_many_associated_constants_is_made_off_the_owner);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-assoc-consts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, ASSOC_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "assoc_consts", false).unwrap();
+    let def = |prog: &Program, n: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == n).then_some(id)
+    }).unwrap();
+    let (pick_d, code_d) = (def(&prog, "pick"), def(&prog, "code"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    let (pick, code) = crate::owner::call(crate::owner::Class::Program, || (u.fn_id(FnKey::Inst(pick_d, Vec::new())), u.fn_id(FnKey::Inst(code_d, Vec::new()))));
+    let front = crate::owner::call(crate::owner::Class::Program, || u.front.clone());
+    assert!(prefront_slot(&front, pick), "the front of a body that returns 16 associated constants was not made off the owner");
+    assert!(prefront_slot(&front, code), "the front of a body that matches on 15 associated constants was not made off the owner");
+    let taken = crate::owner::call(crate::owner::Class::Program, || unsafe { (take_lowered_ahead(&mut *up, pick).is_some(), take_lowered_ahead(&mut *up, code).is_some()) });
+    assert_eq!(taken, (true, true), "a front made off the owner was refused at its take (pick, code)");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const TWIN_SOURCE: &str = r#"
 pub struct S { a: Vec<u32> }
 pub fn inner(s: &mut S, t: &S) -> u32 {
