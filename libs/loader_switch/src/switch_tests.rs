@@ -45,8 +45,8 @@ fn switch_confirmation_and_idempotence() {
     fs::write(&backup, "stray backup").unwrap();
     begin_switch(&lock, A, "record a\n").unwrap(); assert_eq!(active(&t.root).name, A); assert_eq!(pointer(&t.root, "previous").as_deref(), Some("src"));
     assert!(!backup.exists());
-    assert!(confirms_own_boot(&t.root, &t.root.join(A)));
-    assert!(!confirms_own_boot(&t.root, &t.root.join("src")));
+    assert!(is_trial(&t.root, &t.root.join(A), None), "the loader trial needs no token");
+    assert!(!is_trial(&t.root, &t.root.join("src"), None), "a start on the old loader is not the trial");
     assert_eq!(fs::read_to_string(t.root.join(A).join("runner.launch")).unwrap(), "record a\n", "the new folder holds its pin");
     assert!(pending_is(&t.root, &t.root.join(A))); assert!(begin_switch(&lock, A, "refused\n").is_err());
     assert_eq!(fs::read_to_string(t.root.join(A).join("runner.launch")).unwrap(), "record a\n", "a refused switch leaves the pin");
@@ -63,7 +63,10 @@ fn switch_confirmation_and_idempotence() {
     }
     assert_eq!(fs::read_to_string(&backup).unwrap(), "record a\n");
     assert_eq!(fs::read_to_string(&record).unwrap(), "record b\n");
-    assert!(!confirms_own_boot(&t.root, &t.root.join(A)), "only the watcher confirms a code switch");
+    assert!(!is_trial(&t.root, &t.root.join(A), None), "sharing the code trial's folder does not identify it");
+    let before = files(&t.home);
+    assert!(!confirm_trial(&lock, &t.root.join("src")).unwrap(), "another folder cannot confirm this trial");
+    assert_eq!(files(&t.home), before, "a confirmation for the wrong folder leaves every file alone");
     // A backup that cannot be removed must leave pending in place for recovery.
     fs::remove_file(&backup).unwrap();
     fs::create_dir(&backup).unwrap();
@@ -72,9 +75,39 @@ fn switch_confirmation_and_idempotence() {
     assert!(pending_is(&t.root, &t.root.join(A)));
     fs::remove_dir_all(&backup).unwrap();
     fs::write(&backup, "record a\n").unwrap();
-    confirm_boot(&lock).unwrap(); confirm_boot(&lock).unwrap();
+    assert!(confirm_trial(&lock, &t.root.join(A)).unwrap(), "the pending trial confirms under its lock");
     assert!(!backup.exists() && !t.root.join("pending").exists());
+    assert!(!t.root.join("rolled-back").exists(), "a confirmed trial leaves no rollback note");
+    let before = files(&t.home);
+    assert!(!confirm_trial(&lock, &t.root.join(A)).unwrap(), "a finished trial cannot confirm again");
+    assert_eq!(files(&t.home), before, "a late confirmation leaves every file alone");
+    confirm_boot(&lock).unwrap(); confirm_boot(&lock).unwrap();
     assert_eq!(fs::read_to_string(record).unwrap(), "record b\n");
+}
+
+#[test]
+fn trial_identity_depends_on_the_pending_folder_and_its_token() {
+    let t = Temp::new();
+    let lock = Lock::acquire(&t.root).unwrap();
+    let dir = t.built(A).dir;
+    let token = write_trial(&lock).unwrap();
+    let file = t.root.join(TRIAL_FILE);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token, "publish the token given to the trial");
+    for has_file in [true, false] {
+        if has_file { fs::write(&file, format!("{token}\n")).unwrap(); } else { fs::remove_file(&file).unwrap(); }
+        for previous in [A, B] {
+            fs::write(t.root.join("previous"), previous).unwrap();
+            for pending in [Some(A), Some(B), None] {
+                let path = t.root.join("pending");
+                if let Some(name) = pending { fs::write(path, name).unwrap(); } else { fs::remove_file(path).unwrap(); }
+                for marker in [Some(token.as_str()), Some("stale"), None] {
+                    let expected = pending == Some(A) && (previous != A || (has_file && marker == Some(token.as_str())));
+                    assert_eq!(is_trial(&t.root, &dir, marker), expected,
+                        "pending={pending:?}, previous={previous}, marker={marker:?}, trial file={has_file}");
+                }
+            }
+        }
+    }
 }
 #[test]
 fn crash_states_roll_back_to_previous_and_twice_is_a_noop() {
@@ -201,6 +234,13 @@ fn every_write_prefix_settles_without_changing_loaders() {
                         (!pending || (code_only && !trial.dir.join("runner.launch.previous").exists()));
                     let expected = if kept_trial { &trial } else { &old };
                     assert_eq!(&selected, expected, "{case}");
+                    let start_record = read_record_for_start(root, &selected.dir, false).unwrap();
+                    if code_only {
+                        let own_record = fs::read_to_string(trial.dir.join("runner.launch")).unwrap();
+                        assert_eq!(read_record_for_start(root, &trial.dir, true).unwrap(), own_record, "trial reads its own record: {case}");
+                        assert_eq!(start_record == "trial record", op == Operation::Confirm && cut >= 1,
+                            "another start sees trial code only after confirm's first write: {case}");
+                    }
                     let settled = settle(root).unwrap();
                     assert_eq!(settled, if pending { Settlement::RolledBack } else { Settlement::Idle }, "{case}");
                     assert_eq!(active(root), selected, "starter and recovered loader: {case}");
@@ -209,6 +249,7 @@ fn every_write_prefix_settles_without_changing_loaders() {
                         assert!(!trial.dir.join("runner.launch.previous").exists(), "settled trial backup: {case}");
                     }
                     let record = fs::read_to_string(selected.dir.join("runner.launch")).unwrap();
+                    assert_eq!(start_record, record, "the reader chose the same record as recovery: {case}");
                     assert_eq!(record, if kept_trial { "trial record" } else { "confirmed record" }, "{case}");
                     assert_eq!(root.join("rolled-back").exists(), !kept_trial && (pending || op == Operation::Rollback), "rollback note: {case}");
                     let settled_files = files(&t.home);
@@ -239,7 +280,8 @@ fn live_watcher_owns_settlement_and_confirmation() {
         let before = files(&t.home);
         assert!(matches!(Lock::try_acquire(&t.root).unwrap(), TryLock::Busy));
         assert_eq!(settle(&t.root).unwrap(), Settlement::Live);
-        confirm_own_boot(&t.root, &trial.dir).unwrap();
+        assert!(Lock::try_hold(&t.root).unwrap().is_none(), "the trial cannot confirm while its watcher holds the lock");
+        assert_eq!(read_record_for_start(&t.root, &trial.dir, true).unwrap(), "trial record", "the trial reads its own record while waiting");
         assert_eq!(files(&t.home), before, "a second start and its first frame leave the live trial alone");
         drop(watcher);
         assert_eq!(settle(&t.root).unwrap(), Settlement::RolledBack);

@@ -430,7 +430,7 @@ pub fn run_with_args(args: Vec<Vec<u8>>) {
 
 /// Settle before launch::resolve reads a Runner record. Windows shortcuts name their home
 /// on the app command line; all other starts use the usual loader home.
-fn settle_installation(words: &[String]) {
+fn settle_installation(words: &[String], exe: Option<&std::path::Path>) -> launch::RunnerStart {
     let home = match words {
         [app, flag, dir, _, ..] if app == "app" && flag == "--home" && !dir.is_empty() => PathBuf::from(dir),
         _ => fetch::home(),
@@ -439,7 +439,11 @@ fn settle_installation(words: &[String]) {
     if words.first().is_some_and(|cmd| cmd == "recover") {
         std::process::exit(makepad_loader_switch::recover_command(&root, &words[1..]));
     }
-    if let Err(e) = makepad_loader_switch::settle(&root) { eprintln!("makepad: loader switch recovery: {e}"); }
+    let start = launch::RunnerStart::for_loader(&home, exe);
+    if !start.trial {
+        if let Err(e) = makepad_loader_switch::settle(&root) { eprintln!("makepad: loader switch recovery: {e}"); }
+    }
+    start
 }
 
 fn run(raw_args: Vec<Vec<u8>>, installation_start: bool) {
@@ -466,13 +470,13 @@ fn run(raw_args: Vec<Vec<u8>>, installation_start: bool) {
     // a git URL or a --workspace-dir elsewhere name their own, before a record's environment
     // applies. An export of a git URL keeps RELAX_EDITS: the edits folder its invoker gave it.
     let words: Vec<String> = raw_args.iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    if installation_start { settle_installation(&words); }
+    let start = installation_start.then(|| settle_installation(&words, relax_compiler::dirs::loader_exe().ok().as_deref()));
     for n in fetch::dropped_mount_names(&words, &std::env::var("RELAX_VFS").unwrap_or_default()) {
         std::env::remove_var(std::str::from_utf8(n).unwrap());
     }
     // `makepad app <id>` and `makepad` alone: the launch record's command line (launch.rs), with
     // its folder and environment applied before anything reads them
-    let raw_args = match launch::resolve(&raw_args, host().default_launch) {
+    let raw_args = match launch::resolve_for_start(&raw_args, host().default_launch, start) {
         None => raw_args,
         Some(Ok(words)) => {
             relax_compiler::os::proc::set_args(words.clone());

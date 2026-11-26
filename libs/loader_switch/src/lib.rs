@@ -1,8 +1,8 @@
 //! An installation's loader folders (`<home>/cache/loader`) and the switch between them.
 //!
 //! A switch's watcher (the Runner that tries an update) holds [`LOCK_FILE`] from before the switch
-//! begins until it confirms or rolls back. The OS drops the lock when the holder ends, however it
-//! ends, so a free lock with a pending switch means nobody is trying it any more.
+//! begins until it confirms or rolls back. If the watcher dies, a presented trial can take the
+//! lock and confirm. Another start that takes the lock first recovers the pending switch.
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -233,16 +233,49 @@ fn has_backup(dir: &Path) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
-pub fn confirms_own_boot(root: &Path, dir: &Path) -> bool {
-    pending_is(root, dir) && !pointer(root, "previous").is_some_and(|name| root.join(name) == dir)
-        && matches!(has_backup(dir), Ok(false))
+
+pub const TRIAL_ENV: &str = "MAKEPAD_RUNNER_TRIAL";
+pub const TRIAL_FILE: &str = "trial";
+
+/// Publish the token for the next trial before beginning its switch.
+pub fn write_trial(lock: &Lock) -> io::Result<String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(io::Error::other)?;
+    let token = format!("{}-{}", std::process::id(), now.as_nanos());
+    atomic_write(&lock.root().join(TRIAL_FILE), &token)?;
+    Ok(token)
 }
-/// A first frame can confirm its own JIT trial after its watcher has gone away.
-pub fn confirm_own_boot(root: &Path, dir: &Path) -> io::Result<()> {
-    if let Some(lock) = Lock::try_hold(root)? {
-        if confirms_own_boot(root, dir) { confirm_boot(&lock)?; }
+
+/// A loader trial has its own folder. A code trial shares the confirmed folder and needs its token.
+pub fn is_trial(root: &Path, dir: &Path, token: Option<&str>) -> bool {
+    pending_is(root, dir) && (
+        !pointer(root, "previous").is_some_and(|name| root.join(name) == dir)
+        || token.is_some_and(|token| fs::read_to_string(root.join(TRIAL_FILE)).is_ok_and(|value| token == value.trim()))
+    )
+}
+
+/// Read the confirmed record for other starts while the trial reads its own. Recheck the
+/// choice after the read because begin, confirm or rollback can change it without a reader lock.
+pub fn read_record_for_start(root: &Path, dir: &Path, trial: bool) -> io::Result<String> {
+    let record = dir.join("runner.launch");
+    let backup = dir.join("runner.launch.previous");
+    let choice = || -> io::Result<&Path> {
+        if !trial && pending_is(root, dir) && has_backup(dir)? { Ok(&backup) } else { Ok(&record) }
+    };
+    loop {
+        let path = choice()?;
+        let text = match fs::read_to_string(path) {
+            Err(e) if path == backup && e.kind() == io::ErrorKind::NotFound => continue,
+            result => result?,
+        };
+        if choice()? == path { return Ok(text); }
     }
-    Ok(())
+}
+
+/// Called after the trial has presented and acquired the switch lock from its watcher.
+pub fn confirm_trial(lock: &Lock, dir: &Path) -> io::Result<bool> {
+    if !pending_is(lock.root(), dir) { return Ok(false); }
+    confirm_boot(lock)?;
+    Ok(true)
 }
 
 pub fn rollback(lock: &Lock, reason: &str) -> io::Result<Active> {
@@ -450,7 +483,14 @@ mod tests {
                 out.flush().unwrap();
                 wait_stdin();
             }
-            "wait" => { let _lock = Lock::acquire(root).unwrap(); writeln!(out, "role: acquired").unwrap(); }
+            "wait" => {
+                writeln!(out, "role: {}", state(root)).unwrap();
+                out.flush().unwrap();
+                let _lock = Lock::acquire(root).unwrap();
+                writeln!(out, "role: acquired").unwrap();
+                out.flush().unwrap();
+                wait_stdin();
+            }
             "idle" => { writeln!(out, "role: idle").unwrap(); out.flush().unwrap(); wait_stdin(); }
             "probe" => writeln!(out, "role: {}", state(root)).unwrap(),
             other => panic!("unknown role {other}"),
@@ -464,6 +504,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the lock stayed held after {what} ended");
+    }
+
+    fn waiter_takes_released_lock(root: &Path, release: impl FnOnce()) {
+        let (mut waiter, mut lines) = spawn(root, "wait");
+        assert_eq!(answer(&mut lines, "waiter"), "busy", "the waiter must encounter the holder");
+        release();
+        assert_eq!(answer(&mut lines, "waiter"), "acquired", "a blocking take must finish after release");
+        assert_eq!(state(root), "busy", "the waiter must own the lock");
+        drop(waiter.stdin.take());
+        assert!(waiter.wait().unwrap().success());
     }
 
     /// The watcher's liveness, as the loader reads it: a lock another process holds is busy, it is
@@ -498,19 +548,21 @@ mod tests {
             let (mut holder, mut lines) = spawn(&root, "hold");
             assert_eq!(answer(&mut lines, "holder"), "held");
             assert_eq!(state(&root), "busy", "a lock another process holds must be busy here");
-            if end == "kill" { holder.kill().unwrap(); } else { drop(holder.stdin.take()); }
-            let _ = holder.wait().unwrap();
+            if end == "kill" {
+                waiter_takes_released_lock(&root, || {
+                    holder.kill().unwrap();
+                    assert!(!holder.wait().unwrap().success(), "the holder was killed while the waiter was starting its take");
+                });
+            } else {
+                drop(holder.stdin.take());
+                assert!(holder.wait().unwrap().success());
+            }
             free_after_exit(&format!("its holder's {end}"), || state(&root) == "free");
         }
 
         // A blocking take waits while the lock is held here and returns once it is dropped.
         let here = Lock::acquire(&root).unwrap();
-        let (mut waiter, mut lines) = spawn(&root, "wait");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(waiter.try_wait().unwrap().is_none(), "a blocking take must wait while the lock is held");
-        drop(here);
-        assert_eq!(answer(&mut lines, "waiter"), "acquired");
-        assert!(waiter.wait().unwrap().success());
+        waiter_takes_released_lock(&root, || drop(here));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
