@@ -37,6 +37,7 @@ fn active_selection_and_invalid_names() {
 }
 #[test]
 fn switch_confirmation_and_idempotence() {
+    let _beside = super::tests::beside();
     let t = Temp::new(); let lock = Lock::acquire(&t.root).unwrap(); t.built("src"); t.built(A);
     let record = t.root.join(A).join("runner.launch");
     let backup = t.root.join(A).join("runner.launch.previous");
@@ -87,6 +88,7 @@ fn switch_confirmation_and_idempotence() {
 
 #[test]
 fn trial_identity_depends_on_the_pending_folder_and_its_token() {
+    let _beside = super::tests::beside();
     let t = Temp::new();
     let lock = Lock::acquire(&t.root).unwrap();
     let dir = t.built(A).dir;
@@ -111,6 +113,7 @@ fn trial_identity_depends_on_the_pending_folder_and_its_token() {
 }
 #[test]
 fn crash_states_roll_back_to_previous_and_twice_is_a_noop() {
+    let _beside = super::tests::beside();
     for previous in ["src", A] {
         for current_written in [false, true] {
             let t = Temp::new(); let lock = Lock::acquire(&t.root).unwrap(); t.built("src"); t.built(A); t.built(B);
@@ -190,6 +193,7 @@ enum Operation { Begin, Confirm, Rollback }
 
 #[test]
 fn every_write_prefix_settles_without_changing_loaders() {
+    let _beside = super::tests::beside();
     for previous in ["src", A] {
         for code_only in [false, true] {
             for op in [Operation::Begin, Operation::Confirm, Operation::Rollback] {
@@ -264,6 +268,7 @@ fn every_write_prefix_settles_without_changing_loaders() {
 
 #[test]
 fn live_watcher_owns_settlement_and_confirmation() {
+    let _beside = super::tests::beside();
     for code_only in [false, true] {
         let t = Temp::new();
         let old = t.built("src");
@@ -293,6 +298,7 @@ fn live_watcher_owns_settlement_and_confirmation() {
 
 #[test]
 fn recover_command_waits_for_the_watcher_before_rolling_back() {
+    let _alone = super::tests::alone();
     use super::tests::{answer, spawn};
     use std::{sync::mpsc, thread, time::Duration};
 
@@ -335,6 +341,7 @@ fn recover_command_waits_for_the_watcher_before_rolling_back() {
 
 #[test]
 fn prune_keeps_active_and_previous_and_never_prunes_pending() {
+    let _beside = super::tests::beside();
     let t = Temp::new();
     let lock = Lock::acquire(&t.root).unwrap();
     let targets = t.home.join("target/loader");
@@ -360,6 +367,7 @@ fn prune_keeps_active_and_previous_and_never_prunes_pending() {
 }
 #[test]
 fn retry_removes_only_an_incomplete_valid_version() {
+    let _beside = super::tests::beside();
     let t = Temp::new(); t.built("src"); fs::create_dir(t.root.join(A)).unwrap(); fs::write(t.root.join(A).join("partial"), b"partial").unwrap();
     let targets = t.home.join("target/loader");
     fs::create_dir_all(targets.join(A)).unwrap();
@@ -373,6 +381,7 @@ fn retry_removes_only_an_incomplete_valid_version() {
 
 #[test]
 fn another_runner_cannot_prune_a_build_or_offer_until_its_owner_exits() {
+    let _alone = super::tests::alone();
     use super::tests::{answer, free_after_exit, spawn};
 
     let t = Temp::new();
@@ -413,6 +422,7 @@ fn another_runner_cannot_prune_a_build_or_offer_until_its_owner_exits() {
 #[cfg(unix)]
 #[test]
 fn cleanup_does_not_follow_symlinks() {
+    let _beside = super::tests::beside();
     let t = Temp::new(); let lock = Lock::acquire(&t.root).unwrap(); let outside = Temp::new(); t.built("src");
     let prepare = |name| prepare_version(&Prepare::try_hold(&t.root).unwrap().unwrap(), name);
     std::os::unix::fs::symlink(&outside.root, t.root.join(A)).unwrap();

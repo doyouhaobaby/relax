@@ -435,6 +435,16 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// On Unix a child holds a copy of each file open in this process from its start until its
+    /// exec, and with the file any lock taken through it: a flock lock belongs to the open file,
+    /// not to the process. So while one test starts a child, a lock another test has just released
+    /// can stay busy for a moment. A test that starts children runs `alone()`; a test that takes or
+    /// releases locks runs `beside()` the others.
+    static STARTS: RwLock<()> = RwLock::new(());
+    pub(super) fn alone() -> RwLockWriteGuard<'static, ()> { STARTS.write().unwrap_or_else(|e| e.into_inner()) }
+    pub(super) fn beside() -> RwLockReadGuard<'static, ()> { STARTS.read().unwrap_or_else(|e| e.into_inner()) }
 
     const ROLE: &str = "MAKEPAD_LOADER_SWITCH_TEST_ROLE";
     const ROOT: &str = "MAKEPAD_LOADER_SWITCH_TEST_ROOT";
@@ -447,7 +457,8 @@ mod tests {
             TryLock::Unsupported(e) => panic!("the lock is unsupported here: {e}"),
         }
     }
-    /// This test's own binary again, as one role; its stdout lines come back through `lines`.
+    /// This test's own binary again, as one role; its stdout lines come back through `lines`. Its
+    /// caller runs `alone()`.
     pub(super) fn spawn(root: &Path, role: &str) -> (Child, impl Iterator<Item = String>) {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
@@ -524,6 +535,7 @@ mod tests {
         if let (Ok(role), Some(root)) = (std::env::var(ROLE), std::env::var_os(ROOT)) {
             return play(&role, Path::new(&root));
         }
+        let _alone = alone();
         let root: PathBuf = std::env::temp_dir().join(format!("loader-switch-lock-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
 
