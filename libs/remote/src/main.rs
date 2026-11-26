@@ -14,6 +14,7 @@ fn print_usage() {
     eprintln!("  App:    makepad-remote app <pid|socket|endpoint-file> <command> [k=v ...]   (a running makepad app's endpoint; `help` lists its commands; an app name only at a terminal, or for an app of your own lease)");
     eprintln!("          makepad-remote app <pid> grab [w=ID] [scale=F] out=<file>   (images are written by this client)");
     eprintln!("          makepad-remote app <pid> tools | call <service>.<tool> [instance] [json]   (its AI tools: the `app` service)");
+    eprintln!("          makepad-remote app <endpoint-file> --reconnect call <service>.<tool> [json]   (replay a held call across endpoint restarts)");
     eprintln!("  MCP:    makepad-remote mcp <pid|app-name|host:pid|endpoint-file> [--no-builtins] [--caller-env NAME] [--launch <program> [args...]]   (stdio MCP server)");
     eprintln!("  Server: makepad-remote --server [--port 8384] [--bind lan|<ip>] [--all]");
     eprintln!("                         [--keys <file>] [--identity <dir>] [--audit-log <file>] [--max-run <secs>]");
@@ -47,6 +48,13 @@ fn exit_with(result: std::io::Result<i32>) -> ExitCode {
 /// `makepad-remote app <pid|app|socket> <command> [k=v ...]`: prints the answer's lines; exit
 /// status 1 when the answer had an error, 2 when the app cannot be reached.
 fn run_app(spec: &str, argv: &[String]) -> ExitCode {
+    if let Some(("--reconnect", call)) = argv.split_first().map(|(flag, rest)| (flag.as_str(), rest)) {
+        return match makepad_remote::app::reconnect_call(spec, call, &mut |line| println!("{line}")) {
+            Ok(false) => ExitCode::SUCCESS,
+            Ok(true) => ExitCode::from(1),
+            Err(e) => { eprintln!("makepad-remote app: {e}"); ExitCode::from(1) }
+        }
+    }
     // `<host>:<app|pid>` goes through the hub to an app on another machine (a phone that dials in)
     #[cfg(unix)]
     let routed = (spec.contains(':') && !spec.contains('/')).then(|| {

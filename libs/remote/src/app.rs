@@ -152,6 +152,118 @@ pub fn run_printed(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) 
     run(client, argv, &mut |l| each(&call_image_line(l, || (*dir).clone())))
 }
 
+/// Run a caller-declared replayable tool call. Only the endpoint file is stable across
+/// restarts; never redial a cached socket or retry after receiving a definitive result.
+pub fn reconnect_call(spec: &str, argv: &[String], print: &mut dyn FnMut(&str)) -> Result<bool, Error> {
+    if !discovery::is_endpoint_file(spec) || argv.first().map(String::as_str) != Some("call") {
+        return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "--reconnect requires an endpoint file and a replayable call")))
+    }
+    let caller = discovery::Caller::command_line();
+    replay_call(argv, print, || Client::connect_as(spec, &caller), || std::thread::sleep(std::time::Duration::from_secs(1)))
+}
+
+fn replay_call(argv: &[String], print: &mut dyn FnMut(&str), mut connect: impl FnMut() -> Result<Client, Error>, mut pause: impl FnMut()) -> Result<bool, Error> {
+    loop {
+        let run = connect().and_then(|client| {
+            let mut outcome = None;
+            let failed = run_printed(&client, argv, &mut |line| {
+                if let Ok(value) = json::parse_depth(line.as_bytes(), json::TOOL_JSON_DEPTH) {
+                    if value.get("Progress").is_some() { return true }
+                    if let Some(result) = value.get("Result") {
+                        let result = result.as_arr().and_then(|items| items.first()).unwrap_or(result);
+                        let status = result.get("outcome");
+                        if status.is_some_and(|s| s.get("Unavailable").is_some()) { return false }
+                        outcome = Some(status.is_none_or(|s| s.get("Ok").is_none()));
+                    }
+                }
+                print(line);
+                outcome.get_or_insert(true);
+                false
+            })?;
+            Ok(outcome.or(failed.then_some(true)))
+        });
+        match run {
+            Ok(Some(failed)) => return Ok(failed),
+            Ok(None) | Err(Error::LinkLost(_) | Error::Refused(crate::conn::CLOSE_LINK_LOST, _)) => pause(),
+            Err(why) => return Err(why),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn replay_a_held_call_after_disconnect_and_stop_on_its_result() {
+    use crate::conn::{Open, CLOSE_NORMAL};
+    use crate::endpoint::Endpoint;
+    use std::{os::unix::net::UnixListener, sync::{mpsc, Arc}, time::Duration};
+
+    let root = crate::carrier::unix::test_root().join(format!("replay-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let reference = root.join("endpoint");
+    let serving = |name: &str| {
+        let path = root.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        let ep = Endpoint::new(name);
+        let (tx, rx) = mpsc::channel();
+        ep.register("app", 1, Arc::new(move |conn, open| {
+            tx.send((conn.clone(), open)).unwrap();
+            Ok(())
+        }));
+        let server = std::thread::spawn(move || {
+            let sock = listener.accept().unwrap().0;
+            ep.serve(crate::frame::FrameReader::new(Box::new(sock.try_clone().unwrap())),
+                Box::new(sock.try_clone().unwrap()), Box::new(move || { let _ = sock.shutdown(std::net::Shutdown::Both); })).unwrap()
+        });
+        fs::write(&reference, path.to_str().unwrap()).unwrap();
+        (server, rx)
+    };
+    let (first, opened) = serving("first.sock");
+    let (lost, missing) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let run = |file: PathBuf, pause: &mut dyn FnMut()| {
+        let mut output = Vec::new();
+        let argv = ["call".into(), "sample.wait".into(), "{}".into()];
+        let failed = replay_call(&argv, &mut |s| output.push(s.to_owned()), || {
+            let path = fs::read_to_string(&file).map_err(|e| Error::LinkLost(e.to_string()))?;
+            Client::connect(&path)
+        }, pause).unwrap();
+        (failed, output)
+    };
+    let file = reference.clone();
+    let waiter = std::thread::spawn(move || run(file.clone(), &mut || {
+        // The listener and reference are gone; resume only when their replacement exists.
+        assert!(!file.exists());
+        lost.send(()).unwrap();
+        resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let (conn, request) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(request.args, "call sample.wait\n{}");
+    fs::remove_file(&reference).unwrap();
+    conn.close("server stopped");
+    first.join().unwrap();
+    missing.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (second, opened) = serving("second.sock");
+    resume.send(()).unwrap();
+    let (_, Open { channel, args, .. }) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(args, request.args);
+    let success = r#"{"Result":[{"outcome":{"Ok":[]},"text":"pending line"}]}"#;
+    channel.send(success.as_bytes().to_vec()).unwrap();
+    channel.close(CLOSE_NORMAL, "done");
+    assert_eq!(waiter.join().unwrap(), (false, vec![success.to_owned()]));
+    second.join().unwrap();
+
+    let (last, opened) = serving("last.sock");
+    let file = reference.clone();
+    let refused = std::thread::spawn(move || run(file, &mut || panic!("a definitive refusal was retried")));
+    let (_, request) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    let ended = r#"{"Result":[{"outcome":{"Refused":[]},"text":"ended"}]}"#;
+    request.channel.send(ended.as_bytes().to_vec()).unwrap();
+    request.channel.close(CLOSE_NORMAL, "done");
+    assert_eq!(refused.join().unwrap(), (true, vec![ended.to_owned()]));
+    last.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// [`run_line`] as a command line prints it ([`run_printed`]).
 pub fn run_line_printed(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
     let dir = std::cell::LazyCell::new(|| grab_dir(client));
