@@ -1139,6 +1139,10 @@ pub fn set_ui_thread() -> bool {
     applied
 }
 
+/// Whether the calling thread was marked by [`set_ui_thread`].
+#[relax_api]
+pub fn on_ui_thread() -> bool { UI_THREAD.with(Cell::get) }
+
 /// `true`: the calling thread's OS priority stays at Interactive or above on later requests (a
 /// Background or idle request changes only its logical class). `false`: it may go lower again, as a
 /// thread that goes back to a shared pool must.
