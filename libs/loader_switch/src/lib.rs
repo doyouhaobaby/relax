@@ -1,0 +1,424 @@
+//! An installation's loader folders (`<home>/cache/loader`) and the switch between them.
+//!
+//! A switch's watcher (the Runner that tries an update) holds [`LOCK_FILE`] from before the switch
+//! begins until it confirms or rolls back. The OS drops the lock when the holder ends, however it
+//! ends, so a free lock with a pending switch means nobody is trying it any more.
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+/// The lock file in the loader root. Opened, never written and never deleted: deleting a lock file
+/// splits the lock across two files.
+pub const LOCK_FILE: &str = "switch.lock";
+
+/// The switch lock, held until dropped.
+#[derive(Debug)]
+pub struct Lock {
+    root: PathBuf,
+    _file: Option<File>,
+}
+
+#[derive(Debug)]
+pub enum TryLock {
+    Held(Lock),
+    /// Another process (or handle) holds it.
+    Busy,
+    /// The file system takes no locks; the caller treats it as held, as before there was a lock.
+    Unsupported(io::Error),
+}
+
+fn open(root: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).write(true).truncate(false).open(root.join(LOCK_FILE))
+}
+
+// Some filesystems return these OS codes without std mapping them to Unsupported.
+fn locks_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || (cfg!(target_vendor = "apple") && error.raw_os_error() == Some(45)) // ENOTSUP
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(1 | 50))) // INVALID_FUNCTION, NOT_SUPPORTED
+}
+
+impl Lock {
+    pub fn root(&self) -> &Path { &self.root }
+
+
+    /// Takes the lock if it is free; never waits.
+    pub fn try_acquire(root: &Path) -> io::Result<TryLock> {
+        let file = open(root)?;
+        match file.try_lock() {
+            Ok(()) => Ok(TryLock::Held(Lock { root: root.into(), _file: Some(file) })),
+            Err(TryLockError::WouldBlock) => Ok(TryLock::Busy),
+            Err(TryLockError::Error(e)) if locks_unsupported(&e) => Ok(TryLock::Unsupported(e)),
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+    // On a filesystem without locking, retain the original single-watcher behaviour.
+    fn unsupported(root: &Path, error: io::Error) -> Lock {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            let _ = writeln!(io::stderr(), "makepad: loader switch lock unsupported: {error}");
+        });
+        Lock { root: root.into(), _file: None }
+    }
+
+    /// A switch owner, or None while another watcher holds the lock.
+    pub fn try_hold(root: &Path) -> io::Result<Option<Lock>> {
+        match Self::try_acquire(root)? {
+            TryLock::Held(lock) => Ok(Some(lock)),
+            TryLock::Busy => Ok(None),
+            TryLock::Unsupported(e) => Ok(Some(Self::unsupported(root, e))),
+        }
+    }
+
+    /// Takes the lock, waiting while another holds it.
+    pub fn acquire(root: &Path) -> io::Result<Lock> {
+        let file = open(root)?;
+        match file.lock() {
+            Ok(()) => Ok(Lock { root: root.into(), _file: Some(file) }),
+            Err(e) if locks_unsupported(&e) => Ok(Self::unsupported(root, e)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Active { pub name: String, pub dir: PathBuf, pub binary: PathBuf }
+
+pub fn commit_name(name: &str) -> bool { name.len() == 40 && name.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
+pub fn folder_name(name: &str) -> bool { name == "src" || commit_name(name) }
+pub fn pointer(root: &Path, key: &str) -> Option<String> {
+    fs::read_to_string(root.join(key)).ok().map(|v| v.trim().to_string()).filter(|v| folder_name(v))
+}
+pub const HOST_BINARY: &str = if cfg!(windows) { "host/makepad.exe" } else { "host/makepad" };
+pub fn target_root(root: &Path) -> PathBuf {
+    root.parent().and_then(Path::parent).expect("loader root is under home/cache").join("target/loader")
+}
+pub fn target_dir(root: &Path, name: &str) -> PathBuf {
+    let target = target_root(root).join(name);
+    if target.join(HOST_BINARY).is_file() { target } else { root.join(name).join("target") }
+}
+pub fn named(root: &Path, name: &str) -> Active {
+    let dir = root.join(name);
+    let binary = target_dir(root, name).join(HOST_BINARY);
+    Active { name: name.into(), dir, binary }
+}
+fn select(root: &Path, key: &str) -> Active {
+    if let Some(name) = pointer(root, key) {
+        let selected = named(root, &name);
+        if selected.binary.is_file() { return selected; }
+    }
+    named(root, "src")
+}
+
+pub fn active(root: &Path) -> Active { select(root, "current") }
+
+/// The loader a starter can run straight through recovery. Both kinds of begin publish
+/// previous before pending. While pending exists, it is previous that rollback restores.
+pub fn confirmed(root: &Path) -> Active {
+    if root.join("pending").exists() { select(root, "previous") } else { active(root) }
+}
+
+pub fn atomic_write(path: &Path, text: &str) -> io::Result<()> {
+    let part = path.with_file_name(format!("{}.part", path.file_name().unwrap().to_string_lossy()));
+    let mut file = fs::File::create(&part)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(part, path)?;
+    sync_parent(path)
+}
+
+// Order directory entries as well as file contents across a power failure on Unix.
+fn sync_parent(path: &Path) -> io::Result<()> {
+    if cfg!(unix) { File::open(path.parent().unwrap())?.sync_all()?; }
+    #[cfg(test)]
+    switch_tests::write_completed()?;
+    Ok(())
+}
+fn remove_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }?;
+    sync_parent(path)
+}
+fn invalid(text: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, text) }
+fn check_can_begin(root: &Path) -> io::Result<()> {
+    if root.join("pending").try_exists()? {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "A loader switch is already pending"));
+    }
+    // Another Runner may have queued its update before recovery wrote the note.
+    if root.join("rolled-back").try_exists()? {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Dismiss the previous rollback before starting an update"));
+    }
+    Ok(())
+}
+
+/// `record`: the Runner's pin for the new loader (runner_code), written into its folder after the
+/// checks and before any pointer moves, so a refused switch never touches a folder's pin.
+pub fn begin_switch(lock: &Lock, new_name: &str, record: &str) -> io::Result<()> {
+    let root = lock.root();
+    if !commit_name(new_name) { return Err(invalid("Invalid loader version")); }
+    check_can_begin(root)?;
+    let next = named(root, new_name);
+    checked_dir(root, new_name)?;
+    if !next.binary.is_file() || !next.dir.join(".built").is_file() { return Err(invalid("The new loader has not finished building")); }
+    let old = active(root);
+    if old.name == new_name { return Err(invalid("The new loader is already selected")); }
+    remove_file(&next.dir.join("runner.launch.previous"))?;
+    atomic_write(&next.dir.join("runner.launch"), record)?;
+    atomic_write(&root.join("previous"), &old.name)?;
+    atomic_write(&root.join("pending"), new_name)?;
+    atomic_write(&root.join("current"), new_name)
+}
+pub fn begin_code_switch(lock: &Lock, name: &str, record: &str) -> io::Result<()> {
+    let root = lock.root();
+    check_can_begin(root)?;
+    if !folder_name(name) || active(root).name != name { return Err(invalid("The running loader is no longer selected")); }
+    let dir = checked_dir(root, name)?;
+    let path = dir.join("runner.launch");
+    let old = fs::read_to_string(&path)?;
+    if old == record { return Err(invalid("The Runner already has this launch record")); }
+    atomic_write(&dir.join("runner.launch.previous"), &old)?;
+    atomic_write(&root.join("previous"), name)?;
+    atomic_write(&root.join("pending"), name)?;
+    atomic_write(&path, record)
+}
+
+// Preserve pending on an I/O error. A missing or invalid folder has no backup to recover.
+fn pending_dir(root: &Path) -> io::Result<Option<PathBuf>> {
+    let name = match fs::read_to_string(root.join("pending")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        result => result?,
+    };
+    if !folder_name(name.trim()) { return Ok(None); }
+    match checked_dir(root, name.trim()) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        result => result.map(Some),
+    }
+}
+
+pub fn confirm_boot(lock: &Lock) -> io::Result<()> {
+    let root = lock.root();
+    if let Some(dir) = pending_dir(root)? {
+        remove_file(&dir.join("runner.launch.previous"))?;
+    }
+    remove_file(&root.join("pending"))
+}
+fn pending_is(root: &Path, dir: &Path) -> bool {
+    pointer(root, "pending").is_some_and(|name| root.join(name) == dir)
+}
+fn has_backup(dir: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(dir.join("runner.launch.previous")) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+pub fn confirms_own_boot(root: &Path, dir: &Path) -> bool {
+    pending_is(root, dir) && !pointer(root, "previous").is_some_and(|name| root.join(name) == dir)
+        && matches!(has_backup(dir), Ok(false))
+}
+/// A first frame can confirm its own JIT trial after its watcher has gone away.
+pub fn confirm_own_boot(root: &Path, dir: &Path) -> io::Result<()> {
+    if let Some(lock) = Lock::try_hold(root)? {
+        if confirms_own_boot(root, dir) { confirm_boot(&lock)?; }
+    }
+    Ok(())
+}
+
+pub fn rollback(lock: &Lock, reason: &str) -> io::Result<Active> {
+    let root = lock.root();
+    let target = confirmed(root);
+    if !root.join("pending").try_exists()? { return Ok(target); }
+    let dir = pending_dir(root)?;
+    if target.name == "src" { remove_file(&root.join("current"))?; }
+    else { atomic_write(&root.join("current"), &target.name)?; }
+
+    let restore = match &dir { Some(dir) => has_backup(dir)?, None => false };
+    // No backup in the same folder: confirm already removed it, or rollback already
+    // restored it after writing the note. Finish without changing that record or note.
+    let finished_code_switch = !restore && pointer(root, "previous").is_some_and(|name| dir.as_deref() == Some(root.join(name).as_path()));
+    let note = root.join("rolled-back");
+    if !finished_code_switch && !note.try_exists()? {
+        atomic_write(&note, &reason.replace(['\r', '\n'], " "))?;
+    }
+    if let Some(dir) = dir {
+        let record = dir.join("runner.launch");
+        if restore { fs::rename(dir.join("runner.launch.previous"), &record)?; }
+        // Also sync a previous removal/restore interrupted before its own directory sync.
+        sync_parent(&record)?;
+    }
+    remove_file(&root.join("pending"))?;
+    Ok(target)
+}
+
+pub fn dismiss_rollback(lock: &Lock) -> io::Result<()> {
+    remove_file(&lock.root.join("rolled-back"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settlement { Idle, RolledBack, Live }
+
+/// The common startup path performs only one stat when there is no switch to settle.
+pub fn settle(root: &Path) -> io::Result<Settlement> {
+    if !root.join("pending").try_exists()? { return Ok(Settlement::Idle); }
+    match Lock::try_hold(root)? {
+        Some(lock) => settle_locked(&lock),
+        None => Ok(Settlement::Live),
+    }
+}
+
+/// Re-read pending under the lock; the previous owner may already have confirmed.
+pub fn settle_locked(lock: &Lock) -> io::Result<Settlement> {
+    if !lock.root.join("pending").try_exists()? { return Ok(Settlement::Idle); }
+    rollback(lock, "The update did not confirm its first frame.")?;
+    Ok(Settlement::RolledBack)
+}
+
+/// The installer's `makepad recover [--wait]` command. A waiting installer takes the
+/// lock first, including when the watcher has acquired it but has yet to publish pending.
+pub fn recover_command(root: &Path, args: &[String]) -> i32 {
+    let result = match args {
+        [] => settle(root),
+        [flag] if flag == "--wait" => match Lock::acquire(root) {
+            Ok(lock) => settle_locked(&lock),
+            // A fresh home has no switch and no directory for the lock.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && matches!(root.try_exists(), Ok(false)) => Ok(Settlement::Idle),
+            Err(e) => Err(e),
+        },
+        _ => {
+            let _ = writeln!(io::stderr(), "usage: makepad recover [--wait]");
+            return 2;
+        }
+    };
+    match result {
+        Ok(Settlement::Idle | Settlement::RolledBack) => 0,
+        Ok(Settlement::Live) => 3,
+        Err(e) => { let _ = writeln!(io::stderr(), "makepad recover: {e}"); 1 }
+    }
+}
+
+/// Only direct, real directories in this loader root can be recursively deleted. Symlinks
+/// (including a valid-looking commit symlink) are left alone, never followed.
+pub fn checked_dir(root: &Path, name: &str) -> io::Result<PathBuf> {
+    if !folder_name(name) && name != ".unpack" { return Err(invalid("Invalid loader directory")); }
+    let path = root.join(name);
+    check_real_dir(&path)?;
+    Ok(path)
+}
+pub fn check_real_dir(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.file_type().is_dir() || fs::canonicalize(path)?.parent() != Some(fs::canonicalize(path.parent().unwrap())?.as_path()) {
+        return Err(invalid("Loader directory is not a direct directory inside its root"));
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod switch_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+
+    const ROLE: &str = "MAKEPAD_LOADER_SWITCH_TEST_ROLE";
+    const ROOT: &str = "MAKEPAD_LOADER_SWITCH_TEST_ROOT";
+    const NAME: &str = "tests::the_switch_lock_holds_across_processes";
+
+    fn state(root: &Path) -> &'static str {
+        match Lock::try_acquire(root).unwrap() {
+            TryLock::Held(_) => "free",
+            TryLock::Busy => "busy",
+            TryLock::Unsupported(e) => panic!("the lock is unsupported here: {e}"),
+        }
+    }
+    /// This test's own binary again, as one role; its stdout lines come back through `lines`.
+    pub(super) fn spawn(root: &Path, role: &str) -> (Child, impl Iterator<Item = String>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROLE, role)
+            .env(ROOT, root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines().map(|l| l.unwrap());
+        (child, lines)
+    }
+    pub(super) fn answer(lines: &mut impl Iterator<Item = String>, what: &str) -> String {
+        lines.find_map(|l| l.strip_prefix("role: ").map(str::to_string)).unwrap_or_else(|| panic!("no answer from the {what} child"))
+    }
+    /// The roles a child plays. `hold` takes the lock and keeps it until its stdin closes; `wait`
+    /// takes it blocking and says so; `idle` only waits for its stdin to close (a process started
+    /// while the lock is held, as the trial is); `probe` reports the lock's state.
+    fn play(role: &str, root: &Path) {
+        let mut out = io::stdout();
+        let wait_stdin = || { let _ = io::stdin().read_line(&mut String::new()); };
+        match role {
+            "hold" => { let _lock = Lock::acquire(root).unwrap(); writeln!(out, "role: held").unwrap(); out.flush().unwrap(); wait_stdin(); }
+            "wait" => { let _lock = Lock::acquire(root).unwrap(); writeln!(out, "role: acquired").unwrap(); }
+            "idle" => { writeln!(out, "role: idle").unwrap(); out.flush().unwrap(); wait_stdin(); }
+            "probe" => writeln!(out, "role: {}", state(root)).unwrap(),
+            other => panic!("unknown role {other}"),
+        }
+        out.flush().unwrap();
+    }
+    fn free_after_exit(root: &Path, what: &str) {
+        // Windows releases a dead process's locks soon after it ends, not at once (LockFileEx).
+        for _ in 0..1000 {
+            if state(root) == "free" { return; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the lock stayed held after {what} ended");
+    }
+
+    /// The watcher's liveness, as the loader reads it: a lock another process holds is busy, it is
+    /// free once that process ends (closed or killed), a process started while it was held does not
+    /// keep it, and a blocking take waits for the holder.
+    #[test]
+    fn the_switch_lock_holds_across_processes() {
+        if let (Ok(role), Some(root)) = (std::env::var(ROLE), std::env::var_os(ROOT)) {
+            return play(&role, Path::new(&root));
+        }
+        let root: PathBuf = std::env::temp_dir().join(format!("loader-switch-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Held here: another process sees it busy, and takes it once it is dropped here.
+        let here = Lock::acquire(&root).unwrap();
+        assert!(matches!(Lock::try_acquire(&root).unwrap(), TryLock::Busy), "a second handle in one process must see the lock busy");
+        let (mut probe, mut lines) = spawn(&root, "probe");
+        assert_eq!(answer(&mut lines, "probe"), "busy", "another process must see a held lock busy");
+        assert!(probe.wait().unwrap().success());
+        // A process started while it is held (the trial) does not inherit it.
+        let (mut idle, mut idle_lines) = spawn(&root, "idle");
+        assert_eq!(answer(&mut idle_lines, "idle"), "idle");
+        drop(here);
+        let (mut probe, mut lines) = spawn(&root, "probe");
+        assert_eq!(answer(&mut lines, "probe"), "free", "a child started while the lock was held must not keep it");
+        assert!(probe.wait().unwrap().success());
+        drop(idle.stdin.take());
+        assert!(idle.wait().unwrap().success());
+
+        // Held by another process: busy here until it exits, and free after it is killed.
+        for end in ["exit", "kill"] {
+            let (mut holder, mut lines) = spawn(&root, "hold");
+            assert_eq!(answer(&mut lines, "holder"), "held");
+            assert_eq!(state(&root), "busy", "a lock another process holds must be busy here");
+            if end == "kill" { holder.kill().unwrap(); } else { drop(holder.stdin.take()); }
+            let _ = holder.wait().unwrap();
+            free_after_exit(&root, &format!("its holder's {end}"));
+        }
+
+        // A blocking take waits while the lock is held here and returns once it is dropped.
+        let here = Lock::acquire(&root).unwrap();
+        let (mut waiter, mut lines) = spawn(&root, "wait");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(waiter.try_wait().unwrap().is_none(), "a blocking take must wait while the lock is held");
+        drop(here);
+        assert_eq!(answer(&mut lines, "waiter"), "acquired");
+        assert!(waiter.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

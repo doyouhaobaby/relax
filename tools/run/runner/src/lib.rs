@@ -370,11 +370,17 @@ pub fn main(host: &'static Host) {
     // (relax-api env) answers with them. A test's package binary that a launcher clearing the
     // environment started builds with its test's run's build environment (selfexe.rs prepared_build).
     // A run Relax std's spawn started takes its parent's by the descriptor it names (spawned_build).
+    // Some child starts carry the build in the environment (including Windows); a prepared
+    // package wrapper sets ARG0 even if its build descriptor did not reach the child.
+    let installation_start = host.tool == "makepad" && bin.is_none() && relaunch.is_none()
+        && ["RELAX_BUILD_ENV", "RELAX_BUILD_FD", "RELAX_ARG0", "RELAX_AS_RUSTC", "RELAX_RESTART_PARENT"]
+            .iter().all(|key| std::env::var_os(key).is_none());
     let handed = match &relaunch {
         Some(_) => relax_compiler::selfexe::relaunch_build(),
         None if bin.is_none() => relax_compiler::selfexe::spawned_build().or_else(|| relax_compiler::selfexe::prepared_build(&relax_compiler::os::proc::args_bytes())),
         None => None,
     };
+    let installation_start = installation_start && handed.is_none();
     relax_compiler::progenv::init_handed(handed);
     relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
     if let Some(args) = bin.or(relaunch) {
@@ -383,7 +389,7 @@ pub fn main(host: &'static Host) {
     start_host(host);
     warn_legacy_env();
     relax_compiler::wasm_export::startup();
-    run(relax_compiler::os::proc::args_bytes())
+    run(relax_compiler::os::proc::args_bytes(), installation_start)
 }
 
 /// Warn about legacy environment names still carried in people's notes.
@@ -419,10 +425,24 @@ pub fn run_with_args(args: Vec<Vec<u8>>) {
     relax_compiler::progenv::init();
     relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
     relax_compiler::os::proc::set_args(args.clone());
-    run(args)
+    run(args, false)
 }
 
-fn run(raw_args: Vec<Vec<u8>>) {
+/// Settle before launch::resolve reads a Runner record. Windows shortcuts name their home
+/// on the app command line; all other starts use the usual loader home.
+fn settle_installation(words: &[String]) {
+    let home = match words {
+        [app, flag, dir, _, ..] if app == "app" && flag == "--home" && !dir.is_empty() => PathBuf::from(dir),
+        _ => fetch::home(),
+    };
+    let root = home.join("cache/loader");
+    if words.first().is_some_and(|cmd| cmd == "recover") {
+        std::process::exit(makepad_loader_switch::recover_command(&root, &words[1..]));
+    }
+    if let Err(e) = makepad_loader_switch::settle(&root) { eprintln!("makepad: loader switch recovery: {e}"); }
+}
+
+fn run(raw_args: Vec<Vec<u8>>, installation_start: bool) {
     {
         let _k = relax_compiler::zone_alloc::kept();
         // A connected zero-capacity receive enters std's persistent mpmc context before
@@ -446,6 +466,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
     // a git URL or a --workspace-dir elsewhere name their own, before a record's environment
     // applies. An export of a git URL keeps RELAX_EDITS: the edits folder its invoker gave it.
     let words: Vec<String> = raw_args.iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    if installation_start { settle_installation(&words); }
     for n in fetch::dropped_mount_names(&words, &std::env::var("RELAX_VFS").unwrap_or_default()) {
         std::env::remove_var(std::str::from_utf8(n).unwrap());
     }
