@@ -1180,7 +1180,7 @@ pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
             if add > 0 { jit::queue_check(&batch, add); }
             return;
         }
-        crate::pool::checkpoint(0, "check beside the program");
+        crate::pool::checkpoint();
     }
 }
 

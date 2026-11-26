@@ -14914,7 +14914,6 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     let (root, holder) = (flight.root, flight.holder);
     // the build runs at the class of who waits for it, or it could starve behind that class's work
     let _priority = queue::promote(up as usize, root, owner::waiter_class());
-    let _token = crate::pool::lend_served();
     // a program thread's front gives the owner back rather than wait here while program requests
     // queue (owner::may_yield): it asks again once the build ended
     owner::pump_wait_build(id, end.name, holder, &|| !(&*up).fns[id as usize].inflight || owner::may_yield());
@@ -28373,7 +28372,7 @@ fn run_spec(unit: usize, id: u32) {
 /// answer to a test waiting for that build at BACK_END_GATE that it will not come.
 fn spec_dropped(unit: usize, id: u32, why: impl FnOnce() -> String) {
     #[cfg(test)]
-    if BACK_END_GATE.load(Ordering::SeqCst) == 1 {
+    if matches!(BACK_END_GATE.load(Ordering::SeqCst), 1 | 3) {
         BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner()).push((unit, id, why()));
         BACK_END_STOPPED.1.notify_all();
         return;
@@ -28475,7 +28474,7 @@ fn take_pause_turn(mine: u32) {
         job_rows::counted(false);
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
-    let _budget = crate::pool::suspend_program();
+    let _budget = crate::pool::suspend();
     while PAUSE_HOLDER.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
@@ -28583,7 +28582,7 @@ fn job_gate() -> JobGuard {
             return JobGuard;
         }
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        let _budget = crate::pool::suspend_program();
+        let _budget = crate::pool::suspend();
         // A job never starts while an allocator swap is in progress, however long the swap
         // takes: it would allocate from the zone the swap is re-registering (a wall-clock
         // escape here turned a slow machine into a crash). The thread that began the swap
@@ -28639,30 +28638,13 @@ impl Drop for JobIdle {
                 return;
             }
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-            let _budget = crate::pool::suspend_program();
+            let _budget = crate::pool::suspend();
             let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
             while BG_DRAINED.load(Ordering::SeqCst) {
                 g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
             }
         }
     }
-}
-
-/// A compile job's wait for a CPU token (relax-base pool: a readmission, a checkpoint that yields)
-/// lifts the job as a wait on the owner does (JobIdle): a pause (a fork, an allocator swap) waits
-/// for the running jobs, and the jobs it holds at their start keep their permits, so a job counted
-/// while it waited for one of those tokens kept the pause waiting, and the pause kept the tokens
-/// held (a fork in a teardown test waited for an O3 job's readmission after its poll's sleep for
-/// good, 2026-11-14). `job_lift` says whether it lifted the job; `job_back` takes that.
-pub(crate) fn job_lift() -> bool {
-    let idle = JobIdle::enter();
-    let lifted = idle.0;
-    std::mem::forget(idle);
-    lifted
-}
-
-pub(crate) fn job_back(lifted: bool) {
-    drop(JobIdle(lifted));
 }
 
 /// A compile job's sleep that waits for no owner request (a poll): the job is not running meanwhile
@@ -28718,7 +28700,7 @@ fn pause_compile_jobs(what: &str, trace: bool) {
     let mut told = false;
     let busy = || BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me());
     // the jobs it waits for may need a token
-    let _budget = crate::pool::suspend_program();
+    let _budget = crate::pool::suspend();
     loop {
         #[cfg(test)]
         {
@@ -29750,14 +29732,15 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     Begin::Back(BackWork { id, capture_unit: u.wasm_export_id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
 }
 
-/// (tests) 1: the next back end stops at its start, showing 2 and its thread, until a test stores 0.
+/// (tests) 1: the next back end stops at its start, showing 2, until a test stores 0. 3: every back
+/// end stops at its start (BACK_ENDS_HELD counts them) until a test stores 0.
 #[cfg(test)]
 static BACK_END_GATE: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
-static BACK_END_THREAD: AtomicU64 = AtomicU64::new(0);
+static BACK_ENDS_HELD: AtomicU32 = AtomicU32::new(0);
 /// (tests) A back end stopped at BACK_END_GATE, or a speculative build that will not come to it
-/// (spec_dropped: its unit, slot and why): the condvar wakes `back_end_at_gate`'s wait (the back
-/// end itself spins there, keeping its token).
+/// (spec_dropped: its unit, slot and why): the condvar wakes the tests' waits for the gate (the
+/// back end itself spins there).
 #[cfg(test)]
 static BACK_END_STOPPED: (std::sync::Mutex<Vec<(usize, u32, String)>>, std::sync::Condvar) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
@@ -29766,7 +29749,6 @@ impl BackWork {
     pub(crate) fn run(self) -> BackDone {
         #[cfg(test)]
         if BACK_END_GATE.load(Ordering::SeqCst) == 1 {
-            BACK_END_THREAD.store(me(), Ordering::SeqCst);
             {
                 let _seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
                 BACK_END_GATE.store(2, Ordering::SeqCst);
@@ -29775,6 +29757,18 @@ impl BackWork {
             while BACK_END_GATE.load(Ordering::SeqCst) != 0 {
                 std::thread::yield_now();
             }
+        }
+        #[cfg(test)]
+        if BACK_END_GATE.load(Ordering::SeqCst) == 3 {
+            {
+                let _seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
+                BACK_ENDS_HELD.fetch_add(1, Ordering::SeqCst);
+            }
+            BACK_END_STOPPED.1.notify_all();
+            while BACK_END_GATE.load(Ordering::SeqCst) == 3 {
+                std::thread::yield_now();
+            }
+            BACK_ENDS_HELD.fetch_sub(1, Ordering::SeqCst);
         }
         let BackWork { id, capture_unit, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
         let options = &session.options;
@@ -31202,7 +31196,6 @@ thread_local! {
     /// this thread's front reads held now (counted from before each is taken until after it was
     /// given back: front_read)
     static FRONT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static FRONT_READ_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
 #[cfg(test)]
@@ -31228,7 +31221,6 @@ pub(crate) fn front_reads_held() -> u32 {
 }
 
 pub struct FrontRead {
-    prior_site: &'static str,
     /// given back first in `drop`, before this thread stops counting as a reader (front_read)
     g: std::mem::ManuallyDrop<std::sync::RwLockReadGuard<'static, ()>>,
     traced: Option<(&'static str, std::time::Instant)>,
@@ -31240,7 +31232,6 @@ impl Drop for FrontRead {
         unsafe { std::mem::ManuallyDrop::drop(&mut self.g) };
         std::sync::atomic::compiler_fence(Ordering::SeqCst);
         front_read_between(2);
-        let _ = FRONT_READ_SITE.try_with(|site| site.set(self.prior_site));
         let _ = FRONT_READS.try_with(|c| c.set(c.get().saturating_sub(1)));
         if let Some(k) = self.row {
             front_holders::release(k);
@@ -31303,7 +31294,7 @@ pub fn front_read(site: &'static str) -> FrontRead {
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             // behind a writer, the owner: what it waits for may need the token
-            let _budget = crate::pool::suspend_program();
+            let _budget = crate::pool::suspend();
             // a wait the registry names (inspect `waits`, a hitch's waits, the timeline): a UI
             // thread's check ahead behind a graph load's or a live edit's front write
             let _w = crate::waits::begin(crate::waits::Kind::Futex, &FRONT_RW as *const _ as u64, 0, "front read");
@@ -31313,7 +31304,7 @@ pub fn front_read(site: &'static str) -> FrontRead {
     if let Some(k) = row {
         front_holders::holding(k);
     }
-    FrontRead { prior_site: FRONT_READ_SITE.try_with(|old| old.replace(site)).unwrap_or(""), g: std::mem::ManuallyDrop::new(g), traced: front_trace().then(|| (site, std::time::Instant::now())), row }
+    FrontRead { g: std::mem::ManuallyDrop::new(g), traced: front_trace().then(|| (site, std::time::Instant::now())), row }
 }
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
 /// context (shared, Sync), slot keys, and the checked bodies waiting for their builds.
@@ -33643,265 +33634,60 @@ mod front_yield_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Two fns (`triple`, `quad`) in a fresh unit, and the path of their source.
-    fn two_fn_unit(name: &str) -> (Box<Unit>, u32, u32, std::path::PathBuf) {
+    /// `fns` of a fresh unit made of `source`, and the path of the source.
+    fn unit_of(name: &str, source: &str, fns: &[&str]) -> (Box<Unit>, Vec<u32>, std::path::PathBuf) {
         crate::borrowck::lazy::disable_gandalf();
-        let source = "#![no_std]\npub fn triple(x: u32) -> u32 { x * 3 }\npub fn quad(x: u32) -> u32 { x * 4 }\n";
         let path = std::env::temp_dir().join(format!("relax-{name}-{}.rs", std::process::id()));
         std::fs::write(&path, source).unwrap();
         let session = std::sync::Arc::new(crate::Session::default());
         let mut prog = Program::new(&session);
         prog.load_crate(name, path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
         let def = |n: &str| prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == n).then_some(DefId(i as u32))).unwrap();
-        let (triple, quad) = (def("triple"), def("quad"));
+        let defs: Vec<DefId> = fns.iter().map(|n| def(n)).collect();
         let mut tcx = Tcx::new();
         tcx.collect(&prog);
         let mut u = Unit::new(prog, tcx, 0);
-        let (f, g) = (u.fn_id(FnKey::Inst(triple, Vec::new())), u.fn_id(FnKey::Inst(quad, Vec::new())));
+        let ids = defs.into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
         SPEC_UNIT.store(&mut *u as *mut Unit, Ordering::Release);
-        (u, f, g, path)
+        (u, ids, path)
     }
 
-    /// A compile job running beside the build below, with the rest of the JIT's room in the budget:
-    /// the build cannot go above the budget (the JIT has a job running), it needs a token. It waits
-    /// for the build as far as the registry goes: no thread here runs on while the others are stuck.
-    /// Ends with `stop`.
-    fn other_compile_job(stop: std::sync::Arc<AtomicBool>) -> (std::thread::JoinHandle<()>, u64) {
-        use makepad_cpu_budget as budget;
-        BACK_END_THREAD.store(0, Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let job = std::thread::spawn(move || {
-            let permit = budget::admit(budget::BACKGROUND, budget::JIT, "another compile job");
-            tx.send(me()).unwrap();
-            let mut building = 0;
-            while building == 0 {
-                building = BACK_END_THREAD.load(Ordering::SeqCst);
-                std::thread::yield_now();
-            }
-            let _row = crate::waits::begin(crate::waits::Kind::Build, u64::MAX, building, "another compile job's wait");
-            while !stop.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            budget::release(permit);
-        });
-        let thread = rx.recv().unwrap();
-        (job, thread)
+    /// `n` fns (`f0`, `f1`, ..) in a fresh unit, and the path of their source.
+    fn fn_unit(name: &str, n: usize) -> (Box<Unit>, Vec<u32>, std::path::PathBuf) {
+        let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+        let source: String = std::iter::once("#![no_std]\n".to_string()).chain(names.iter().enumerate().map(|(i, f)| format!("pub fn {f}(x: u32) -> u32 {{ x * {} }}\n", i + 2))).collect();
+        unit_of(name, &source, &names.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
-    /// Blocks until `state`, a state of the CPU budget (who holds a token, who waits for one) or
-    /// one that comes with a change of it, holds: looked at again at each change, never by the
-    /// clock. One that never comes holds the test (a hung test).
-    fn on_budget_change(state: impl Fn() -> bool) {
-        let mut seen = makepad_cpu_budget::changes();
-        while !state() {
-            seen = makepad_cpu_budget::wait_for_change(seen);
-        }
-    }
-
-    /// Blocks until the speculative build of `slot` (unit `up`) queued with BACK_END_GATE at 1
-    /// stopped at its gate. One that ended without its back end (spec_dropped) fails the test with
-    /// its reason.
-    fn back_end_at_gate(up: usize, slot: u32) {
+    /// Blocks until `n` back ends stopped at BACK_END_GATE 3. A speculative build of `up` that ended
+    /// without its back end (spec_dropped) fails the test with its reason.
+    fn back_ends_held(up: usize, n: u32) {
         let mut seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
-        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
-            if let Some((_, _, why)) = seen.iter().find(|d| d.0 == up && d.1 == slot) {
+        while BACK_ENDS_HELD.load(Ordering::SeqCst) < n {
+            if let Some((_, slot, why)) = seen.iter().find(|d| d.0 == up) {
                 panic!("the speculative build of #{slot} will not come to its gate: {why}");
             }
             seen = BACK_END_STOPPED.1.wait(seen).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    /// The budget's rows of these tests' pool jobs (`label`), lent ones too.
-    fn pool_jobs(label: &str) -> usize {
-        makepad_cpu_budget::tokens().holders.iter().filter(|h| h.label == label).count()
-    }
-
-    /// As many jobs as Visible lets in, each with its token, all calling one fn whose speculative
-    /// build (Background, in flight) sits out a checkpoint for them: the build needs a token and they
-    /// wait for the build. Budget::acquire held it for good: nothing moved until the process died.
-    /// `callers` of the jobs call; the others keep their tokens, running.
-    /// `jobs` is what Visible lets in beside the compile jobs past the JIT's floor (it does not count
-    /// the JIT's builds past the floor): with the build, the CPU is over its cores.
-    /// Returns once the callers are on their way: the jobs, and the callers still to end.
-    fn jobs_on_every_token(up: usize, slot: u32, jobs: usize, callers: usize) -> (Vec<std::thread::JoinHandle<u64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use makepad_cpu_budget as budget;
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::Arc;
-        BACK_END_GATE.store(1, Ordering::SeqCst);
-        queue::spec(up, slot);
-        back_end_at_gate(up, slot);
-        let (go, left) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
-        let handles = (0..jobs).map(|i| {
-            let (go, left) = (go.clone(), left.clone());
-            std::thread::spawn(move || {
-                // (the wait's own code compiled first: under the JIT a thread waiting for a compile
-                // lends its token, and the build would get it)
-                let _ = go.load(Ordering::SeqCst);
-                std::thread::yield_now();
-                let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
-                while !go.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                let code = if i < callers {
-                    let code = rt_compile_in(up, slot as u64);
-                    left.fetch_sub(1, Ordering::SeqCst);
-                    code
-                } else {
-                    1
-                };
-                while left.load(Ordering::SeqCst) != 0 {
-                    std::thread::yield_now();
-                }
-                budget::release(permit);
-                code
-            })
-        }).collect();
-        // the jobs in, the CPU is over its cores: the build's first checkpoint yields its token
-        on_budget_change(|| pool_jobs("a pool job") >= jobs);
-        BACK_END_GATE.store(0, Ordering::SeqCst);
-        // (a build that no longer stops here would pass without showing anything; asked of the budget,
-        // which every JIT in the process shares: under the JIT the wait hook is the loader's)
-        let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        on_budget_change(|| {
-            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint over the cores");
-            budget::tokens().waiting.iter().any(|w| w.thread == building)
-        });
-        go.store(true, Ordering::SeqCst);
-        (handles, left)
-    }
-
-    /// Other compile jobs one past the JIT's floor: with the build and the jobs Visible lets in, the
-    /// CPU is one over its cores, and the build gives its token up at its checkpoint and needs
-    /// another. (A build gives its token up only then: a job waiting for a token could not have it.
-    /// At the floor it keeps its token: `a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it`.)
-    fn compile_jobs_past_the_floor(stop: &std::sync::Arc<AtomicBool>) -> (Vec<std::thread::JoinHandle<()>>, Vec<u64>) {
-        (0..makepad_cpu_budget::jit_floor() + 1).map(|_| other_compile_job(stop.clone())).unzip()
-    }
-
-    /// With the JIT short of its floor, Visible work leaves it the token: the build keeps its own
-    /// through its checkpoints and finishes while a job waits for a token, and the job then runs. The
-    /// build waits for nothing that job holds, so this is no hang.
+    /// The app's pool on every token, giving none up (it neither lends nor reaches a checkpoint),
+    /// and more builds queued than the JIT runs at once, one of them waited for by a program thread
+    /// through the owner: every build runs, the caller gets its code, and no JIT thread holds or
+    /// waits for a token. The 11-05 deadlock (the slicer's workers on every token, each waiting for
+    /// a build that needed one) with its cause gone, not held shut.
     #[test]
-    fn a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it() {
-        isolated_test!(a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it, cores = 12);
+    fn compile_jobs_run_while_every_app_token_is_held() {
+        isolated_test!(compile_jobs_run_while_every_app_token_is_held, cores = 8);
         use makepad_cpu_budget as budget;
         use std::sync::Arc;
-        // (a small machine has no floor for the build to be below)
-        if budget::jit_floor() < 2 {
-            return;
-        }
-        let (u, f, _, path) = two_fn_unit("budget_floor");
+        // (past the startup's widths: the JIT runs as wide as its own pool)
+        HEADLESS.store(true, Ordering::Release);
+        let (u, fns, path) = fn_unit("every_token_held", budget::background_limit() as usize + 2);
         let up = &*u as *const Unit as usize;
-        let jobs = budget::limit() as usize - 1;
-        let stop = Arc::new(AtomicBool::new(false));
-        let (other, _) = other_compile_job(stop.clone());
-        BACK_END_GATE.store(1, Ordering::SeqCst);
-        queue::spec(up, f);
-        back_end_at_gate(up, f);
-        let done = Arc::new(AtomicBool::new(false));
-        let handles: Vec<_> = (0..jobs).map(|_| {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                // (compiled before it holds a token, as in `jobs_on_every_token`)
-                let _ = done.load(Ordering::SeqCst);
-                std::thread::yield_now();
-                let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
-                while !done.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                budget::release(permit);
-            })
-        }).collect();
-        on_budget_change(|| budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
-        BACK_END_GATE.store(0, Ordering::SeqCst);
-        // (the jobs keep their tokens until the end: a build that gave its own up would stand still
-        // here. Its worker leaves the queue's running list before it gives the build's token back,
-        // a change of the budget: with the last job waiting for one it keeps none for a next job.)
-        on_budget_change(|| queue::running_class(up, f).is_none());
-        // the last job running after it
-        on_budget_change(|| pool_jobs("a pool job") >= jobs);
-        done.store(true, Ordering::SeqCst);
-        for job in handles {
-            job.join().unwrap();
-        }
-        stop.store(true, Ordering::SeqCst);
-        other.join().unwrap();
-        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
-        // (the isolated process owns the runtime globals)
-        std::mem::forget(u);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn jobs_on_every_token_do_not_hang_on_a_build_that_needs_one() {
-        isolated_test!(jobs_on_every_token_do_not_hang_on_a_build_that_needs_one, cores = 8);
-        use std::sync::Arc;
-        let (u, f, g, path) = two_fn_unit("budget_lock");
-        let up = &*u as *const Unit as usize;
-        let floor = makepad_cpu_budget::jit_floor().max(1);
-        let jobs_beside = makepad_cpu_budget::limit() as usize - floor as usize;
-        assert!(makepad_cpu_budget::background_limit() > floor, "this needs the build and the other compile jobs in Background");
-        // every job calls: they sleep without their tokens, and the build gets one. The registry's
-        // chain says so when it does not: a plain failure, as it stands still. (A second of age: a
-        // job between its wait's row and giving its token up looks stuck for that moment.)
-        let stop = Arc::new(AtomicBool::new(false));
-        let (others, _) = compile_jobs_past_the_floor(&stop);
-        let (jobs, left) = jobs_on_every_token(up, f, jobs_beside, jobs_beside);
-        while left.load(Ordering::SeqCst) != 0 {
-            if let Some(chain) = crate::inspect::budget_deadlock(1_000_000_000) {
-                panic!("deadlock: {chain}");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        for job in jobs {
-            assert_ne!(job.join().unwrap(), 0);
-        }
-        stop.store(true, Ordering::SeqCst);
-        others.into_iter().for_each(|other| other.join().unwrap());
-        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
-        // one job calls and the others run on: only its token comes free, and Background is not let
-        // in below its limit. The build takes the class of who waits for it.
-        let stop = Arc::new(AtomicBool::new(false));
-        let (others, other_threads) = compile_jobs_past_the_floor(&stop);
-        let (jobs, left) = jobs_on_every_token(up, g, jobs_beside, 1);
-        let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        let waiter = || crate::waits::snapshot().into_iter().find(|w| !other_threads.contains(&w.thread) && w.holder == building && matches!(w.kind, crate::waits::Kind::Pump | crate::waits::Kind::Build)).map(|w| (w.thread, w.since_ns));
-        while left.load(Ordering::SeqCst) != 0 {
-            // (the same wait before and after: its promotion stands while the class is read)
-            let before = waiter();
-            let class = queue::running_class(up, g);
-            if let (Some(_), Some(class)) = (before, class) {
-                if waiter() == before {
-                    assert_eq!(class, makepad_cpu_budget::VISIBLE, "the build runs at its waiter's class");
-                }
-            }
-            std::thread::yield_now();
-        }
-        for job in jobs {
-            assert_ne!(job.join().unwrap(), 0);
-        }
-        stop.store(true, Ordering::SeqCst);
-        others.into_iter().for_each(|other| other.join().unwrap());
-        assert!(u.fns[g as usize].build_err.is_none(), "{:?}", u.fns[g as usize].build_err);
-        assert!(makepad_cpu_budget::tokens().holders.iter().all(|h| h.client != makepad_cpu_budget::APP), "the jobs' permits are released, none lent");
-        // (the isolated process owns the runtime globals)
-        std::mem::forget(u);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The app's jobs hold every token and run on, waiting for nothing: a speculative build queued
-    /// behind them still runs, beside them and taking none of their tokens: a tier-up does not wait
-    /// for a busy pool, which would leave its work on slow code.
-    #[test]
-    fn a_compile_job_runs_beside_jobs_on_every_token() {
-        isolated_test!(a_compile_job_runs_beside_jobs_on_every_token);
-        use makepad_cpu_budget as budget;
-        use std::sync::Arc;
-        let (u, f, _, path) = two_fn_unit("budget_full");
-        let up = &*u as *const Unit as usize;
+        let waits = crate::waits::jit_token_waits();
         // On a thread that runs no new code and does not sleep while it holds them: under the JIT a
-        // thread waiting for a compile of its own or sleeping lends its tokens, and the build would
-        // be let in on one.
+        // thread waiting for a compile of its own or sleeping lends its tokens.
         let (full, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let holder = {
             let (full, done) = (full.clone(), done.clone());
@@ -33921,37 +33707,69 @@ mod front_yield_tests {
         while !full.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        BACK_END_GATE.store(1, Ordering::SeqCst);
-        queue::spec(up, f);
-        // (held back it stands still with no compile job in the budget: a plain failure after 10 s)
-        let mut since = std::time::Instant::now();
-        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
-            if budget::tokens().holders.iter().any(|h| h.client == budget::JIT) {
-                since = std::time::Instant::now();
+        for &f in &fns[1..] {
+            queue::spec(up, f);
+        }
+        let waited = fns[0];
+        let caller = std::thread::spawn(move || rt_compile_in(up, waited as u64));
+        // (a cycle through the budget reads as a chain in the wait registry: a plain failure)
+        while !caller.is_finished() || queue::counts()[3] + queue::running()[3] != 0 {
+            if let Some(chain) = crate::inspect::budget_deadlock(1_000_000_000) {
+                panic!("deadlock: {chain}");
             }
-            assert!(since.elapsed().as_secs() < 10, "no compile job runs beside a full budget: {}", budget::report_string());
             std::thread::yield_now();
         }
-        // (its own row: under the JIT the loader's compile jobs share this budget)
-        let building = BACK_END_THREAD.load(Ordering::SeqCst);
+        assert_ne!(caller.join().unwrap(), 0, "the program thread waiting through the owner gets its code");
+        for &f in &fns {
+            assert!(u.fns[f as usize].build_err.is_none(), "a build failed: {:?}", u.fns[f as usize].build_err);
+        }
         let held = budget::tokens();
-        let rows: Vec<String> = held.holders.iter().map(|h| format!("{} client {} class {} lent {} above {} {}", h.thread, h.client, h.class, h.lent, h.above, h.label)).collect();
-        // The app keeps every token it holds, and the build runs beside them: above the budget, or,
-        // while the JIT comes first (`budget::set_jit_first`, at each pick of a compile queue: this
-        // one's or, under the JIT, the host's, which shares the budget), on a token of the JIT's own
-        // part past the app's limit. Either can be the case here (11-21: the second, 1 run in many).
-        let app = held.holders.iter().filter(|h| h.client == budget::APP && !h.lent).count();
-        assert_eq!(app, budget::limit() as usize, "the app keeps every token it took: {rows:#?}");
-        let beside = |h: &budget::Holder| h.above || held.running > budget::limit() as usize;
-        assert!(held.holders.iter().any(|h| h.thread == building && h.client == budget::JIT && beside(h)), "it runs beside the full budget, taking no token from the app: thread {building}, running {}, jit first {}, {rows:#?}", held.running, budget::jit_first());
-        BACK_END_GATE.store(0, Ordering::SeqCst);
-        while queue::running_class(up, f).is_some() {
-            std::thread::yield_now();
-        }
-        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        assert!(held.holders.iter().all(|h| h.client == budget::APP), "only the app holds tokens: {}", budget::report_string());
+        assert!(held.waiting.iter().all(|w| w.client == budget::APP), "no JIT thread waits for one: {}", budget::report_string());
+        assert_eq!(crate::waits::jit_token_waits(), waits, "the boundary counted no token wait on a JIT thread");
         done.store(true, Ordering::SeqCst);
         holder.join().unwrap();
         // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every build the JIT's own width starts, held at its back end's start, and more queued behind
+    /// them: the app's pool admits Background work up to its limit at once, and its Visible job is
+    /// never asked to yield. The app is never starved for the JIT.
+    #[test]
+    fn app_jobs_are_admitted_while_every_drain_builds() {
+        isolated_test!(app_jobs_are_admitted_while_every_drain_builds, cores = 8);
+        use makepad_cpu_budget as budget;
+        HEADLESS.store(true, Ordering::Release);
+        let b = budget::background_limit() as usize;
+        let (u, fns, path) = fn_unit("every_drain_builds", b + 2);
+        let up = &*u as *const Unit as usize;
+        BACK_END_GATE.store(3, Ordering::SeqCst);
+        for &f in &fns {
+            queue::spec(up, f);
+        }
+        back_ends_held(up, b as u32);
+        assert_eq!((queue::running()[3], queue::counts()[3]), (b, 2), "the JIT runs its own width and queues the rest: {}", queue::pool_line());
+        // (Background counts all that runs against its ceiling, so it goes first; Visible's is higher)
+        let background: Vec<u32> = (0..budget::background_limit()).map(|i| {
+            budget::Admission::default().poll(budget::BACKGROUND, budget::APP, "the app's Background work")
+                .unwrap_or_else(|| panic!("Background job {i} of the app is let in at once: {}", budget::report_string()))
+        }).collect();
+        let visible = budget::Admission::default().poll(budget::VISIBLE, budget::APP, "the app's Visible job")
+            .unwrap_or_else(|| panic!("the app's Visible job is let in at once: {}", budget::report_string()));
+        assert!(!budget::should_yield(visible), "the app's Visible job is not asked to yield to the JIT: {}", budget::report_string());
+        for permit in background {
+            budget::release(permit);
+        }
+        budget::release(visible);
+        BACK_END_GATE.store(0, Ordering::SeqCst);
+        while queue::counts()[3] + queue::running()[3] != 0 {
+            std::thread::yield_now();
+        }
+        for &f in &fns {
+            assert!(u.fns[f as usize].build_err.is_none(), "a build failed: {:?}", u.fns[f as usize].build_err);
+        }
         std::mem::forget(u);
         let _ = std::fs::remove_file(&path);
     }
@@ -34188,112 +34006,6 @@ mod allocator_swap_tests {
         pauser.join().unwrap();
         wait_for(&served, "the nested job's request was never served after the pause");
         nested.join().unwrap();
-    }
-
-    /// A fork never waits for a compile job that waits for a CPU token. The jobs a pause holds at
-    /// their start keep their permits; a job that gave its token back for a poll's sleep and asks
-    /// for one again while those hold every token waits for them, and they for the pause: counted
-    /// as running there, it held a fork for good (a teardown test's fork, 10 min, 2026-11-14).
-    /// Here the held jobs take every token there is, and one more ask queued ahead of the job's
-    /// keeps it waiting whoever else in the process holds one.
-    #[cfg(unix)]
-    #[test]
-    fn a_fork_does_not_wait_for_a_job_waiting_for_a_token() {
-        isolated_test!(a_fork_does_not_wait_for_a_job_waiting_for_a_token, cores = 2);
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        use makepad_cpu_budget as budget;
-        use std::sync::Arc;
-        owner::start();
-        let wait_for = |f: &AtomicBool, what: &str| {
-            let t0 = std::time::Instant::now();
-            while !f.load(Ordering::SeqCst) {
-                assert!(t0.elapsed().as_secs() < 30, "{what}");
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        };
-        let flag = || Arc::new(AtomicBool::new(false));
-        let (in_job, gave_back, asks, readmitted, release) = (flag(), flag(), flag(), flag(), flag());
-        // the job: admitted as the queue's workers are, counted, then a poll's sleep inside the pause
-        let (j, g, a, r) = (in_job.clone(), gave_back.clone(), asks.clone(), readmitted.clone());
-        let (id_tx, id_rx) = std::sync::mpsc::channel();
-        let job = std::thread::spawn(move || {
-            let permit = budget::admit(budget::BACKGROUND, budget::JIT, "job");
-            let _job = crate::pool::BudgetJob::from_permit(permit, budget::BACKGROUND, "job");
-            let _guard = compile_job();
-            id_tx.send(crate::waits::me()).unwrap();
-            j.store(true, Ordering::SeqCst);
-            while paused_for() == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            let sleeping = crate::pool::suspend();
-            g.store(true, Ordering::SeqCst);
-            while !a.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            // its readmission: behind every token's holder
-            drop(sleeping);
-            r.store(true, Ordering::SeqCst);
-        });
-        wait_for(&in_job, "the job never began");
-        let job_id = id_rx.recv().unwrap();
-        let fork: extern "C" fn() -> i32 = unsafe { std::mem::transmute(loader_symbol(b"fork").expect("the loader provides fork")) };
-        let (forked, child) = (flag(), Arc::new(std::sync::atomic::AtomicI32::new(0)));
-        let (f, c) = (forked.clone(), child.clone());
-        let pauser = std::thread::spawn(move || {
-            let pid = fork();
-            if pid == 0 {
-                os::thread::exit_now(0);
-            }
-            c.store(pid, Ordering::SeqCst);
-            f.store(true, Ordering::SeqCst);
-        });
-        wait_for(&gave_back, "the job never gave its token back");
-        // jobs that start inside the pause, each with a token it keeps at its start, until an ask
-        // finds none: that one waits, ahead of the job's
-        let mut held = Vec::new();
-        loop {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let go = release.clone();
-            held.push(std::thread::spawn(move || {
-                let mut admission = budget::Admission::default();
-                let permit = admission.poll(budget::BACKGROUND, budget::JIT, "held");
-                tx.send(permit.is_some()).unwrap();
-                let _job = permit.map(|p| crate::pool::BudgetJob::from_permit(p, budget::BACKGROUND, "held"));
-                let _guard = permit.map(|_| compile_job());
-                while !go.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }));
-            if !rx.recv().unwrap() {
-                break;
-            }
-        }
-        let holders = held.len() - 1;
-        asks.store(true, Ordering::SeqCst);
-        // the budget's table: the held jobs have their tokens, the job waits for one
-        let t0 = std::time::Instant::now();
-        while !budget::tokens().waiting.iter().any(|w| w.thread == job_id && w.class == budget::BACKGROUND && w.client == budget::JIT) {
-            assert!(t0.elapsed().as_secs() < 30 && !readmitted.load(Ordering::SeqCst), "the job's ask for a token never waited");
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        wait_for(&forked, "the fork waited for a job that waits for a CPU token");
-        assert!(child.load(Ordering::SeqCst) > 0, "fork failed");
-        assert!(!readmitted.load(Ordering::SeqCst), "the job got a token ahead of an earlier ask");
-        assert_eq!(budget::tokens().holders.iter().filter(|h| h.label == "held").count(), holders, "a held job gave its token up");
-        release.store(true, Ordering::SeqCst);
-        pauser.join().unwrap();
-        for h in held {
-            h.join().unwrap();
-        }
-        wait_for(&readmitted, "the job was never readmitted after the fork");
-        job.join().unwrap();
-        extern "C" {
-            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-        }
-        let mut status = 0i32;
-        let pid = child.load(Ordering::SeqCst);
-        assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
-        assert_eq!(status, 0, "the child did not exit cleanly");
     }
 
     /// A spawn's fork (Relax std's Command with pre_exec closures: `__relax_fork_exec`) goes ahead
@@ -37720,9 +37432,7 @@ fn run_tick() {
 
 fn compile_checkpoint() {
     if !queue::takes_jobs() { return; }
-    let held = front_reads_held() + u32::from(owner::is_owner());
-    let site = if owner::is_owner() { "jit owner unit" } else { FRONT_READ_SITE.try_with(|site| site.get()).unwrap_or("jit front read") };
-    crate::pool::checkpoint(held, site);
+    crate::pool::checkpoint();
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
