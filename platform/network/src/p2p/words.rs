@@ -236,7 +236,8 @@ pub fn group(words: &[&str]) -> String {
 }
 
 pub const INVITE_DOMAIN: &[u8] = b"makepad p2p invite v1";
-const COMMIT_DOMAIN: &[u8] = b"makepad work invite commitment v1";
+const VERSION: u8 = 0;
+const COMMIT_DOMAIN: &[u8] = b"makepad p2p invite commitment v1\0";
 pub const COMMIT_BITS: usize = 54;
 const COMMIT_MASK: u64 = (1 << COMMIT_BITS) - 1;
 
@@ -249,9 +250,10 @@ const INVITE_PAYLOAD_BITS: usize = VERSION_SHIFT + 1;
 const INVITE_BITS: usize = INVITE_PAYLOAD_BITS + 5;
 const _: () = assert!(INVITE_BITS == 10 * BITS_PER_WORD);
 
-// Independently computed for the fixed test public key [0x11; 32].
+// Independently computed for the fixed test public key [0x11; 32] in an invite for 192.0.2.1:0
+// with an unknown NAT.
 #[cfg(test)]
-pub(super) const TEST_COMMITMENT: u64 = 0x01_b180_b777_36fa;
+pub(super) const TEST_COMMITMENT: u64 = 0x33_8a4f_7910_99dd;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite {
@@ -262,11 +264,14 @@ pub struct Invite {
 }
 
 impl Invite {
-    /// Hashes the commitment domain and public key together, then applies SHA-256 another
-    /// 2^20 times. The first 54 bits of the final hash form the invite's key commitment.
+    /// Hashes the commitment domain, the invite's own fields and the public key together, then
+    /// applies SHA-256 another 2^20 times. The first 54 bits of the final hash form the invite's
+    /// key commitment. The fields salt it: `version u8 | hint u8 | IPv4 [4] | port u16`, network
+    /// order, so work done ahead for one address and port serves no other.
     /// Run this off the UI thread. Each candidate key requires the full stretch.
-    pub fn commitment(public_key: &[u8]) -> u64 {
-        let mut hash = sha256_hash(&[COMMIT_DOMAIN, public_key].concat());
+    pub fn commitment(nat: Hint, addr: SocketAddrV4, public_key: &[u8]) -> u64 {
+        let salt = [&[VERSION, nat as u8][..], &addr.ip().octets(), &addr.port().to_be_bytes()].concat();
+        let mut hash = sha256_hash(&[COMMIT_DOMAIN, &salt, public_key].concat());
         for _ in 0..(1 << 20) {
             hash = sha256_hash(&hash);
         }
@@ -275,7 +280,7 @@ impl Invite {
 
     /// Checks the peer's public key against the invite. Run this off the UI thread.
     pub fn matches(&self, public_key: &[u8]) -> bool {
-        Self::commitment(public_key) == (self.commit & COMMIT_MASK)
+        Self::commitment(self.nat, self.addr, public_key) == (self.commit & COMMIT_MASK)
     }
 
     pub fn to_words(&self) -> Vec<&'static str> {
@@ -293,7 +298,7 @@ impl Invite {
         bytes[..payload.len()].copy_from_slice(&payload);
         let bits = u128::from_be_bytes(bytes) >> (128 - INVITE_PAYLOAD_BITS);
         let version = (bits >> VERSION_SHIFT) as u8;
-        if version != 0 {
+        if version != VERSION {
             return Err(WordsError::NewerVersion { version });
         }
         let nat = match (bits >> HINT_SHIFT) & 3 {
@@ -384,7 +389,7 @@ mod tests {
         let invite = Invite {
             addr: "198.51.100.23:41394".parse().unwrap(),
             nat: Hint::Symmetric,
-            commit: TEST_COMMITMENT,
+            commit: 0x01_b180_b777_36fa,
         };
         let text = "kestrel damask catlike tundra · gulp huggable acoustic jumpers · opossum tuneful";
         assert_eq!(group(&invite.to_words()), text, "v1 wire vector");
@@ -427,6 +432,8 @@ mod tests {
         };
         assert!(invite.matches(&[0x11; 32]), "the key reproduces the independently stretched commitment");
         assert!(!invite.matches(&[0x22; 32]), "a different key has a different commitment");
+        let other_port = Invite { addr: "192.0.2.1:1".parse().unwrap(), ..invite };
+        assert!(!other_port.matches(&[0x11; 32]), "the invite's address and port salt the commitment");
     }
 
     #[test]
