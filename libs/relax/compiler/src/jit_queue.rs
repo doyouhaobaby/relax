@@ -183,8 +183,8 @@ pub(super) struct Queue {
 struct Hold { reason: usize, after: bool, since: u64, queued: u64 }
 impl Queue {
     fn new() -> Self {
-        static GRANTED: OnceLock<bool> = OnceLock::new();
-        let granted = *GRANTED.get_or_init(|| std::env::var_os("MAKEPAD_CPU_GRANT").is_some_and(|v| v == "1"));
+        // (made once, by `queue()`: the run's grant is its environment's)
+        let granted = std::env::var_os("MAKEPAD_CPU_GRANT").is_some_and(|v| v == "1");
         let grant = granted.then(|| Grant::new(wall_ns(), crate::first_frame::process_cpu_ns()));
         Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_since: 0, ahead_len: 0,
             tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false, hold: None, grant }
