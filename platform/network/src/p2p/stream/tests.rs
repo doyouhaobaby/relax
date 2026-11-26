@@ -612,6 +612,39 @@ fn orderly_close_survives_lost_final_ack() {
 }
 
 #[test]
+fn unsent_bytes_tracks_first_transmissions_under_a_rate_cap() {
+    let mut w = Pair::new(29);
+    w.open();
+    w.keys();
+    w.streams[0].set_rate_cap(Some(80_000));
+    let data = vec![7; 20 * SEGMENT];
+    // A short first write leaves a partial segment at each end of the transfer.
+    let mut written = w.streams[0].write(&data[..SEGMENT / 2]);
+    let mut sent = 0;
+    let deadline = w.net.now() + IDLE;
+    while sent < data.len() {
+        assert!(w.net.now() < deadline, "the capped stream sends all accepted bytes");
+        assert_eq!(w.streams[0].unsent_bytes(), written - sent, "queued payload before transmission");
+        w.step_with(|side, _, bytes| {
+            if side == 0 && kind(bytes) == DATA {
+                let (packet, _) = Packet::decode(bytes, &ID, Some(&KEYS[0])).expect("valid data datagram");
+                sent += packet.body.len();
+            }
+            true
+        });
+        assert_eq!(w.streams[0].unsent_bytes(), written - sent, "sending retires payload before its ACK");
+        if written < data.len() {
+            written += w.streams[0].write(&data[written..]);
+            if written == data.len() {
+                w.streams[0].close(); // Queue the FIN behind the remaining data.
+            }
+        }
+    }
+    assert_eq!(w.streams[0].unsent_bytes(), 0, "all payload has gone out");
+    assert!(w.streams[0].tx.acked_bytes < sent as u64, "the last data is still in flight");
+}
+
+#[test]
 fn a_rate_cap_paces_new_data_and_loses_nothing() {
     const CAP: u64 = 400_000;
     let data = content(150_000);

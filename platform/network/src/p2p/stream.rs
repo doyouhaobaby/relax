@@ -302,6 +302,11 @@ impl Stream {
         self.sent_bytes
     }
 
+    /// Payload bytes accepted by `write` that are still waiting for their first transmission.
+    pub fn unsent_bytes(&self) -> usize {
+        self.tx.unsent_bytes()
+    }
+
     pub fn state(&self) -> State {
         self.state
     }
