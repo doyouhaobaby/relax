@@ -2216,9 +2216,17 @@ fn order_install(u: &mut Unit, id: u32) {
 static PRELINKED_ORDER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
 /// The counted slots this run's startup image installed ahead of any call (prelink_startup).
 static PRELINKED_AHEAD: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
-/// Those of them no call had reached when the startup image's window closed (taken by the next
-/// tick, or by the manifest's first write when no tick took it): startup_set_called.
+/// The slots the seed walk installed ahead from the manifest's startup part (spec_seed_manifest):
+/// judged by their calls as the image's slots are (take_not_called, prelinked_not_called), but
+/// not kept in the next image by the union of recent startups (prelinked_ahead): a slot seeded
+/// that no call reached is no startup slot, and never joins an image.
+static SEEDED: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+/// Those of them and of the seeded ones no call had reached when the startup image's window
+/// closed (taken by the next tick, or by the manifest's first write when no tick took it):
+/// startup_set_called.
 static NOT_CALLED_AT_PRESENT: relax_session::sync::Mutex<Option<Vec<u32>>> = relax_session::sync::Mutex::new(None);
+/// How many of NOT_CALLED_AT_PRESENT are the image's own (the first ones): not_called_at_present.
+static NOT_CALLED_IMAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NOT_CALLED_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Slot `id`, armed by the startup image (PRELINKED_AHEAD), has not been called since: its count
@@ -2233,11 +2241,25 @@ unsafe fn not_called_since_armed(u: &Unit, id: u32) -> bool {
     (*rec.add(3)).load(Ordering::Acquire) == T_COUNTING && (*rec.add(9)).load(Ordering::Acquire) == 0 && (*rec).load(Ordering::Relaxed) == tier_refill(threshold, 0)
 }
 
-/// The slots the startup image installed ahead that no call has reached (yet): add_called follows
-/// call edges to called slots only.
+/// The slots the startup image or the seed walk installed ahead that no call has reached (yet):
+/// add_called follows call edges to called slots only.
 pub(crate) fn prelinked_not_called(u: &Unit) -> crate::fxhash::HashSet<u32> {
     let ids = PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    ids.iter().copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()
+    let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+    ids.iter().chain(seeded.iter()).copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()
+}
+
+/// Slot `id` was installed by the seed walk from the manifest's startup part (owner thread): the
+/// window's close judges it with the image's slots. One installed as the window closed, after that
+/// judgement, is judged now: just installed, no call has reached it.
+unsafe fn note_seeded(u: &Unit, id: u32) {
+    let mut out = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+    crate::zone_alloc::kept_with(|| SEEDED.lock().unwrap_or_else(|e| e.into_inner()).push(id));
+    if let Some(v) = out.as_mut() {
+        if not_called_since_armed(u, id) {
+            crate::zone_alloc::kept_with(|| v.push(id));
+        }
+    }
 }
 
 /// The slots the startup image installed ahead this run (PRELINKED_AHEAD): a manifest written
@@ -2260,16 +2282,26 @@ fn note_startup_calls() {
 }
 
 /// How many of the slots the startup image installed ahead no call reached while its window was
-/// open (0 until known): the image is rewritten when they are more than a few.
+/// open (0 until known; the seeded ones are not the image's): the image is rewritten when they are
+/// more than a few.
 pub(crate) fn not_called_at_present() -> usize {
-    NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |v| v.len())
+    let out = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+    if out.is_none() { 0 } else { NOT_CALLED_IMAGE.load(Ordering::Relaxed) }
 }
 
 fn take_not_called(u: &Unit) {
     let mut out = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
     if out.is_none() {
         let ids = PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-        *out = Some(crate::zone_alloc::kept_with(|| ids.iter().copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()));
+        let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+        let not_called = |&id: &u32| unsafe { not_called_since_armed(u, id) };
+        let v: Vec<u32> = crate::zone_alloc::kept_with(|| {
+            let mut v: Vec<u32> = ids.iter().copied().filter(not_called).collect();
+            NOT_CALLED_IMAGE.store(v.len(), Ordering::Relaxed);
+            v.extend(seeded.iter().copied().filter(not_called));
+            v
+        });
+        *out = Some(v);
         NOT_CALLED_TAKEN.store(true, Ordering::Relaxed);
     }
 }
@@ -2284,9 +2316,12 @@ fn take_not_called(u: &Unit) {
 /// stub is out of the slot) or without a count stub (glue, shims) -- stays only if the loaded
 /// manifest had it in its startup set (Cache::was_startup_slot); the image's callees among them
 /// go behind it (a warm start kept ~18,000 such slots, ~12,000 of them callees no startup code
-/// called, and each next image prelinked them before main). A slot first installed after the
-/// first present stays only if a call reached it (first_by_call): the window stays open through
-/// the burst after the present, and an install ahead in it (seeded, speculative) is no call.
+/// called, and each next image prelinked them before main). A slot the seed walk installed from the
+/// manifest's startup part (SEEDED) is judged as the image's are, by its count stub at the window's
+/// close (one without a count stub was a startup slot of the loaded manifest: it stays). A slot first
+/// installed after the first present stays only if a call reached it (first_by_call): the window
+/// stays open through the burst after the present, and an install ahead in it (seeded, speculative)
+/// is no call.
 fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
     take_not_called(u);
     let late: crate::fxhash::HashSet<u32> = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(Default::default, |v| v.iter().copied().collect());
@@ -2295,6 +2330,8 @@ fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, u
     if late.is_empty() && p0 == p1 && at_present >= present {
         return (order, present);
     }
+    // (a seeded slot's count stub says whether a call reached it: no first call compiled it)
+    let seeded: crate::fxhash::HashSet<u32> = SEEDED.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
     let cache = u.cache.as_ref();
     let unseen = |i: usize, id: u32| {
         if i < p0 || i >= p1 {
@@ -2310,7 +2347,7 @@ fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, u
             if !unsafe { not_called_since_armed(u, id) } {
                 later.push(id);
             }
-        } else if unseen(i, id) || i >= at_present && !u.fns[id as usize].first_by_call.load(Ordering::Acquire) {
+        } else if unseen(i, id) || i >= at_present && !seeded.contains(&id) && !u.fns[id as usize].first_by_call.load(Ordering::Acquire) {
             later.push(id);
         } else {
             out.push(id);
@@ -2325,6 +2362,8 @@ fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, u
 // The installer's own counters: the verbose [installahead] line at the run's end.
 static INSTALL_AHEAD_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTALL_AHEAD_INSTALLED: AtomicU64 = AtomicU64::new(0);
+/// of them, from the manifest's startup part before the window closed (SEEDED)
+static INSTALL_AHEAD_STARTUP: AtomicU64 = AtomicU64::new(0);
 static INSTALL_AHEAD_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static INSTALL_AHEAD_BAILS: AtomicU64 = AtomicU64::new(0);
 static INSTALL_AHEAD_LAZY: AtomicU64 = AtomicU64::new(0);
@@ -2366,8 +2405,10 @@ fn install_ahead_main_request() {
 pub(crate) fn install_ahead_line() -> String {
     let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
     let first = n(&INSTALL_AHEAD_FIRST_MAIN);
-    format!("[installahead] enabled={} installed={} skipped_ready={} bails={} left_lazy={} batches={} main_yields={} first_main_index={} end_index={} owner_ns={} owner_cpu_ns={}",
-        INSTALL_AHEAD_ENABLED.load(Ordering::Relaxed), n(&INSTALL_AHEAD_INSTALLED), n(&INSTALL_AHEAD_SKIPPED), n(&INSTALL_AHEAD_BAILS), n(&INSTALL_AHEAD_LAZY), n(&INSTALL_AHEAD_BATCHES), n(&INSTALL_AHEAD_MAIN_YIELDS),
+    // (the seeded slots no call had reached at the window's close: no startup slots of the next image)
+    let seeded_late = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |v| v.len().saturating_sub(NOT_CALLED_IMAGE.load(Ordering::Relaxed)));
+    format!("[installahead] enabled={} installed={} startup_installed={} startup_not_called={} skipped_ready={} bails={} left_lazy={} batches={} main_yields={} first_main_index={} end_index={} owner_ns={} owner_cpu_ns={}",
+        INSTALL_AHEAD_ENABLED.load(Ordering::Relaxed), n(&INSTALL_AHEAD_INSTALLED), n(&INSTALL_AHEAD_STARTUP), seeded_late, n(&INSTALL_AHEAD_SKIPPED), n(&INSTALL_AHEAD_BAILS), n(&INSTALL_AHEAD_LAZY), n(&INSTALL_AHEAD_BATCHES), n(&INSTALL_AHEAD_MAIN_YIELDS),
         if first == u64::MAX { "none".to_string() } else { first.to_string() }, n(&INSTALL_AHEAD_INDEX), n(&INSTALL_AHEAD_OWNER_NS), n(&INSTALL_AHEAD_CPU_NS))
 }
 
@@ -2383,23 +2424,42 @@ unsafe fn manifest_install_allowed(up: *mut Unit) -> bool {
     ahead_policy().spec_cached && (&*up).cache.as_ref().is_some_and(|c| c.mode != crate::cache::Mode::Verify) && !manifest_install_stopped()
 }
 
-/// Installs the manifest's tail after the startup image window, in manifest order. Each guarded
-/// link is the preemption grain; a batch gives the owner back as soon as main queues a request,
-/// after a link once another thread's request waits (owner::request_waiting) and SEED_BATCH_NS
-/// after it began, as the record batches do (record_cache_batch). Given back to main only, a warm
-/// launch of a large app linked 17-28 k slots a batch in 0.7-1.0 s each: an app pool thread's lazy call waited
-/// for all of it, and every background publish (the O3 takes, the startup's) with it.
+/// Installs the manifest's slots ahead of their calls, in manifest order, on a background thread.
+/// A start the image prelinked walks the manifest's startup part first, from the prelink's end and
+/// beside main: the slots the image did not install -- left out of it, or stale (their entries
+/// replaced since it was built) -- each cost main a cache link on its own thread before its first
+/// present (a large app: ~600 a warm start, 1,000-2,000 after an edit). These go through `note_seeded`:
+/// one no call reaches by the window's close is no startup slot of the next image. A test binary's
+/// manifest is walked from its present, as before: its run never presents, so its startup part is
+/// its whole order, made of other tests' bodies (the exit's union), and walked ahead it linked a
+/// median 12,349 slots and 312 ms of owner time a test child for few calls (relax-compiler's lib
+/// tests under the JIT). The tail
+/// follows after the startup image window. Each guarded link is the preemption grain; a batch gives
+/// the owner back as soon as main queues a request, after a link once another thread's request
+/// waits (owner::request_waiting) and SEED_BATCH_NS after it began, as the record batches do
+/// (record_cache_batch). Given back to main only, a warm launch of a large app linked 17-28 k slots
+/// a batch in 0.7-1.0 s each: an app pool thread's lazy call waited for all of it, and every
+/// background publish (the O3 takes, the startup's) with it.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     // Verify mode compiles what it checks, and an edited program's identities are not the
     // manifest's: neither installs ahead
-    let (list, present) = owner::call(owner::Class::Program, || {
-        if !manifest_install_allowed(up) { return (Vec::new(), 0); }
-        (&*up).cache.as_ref().map(|c| (c.manifest[c.manifest_present..].to_vec(), c.manifest_present)).unwrap_or_default()
+    let (list, from, startup) = owner::call(owner::Class::Program, || {
+        if !manifest_install_allowed(up) { return (Vec::new(), 0, 0); }
+        // (no image prelinked: its startup part stays with the calls, as before the image)
+        let imaged = PRELINKED_ORDER[1].load(Ordering::Relaxed) > PRELINKED_ORDER[0].load(Ordering::Relaxed);
+        // (a test binary: a libtest harness never presents; its root crate holds cfg(test), the
+        // mark preload::crate_key tells a test crate by)
+        let test_binary = (&*up).prog.crates.get(crate::layout::root_crate() as usize).is_some_and(|c| c.cfg.holds("test"));
+        (&*up).cache.as_ref().map(|c| {
+            let present = c.manifest_present.min(c.manifest.len());
+            let from = if imaged && !test_binary { 0 } else { present };
+            (c.manifest[from..].to_vec(), from, present - from)
+        }).unwrap_or_default()
     });
     if list.is_empty() || !pipelined() {
         return;
     }
-    INSTALL_AHEAD_INDEX.store(present as u64, Ordering::Relaxed);
+    INSTALL_AHEAD_INDEX.store(from as u64, Ordering::Relaxed);
     INSTALL_AHEAD_ENABLED.store(true, Ordering::Relaxed);
     struct P(*mut Unit);
     unsafe impl Send for P {}
@@ -2410,56 +2470,67 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
         let up = p.0;
         set_worker(true);
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-        if !crate::postframe::wait_image_window_closed(&manifest_install_stopped) { return; }
         let mut at = 0;
-        while at < list.len() && !manifest_install_stopped() {
-            let _job = compile_job();
-            let result = owner::publish_or_bail(|| {
-                let _install = InstallingManifest::enter();
-                if !manifest_install_allowed(up) { return false; }
-                INSTALL_AHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
-                let (t0, first) = (wall_ns(), at);
-                while at < list.len() {
-                    if manifest_install_stopped() { return false; }
-                    if owner::main_waiting() {
-                        INSTALL_AHEAD_MAIN_YIELDS.fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    }
-                    // (always after one link: a stream of requests does not stop the walk)
-                    if at > first && (owner::request_waiting() || wall_ns() - t0 >= SEED_BATCH_NS) {
-                        return true;
-                    }
-                    // Advance before the guarded link: a bail leaves this slot lazy and the
-                    // next publish continues with its successor, never retries a front here.
-                    let bytes = &list[at];
-                    at += 1;
-                    INSTALL_AHEAD_INDEX.store((present + at) as u64, Ordering::Relaxed);
-                    let Some(id) = crate::cache::slot_for_bytes_unit(up, bytes) else {
-                        INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    };
-                    let f = &(&*up).fns[id as usize];
-                    if f.compiled {
-                        INSTALL_AHEAD_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                    } else if f.building || f.inflight || skip_initializer_seed(&*up, id) {
-                        // A build already owns this slot, or it is an initializer: retain
-                        // the seed path's demand boundary instead of racing that build.
-                        INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
-                    } else if ready_code_locked(up, id).is_some() {
-                        INSTALL_AHEAD_INSTALLED.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                false
-            });
-            match result {
-                Ok(false) => break,
-                Ok(true) => {} // the owner's next pick serves main before this thread's publish
-                Err(_) => { INSTALL_AHEAD_BAILS.fetch_add(1, Ordering::Relaxed); }
-            }
-        }
+        seed_walk(up, &list, &mut at, startup, from, true);
+        if !crate::postframe::wait_image_window_closed(&manifest_install_stopped) { return; }
+        seed_walk(up, &list, &mut at, list.len(), from, false);
     });
+    }
+}
+
+/// spec_seed_manifest's walk of `list[*at..end]` (`from`: the manifest index of `list[0]`);
+/// `startup`: slots of the manifest's startup part (note_seeded).
+unsafe fn seed_walk(up: *mut Unit, list: &[Vec<u8>], at: &mut usize, end: usize, from: usize, startup: bool) {
+    while *at < end && !manifest_install_stopped() {
+        let _job = compile_job();
+        let result = owner::publish_or_bail(|| {
+            let _install = InstallingManifest::enter();
+            if !manifest_install_allowed(up) { return false; }
+            INSTALL_AHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
+            let (t0, first) = (wall_ns(), *at);
+            while *at < end {
+                if manifest_install_stopped() { return false; }
+                if owner::main_waiting() {
+                    INSTALL_AHEAD_MAIN_YIELDS.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                // (always after one link: a stream of requests does not stop the walk)
+                if *at > first && (owner::request_waiting() || wall_ns() - t0 >= SEED_BATCH_NS) {
+                    return true;
+                }
+                // Advance before the guarded link: a bail leaves this slot lazy and the
+                // next publish continues with its successor, never retries a front here.
+                let bytes = &list[*at];
+                *at += 1;
+                INSTALL_AHEAD_INDEX.store((from + *at) as u64, Ordering::Relaxed);
+                let Some(id) = crate::cache::slot_for_bytes_unit(up, bytes) else {
+                    INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let f = &(&*up).fns[id as usize];
+                if f.compiled {
+                    INSTALL_AHEAD_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                } else if f.building || f.inflight || skip_initializer_seed(&*up, id) {
+                    // A build already owns this slot, or it is an initializer: retain
+                    // the seed path's demand boundary instead of racing that build.
+                    INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
+                } else if ready_code_locked(up, id).is_some() {
+                    INSTALL_AHEAD_INSTALLED.fetch_add(1, Ordering::Relaxed);
+                    if startup {
+                        INSTALL_AHEAD_STARTUP.fetch_add(1, Ordering::Relaxed);
+                        note_seeded(&*up, id);
+                    }
+                } else {
+                    INSTALL_AHEAD_LAZY.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            false
+        });
+        match result {
+            Ok(false) => break,
+            Ok(true) => {} // the owner's next pick serves main before this thread's publish
+            Err(_) => { INSTALL_AHEAD_BAILS.fetch_add(1, Ordering::Relaxed); }
+        }
     }
 }
 
@@ -37680,10 +37751,12 @@ pub(crate) unsafe fn reset_statics() {
         p.store(0, Ordering::Relaxed);
     }
     reset(&PRELINKED_AHEAD, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&SEEDED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&NOT_CALLED_AT_PRESENT, relax_session::sync::Mutex::new(None));
+    reset(&NOT_CALLED_IMAGE, std::sync::atomic::AtomicUsize::new(0));
     reset(&NOT_CALLED_TAKEN, AtomicBool::new(false));
     reset(&INSTALL_AHEAD_ENABLED, AtomicBool::new(false));
-    for c in [&INSTALL_AHEAD_INSTALLED, &INSTALL_AHEAD_SKIPPED, &INSTALL_AHEAD_BAILS, &INSTALL_AHEAD_LAZY, &INSTALL_AHEAD_BATCHES, &INSTALL_AHEAD_MAIN_YIELDS, &INSTALL_AHEAD_INDEX, &INSTALL_AHEAD_OWNER_NS, &INSTALL_AHEAD_CPU_NS] {
+    for c in [&INSTALL_AHEAD_INSTALLED, &INSTALL_AHEAD_STARTUP, &INSTALL_AHEAD_SKIPPED, &INSTALL_AHEAD_BAILS, &INSTALL_AHEAD_LAZY, &INSTALL_AHEAD_BATCHES, &INSTALL_AHEAD_MAIN_YIELDS, &INSTALL_AHEAD_INDEX, &INSTALL_AHEAD_OWNER_NS, &INSTALL_AHEAD_CPU_NS] {
         c.store(0, Ordering::Relaxed);
     }
     reset(&INSTALL_AHEAD_FIRST_MAIN, AtomicU64::new(u64::MAX));
