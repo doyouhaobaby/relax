@@ -808,8 +808,10 @@ impl ProgramAllocatorCtx {
         ctx.call(|| unsafe { (ctx.dealloc)(p, size, align) })
     }
 
-    // The probe is a heuristic. The check at every routed allocation is the rule.
-    fn probe(&self) -> Result<(), String> {
+    // The probe is a heuristic. The check at every routed allocation is the rule. Ok(Some(line)):
+    // a probe block was outside the memory the domain owns (an allocator over its own mappings,
+    // sbrk or another process-wide heap), so nothing may route through the allocator.
+    fn probe(&self) -> Result<Option<String>, String> {
         let interrupted = || format!("global allocator `{}` probe interrupted", self.path);
         for (size, align) in [(16, 8), (4096, 8), (4096, 4096), (256 << 10, 8), (4 << 20, 8)] {
             let mut block = std::ptr::null_mut();
@@ -820,12 +822,12 @@ impl ProgramAllocatorCtx {
             if block.is_null() { continue; }
             // The allocator that made this probe block can free it directly, including on refusal.
             let freed = unsafe { Self::dealloc(std::ptr::from_ref(self) as usize, block, size, align) };
-            if !owned {
-                return Err(format!("relax: the program's #[global_allocator] `{}` returned {:#x} for a {size}-byte probe, outside the memory its domain owns (its heap and its statics): an allocator over its own mappings, sbrk or another process-wide heap cannot serve the loader's ops under `makepad run`; the run does not start", self.path, block as usize));
-            }
             if !freed { return Err(interrupted()); }
+            if !owned {
+                return Ok(Some(format!("relax: the program's #[global_allocator] `{}` returned {:#x} for a {size}-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it", self.path, block as usize)));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -863,7 +865,19 @@ impl ProgramHeap {
         // Loading keeps the registered heap alive. A lazy probe entry can compile or call
         // native code, so run it outside the domain lock and the compiler owner request.
         if let Some(allocator) = allocator {
-            if let Err(error) = allocator.probe() { return fail(loading.0, vec![error]); }
+            match allocator.probe() {
+                Err(error) => return fail(loading.0, vec![error]),
+                // Nothing was routed yet: the heap goes on as one without a program allocator,
+                // as before routing existed (a mapping allocator, an app's large blocks on macOS)
+                Ok(Some(line)) => {
+                    eprintln!("{line}");
+                    let ds = domains();
+                    if let Some(heap) = ds.iter().find(|d| d.info.id == loading.0).and_then(|d| d.heap.as_ref()) {
+                        heap.stop_routing();
+                    }
+                }
+                Ok(None) => {}
+            }
         }
         Ok(loading.0)
     }

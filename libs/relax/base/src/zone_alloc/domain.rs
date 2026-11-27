@@ -115,6 +115,16 @@ impl DomainHeap {
     pub fn as_ptr(&self) -> *const Heap {
         Arc::as_ptr(&self.inner)
     }
+    /// Stops routing through the program's allocator: its probe found a block outside the memory
+    /// this heap owns, before anything was routed. From here the heap is one without a program
+    /// allocator, as before routing existed: run ops allocate in it, and the loader frees and
+    /// resizes its blocks itself. Called before the domain's code runs; a region added later
+    /// copies the first one's cleared entry.
+    pub fn stop_routing(&self) {
+        for r in self.inner.arena.regions() {
+            r.program.store(std::ptr::null_mut(), Ordering::Release);
+        }
+    }
     /// A fork child cannot drain inherited leases. Its still-registered heap keeps its PA
     /// static block mapped just as it keeps its arena regions.
     pub fn retains_statics_on_drop(&self) -> bool {
@@ -316,9 +326,10 @@ unsafe fn owner_in_bounds<const LOADER: bool>(p: *mut u8) -> Owner {
     };
     let mut h = HEAD.load(Ordering::Relaxed);
     while let Some(heap) = h.as_ref() {
-        // The loader owns Rust blocks by range. Program mappings join the static block here.
+        // The loader owns Rust blocks by range. Program mappings join the static block here,
+        // while the heap routes through its program allocator (`stop_routing` ends that).
         let region = heap.arena.region_of(p).or_else(|| {
-            (LOADER && heap.program.is_some() && (p as usize).wrapping_sub(heap.statics.0) < heap.statics.1)
+            (LOADER && program_allocator(&heap.arena).is_some() && (p as usize).wrapping_sub(heap.statics.0) < heap.statics.1)
                 .then_some(&*heap.arena)
         });
         if let Some(r) = region {

@@ -1617,6 +1617,7 @@ fn a_run_ends_in_the_program_allocator_of_a_locked_op() {
 #[test]
 fn allocator_ranges_are_checked_before_main_and_at_the_op() {
     const LATE: &str = "RELAX_TEST_LATE_ALLOCATOR_BLOCK";
+    const REFUSED: &str = "RELAX_TEST_REFUSED_ALLOCATOR_PROBE";
     isolated_test!(allocator_ranges_are_checked_before_main_and_at_the_op);
     use crate::zone_alloc::RelaxAlloc;
     use std::alloc::{GlobalAlloc, Layout};
@@ -1696,22 +1697,35 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
         main.join().unwrap();
         panic!("a late outside allocation returned to the op");
     }
-    BAD_SIZE.store(16, Ordering::Release);
-    let errors = try_launch_with(&mut u, entry, None, arg, true).unwrap_err();
-    let p = OUTSIDE.load(Ordering::Acquire);
-    assert_ne!(p, 0, "the probe exercised the process malloc");
-    assert_eq!(errors, [format!("relax: the program's #[global_allocator] `{path}` returned {p:#x} for a 16-byte probe, outside the memory its domain owns (its heap and its statics): an allocator over its own mappings, sbrk or another process-wide heap cannot serve the loader's ops under `makepad run`; the run does not start")],
-        "an outside probe block fails startup with the allocator diagnostic");
+    if std::env::var_os(REFUSED).is_some() {
+        BAD_SIZE.store(16, Ordering::Release);
+        let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).expect("a refused probe does not stop the run");
+        main.join().unwrap();
+        wait_thread_done(id);
+        assert_ne!(OUTSIDE.load(Ordering::Acquire), 0, "the probe exercised the process malloc");
+        assert_eq!(state(id), Some(DomainState::Exited(0)), "the run goes on after a refused probe");
+        assert_eq!(SAW_STATIC.load(Ordering::Acquire), 0, "after a refused probe the op allocates in the domain's heap, not through the allocator");
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
 
     BAD_SIZE.store(0, Ordering::Release);
     let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
     main.join().unwrap();
     wait_thread_done(id);
-    assert_eq!(state(id), Some(DomainState::Exited(0)), "a static PA starts after the rejected domain");
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "a static PA starts");
     assert_eq!(SAW_STATIC.load(Ordering::Acquire), 31, "all five probes ran before the op received its static block");
     std::fs::remove_dir_all(root).unwrap();
 
     let test = "domain::teardown_tests::allocator_ranges_are_checked_before_main_and_at_the_op";
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"]).env(REFUSED, "1"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a refused probe leaves the run going: {err}");
+    let prefix = format!("relax: the program's #[global_allocator] `{path}` returned 0x");
+    let suffix = " for a 16-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it";
+    assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
+        .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "a refused probe says so in one line, with the address: {err}");
     let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"]).env(LATE, "1"));
     let err = String::from_utf8_lossy(&out.stderr);
