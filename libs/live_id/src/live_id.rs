@@ -20,7 +20,7 @@ impl LiveIdInterner {
         self.id_to_string.contains_key(&LiveId::from_str(val))
     }
 
-    pub fn with<F, R>(f: F) -> R
+    pub(crate) fn with<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Self) -> R,
     {
