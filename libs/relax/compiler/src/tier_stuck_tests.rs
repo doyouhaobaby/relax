@@ -303,7 +303,7 @@ fn an_opaque_types_own_methods_are_made_off_the_owner() {
     assert!(!report.contains("NATIVE") && !report.contains("UNUSED"), "an op's body, and the fn only it calls, are rustc's:\n{report}");
     assert!(!report.contains("HIDDEN"), "a pub fn of a private module is no way in:\n{report}");
     assert!(report.contains("static\tFAIL\topaque_front::SHOWN\t") && report.contains("  reached\topaque_front::inner::shown\n"), "a `pub use` of a private module's fn is a way in:\n{report}");
-    assert!(report.contains("static\tFAIL\topaque_front::RETURNED\t") && report.contains("  reached\topaque_front::inner::::drop\n"), "the drop of a type a pub fn gives out is a way in:\n{report}");
+    assert!(report.contains("static\tFAIL\topaque_front::RETURNED\t") && report.contains("  reached\topaque_front::inner::::drop [JIT code holds `opaque_front::inner::Lease`: the signature of `opaque_front::lease`]\n"), "the drop of a type a pub fn gives out is a way in, and the row says which signature hands JIT code the type:\n{report}");
     let rest = ["SHOWN", "RETURNED"].map(|s| (format!("opaque_front::{s}"), "a way in".to_string()));
     let allowed: Vec<_> = rest.iter().cloned().chain([("opaque_front::MACHINE".to_string(), "a refusal case".to_string())]).collect();
     let (report, failed) = statics(&*u, &allowed);
