@@ -1,6 +1,7 @@
-//! rustc_metadata creader.rs inject_allocator_crate: one `#[global_allocator]` per crate and one per
-//! compiled binary (the binary and the crates it links). Each test target is its own binary, so two
-//! targets of a package that each define one do not conflict.
+//! Item checks of a crate (item_checks.rs). rustc_metadata creader.rs inject_allocator_crate: one
+//! `#[global_allocator]` per crate and one per compiled binary (the binary and the crates it links).
+//! Each test target is its own binary, so two targets of a package that each define one do not
+//! conflict. And E0428, two items of one name in one module or block.
 use crate::program::Program;
 
 fn load(prog: &mut Program, name: &str, source: &str, deps: &[u32]) -> u32 {
@@ -68,4 +69,63 @@ fn a_test_target_named_alloc_is_not_linked_by_its_siblings() {
     let mut own = vec![false; prog.crates.len()];
     for k in targets { own[k as usize] = true; }
     assert_eq!(crate::item_checks::global_allocators_and_lang_items(&prog, &own, &targets), Vec::<String>::new());
+}
+
+/// E0428 (rustc_resolve build_reduced_graph, report_conflict): a body's items are their block's,
+/// each block a scope of its own. Two values or two types of one module or block collide (a fn
+/// body that held two `static MET`s used to run, a lookup taking one for both, 11-26); a type and a
+/// value of one name do not, nor sibling blocks, a block and the module around it, an inner block
+/// and the outer one, or an impl's or a trait's item and a block's fn. Each error is at the second
+/// item's start, its visibility and not its attributes, where rustc puts it.
+#[test]
+fn two_items_of_one_name_in_one_module_or_block_are_refused_and_no_others() {
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let mut prog = Program::new(sess);
+    let src = [
+        "pub static MET: u32 = 9;",
+        "#[allow(dead_code)]",
+        "pub(crate) static MET: u32 = 1;",
+        "pub fn one() -> u32 {",
+        "    static MET: u32 = 0;",
+        "    let f = || MET;",
+        "    static MET: u32 = 1;",
+        "    f() + MET",
+        "}",
+        "pub fn ns() -> u32 {",
+        "    struct T { x: u32 }",
+        "    static T: u32 = 0;",
+        "    struct U;",
+        "    fn U() {}",
+        "    struct V;",
+        "    enum V { A }",
+        "    let c = || { static D: u32 = 0; static D: u32 = 1; D };",
+        "    let g = { static G: u32 = 0; G } + { static G: u32 = 1; { static G: u32 = 2; G } };",
+        "    struct W;",
+        "    impl W { fn m(&self) {} }",
+        "    fn m() {}",
+        "    trait Tr { fn t(&self) {} }",
+        "    fn t() {}",
+        "    const K: u32 = { static Z: u32 = 1; static Z: u32 = 2; Z };",
+        "    c() + g + K",
+        "}",
+    ].join("\n");
+    let k = load(&mut prog, "dup", &src, &[]);
+    prog.resolve_imports();
+    let mut own = vec![false; prog.crates.len()];
+    own[k as usize] = true;
+    // (each as "line:col: message", the file's path cut off; by position, the order check_order
+    // gives them)
+    let mut errors: Vec<String> = crate::item_checks::duplicate_items(&prog, &own).iter().map(|e| e.split_once(".rs:").map_or(e.clone(), |(_, at)| at.to_string())).collect();
+    let e0428 = |at: &str, name: &str, ns: &str, scope: &str| format!("{at}: E0428: the name `{name}` is defined multiple times -- note: `{name}` must be defined only once in the {ns} namespace of {scope}");
+    errors.sort();
+    let mut want = [
+        e0428("3:1", "MET", "value", "this module"),
+        e0428("7:5", "MET", "value", "this block"),
+        e0428("14:5", "U", "value", "this block"),
+        e0428("16:5", "V", "type", "this block"),
+        e0428("17:37", "D", "value", "this block"),
+        e0428("24:41", "Z", "value", "this block"),
+    ];
+    want.sort();
+    assert_eq!(errors, want);
 }

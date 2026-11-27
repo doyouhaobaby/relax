@@ -29,10 +29,15 @@ fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
     }
 }
 
-/// E0428: two items of one module (or block) with the same name in the same namespace. The
-/// second is reported, as rustc does ("the name `X` is defined multiple times").
+/// E0428: two items of one module, block or trait with the same name in the same namespace. The
+/// second is reported at its start (its visibility, not its attributes), as rustc does ("the name
+/// `X` is defined multiple times"). A body's items are their block's: the anonymous module they
+/// are collected into (their `scope`; their parent is the body's owner, a fn, a constant or a
+/// closure), so sibling blocks, a block and the module around it, and an inner block and the outer
+/// one never collide. (Two of one block were let through, and a lookup took one for both.)
 pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
-    let mut seen: crate::fxhash::HashMap<(DefId, bool, u32), DefId> = Default::default();
+    // (the scope: a module's or a trait's def, or a block's module index, with whether it is a block)
+    let mut seen: crate::fxhash::HashMap<(u32, bool, bool, u32), DefId> = Default::default();
     let mut errors = Vec::new();
     let mut top_foreign: crate::fxhash::HashSet<(u32, u32)> = Default::default();
     for (m, md) in prog.mods.iter().enumerate() {
@@ -49,7 +54,15 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         let d = DefId(i as u32);
         let def = prog.def(d);
         if !own.get(def.krate as usize).copied().unwrap_or(false) || def.parent == NO_DEF { continue; }
-        if !matches!(prog.def(def.parent).kind, DefKind::Mod | DefKind::Trait) { continue; }
+        let parent_kind = prog.def(def.parent).kind;
+        let (scope, block) = match parent_kind {
+            DefKind::Mod | DefKind::Trait => (def.parent.0, false),
+            // (an impl's items and a type's fields and variants are in a block's module too, but
+            // are none of its names)
+            DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst | DefKind::Closure
+                if prog.mods.get(def.scope as usize).is_some_and(|m| m.lexical_parent.is_some()) => (def.scope, true),
+            _ => continue,
+        };
         // only items the module's source declares (not the compiler's own definitions)
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let name = prog.syms.str(def.name);
@@ -65,19 +78,19 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         let (ty_ns, value_ns) = namespaces(prog, d);
         for (ns, on) in [(true, ty_ns), (false, value_ns)] {
             if !on { continue; }
-            match seen.get(&(def.parent, ns, def.name)) {
+            match seen.get(&(scope, block, ns, def.name)) {
                 Some(&first) if first != d => {
                     let ast = &prog.files[def.file as usize].ast;
-                    let pos = if foreign { ast.item(def.item).lo } else { ast.item(def.item).name.lo };
+                    let pos = ast.item(def.item).lo;
                     let ns_name = if ns { "type" } else { "value" };
-                    let module = if prog.def(def.parent).kind == DefKind::Trait { "this trait" } else if prog.block_owner.get(&prog.def(def.parent).sub).is_some() { "this block" } else { "this module" };
+                    let module = if parent_kind == DefKind::Trait { "this trait" } else if block { "this block" } else { "this module" };
                     errors.push(prog.record_error(def.file, pos, "resolve", format!(
                         "E0428: the name `{}` is defined multiple times -- note: `{}` must be defined only once in the {} namespace of {}",
                         name, name, ns_name, module)));
                     break;
                 }
                 Some(_) => {}
-                None => { seen.insert((def.parent, ns, def.name), d); }
+                None => { seen.insert((scope, block, ns, def.name), d); }
             }
         }
     }
