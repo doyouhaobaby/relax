@@ -697,3 +697,28 @@ fn a_rate_cap_paces_new_data_and_loses_nothing() {
     let uncapped = w.net.now() - start;
     assert!(uncapped * 3 < elapsed, "without the cap the same bytes take {uncapped} ms, not {elapsed}");
 }
+
+#[test]
+fn queued_peer_input_is_serviced_before_the_idle_timeout_after_a_stall() {
+    let mut pair = Pair::new(7);
+    pair.open();
+    pair.keys();
+    let now = pair.net.now();
+    assert_eq!(pair.streams[0].write(b"still here"), 10);
+    let (_, packet) = pair.streams[0].poll_transmit(now).unwrap();
+    let receiver = &mut pair.streams[1];
+    let peer = receiver.peer();
+    let due = receiver.deadline;
+    let mut silent = receiver.clone();
+    silent.poll_transmit(due - 1);
+    assert_eq!(silent.state(), State::Open);
+    silent.poll_transmit(due);
+    assert_eq!(silent.state(), State::Closed(CloseReason::TimedOut));
+
+    receiver.handle_datagram(due + 1, peer, &packet);
+    assert_eq!(receiver.state(), State::Open, "a queued authenticated packet survives the scheduling stall");
+    assert_eq!(receiver.deadline, due + 1 + IDLE);
+    receiver.handle_datagram(receiver.deadline, peer, &packet);
+    receiver.poll_transmit(receiver.deadline);
+    assert_eq!(receiver.state(), State::Closed(CloseReason::TimedOut), "a replay cannot renew the idle timer");
+}
