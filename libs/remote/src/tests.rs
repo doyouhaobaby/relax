@@ -102,6 +102,74 @@ fn data(ch: &Channel) -> Vec<u8> {
 }
 
 #[test]
+fn program_service_retries_data_in_order_and_closes_once() {
+    use crate::program::ServiceSink;
+    use std::{ffi::c_void, sync::mpsc, thread};
+
+    const HANDLE: usize = 7;
+    struct Producer {
+        sink: Option<(ServiceSink, usize)>,
+        offers: Vec<Vec<u8>>,
+        taken: Vec<Vec<u8>>,
+        closes: Vec<usize>,
+        receiver: Option<thread::ThreadId>,
+        exited: mpsc::Sender<()>,
+    }
+    static PRODUCER: Mutex<Option<Producer>> = Mutex::new(None);
+
+    extern "C" fn open(_: *const u8, _: usize, sink: ServiceSink, ctx: *mut c_void) -> usize {
+        PRODUCER.lock().unwrap().as_mut().unwrap().sink = Some((sink, ctx as usize));
+        HANDLE
+    }
+    extern "C" fn receive(handle: usize, ptr: *const u8, len: usize) -> bool {
+        let mut state = PRODUCER.lock().unwrap();
+        let Some(p) = state.as_mut().filter(|_| handle == HANDLE) else { return true };
+        p.receiver = Some(thread::current().id());
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        p.offers.push(bytes.to_vec());
+        if p.offers.len() == 1 { return false }
+        p.taken.push(bytes.to_vec());
+        if bytes == b"Ben" {
+            let (sink, ctx) = p.sink.unwrap();
+            let reply = b"received";
+            sink(ctx as *mut c_void, 0, reply.as_ptr(), reply.len());
+        }
+        true
+    }
+    extern "C" fn close(handle: usize) {
+        let mut state = PRODUCER.lock().unwrap();
+        let p = state.as_mut().unwrap();
+        p.closes.push(handle);
+        if let Some((sink, ctx)) = p.sink.take() {
+            sink(ctx as *mut c_void, 1, std::ptr::null(), 0);
+        }
+    }
+    fn exited() {
+        if let Some(p) = PRODUCER.lock().unwrap().as_ref() {
+            if p.receiver == Some(thread::current().id()) { let _ = p.exited.send(()); }
+        }
+    }
+
+    let (finished, done) = mpsc::channel();
+    *PRODUCER.lock().unwrap() = Some(Producer { sink: None, offers: vec![], taken: vec![], closes: vec![], receiver: None, exited: finished });
+    let ep = Endpoint::with_ring("test", 1024);
+    ep.set_hooks(Hooks { exit: exited, ..Default::default() });
+    ep.register_program("notes", 1, open, close, Some(receive));
+    let client = pair(&ep);
+    let ch = client.open("notes", "").expect("the client opens the registered program service");
+    ch.send(b"Ana".to_vec()).expect("the client sends the first DATA message");
+    ch.send(b"Ben".to_vec()).expect("the client sends the second DATA message");
+    assert!(matches!(ch.recv(), Some(Event::Data(d)) if d == b"received"), "the producer's sink answer reaches the client");
+    ch.close(crate::conn::CLOSE_NORMAL, "");
+    done.recv().expect("the service thread exits after the client closes its channel");
+    let p = PRODUCER.lock().unwrap().take().unwrap();
+    assert_eq!(p.offers, [b"Ana", b"Ana", b"Ben"], "the first refusal retries the same message exactly once");
+    assert_eq!(p.taken, [b"Ana", b"Ben"], "the producer takes both DATA messages in send order");
+    assert_eq!(p.closes, [HANDLE], "closing the channel calls close exactly once with the producer handle");
+    client.close("done");
+}
+
+#[test]
 fn data_must_fit_the_granted_window() {
     use crate::conn::{CLOSE_PROTOCOL, INITIAL_CREDIT};
 
