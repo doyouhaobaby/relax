@@ -214,6 +214,15 @@ fn main() {
     let h = Handle { x: 5 };
     let _ = h.clone().get();
 }
+// the loader build's statics check, as the CPU budget was when every app's start refused it: a
+// plain fn reads an unmarked OnceLock; an op reads another, and a private fn only the op calls a third
+static MACHINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub fn machine_cores() -> usize { *MACHINE.get_or_init(|| 4) }
+static NATIVE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub fn native_cores() -> usize { *NATIVE.get_or_init(native_only) }
+static UNUSED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn native_only() -> usize { *UNUSED.get_or_init(|| 2) }
+pub static LIMIT: usize = 8;
 "#;
 
 /// A provided crate's opaque type (as the loader binds makepad-script's ScriptHeap) keeps the
@@ -221,6 +230,10 @@ fn main() {
 /// off the owner too. They were refused there as if every impl's method were bridged, and the O3
 /// builds of their hot callers left them calls for the rest of the run ("its front is not made off
 /// the owner: refused": ScriptHeap::heap_key and ::value under a text view's draw).
+/// The same crate holds the loader build's provided-statics cases (boundary::statics): an unmarked
+/// static a plain fn reaches fails with the runtime's refusal and the way in, marked `per_side` it
+/// passes, an op's statics are the loader's, and the allow list passes a refusal but not a row that
+/// names none.
 #[test]
 fn an_opaque_types_own_methods_are_made_off_the_owner() {
     isolated_test!(an_opaque_types_own_methods_are_made_off_the_owner);
@@ -260,6 +273,26 @@ fn an_opaque_types_own_methods_are_made_off_the_owner() {
     let get = crate::owner::call(crate::owner::Class::Program, || u.fn_id(FnKey::Inst(get_d, Vec::new())));
     let front = crate::owner::call(crate::owner::Class::Program, || u.front.clone());
     assert!(prefront_slot(&front, get), "the front of Handle::get was not made off the owner");
+
+    // the loader build's statics check over the same crate: native_cores is an op (its body rustc's)
+    unsafe extern "C" fn no_op(_: *const *mut u8, _: *mut u8) -> u32 { 0 }
+    let native = def(&u.prog, "native_cores", DefKind::Fn);
+    let key = crate::provided::key(&u.prog, &u.tcx, native);
+    u.provided[0].1.shims.insert(key, crate::provided::Shim { sig: "", slots: &[], f: no_op });
+    let statics = |u: &Unit, allowed: &[(String, String)]| crate::owner::call(crate::owner::Class::Program, || crate::boundary::statics(u, &["opaque_front".to_string()], allowed, "allow.tsv"));
+    let (report, failed) = statics(&*u, &[]);
+    assert_eq!(failed, 1, "the unmarked MACHINE is the one failure:\n{report}");
+    let refusal = "static `opaque_front::MACHINE` (`OnceLock<usize>`) is laid out and run by rustc's std on the loader's side and by Relax's on this side (a lock, a lazy cell, a collection, a box or an Rc/Arc): reach it through an op of the crate (#[relax_api] fn), or mark it `#[relax_api(per_side)]`";
+    assert!(report.contains(&format!("static\tFAIL\topaque_front::MACHINE\t{refusal}\n  reached\topaque_front::machine_cores\n")), "the runtime's refusal, and the plain fn it is reached through:\n{report}");
+    assert!(!report.contains("NATIVE") && !report.contains("UNUSED"), "an op's body, and the fn only it calls, are rustc's:\n{report}");
+    let allowed = [("opaque_front::MACHINE".to_string(), "a refusal case".to_string())];
+    let (report, failed) = statics(&*u, &allowed);
+    assert!(failed == 0 && report.contains("static\tallowed\topaque_front::MACHINE\ta refusal case\n"), "a listed refusal passes:\n{report}");
+    u.provided[0].1.per_side.insert(crate::provided::norm("opaque_front::MACHINE"));
+    let (report, failed) = statics(&*u, &[]);
+    assert_eq!(failed, 0, "marked per_side, JIT code keeps its own instance:\n{report}");
+    let (report, failed) = statics(&*u, &allowed);
+    assert!(failed == 1 && report.contains("allow\tFAIL\topaque_front::MACHINE\tlisted in allow.tsv"), "a listed static that is no refusal fails, so the list keeps to what is true:\n{report}");
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();

@@ -660,6 +660,11 @@ pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
     }
 }
 
+/// The names of every crate the loader registered (`makepad_script`).
+pub(crate) fn registered_names() -> Vec<String> {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.name.clone()).collect()
+}
+
 /// The loader's provided crates present in a source-only program, matched by name as
 /// `take_for` matches them, without a source-identity check or any host binding table.
 pub(crate) fn registered_in(prog: &Program) -> Vec<u32> {

@@ -445,7 +445,7 @@ fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> boo
             "--units" => return true,
             "--offline" | "--frozen" => { flags.push(args[i].clone()); i += 1; }
             "--workspace-dir" => { let Some(dir) = args.get(i + 1) else { return false }; workspace = dir.clone(); i += 2; }
-            "--report-to" | "--run-dir" | "--cfg" | "--boundary" => i += 2,
+            "--report-to" | "--run-dir" | "--cfg" | "--boundary" | "--known-refused" => i += 2,
             _ => i += 1,
         }
     }
@@ -1175,6 +1175,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut watch = session.is_some();
     let mut deep = false;
     let mut boundary: Option<Vec<String>> = None;
+    // `--boundary statics`: the statics the runtime refuses on purpose (boundary::read_allowed)
+    let mut known_refused: Option<String> = None;
     let mut root_only = false;
     let mut selftest = false;
     // `makepad check --workspace`: every workspace crate the package reaches, not only its app crates
@@ -1341,6 +1343,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 i += 1;
                 boundary = args.get(i).map(|s| s.split(',').map(|x| x.to_string()).collect());
             }
+            "--known-refused" => {
+                i += 1;
+                known_refused = args.get(i).cloned();
+            }
             _ => return usage(),
         }
         i += 1;
@@ -1354,6 +1360,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let boundary_target = (boundary_options && crate::cfg::CfgSet::host(sess, &[]).triple() != crate::cfg::CfgSet::machine(sess, &[]).triple())
         .then(|| crate::cfg::CfgSet::host(sess, &[]).triple());
     if boundary.is_some() && !check { return usage(); }
+    let boundary_statics = boundary.as_ref().is_some_and(|b| b.len() == 1 && b[0] == "statics");
+    if known_refused.is_some() && !boundary_statics { return usage(); }
     if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
     // a profile is a test's: `makepad run` builds as the release profile does. A test's start of
     // its package's binary (CARGO_BIN_EXE_<name>, which names it in RELAX_ARG0) has the test's, as
@@ -2382,6 +2390,21 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         phase("load checked files", t);
         crate::jit::compile_watch(Some(("check: crate", 0)));
+        if boundary_statics {
+            let allowed = match known_refused.as_deref().map(crate::boundary::read_allowed).transpose() {
+                Ok(a) => a.unwrap_or_default(),
+                Err(e) => { eprintln!("relax: {e}"); return 2; }
+            };
+            let up: *mut Unit = &mut *u;
+            let (rep, failed) = crate::owner::call(crate::owner::Class::Program, || crate::boundary::statics(unsafe { &*up }, &crate::provided::registered_names(), &allowed, known_refused.as_deref().unwrap_or("")));
+            print!("{}", rep);
+            std::mem::forget(u);
+            if failed > 0 {
+                eprintln!("relax check --boundary statics: {failed} failure(s): a static of a provided crate that JIT-compiled code can reach is refused when that code first runs");
+                return 1;
+            }
+            return 0;
+        }
         if let Some(b) = &boundary {
             if let Err(e) = crate::boundary::start(&u, b) {
                 eprintln!("relax: {}", e);

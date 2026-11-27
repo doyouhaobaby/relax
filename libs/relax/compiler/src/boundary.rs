@@ -18,6 +18,9 @@
 //! when the code that reaches it first runs (an app's deck reached `shell::Shared::global`
 //! through the unmarked `makepad_hal::screens`); the gates run the audit over the apps.
 //!
+//! `--boundary statics` judges every static of every bound provided crate that JIT code can
+//! reach, from the crates' source alone (`statics`): the loader's build runs it.
+//!
 //! An independent declaration scan reports missing or mismatched tagged Option entries as
 //! `option-entry` failures, including unreachable items. `--boundary options` runs only
 //! this scan for every bound provided crate, before creating a JIT unit. On another check
@@ -66,7 +69,7 @@ pub(crate) fn requested() -> bool {
 /// Resolve the audited crate set; cross-target options use registry names without binding.
 pub(crate) fn crates(prog: &crate::program::Program, provided: &[(u32, crate::provided::ProvidedCrate)], names: &[String], cross_options: bool) -> Result<Vec<u32>, String> {
     let mut crates = Vec::new();
-    if names.len() == 1 && matches!(names[0].as_str(), "all" | "options") {
+    if names.len() == 1 && matches!(names[0].as_str(), "all" | "options" | "statics") {
         if cross_options {
             crates.extend(crate::provided::registered_in(prog));
         } else {
@@ -553,3 +556,174 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
     }
     (out, failing + a.option_entries.len())
 }
+
+/// `makepad check --boundary statics [--known-refused <tsv>] <package>`: every static of a provided
+/// crate that JIT-compiled code can reach, judged as lowering judges it when that code first runs
+/// (provided::static_use, lower.rs check_provided_static). The loader's build runs it
+/// (tools/run/fixture/loader_build.sh) over a program holding every crate the loader provides: a
+/// static that would be refused at run time fails the build with the message the run would give
+/// (an unmarked `OnceLock` in the CPU budget passed cargo check and the crate's own tests, then
+/// every app's start refused it).
+///
+/// What JIT code reaches is taken from the crates' source, not from any one app: the bodies
+/// Relax compiles from a provided crate's source are its fns that are not bound ops (generic
+/// fns, fns without an op mark or that refuse binding: `binding`), and JIT code can enter them
+/// through any `pub` fn, any trait impl's method (Drop's too) and any trait's default body. Each
+/// such body is read as typeck left it (closures with it), and every fn, const and static it
+/// names is followed: a provided crate's non-op fn or free const is read in turn, a static is
+/// judged.
+/// A `pub` static is reached as it is (JIT code names it). An op's body is rustc's: what it
+/// reaches is the loader's.
+///
+/// `registered`: the crates the loader provides (provided::registered_names), each of which the
+/// program must bind. `allowed` (path, why): statics the runtime refuses on purpose (the fixture
+/// crate's refusal cases). A listed static that is not a refused one JIT code reaches fails as
+/// well, so the list keeps to what is true. Returns the report and the number of failures.
+/// (Tested with the opaque-front fixture crate: tier_stuck_tests.rs.)
+pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], allow_file: &str) -> (String, usize) {
+    use crate::ast::{ItemKind, Vis};
+    let prog = &u.prog;
+    let provided: Vec<u32> = u.provided.iter().map(|(k, _)| *k).collect();
+    use std::fmt::Write;
+    let mut rows = String::new();
+    let mut failed = 0usize;
+    // every crate the loader provides is in the program and bound: a missing one goes unchecked
+    for name in registered {
+        if !u.provided.iter().any(|(_, p)| p.name == *name) {
+            failed += 1;
+            let _ = writeln!(rows, "crate\tFAIL\t{name}\tregistered by the loader but not bound in this program: its statics go unchecked (the program depends on every provided crate)");
+        }
+    }
+    let jit_side = |d: DefId| provided.contains(&prog.def(d).krate) && !binding(u, d, &[]).0;
+    let has_body = |d: DefId| {
+        let def = prog.def(d);
+        let ast = &prog.files[def.file as usize].ast;
+        match &ast.item(def.item).kind {
+            ItemKind::Fn(s, b, _) => b.is_some() || ast.fn_sig(*s).lazy_body.is_some(),
+            _ => false,
+        }
+    };
+    // the body (or `pub`) each def was first reached from: the way in, for a failure's row
+    let mut from: std::collections::HashMap<DefId, Option<DefId>> = std::collections::HashMap::new();
+    let mut queue: Vec<DefId> = Vec::new();
+    let mut reached_statics: BTreeMap<String, DefId> = BTreeMap::new();
+    for (di, def) in prog.defs.iter().enumerate() {
+        if !provided.contains(&def.krate) {
+            continue;
+        }
+        let d = DefId(di as u32);
+        let public = || matches!(prog.files[def.file as usize].ast.item(def.item).vis, Vis::Pub);
+        let root = match def.kind {
+            DefKind::Fn | DefKind::AssocFn => {
+                let parent = prog.def(def.parent);
+                (public() || (parent.kind == DefKind::Impl && u.tcx.impl_trait.contains_key(&def.parent)) || parent.kind == DefKind::Trait)
+                    && has_body(d) && jit_side(d)
+            }
+            DefKind::Const => public(),
+            DefKind::Static => {
+                if public() {
+                    from.insert(d, None);
+                    reached_statics.insert(prog.def_path(d), d);
+                }
+                false
+            }
+            _ => false,
+        };
+        if root {
+            from.insert(d, None);
+            queue.push(d);
+        }
+    }
+    let mut read = 0usize;
+    let mut unread: Vec<String> = Vec::new();
+    while let Some(d) = queue.pop() {
+        read += 1;
+        let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.typeck(prog, d))) {
+            Ok(b) => b,
+            Err(p) => {
+                unread.push(format!("{}\t{}", prog.def_path(d), p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default().lines().next().unwrap_or("")));
+                continue;
+            }
+        };
+        let named = body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values())
+            .filter_map(|r| if let crate::typeck::Res::Def(x) = r { Some(*x) } else { None })
+            .chain(body.methods.values().chain(body.binops.values()).map(|m| m.def));
+        for x in named {
+            if (x.0 as usize) >= prog.defs.len() || !provided.contains(&prog.def(x).krate) || from.contains_key(&x) {
+                continue;
+            }
+            match prog.def(x).kind {
+                DefKind::Static => {
+                    from.insert(x, Some(d));
+                    reached_statics.insert(prog.def_path(x), x);
+                }
+                DefKind::Fn | DefKind::AssocFn if has_body(x) && jit_side(x) => {
+                    from.insert(x, Some(d));
+                    queue.push(x);
+                }
+                DefKind::Const => {
+                    from.insert(x, Some(d));
+                    queue.push(x);
+                }
+                _ => {}
+            }
+        }
+    }
+    let way_in = |s: DefId| {
+        let mut path = Vec::new();
+        let mut at = from.get(&s).copied().flatten();
+        while let Some(d) = at.filter(|_| path.len() < 24) {
+            path.push(prog.def_path(d));
+            at = from.get(&d).copied().flatten();
+        }
+        path.reverse();
+        if path.is_empty() { "pub: JIT code names it".to_string() } else { path.join(" -> ") }
+    };
+    let mut refused = 0usize;
+    let mut listed_seen: Vec<&str> = Vec::new();
+    for (path, &s) in &reached_statics {
+        let Some(t) = u.tcx.const_ty(prog, s) else { continue };
+        let crate::provided::StaticUse::Refused(msg) = crate::provided::static_use(u, s, t) else { continue };
+        refused += 1;
+        if let Some((p, why)) = allowed.iter().find(|(p, _)| p == path) {
+            listed_seen.push(p);
+            let _ = writeln!(rows, "static\tallowed\t{path}\t{why}");
+            continue;
+        }
+        failed += 1;
+        let _ = writeln!(rows, "static\tFAIL\t{path}\t{msg}");
+        let _ = writeln!(rows, "  reached\t{}", way_in(s));
+    }
+    for (p, _) in allowed {
+        if !listed_seen.contains(&p.as_str()) {
+            failed += 1;
+            let _ = writeln!(rows, "allow\tFAIL\t{p}\tlisted in {allow_file}, but it is no static the runtime refuses that JIT code reaches: drop the row");
+        }
+    }
+    for e in &unread {
+        failed += 1;
+        let _ = writeln!(rows, "body\tFAIL\t{e}\t(its statics go unchecked)");
+    }
+    let names: Vec<&str> = u.provided.iter().map(|(_, p)| p.name.as_str()).collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "# provided statics: {} provided crates ({}), {} bodies JIT code can compile read, {} statics reached, {} refused ({} allowed): {} failures", names.len(), names.join(", "), read, reached_statics.len(), refused, listed_seen.len(), failed);
+    out.push_str(&rows);
+    (out, failed)
+}
+
+/// The `--known-refused` list: `path<TAB>why` rows, `#` comments and blank lines skipped.
+pub fn read_allowed(path: &str) -> Result<Vec<(String, String)>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("--known-refused {path}: {e}"))?;
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once('\t') {
+            Some((p, why)) if !p.trim().is_empty() && !why.trim().is_empty() => rows.push((p.trim().to_string(), why.trim().to_string())),
+            _ => return Err(format!("--known-refused {path}:{}: a row is `path<TAB>why`", i + 1)),
+        }
+    }
+    Ok(rows)
+}
+
