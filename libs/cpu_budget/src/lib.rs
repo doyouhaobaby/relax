@@ -680,11 +680,16 @@ fn granted_cores(machine: usize, jobs: Option<&str>) -> usize {
 /// CPU quota). A process sizes from this once, at its start: one started under a quota that lifts
 /// later is told its machine's cores, or it keeps its quota's size for its whole life. A live
 /// session launched under a 10-core quota beside a tests shard would have kept a 10-core JIT on a
-/// 16-core box after its launch ended (11-26). Read once.
+/// 16-core box after its launch ended (11-26). Read once on each side of a JIT run ([`MACHINE`]).
 pub fn machine_cores() -> usize {
-    static MACHINE: OnceLock<usize> = OnceLock::new();
     *MACHINE.get_or_init(|| machine_from(std::env::var("MAKEPAD_MACHINE_CORES").ok().as_deref(), || thread::available_parallelism().map_or(1, usize::from)))
 }
+
+/// [`machine_cores`]'s memo. Each side of a JIT run keeps its own: the loader's std and Relax's lay
+/// out a `OnceLock` each their own way, and JIT code reaching an unmarked provided static is refused
+/// (a live app panicked at its start, 11-27). Both sides read the same variable and OS count.
+#[relax_api(per_side)]
+static MACHINE: OnceLock<usize> = OnceLock::new();
 
 /// `given` when it is a count above zero, else what `seen` counts.
 fn machine_from(given: Option<&str>, seen: impl FnOnce() -> usize) -> usize {
