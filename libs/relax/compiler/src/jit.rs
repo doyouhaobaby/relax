@@ -2200,8 +2200,15 @@ pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic
 static ORDER_AT_PRESENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Slot `id` joins the session's install order (Unit::start_order); while the startup image's
-/// window is open, the order's startup part ends with it (ORDER_PRESENT_LEN).
+/// window is open, the order's startup part ends with it (ORDER_PRESENT_LEN). Nothing joins it
+/// once the run is quitting (QUIT_SEEN): the app's shutdown code (a large app's 2,000-2,900 slots
+/// of drop glue and teardown) is cached code that the next quit links from the cache. It went
+/// into the session's tail only when the quit write's pass came after it (4 of 20 cold runs of
+/// a large app, 11-26), and every later start of that cache linked ~2,300 more slots ahead.
 fn order_install(u: &mut Unit, id: u32) {
+    if QUIT_SEEN.load(Ordering::Relaxed) {
+        return;
+    }
     crate::zone_alloc::kept_with(|| u.start_order.push(id));
     let len = u.start_order.len();
     if FIRST_PRESENT.load(Ordering::Acquire) {
