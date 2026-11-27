@@ -233,6 +233,7 @@ pub const DESIGN: &[(&str, &str)] = &[
     ("props", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
     ("locate", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
     ("apply", r#""w":{"type":"integer"},"path":{"type":"string"},"splash":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("typed", r#""w":{"type":"integer"},"path":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("theme", r#""w":{"type":"integer"},"get":{"type":"boolean"},"set":{"type":"boolean"},"install":{"type":"boolean"},"name":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("states", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"}"#),
     ("pose", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"},"state":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
