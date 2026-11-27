@@ -9,6 +9,14 @@ use crate::reload_async_tests::{in_child, live_app, LIVE_UNIT};
 const LIB: &str = r#"mod other;
 pub use other::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+pub static LEVEL: Mutex<u64> = Mutex::new(0);
+pub fn level(out: &mut u64) {
+    let mut l = LEVEL.lock().unwrap();
+    *l += 1;
+    *out = *l as u64;
+}
 
 pub fn sig(out: &mut u64) {
     *out = helper(1);
@@ -254,7 +262,7 @@ fn edits_of_items_apply_live() {
             });
             return;
         }
-        let names = ["sig", "uses_gone", "same", "same_gen", "drops", "cfg_let", "tls"];
+        let names = ["sig", "uses_gone", "same", "same_gen", "drops", "cfg_let", "tls", "level"];
         live_app("items-patch", &[("lib.rs", LIB), ("other.rs", OTHER)], &names, |call, edit| {
             let patch = |edit: &mut dyn FnMut(&str, &[(&str, &str)]) -> crate::reload::Outcome, file: &str, subs: &[(&str, &str)]| {
                 let outcome = edit(file, subs);
@@ -307,6 +315,15 @@ fn edits_of_items_apply_live() {
             // items a macro makes in a fn body
             patch(&mut *edit, "lib.rs", &[("pub fn tls(out: &mut u64) {\n    *out = 1;\n}", "pub fn tls(out: &mut u64) {\n    thread_local! { static T: std::cell::Cell<u64> = std::cell::Cell::new(5); }\n    *out = T.with(|t| t.get());\n}")]);
             assert_eq!(call("tls"), 5);
+            // Qualifying the type keeps the stored value. A different element type needs a restart.
+            assert_eq!(call("level"), 1);
+            assert_eq!(call("level"), 2);
+            patch(&mut *edit, "lib.rs", &[("pub static LEVEL: Mutex<u64>", "pub static LEVEL: std::sync::Mutex<u64>")]);
+            assert_eq!(call("level"), 3);
+            let outcome = edit("lib.rs", &[("std::sync::Mutex<u64> = Mutex::new(0)", "std::sync::Mutex<u32> = Mutex::new(0)")]);
+            assert_eq!(outcome.rung, Rung::Restart, "{:?}", outcome.lines);
+            assert!(outcome.lines.iter().any(|line| line.contains("changed its type from")), "{:?}", outcome.lines);
+            assert_eq!(call("level"), 4);
         });
     });
 }

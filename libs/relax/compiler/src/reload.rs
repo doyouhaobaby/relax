@@ -335,10 +335,10 @@ fn ctfe_relevant_bodies(prog: &Program, file: u32, changed: &[DefId]) -> bool {
     false
 }
 
-/// The running storage an edited const or static initializer made, once placed: `d` itself (a
-/// static) or a static defined inside its initializer (a `thread_local!` key's).
-fn placed_storage(u: &Unit, d: DefId) -> Option<DefId> {
-    u.statics.keys().chain(u.tls_places.keys()).copied().find(|&s| changed_body_owner(&u.prog, s, &[d]))
+/// An edited initializer already made the value of `d` or a static inside it (a `thread_local!` key's).
+fn initializer_restart(u: &Unit, versions: &[(crate::program::FileVersion, Plan)], d: DefId) -> Option<String> {
+    let s = u.statics.keys().chain(u.tls_places.keys()).copied().find(|&s| changed_body_owner(&u.prog, s, &[d]))?;
+    Some(format!("{}the initializer of `{}` changed, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", new_pos(u, versions, d), def_name(&u.prog, d), def_name(&u.prog, s)))
 }
 
 /// Every constant-evaluated context that reads one of `hit` by name, directly or through the consts
@@ -763,8 +763,8 @@ pub(crate) enum Change {
     Body(DefId),
     Const(DefId),
     StaticInit(DefId),
-    /// a named-field struct's field list changed: applied when no field moves (a rename), a new
-    /// layout when no running value of it is left (layout_edit), or the restart rung
+    /// An ADT's layout or a static's declared storage type may have changed.
+    /// The commit compares the running and freshly resolved types.
     Layout(DefId),
     /// a `macro_rules!` changed: the fns of this file that invoke it are rebuilt from their new
     /// expansions (a macro used from another file takes the restart rung)
@@ -786,6 +786,19 @@ pub(crate) struct Plan {
     /// `use` items only the old version has (their position in the old file): their imports go
     pub(crate) removed_uses: Vec<u32>,
     pub(crate) attributes_changed: bool,
+}
+
+impl Plan {
+    /// A check session recollects all possible layout edits. Live statics need only their
+    /// declared types checked at the commit, without invalidating their readers.
+    fn take_live_changes(&mut self, prog: &Program, changes: &mut Vec<Change>, static_type_defs: &mut Vec<DefId>) {
+        for change in self.changes.drain(..) {
+            match change {
+                Change::Layout(d) if prog.def(d).kind == DefKind::Static => static_type_defs.push(d),
+                _ => changes.push(change),
+            }
+        }
+    }
 }
 
 /// Token texts of `pf` in [lo, hi) outside `holes` (comments are not tokens: comment-only
@@ -906,14 +919,18 @@ fn first_tok_at(toks: &(impl crate::parser::lazy_bodies::TokSeq + ?Sized), lo: u
 /// ("no method named `dispatch_a11y_action` found for `&mut Cx`", 11-16). An inner attribute
 /// (`#![..]`) stays its container's.
 fn lo_with_attrs(pf: &crate::parser::ParsedFile, it: &crate::ast::Item) -> u32 {
+    start_with_outer_attrs(pf, it.lo)
+}
+
+fn start_with_outer_attrs(pf: &crate::parser::ParsedFile, lo: u32) -> u32 {
     use crate::lexer::T;
-    if it.lo as usize >= pf.src.len() {
-        return it.lo;
+    if lo as usize >= pf.src.len() {
+        return lo;
     }
     let toks = &pf.toks;
-    let mut i = first_tok_at(toks, it.lo);
-    if i >= toks.len() || toks.at(i).lo != it.lo {
-        return it.lo;
+    let mut i = first_tok_at(toks, lo);
+    if i >= toks.len() || toks.at(i).lo != lo {
+        return lo;
     }
     while i > 0 {
         if toks.at(i - 1).kind == T::DocComment {
@@ -945,7 +962,7 @@ fn lo_with_attrs(pf: &crate::parser::ParsedFile, it: &crate::ast::Item) -> u32 {
             _ => break,
         }
     }
-    toks.at(i).lo.min(it.lo)
+    toks.at(i).lo.min(lo)
 }
 
 fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, u32)]) -> Vec<&'a [u8]> {
@@ -2094,6 +2111,18 @@ fn expr_at(pf: &crate::parser::ParsedFile, it: &crate::ast::Item, e: u32) -> u32
     if (it.lo..=it.hi).contains(&call) { call } else { e }
 }
 
+fn static_init_at(pf: &crate::parser::ParsedFile, it: &crate::ast::Item, init: crate::ast::ExprId) -> u32 {
+    start_with_outer_attrs(pf, expr_at(pf, it, pf.ast.expr(init).lo))
+}
+
+/// The declared type as written, for a static's restart diagnostic.
+fn static_type_spelling(pf: &crate::parser::ParsedFile, it: &crate::ast::Item) -> String {
+    let crate::ast::ItemKind::Static(_, _, init) = it.kind else { unreachable!() };
+    let end = static_init_at(pf, it, init.get().unwrap());
+    let text = pf.src.get(it.name.hi as usize..end as usize).map(String::from_utf8_lossy).unwrap_or_default();
+    text.trim().trim_start_matches(':').trim_end().trim_end_matches('=').split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Classifies the items of one file version against the running one.
 /// Ok: the item pairing (old item -> new item) and the changes that apply live.
 /// Err: the restart reasons (one line each).
@@ -2447,26 +2476,24 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 }
             }
             (ItemKind::Static(_, _, ea), ItemKind::Static(_, _, eb)) if ea.is_some() && eb.is_some() => {
-                let (ea, eb) = (expr_at(old, a, oa.expr(ea.get().unwrap()).lo), expr_at(new, b, na.expr(eb.get().unwrap()).lo));
-                if !attrs_same || toks_norm(old, la, ea, &[]) != toks_norm(new, lb, eb, &[]) {
-                    // its declared type as each version spells it (between the name and the `=`)
-                    let ty = |pf: &crate::parser::ParsedFile, it: &crate::ast::Item, e: u32| -> String {
-                        let t = pf.src.get(it.name.hi as usize..e as usize).map(String::from_utf8_lossy).unwrap_or_default();
-                        let t = t.trim().trim_start_matches(':').trim_end().trim_end_matches('=');
-                        t.split_whitespace().collect::<Vec<_>>().join(" ")
-                    };
-                    let (ta, tb) = (ty(old, a, ea), ty(new, b, eb));
-                    if ta != tb {
-                        why.push(format!("{}: static `{}` changed its type from `{}` to `{}`: its storage holds a value of the old type -- restart the app", pos(new, b.lo), name, ta, tb));
-                    } else {
-                        why.push(format!("{}: static `{}` changed its declaration (attributes or mutability): its storage was made for the old one -- restart the app", pos(new, b.lo), name));
-                    }
+                let (ea, eb) = (static_init_at(old, a, ea.get().unwrap()), static_init_at(new, b, eb.get().unwrap()));
+                // Everything in the header through the name precedes the declared type.
+                if !attrs_same || !same_toks(old, a.lo, a.name.hi, &[], new, b.lo, b.name.hi, &[]) {
+                    why.push(format!("{}: static `{}` changed its declaration (attributes or mutability): its storage was made for the old one -- restart the app", pos(new, b.lo), name));
                     continue;
                 }
-                match def {
-                    Some(d) => out.push(Change::StaticInit(d)),
-                    None => why.push(format!("{}: static `{}` has no definition -- restart the app", pos(new, b.lo), name)),
+                let Some(d) = def else {
+                    why.push(format!("{}: static `{}` has no definition -- restart the app", pos(new, b.lo), name));
+                    continue;
+                };
+                if toks_norm(old, a.name.hi, ea, &[]) != toks_norm(new, b.name.hi, eb, &[]) {
+                    out.push(Change::Layout(d));
+                    if toks_norm(old, ea, a.hi, &[]) == toks_norm(new, eb, b.hi, &[])
+                        && !includes_moved(old, &prog.file_paths[old_file as usize], a, base, &old_exp) {
+                        continue;
+                    }
                 }
+                out.push(Change::StaticInit(d));
             }
             // a named-field struct whose fields changed and nothing else: in place when no field
             // moves, a new layout when no running value is left (decided with the types)
@@ -5899,6 +5926,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // 1-2: parse and classify every file; nothing changes yet
     let mut versions = Vec::new();
     let mut changes = Vec::new();
+    let mut static_type_defs = Vec::new();
     let mut restart = Vec::new();
     let mut kept = None;
     // a whole save holds back its restart-only items alone (hold_back): its texts stay at hand. A
@@ -5931,7 +5959,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             Ok(v) => {
                 trace_count("classify_items", v.pf.ast.items.len() + u.prog.files[e.file as usize].ast.items.len());
                 match classify(&u.prog, e.file, &v.pf, &e.path, base) {
-                    Ok(plan) if module && (plan.removed.iter().any(|d| u.prog.defs[d.0 as usize].is_pub) || plan.changes.iter().any(|c| matches!(c, Change::Layout(_)))) => {
+                    Ok(plan) if module && (plan.removed.iter().any(|d| u.prog.defs[d.0 as usize].is_pub) || plan.changes.iter().any(|c| matches!(c, Change::Layout(d) if u.prog.def(*d).kind != DefKind::Static))) => {
                         // the host holds typed pointers to a module's pub items (exports): one
                         // removed or re-signatured (remove + add) needs a fresh module, and its
                         // types have no live layout migration. Private items removed unbind as in
@@ -5939,7 +5967,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         restart.push(format!("{}:1:1: a pub item of the module was removed or changed its signature, or a layout changed -- unload and load the new text", e.path));
                     }
                     Ok(mut plan) => {
-                        changes.extend(std::mem::take(&mut plan.changes));
+                        plan.take_live_changes(&u.prog, &mut changes, &mut static_type_defs);
                         versions.push((v, plan));
                     }
                     Err(w) => restart.extend(w),
@@ -5954,7 +5982,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         out.ms[0] = ms(t0);
         return out;
     }
-    if kept.is_some() && changes.is_empty() && restart.is_empty()
+    if kept.is_some() && changes.is_empty() && static_type_defs.is_empty() && restart.is_empty()
         && versions.iter().all(|(_, p)| p.added.is_empty() && p.removed.is_empty() && p.removed_uses.is_empty()) {
         out.rung = Rung::Patch;
         out.lines.push(format!("incomplete: {} item(s) kept at their running version", kept.unwrap()));
@@ -6006,8 +6034,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // its running value never sees the new initializer, so the edit lands by a restart
     for c in &changes {
         if let Change::Const(d) | Change::StaticInit(d) = *c {
-            if let Some(s) = placed_storage(u, d) {
-                restart.push(format!("{}the initializer of `{}` changed, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", new_pos(u, &versions, d), def_name(&u.prog, d), def_name(&u.prog, s)));
+            if !static_type_defs.contains(&d) {
+                restart.extend(initializer_restart(u, &versions, d));
             }
         }
     }
@@ -6569,7 +6597,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Ok(v) => match classify_moving(&u.prog, file, &v.pf, &path, base, &moving) {
                     // (its text is the running one's: no change of its own but an include that moved)
                     Ok(mut plan) => {
-                        changes.extend(std::mem::take(&mut plan.changes));
+                        plan.take_live_changes(&u.prog, &mut changes, &mut static_type_defs);
                         for &d in &plan.removed { set_names.push(def_name(&u.prog, d).into_bytes()); }
                         out.changed += plan.removed.len();
                         versions.push((v, plan));
@@ -7004,6 +7032,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if !versions.is_empty() { PROGRAM_EDITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
         trace_stage("gandalf_carry");
+        // Force even an unread static's running type before its DefId points at the edit.
+        let static_types: Vec<_> = static_type_defs.iter().map(|&d| {
+            let def = u.prog.def(d);
+            let init_restart = if static_defs.contains(&d) { initializer_restart(u, &versions, d) } else { None };
+            (d, u.tcx.const_ty(&u.prog, d), def.file, def.item, init_restart)
+        }).collect();
         for (v, plan) in versions {
             let old = v.old;
             // (the caches commit_version clears are freed below, under this write lock)
@@ -7190,6 +7224,24 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             add_errs.extend(e);
         }
         trace_sub("collect_added");
+        for (d, running, old_file, old_item, init_restart) in static_types {
+            let (fresh, errors) = u.tcx.const_ty_fresh(&u.prog, d);
+            if !errors.is_empty() {
+                add_errs.extend(errors);
+            } else if fresh.is_none() || fresh != running {
+                let def = u.prog.def(d);
+                let old = &u.prog.files[old_file as usize];
+                let new = &u.prog.files[def.file as usize];
+                let item = new.ast.item(def.item);
+                let ta = static_type_spelling(old, old.ast.item(old_item));
+                let tb = static_type_spelling(new, item);
+                let name = String::from_utf8_lossy(new.bytes(item.name.lo, item.name.hi));
+                layout_restart.push(format!("{}: static `{name}` changed its type from `{ta}` to `{tb}`: its storage holds a value of the old type -- restart the app", u.pos_str(def.file, item.lo)));
+                types_unapplied = true;
+            } else {
+                layout_restart.extend(init_restart);
+            }
+        }
         // field-list edits: a struct's rename in place, a new layout with no running value left, or
         // the restart rung; an enum's variants placed (enum_place)
         // the enums that took their new layout (enum_place)
