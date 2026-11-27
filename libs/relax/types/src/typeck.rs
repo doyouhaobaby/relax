@@ -6775,10 +6775,23 @@ impl<'a> Fcx<'a> {
     /// `(if c { &a } else { &b }) * 2` the arms stay `&u16` and `&u16: Mul<u16>` applies.
     fn operand_hint(&self, a: ExprId, hint: Option<TyId>) -> Option<TyId> {
         let mut x = a;
+        let mut negated = false;
         loop {
             match self.ast().expr(x).kind {
                 ExprKind::Paren(i) => x = i,
-                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) | ExprKind::TryBlock(_) => return None,
+                // An unsuffixed numeric literal, negated or not, takes the hint's type in check_lit,
+                // where rustc gives it none (op.rs check_overloaded_binop checks the left operand
+                // with no expectation). When both operands are scalars the built-in operator makes
+                // the literal the right operand's type and the result's anyway; otherwise the
+                // operator is `<{float} as Mul<?R>>` until `?R` is known, and the literal may fall
+                // back to f64: `0.75 * sign` with an unannotated closure parameter `sign` stored
+                // into an f32 is E0271 in rustc, which the hint made an f32 product.
+                ExprKind::Unary(UnOp::Neg, i) => {
+                    negated = true;
+                    x = i;
+                }
+                ExprKind::Lit(LitKind::Int | LitKind::Float) => return None,
+                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) | ExprKind::TryBlock(_) if !negated => return None,
                 _ => return hint,
             }
         }

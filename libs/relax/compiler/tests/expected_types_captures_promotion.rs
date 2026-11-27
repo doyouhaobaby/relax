@@ -85,11 +85,25 @@ fn shifted_arm(v: &[u32], c: bool) -> u32 {
     k
 }
 
+// A literal left operand gets no expected type: with an unannotated closure parameter on the right
+// the operator is `<{float} as Mul<?S>>` until the call makes `?S` an f32, which selects
+// `f32: Mul<f32>` and makes the literals f32 too (a float argument would leave them to fall back
+// to f64: E0271, strict_errors/e0271_float_literal_times_closure_param.rs).
+fn scaled_by_a_closure_parameter(sign: f32) -> Vec<f32> {
+    let scaled = |s| {
+        let mut v = vec![0.0f32; 2];
+        v[0] = 0.75 * s;
+        v[1] = -0.25 * s + 1.0;
+        v
+    };
+    scaled(sign)
+}
+
 #[test]
 fn try_operands_of_operators_keep_their_reference() {
     println!("| {:?} {:?} {:?} {:?} {:?}", flipped(&[4]), flipped(&[]), weighted(&[1.0, 2.0], &[0.5, 0.25]), weighted(&[1.0], &[0.5, 0.25]), solved(&[1.0, 2.0], &[3.0, 4.0]));
     println!("| {:?} {:?} {} {} {} {}", shifted(&[3]), sliced(&[[1, 2]]), matched(&[4]), matched(&[]), chosen(&[3, 5], true), chosen(&[3, 5], false));
-    println!("| {} {}", shifted_arm(&[3, 5], false), blocked(&[3]));
+    println!("| {} {} {:?}", shifted_arm(&[3, 5], false), blocked(&[3]), scaled_by_a_closure_parameter(-2.0));
 }
 
 #[derive(Debug, Clone, Copy)]
