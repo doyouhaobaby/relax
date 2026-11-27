@@ -4,7 +4,7 @@
 # Prints "cache_shared_file: ok" or "cache_shared_file: FAILED ...").
 H=$(cd "$(dirname "$0")" && pwd)
 R=$1
-C=$(mktemp -d)
+C=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")
 chmod 700 "$C"
 rc=()
 for k in 1 2 3; do

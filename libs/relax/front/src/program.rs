@@ -23,8 +23,7 @@ pub const BUILTIN_MACROS: &[&str] = &[
     "format", "format_args", "print", "println", "eprint", "eprintln", "write", "writeln", "panic", "vec",
     "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "matches",
     "unreachable", "todo", "unimplemented", "cfg", "concat", "stringify", "line", "file", "column",
-    "module_path", "include_str", "include_bytes", "env", "option_env", "thread_local", "msg_send", "sel",
-    "class", "log", "error", "warning", "warn", "trace", "debug", "asm", "smallvec",
+    "module_path", "include_str", "include_bytes", "env", "option_env", "thread_local", "asm", "smallvec",
     // core::prelude::v1's other built-in macros (`use core::{compile_error, prelude::v1::derive}`)
     "compile_error", "include", "global_asm", "naked_asm", "derive", "test", "bench", "global_allocator",
     "test_case", "trace_macros", "log_syntax", "concat_idents", "cfg_accessible", "cfg_eval", "derive_const",
@@ -611,6 +610,11 @@ pub struct Program {
     pub glob_amb_cache: crate::conc::MemoMap<(u32, Sym, bool, bool), u8>,
     /// precise lookups of a name in a glob's module (what `glob_ambiguity` compares) once imports are resolved
     pub glob_prec_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
+    /// The module bindings `define` replaced with another item of the same name in the same
+    /// namespace (a duplicate, E0428), by the def that replaced them: (module, type namespace,
+    /// name, the def it was). When that def is unbound (a refused live edit's added item), the
+    /// live def it displaced has the name again (`unbind_defs`).
+    displaced: HashMap<DefId, Vec<(u32, bool, Sym, DefId)>>,
     /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
     pub own_crates: Vec<bool>,
     /// rustc's glob ambiguities in the checked crates (the import replay, program/rsim.rs):
@@ -978,6 +982,7 @@ impl Program {
             glob_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             glob_amb_cache: Default::default(),
             glob_prec_cache: Default::default(),
+            displaced: Default::default(),
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_own: Vec::new(),
@@ -1222,6 +1227,22 @@ impl Program {
         None
     }
 
+    /// Whether the path at `pos` of `file`, in `owner` or an item around it, names a generic
+    /// parameter where a constant may not (LegacyOwner::restricted): collection reported it, and
+    /// rustc resolves the path to an error, which reports nothing more. (Every such path has its
+    /// error in `errors`: a program without errors answers at once.)
+    pub fn const_param_restricted(&self, mut owner: DefId, file: u32, pos: u32) -> bool {
+        if self.errors.is_empty() { return false; }
+        while owner != NO_DEF {
+            if let Some(result) = self.legacy_const_args.get(&owner).filter(|r| r.file == file && !r.restricted.is_empty()) {
+                let lo = self.files[file as usize].ast.item(self.def(owner).item).lo;
+                if pos >= lo && result.restricted.contains(&(pos - lo)) { return true; }
+            }
+            owner = self.def(owner).parent;
+        }
+        false
+    }
+
     pub fn ident(&mut self, file: u32, id: Ident) -> Sym {
         let f = &self.files[file as usize];
         let s = std::str::from_utf8(f.bytes(id.lo, id.hi)).unwrap_or("?");
@@ -1365,6 +1386,7 @@ impl Program {
             // runtime entry names. Keep that boundary eager; a complete preload
             // graph (the run/makepad drivers) can safely close demand first.
             self.start_preload(vec![crate::preload::PreCrate {
+                is_bin: false, harness: false,
                 name: kname.clone(),
                 root: root.to_string(),
                 edition,
@@ -2793,6 +2815,22 @@ impl Program {
                 if let Some(items) = self.traits.get_mut(ti) { items.retain(|x| *x != d); }
             }
         }
+        // a def that took a live def's name in its module (a duplicate, E0428: a refused live
+        // edit added it, and its define replaced the binding) gives the name back: without it the
+        // running item's name bound nothing after the refusal, and the code that names it kept
+        // calling the code of before every later patch of it
+        if !self.displaced.is_empty() {
+            for &d in defs {
+                let Some(was) = self.displaced.remove(&d) else { continue };
+                for (module, ns_type, name, w) in was {
+                    if defs.contains(&w) || !self.is_current_version(self.defs[w.0 as usize].file) { continue; }
+                    let m = &self.mods[module as usize];
+                    if (if ns_type { &m.types } else { &m.values }).get(&name).is_none() {
+                        self.define(module, ns_type, name, w);
+                    }
+                }
+            }
+        }
         self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
@@ -3089,10 +3127,9 @@ impl Program {
             self.scope_cache.clear();
         }
         let m = &mut self.mods[module as usize];
-        if ns_type {
-            m.types.insert(name, d);
-        } else {
-            m.values.insert(name, d);
+        let was = if ns_type { m.types.insert(name, d) } else { m.values.insert(name, d) };
+        if let Some(was) = was.filter(|&w| w != d) {
+            self.displaced.entry(d).or_default().push((module, ns_type, name, was));
         }
     }
 
@@ -3584,7 +3621,13 @@ impl Program {
 
     fn collect_new_block_items(&mut self, file: u32, b: BlockId, module: u32, owner: Option<DefId>) -> Result<(), String> {
         let Some((items, subs)) = self.file_blocks[file as usize].get(&b.0).cloned() else { return Ok(()) };
-        let inner = match self.block_mods.get(&(file, b.0)).copied() {
+        // A block module the commit carried over (its items paired) keeps its names only under
+        // the module it was in. When the enclosing block's module is new (an item there was added
+        // or removed), that block's names are new defs, and a lookup from this block falls through
+        // to its old parent's: the old defs. Then this block gets a new module too (11-27: an
+        // `if` block calling a nested fn returning `impl Trait` reached its old opaque).
+        let carried = self.block_mods.get(&(file, b.0)).copied().filter(|&m| self.mods[m as usize].lexical_parent == Some(module));
+        let inner = match carried {
             Some(m) => m,
             None if !items.is_empty() => {
                 let krate = self.mods[module as usize].krate;
@@ -6530,7 +6573,7 @@ enum StdWait {
 
 /// The program's parse of `path`, waiting for it while the program's std load runs.
 fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
-    match shared_std_wait_on(path, &LOAD_STEPS, STD_WAIT_STALL) {
+    match shared_std_wait_on(path, || LOAD_STEPS.load(std::sync::atomic::Ordering::Relaxed), STD_WAIT_STALL) {
         StdWait::Shared(sp) => Some(sp),
         StdWait::Alone => None,
         StdWait::Stalled => {
@@ -6541,10 +6584,11 @@ fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
     }
 }
 
-/// `shared_std_wait` with its steps and the interval with none that is a stall.
-fn shared_std_wait_on(path: &str, steps: &std::sync::atomic::AtomicU64, stall: std::time::Duration) -> StdWait {
+/// `shared_std_wait` with its loads' step count (`steps`, read as it starts and at the end of each
+/// interval) and the interval with no step that is a stall.
+fn shared_std_wait_on(path: &str, mut steps: impl FnMut() -> u64, stall: std::time::Duration) -> StdWait {
     let mut g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
-    let mut seen = steps.load(std::sync::atomic::Ordering::Relaxed);
+    let mut seen = steps();
     loop {
         let Some(m) = g.as_ref() else { return StdWait::Alone };
         if let Some(sp) = m.get(path) {
@@ -6558,7 +6602,7 @@ fn shared_std_wait_on(path: &str, steps: &std::sync::atomic::AtomicU64, stall: s
         if to.timed_out() {
             // a program that registered a graph but loads no std (never expected), or a cycle:
             // no step for the interval, and the file is not here
-            let now = steps.load(std::sync::atomic::Ordering::Relaxed);
+            let now = steps();
             if now == seen && g.as_ref().map_or(true, |m| !m.contains_key(path)) {
                 return StdWait::Stalled;
             }
@@ -6624,6 +6668,7 @@ impl ParseSnapshot {
             assert_eq!(v.pf.token_origins, full.pf.token_origins);
             assert_eq!(v.pf.rules_exp, full.pf.rules_exp);
             assert_eq!(v.pf.body_origin, full.pf.body_origin);
+            assert_eq!(v.pf.meta_origin, full.pf.meta_origin);
             assert_eq!(v.pf.pm_editions, full.pf.pm_editions);
             assert_eq!(v.idents, full.idents);
             let defs = |v: &FileVersion| v.macros.iter().map(|d| format!("{:?}:{:?}:{}:{}:{:?}:{}:{:?}", d.name, d.krate, d.exported, d.builtin, d.def_file, d.def_pos, d.arms)).collect::<Vec<_>>();
@@ -6672,6 +6717,51 @@ impl ParseSnapshot {
         let used = used.unwrap();
         let prep = prepare_file(&mut pf, cfg);
         Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: used.local, imports, reuse: Default::default(), context })
+    }
+}
+
+/// What a crate-level check judges (relax_types item_checks, check.rs crate_level_errors): every
+/// item of the own crates (`makepad check`, a run's app check), or only those of some files of
+/// them (a live edit's new texts: reload.rs). A module's, a block's and a trait's items are in
+/// one file, so an edit's files hold every scope its items can collide or go wrong in. The items
+/// an `include!` brings into a module are its includer's (its parse holds them), and a save of
+/// the included file is an edit of the includer (reload.rs include_edits).
+#[derive(Clone, Copy)]
+pub struct Judged<'a> {
+    pub own: &'a [bool],
+    /// None: every file of the own crates
+    pub files: Option<&'a [u32]>,
+}
+
+impl<'a> Judged<'a> {
+    pub fn crates(own: &'a [bool]) -> Self {
+        Judged { own, files: None }
+    }
+    pub fn files(own: &'a [bool], files: &'a [u32]) -> Self {
+        Judged { own, files: Some(files) }
+    }
+    pub fn has_crate(&self, k: u32) -> bool {
+        self.own.get(k as usize).copied().unwrap_or(false)
+    }
+    /// Whether file `f` is judged: its crate is an own one and, for an edit, it is one of its files.
+    pub fn has_file(&self, prog: &Program, f: u32) -> bool {
+        self.has_crate(prog.file_crate.get(f as usize).copied().unwrap_or(u32::MAX)) && self.files.map_or(true, |fs| fs.contains(&f))
+    }
+    /// The files judged, by index.
+    pub fn file_ids(self, prog: &'a Program) -> impl Iterator<Item = u32> + 'a {
+        let all = self.files.is_none().then(|| 0..prog.files.len() as u32);
+        all.into_iter().flatten().chain(self.files.into_iter().flatten().copied()).filter(move |&f| self.has_file(prog, f))
+    }
+    /// The defs to look at, in definition order: every def (a check skips other crates' by
+    /// `has_crate`), or those of the files judged (from the per-file index).
+    pub fn defs(self, prog: &'a Program) -> impl Iterator<Item = DefId> + 'a {
+        let all = self.files.is_none().then(|| 0..prog.defs.len() as u32);
+        let some = self.files.map(|fs| {
+            let mut v: Vec<u32> = fs.iter().flat_map(|&f| prog.defs_in_file(f).iter().copied()).collect();
+            v.sort_unstable();
+            v
+        });
+        all.into_iter().flatten().chain(some.into_iter().flatten()).map(DefId)
     }
 }
 
@@ -7146,35 +7236,42 @@ pub fn take_missing() -> Vec<(u32, String)> {
 #[cfg(test)]
 mod std_wait_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// The world's wait for a std parse the program's load has not shared yet: while the loads
-    /// take steps, however slowly, it goes on through several of its intervals and ends when the
-    /// load ends its sharing (the world parses alone, nothing said); loads that take no step for
-    /// the interval are a stall, and the wait ends there (the cycle guard, which says so).
+    /// take steps, however slowly (here one per interval, the slowest that moves), it goes on
+    /// through several of its intervals and ends when the load ends its sharing (the world parses
+    /// alone, nothing said); loads that take no step for the interval are a stall, and the wait
+    /// ends there (the cycle guard, which says so). The load's steps come with the wait's looks,
+    /// not from a thread's clock: a thread that stepped every 1 ms went 100 ms without the CPU
+    /// on a full box, and its wait called it a stall (11-24).
     #[test]
     fn a_slow_load_that_moves_is_waited_for_and_a_still_one_is_a_stall() {
         let path = "/relax-std-wait-test/core/lib.rs";
         let stall = Duration::from_millis(100);
-        let steps = AtomicU64::new(0);
         share_std_begin();
+        let (looked, look) = std::sync::mpsc::channel::<()>();
+        let mut looks = 0u64;
         let t = Instant::now();
         let moving = std::thread::scope(|s| {
-            s.spawn(|| {
-                while t.elapsed() < 4 * stall {
-                    steps.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(1));
+            // the load ends its sharing once the wait has read its steps as it began and at the
+            // end of 4 intervals
+            s.spawn(move || {
+                for _ in 0..5 {
+                    if look.recv().is_err() { break; }
                 }
                 share_std_end();
             });
-            shared_std_wait_on(path, &steps, stall)
+            // each look at an interval's end sees a step taken since the last
+            let r = shared_std_wait_on(path, || { looks += 1; let _ = looked.send(()); looks }, stall);
+            drop(looked);
+            r
         });
         assert!(matches!(moving, StdWait::Alone), "a load that moves is waited for, then the world parses alone");
-        assert!(t.elapsed() >= 4 * stall, "through several intervals: {:?}", t.elapsed());
+        assert!(looks >= 5 && t.elapsed() >= 4 * stall, "through several intervals: {looks} looks in {:?}", t.elapsed());
         share_std_begin();
         let t = Instant::now();
-        let still = shared_std_wait_on(path, &AtomicU64::new(0), stall);
+        let still = shared_std_wait_on(path, || 0, stall);
         share_std_end();
         drop_shared_std();
         assert!(matches!(still, StdWait::Stalled), "no step for the interval is a stall");
@@ -7336,6 +7433,7 @@ mod deferred_load_tests {
             let mut p = Program::new(&session);
             if lazy {
                 p.preload(vec![crate::preload::PreCrate {
+                    is_bin: false, harness: false,
                     name: "load_test".into(),
                     root: root.clone(),
                     edition: 2021,

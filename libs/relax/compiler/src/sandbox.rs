@@ -272,7 +272,7 @@ pub struct Domain {
 /// What third-party packages' compile-time code may do (proc macros, pmhost.rs; build scripts,
 /// unitgraph.rs): the entry point's choice, one per process (runner Host `compile_time_code`).
 /// Kept in relax-base, where the build-script runs read it too.
-pub use relax_base::compile_time::{policy, set_policy, Policy};
+pub use relax_base::compile_time::{policy, replace_policy_in_test, set_policy, Policy};
 
 /// The run-time modules' domain: what every domain may call, nothing more; metered (a module's
 /// arena may set a per-call budget).
@@ -2497,7 +2497,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         // (black_box's block runs no instruction)
                         Callee::Asm(b) if b.is_empty() => Callee::Asm(b),
                         Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed code cannot run", f.name)),
-                        Callee::Part => return Err(format!("{}: sandbox transform needs the body before outlining", f.name)),
+                        Callee::Part(_) => return Err(format!("{}: sandbox transform needs the body before outlining", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed, allow)?),
                         Callee::CFn(id, sig) => Callee::CFn(call_target(up, id, &sandboxed, allow)?, sig),
                         Callee::Indirect(v) => Callee::Indirect(mask_fn(&*up, f, &mut insts, &mut pos, p, v)),
@@ -2841,8 +2841,11 @@ mod tests {
 
     #[test]
     fn a_confinement_entry_hands_back_only_addresses_in_its_window() {
-        let base = 7 * WINDOW;
-        let host = &base as *const u64 as u64;
+        // a host address (this stack's), and the window after the one it lies in: a fixed window
+        // held the stack when a thread's stack sat at 0x7_xxxx_xxxx (base 7 * WINDOW handed it back)
+        let probe = 0u64;
+        let host = &probe as *const u64 as u64;
+        let base = (host / WINDOW + 1) * WINDOW;
         assert_eq!(ret_in(base, base + 0x1000), base + 0x1000, "an address in the window is handed back as it is");
         assert_eq!(ret_in(base, base + WINDOW - 1), base + WINDOW - 1, "the window's last byte is in it");
         assert_eq!(ret_in(base, host), 0, "a host address becomes NULL, never the window's bytes at its masked offset");

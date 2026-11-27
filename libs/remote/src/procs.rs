@@ -105,6 +105,42 @@ pub fn cpu_ns(pid: u32) -> Option<u64> {
     cpu_ns_impl(pid)
 }
 
+/// The time the threads of `pid` have waited on a run queue for a CPU, in ns: the second field
+/// of each `/proc/<pid>/task/<tid>/schedstat`. A process that wants to run on a saturated box
+/// waits there and runs next to nothing, yet it is not idle. None once it is gone, or where the
+/// platform (or a kernel without scheduler statistics) cannot say. A thread that ended takes its
+/// wait with it: compare two readings with a saturating difference.
+pub fn run_wait_ns(pid: u32) -> Option<u64> {
+    run_wait_ns_impl(pid)
+}
+
+/// The run-queue wait of one `schedstat` line (`<ns on a CPU> <ns waited on a run queue>
+/// <timeslices run>`).
+pub fn schedstat_wait_ns(line: &str) -> Option<u64> {
+    let mut fields = line.split_whitespace();
+    fields.next()?.parse::<u64>().ok()?;
+    let waited = fields.next()?.parse().ok()?;
+    fields.next()?.parse::<u64>().ok()?;
+    Some(waited)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn run_wait_ns_impl(pid: u32) -> Option<u64> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut waited = None;
+    for task in tasks.flatten() {
+        if let Some(w) = std::fs::read_to_string(task.path().join("schedstat")).ok().and_then(|line| schedstat_wait_ns(&line)) {
+            *waited.get_or_insert(0) += w;
+        }
+    }
+    waited
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn run_wait_ns_impl(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// A thread in an uninterruptible kernel wait ([`blocked_threads`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blocked {
@@ -123,21 +159,58 @@ pub fn blocked_threads(pid: u32) -> Vec<Blocked> {
     blocked_threads_impl(pid)
 }
 
-/// Thread `tid` of `pid` as its `/proc/<pid>/task/<tid>/stat` line says, when its state (the
-/// field after `(comm)`, which may hold spaces and parentheses) is `D`; `wchan` read beside it
-/// (`0`: the kernel names none).
+/// Thread `tid` of `pid` as its `/proc/<pid>/task/<tid>/stat` line says, when its state is `D`
+/// ([`thread_of`]).
 pub fn blocked_of(pid: u32, tid: u32, stat: &str, wchan: &str) -> Option<Blocked> {
+    let t = thread_of(tid, stat, wchan)?;
+    (t.state == 'D').then(|| Blocked { pid, tid, name: t.name, wchan: t.wchan })
+}
+
+/// One thread of a process and what it does now ([`threads`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thread {
+    pub tid: u32,
+    pub name: String,
+    /// the kernel's state letter: `R` runs or waits for a CPU, `S` sleeps, `D` sleeps
+    /// uninterruptibly, `T` is stopped, `Z` has ended
+    pub state: char,
+    /// the kernel function it sleeps in, empty where the kernel names none
+    pub wchan: String,
+}
+
+/// Thread `tid` as its `/proc/<pid>/task/<tid>/stat` line says: its name (inside the
+/// parentheses, which may hold spaces and parentheses) and its state (the field after them);
+/// `wchan` read beside it (`0`: the kernel names none).
+pub fn thread_of(tid: u32, stat: &str, wchan: &str) -> Option<Thread> {
     let (start, end) = (stat.find('(')?, stat.rfind(')')?);
-    if stat.get(end + 1..)?.split_whitespace().next() != Some("D") {
-        return None;
-    }
+    let state = stat.get(end + 1..)?.split_whitespace().next()?.chars().next()?;
     let wchan = wchan.trim();
-    Some(Blocked {
-        pid,
-        tid,
-        name: stat.get(start + 1..end)?.to_string(),
-        wchan: if wchan == "0" { String::new() } else { wchan.to_string() },
-    })
+    Some(Thread { tid, name: stat.get(start + 1..end)?.to_string(), state, wchan: if wchan == "0" { String::new() } else { wchan.to_string() } })
+}
+
+/// Every thread of `pid` with its state and the kernel function it sleeps in, by tid: what a
+/// process that seems stuck does. Empty once it is gone, or where the platform cannot say.
+pub fn threads(pid: u32) -> Vec<Thread> {
+    threads_impl(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn threads_impl(pid: u32) -> Vec<Thread> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for task in tasks.flatten() {
+        let Some(tid) = task.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else { continue };
+        let wchan = std::fs::read_to_string(task.path().join("wchan")).unwrap_or_default();
+        out.extend(thread_of(tid, &stat, &wchan));
+    }
+    out.sort_by_key(|t| t.tid);
+    out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn threads_impl(_pid: u32) -> Vec<Thread> {
+    Vec::new()
 }
 
 /// Each thread of `/proc/<pid>/task` by [`blocked_of`].

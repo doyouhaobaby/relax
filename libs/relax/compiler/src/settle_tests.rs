@@ -25,6 +25,7 @@ fn settle_rebuild_segregates_slot_lifetimes() {
     let session = std::sync::Arc::new(session);
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "slot_lifetimes".into(), root: path.to_string_lossy().into_owned(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -201,6 +202,7 @@ fn settle_rebuild_covers_a_crate_added_at_run_time() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = host.join("lib.rs").to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_host".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -294,6 +296,7 @@ fn settle_rebuild_keeps_coroutines() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = path.to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_coroutines".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -389,6 +392,7 @@ fn settle_rebuild_takes_another_instances_image_once() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let root = path.to_string_lossy().into_owned();
     let pre = vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "settle_instances".into(), root: root.clone(), edition: 2021,
         cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
     }];
@@ -652,6 +656,47 @@ fn allocator_swap_serves_background_finish() {
 }
 
 #[test]
+fn a_pause_waits_for_a_request_the_owner_picked() {
+    isolated_test!(a_pause_waits_for_a_request_the_owner_picked);
+    static PAUSE_DONE: AtomicBool = AtomicBool::new(false);
+    owner::start();
+    let (picked_tx, picked_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let requester = std::thread::spawn(move || {
+        let tid = crate::os::thread::current();
+        *owner::PICKED_TEST.lock().unwrap() = Some((tid, Box::new(move || {
+            picked_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        })));
+        owner::call(owner::Class::Program, || PAUSE_DONE.load(Ordering::SeqCst))
+    });
+    picked_rx.recv().unwrap();
+    let busy_after_pick = owner::busy_for_other(crate::os::thread::current());
+    let (looks, wake) = &PAUSE_LOOKS;
+    *looks.lock().unwrap() = 0;
+    let pauser = std::thread::spawn(move || {
+        pause_compile_jobs("test: picked", false);
+        {
+            let _looks = looks.lock().unwrap();
+            PAUSE_DONE.store(true, Ordering::SeqCst);
+            wake.notify_all();
+        }
+        resume_compile_jobs(false);
+    });
+    let done_while_picked = {
+        let _looks = wake.wait_while(looks.lock().unwrap(), |n| *n < 2 && !PAUSE_DONE.load(Ordering::SeqCst)).unwrap();
+        PAUSE_DONE.load(Ordering::SeqCst)
+    };
+    go_tx.send(()).unwrap();
+    let done_in_request = requester.join().unwrap();
+    pauser.join().unwrap();
+    assert!(busy_after_pick, "a pauser must see the owner busy once it has dequeued a request");
+    assert!(!done_while_picked, "the pause ended while the owner held a picked request");
+    assert!(!done_in_request, "the picked request body must run before the pause ends");
+    assert!(PAUSE_DONE.load(Ordering::SeqCst), "the pause must end after the request");
+}
+
+#[test]
 fn hot_o3_cache_roundtrip() {
     // Tiering is process-global: the second unit is a fresh launch, sharing only disk cache.
     const CHILD: &str = "RELAX_HOT_O3_CACHE_TEST";
@@ -842,7 +887,9 @@ fn main() {}
 /// records it, and the quit write adds what the session installed later as its tail: a first try
 /// that gives way while installs go on does not take them into the manifest (and its image), the
 /// quit write records the tail and leaves the manifest as it was, and the next launch links both
-/// from the cache.
+/// from the cache. What the session compiles once it is quitting (its shutdown code) is cached
+/// code but no part of the order: the next quit links it from the cache, and the quit write's
+/// pass, before or after it, records the same tail.
 #[test]
 fn the_startup_manifest_keeps_its_windows_order_and_the_quit_adds_the_tail() {
     const CHILD: &str = "RELAX_MANIFEST_WINDOW_TEST";
@@ -853,6 +900,7 @@ fn the_startup_manifest_keeps_its_windows_order_and_the_quit_adds_the_tail() {
         std::fs::write(dir.join("input.rs"), r#"
 pub fn first(out: &mut u32) { *out = 11; }
 pub fn later(out: &mut u32) { *out = 22; }
+pub fn after_quit(out: &mut u32) { *out = 33; }
 fn main() {}
 "#).unwrap();
         for phase in ["cold", "warm"] {
@@ -874,14 +922,18 @@ fn main() {}
         let id = DefId(i as u32);
         (d.krate == krate && prog.name(id) == name).then_some(id)
     }).unwrap();
-    let (first_def, later_def) = (def("first"), def("later"));
+    let (first_def, later_def, after_quit_def) = (def("first"), def("later"), def("after_quit"));
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
-    let (first, later) = crate::owner::call(crate::owner::Class::Program, || {
-        let ids = (u.fn_id(FnKey::Inst(first_def, Vec::new())), u.fn_id(FnKey::Inst(later_def, Vec::new())));
+    let (first, later, after_quit) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = (
+            u.fn_id(FnKey::Inst(first_def, Vec::new())),
+            u.fn_id(FnKey::Inst(later_def, Vec::new())),
+            u.fn_id(FnKey::Inst(after_quit_def, Vec::new())),
+        );
         let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
         cache.mode = crate::cache::Mode::On;
         u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
@@ -910,21 +962,24 @@ fn main() {}
         assert!(recorded.is_some(), "the write after it ran");
         // the quit write: the session's tail
         QUIT_SEEN.store(true, Ordering::Relaxed);
+        assert_eq!(run(compile(after_quit)), 33);
         let quit = unsafe { crate::run::quit_write_pass(up) };
         assert!(quit.is_some(), "the quit write ran");
     } else {
         let held = crate::owner::call(crate::owner::Class::Program, || {
             let mut cache = u.cache.take().unwrap();
             cache.load_manifest(crate::layout::root_crate());
-            let held = (cache.manifest_holds(&u, first), cache.manifest_holds(&u, later));
+            let held = (cache.manifest_holds(&u, first), cache.manifest_holds(&u, later), cache.manifest_holds(&u, after_quit));
             u.cache = Some(cache);
             held
         });
-        assert_eq!(held, (Some(true), Some(false)), "the manifest holds the slot its window installed, the tail the one installed after it (manifest, tail)");
-        let entries = crate::owner::call(crate::owner::Class::Program, || unsafe { (ready_code_locked(up, first), ready_code_locked(up, later)) });
-        let (Some(a), Some(b)) = entries else { panic!("the next launch links both from the cache: {entries:?}") };
-        assert_eq!((run(a), run(b)), (11, 22));
-        assert!(u.cache.as_ref().unwrap().stats.hits >= 2, "both came from the cache, not a build");
+        assert_eq!(held, (Some(true), Some(false), None), "the manifest holds the slot its window installed, the tail the one installed after it, and neither the one the quit compiled (manifest, tail, quit)");
+        let entries = crate::owner::call(crate::owner::Class::Program, || unsafe {
+            (ready_code_locked(up, first), ready_code_locked(up, later), ready_code_locked(up, after_quit))
+        });
+        let (Some(a), Some(b), Some(c)) = entries else { panic!("the next launch links all three from the cache: {entries:?}") };
+        assert_eq!((run(a), run(b), run(c)), (11, 22, 33));
+        assert!(u.cache.as_ref().unwrap().stats.hits >= 3, "all three came from the cache, not a build");
     }
     // As in the settling fixture, process exit owns the runtime's teardown.
     std::mem::forget(u);
@@ -1575,10 +1630,14 @@ fn live_o3_split_keeps_the_saved_host_current() {
             let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::live_o3_split_keeps_the_saved_host_current", "--nocapture"])
                 .env(CHILD, opt).env("RELAX_OPT", opt).env("RELAX_CACHE", "off").env("RELAX_O3_STATS", "1")
+                .env("RELAX_DUMP_RIR", "split_live::caller")
                 .env("RELAX_GANDALF", "0").env_remove("RELAX_OUTLINE_WHOLE"));
             let stderr = String::from_utf8_lossy(&result.stderr);
             let stdout = String::from_utf8_lossy(&result.stdout);
             assert!(result.status.success() && stdout.contains("1 passed"), "RELAX_OPT={opt}\n{stdout}\n{stderr}");
+            if opt == "+outline" {
+                assert!(stderr.contains("Call(Part(Some(0)),"), "O3 must pass exit zero as an immediate\n{stderr}");
+            }
             for line in stderr.lines().filter(|l| l.starts_with("relax o3-stats: outline ")) { eprintln!("{line}"); }
         }
         return;
@@ -1588,8 +1647,9 @@ fn live_o3_split_keeps_the_saved_host_current() {
     let dir = std::env::temp_dir().join(format!("relax-outline-live-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("input.rs");
+    // Only the range starts at zero. O3 used to keep that initializer live for exit zero.
     let source = "#[inline] pub fn leaf(x: u32) -> u32 { (x << 1) ^ (x >> 3) ^ 7 }\n\
-        pub fn caller(out: &mut u32) { let mut i = 0; let mut s = 0u32; while i < 100 { s = s.wrapping_add(leaf(i)); i += 1; } *out = s; }\nfn main() {}";
+        pub fn caller(out: &mut u32) { let n = *out; let mut s = 1u32; for i in 0..n { s = s.wrapping_add(leaf(i)); } *out = s; }\nfn main() {}";
     std::fs::write(&path, source).unwrap();
     let mut session = crate::Session::default();
     session.options.live = true;
@@ -1636,16 +1696,16 @@ fn live_o3_split_keeps_the_saved_host_current() {
         }
     }
     let run_saved = || {
-        let mut result = 0u32;
+        let mut result = 100u32;
         unsafe { call_jit(up, saved, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
         result
     };
-    assert_eq!(run_saved(), 9984);
+    assert_eq!(run_saved(), 1 + 9984);
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
         file, path: path.to_string_lossy().into_owned(), src: source.replace("(x << 1) ^ (x >> 3) ^ 7", "((x << 1) ^ (x >> 3) ^ 7) + 1").into_bytes(),
     }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
-    assert_eq!(run_saved(), 10084, "the original host reaches the patched leaf");
+    assert_eq!(run_saved(), 1 + 10084, "the original host reaches the patched leaf");
     unsafe { UNIT = std::ptr::null_mut() };
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -8,6 +8,10 @@
 //!   makepad clean --shared-code            remove the shared code stores of builds not running
 //!   makepad run [opts] <package> [cargo flags] [-- args]   boot a cargo package from source (run.rs)
 
+// thread-locals take no pthread key each on Android (libs/thread_local)
+#[macro_use(thread_local)]
+extern crate makepad_thread_local;
+
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
 // log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
@@ -218,8 +222,8 @@ mod test_child {
     }
 
     /// `run_alone` for a test whose regression is a hang: a child that has not ended `secs` after
-    /// it started is ended, and the test fails saying so.
-    #[cfg(any(target_vendor = "apple", all(target_os = "linux", target_arch = "x86_64")))]
+    /// it started is ended, and the test fails saying so (Windows: run to its end, no deadline).
+    #[cfg(any(target_vendor = "apple", all(any(target_os = "linux", windows), target_arch = "x86_64")))]
     pub fn run_alone_within(module: &str, name: &str, secs: u64) -> bool {
         run_alone_as(module, name, None, Some(secs))
     }
@@ -1095,20 +1099,36 @@ pub fn std_dir() -> String {
 }
 
 /// Where std's sources may be, in order: the workspace's own or that of the makepad checkout it
-/// lies in (apps/commercial builds against the tree around it), beside the binary's target dir,
-/// under <dir>/src, and the tree the binary was built from. The workspace's tree comes first: a
-/// lease's binary matches the lease's tree, and the tree beside it may have moved on since.
+/// lies in (apps/commercial builds against the tree around it), the source tree named by the
+/// target dir, beside that dir, under <dir>/src, and the tree the binary was built from. The
+/// workspace's tree comes first: a lease's binary matches the lease's tree, and the tree beside
+/// it may have moved on since.
 pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
     // the loader's own path, not a run's link of it (selfexe.rs)
-    let mut d = crate::dirs::loader_exe().unwrap_or_default();
-    for _ in 0..3 {
-        d.pop();
-    }
+    std_candidates_for_exe(workspace, &crate::dirs::loader_exe().unwrap_or_default())
+}
+
+fn std_candidates_for_exe(workspace: Option<&str>, exe: &std::path::Path) -> Vec<String> {
+    use std::path::{Component, Path};
     let mut v: Vec<String> = Vec::new();
     if let Some(w) = workspace {
-        for dir in std::path::Path::new(w).ancestors() {
+        for dir in Path::new(w).ancestors() {
             v.push(format!("{}/libs/relax/compiler/std", dir.display()));
         }
+    }
+    // A target dir may name its source tree with a relative path on one line.
+    if let Some(target) = exe.parent().and_then(Path::parent) {
+        let source = std::fs::read_to_string(target.join("source")).unwrap_or_default();
+        let mut lines = source.lines();
+        let path = Path::new(lines.next().unwrap_or_default());
+        let relative = matches!(path.components().next(), Some(Component::Normal(_) | Component::CurDir | Component::ParentDir));
+        if relative && lines.next().is_none() {
+            v.push(target.join(path).join("libs/relax/compiler/std").display().to_string());
+        }
+    }
+    let mut d = exe.to_path_buf();
+    for _ in 0..3 {
+        d.pop();
     }
     v.push(format!("{}/libs/relax/compiler/std", d.display()));
     v.push(format!("{}/src/libs/relax/compiler/std", d.display()));
@@ -1119,16 +1139,18 @@ pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 #[test]
 fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_the_binary() {
-    let v = std_candidates(Some("/t/lane/apps/commercial"));
+    let beside = std::env::temp_dir().join(format!("relax-std-candidates-{}", std::process::id()));
+    let target = beside.join("build");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("source"), "../checkout\r\n").unwrap();
+    let v = std_candidates_for_exe(Some("/t/lane/apps/commercial"), &target.join("host/makepad"));
+    std::fs::remove_dir_all(&beside).unwrap();
     let at = |c: &str| v.iter().position(|x| x == c);
-    // the binary is the loader, as std_candidates takes it: under the JIT this test's own
-    // executable (current_exe) is its run's link of the loader, in the run's folder
-    let mut beside = crate::dirs::loader_exe().unwrap();
-    for _ in 0..3 {
-        beside.pop();
-    }
+    let named = target.join("../checkout").join("libs/relax/compiler/std");
+    let named_at = at(&named.display().to_string()).unwrap();
     assert_eq!(at("/t/lane/apps/commercial/libs/relax/compiler/std"), Some(0));
-    assert!(at("/t/lane/libs/relax/compiler/std").unwrap() < at(&format!("{}/libs/relax/compiler/std", beside.display())).unwrap(), "{v:?}");
+    assert!(at("/t/lane/libs/relax/compiler/std").unwrap() < named_at, "{v:?}");
+    assert_eq!(at(&format!("{}/libs/relax/compiler/std", beside.display())), Some(named_at + 1));
 }
 
 /// Loads core, alloc (when present) and std; returns core and the dependency list user crates
@@ -1139,6 +1161,7 @@ fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_
 pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflow_checks: bool) -> Vec<preload::PreCrate> {
     let dir = std_dir();
     let mut v = vec![preload::PreCrate {
+        is_bin: false, harness: false,
         
         name: "core".to_string(),
         root: format!("{}/core/lib.rs", dir),
@@ -1152,6 +1175,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflo
     let alloc_root = format!("{}/alloc/lib.rs", dir);
     if crate::vfs::exists(&alloc_root) {
         v.push(preload::PreCrate {
+            is_bin: false, harness: false,
             
             name: "alloc".to_string(),
             root: alloc_root,
@@ -1164,6 +1188,7 @@ pub fn std_pre_crates(sess: &std::sync::Arc<crate::Session>, simd: bool, overflo
         });
     }
     v.push(preload::PreCrate {
+        is_bin: false, harness: false,
         
         name: "std".to_string(),
         root: format!("{}/std/lib.rs", dir),
@@ -1381,7 +1406,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let mut u = jit::Unit::new(prog, tcx, core);
     // (a failed enum discriminant does not end it before the check: the check's item checks report
     // it beside the rest, as rustc's analysis carries on past it, tcx.rs check_def_signature)
-    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false).len();
     // (what the tests' own code resolves and expands from now on is no lint's input)
     relax_types::macros::uses::record(false);
     relax_front::program::set_record_import_uses(false);
@@ -1668,6 +1693,8 @@ mod value_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
 mod progsig_tests;
+#[cfg(all(test, windows))]
+mod progexc_tests;
 
 #[cfg(test)]
 mod check_lint_tests;

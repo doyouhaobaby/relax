@@ -101,6 +101,7 @@ pub fn inspect(words: &str) -> Option<&'static str> {
         "gpu diff" => "",
         "gpu path" => "",
         "hal pump" => "",
+        "hal stats" => "",
         "hal pace" => "",
         "hal shell" => "",
         "hal lose" => "",
@@ -211,7 +212,7 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
         ("vsnative", _) => params!("file": "string", "pid": "string", "native": "string", "build": "boolean", "args": "string", "s": "number", "warm_ms": "integer", "hz": "integer", "n": "integer", "ev": "string", "tree": "integer", "min": "number", "roots": "string", "save": "boolean", "threads": "string", "nthreads": "string"),
         ("ab", _) => params!("a": "string", "b": "string", "rounds": "integer", "s": "number", "settle_ms": "integer", "hz": "integer", "metric": "string", "per": "string", "ev": "string", "keep": "string"),
         ("remarks" | "code" | "stale", _) => params!("n": "integer"),
-        ("why-tier", "stuck" | "uncounted") => params!("n": "integer"),
+        ("why-tier", "stuck" | "uncounted" | "parked") => params!("n": "integer"),
         ("why-tier", _) => "",
         ("tier", _) => params!("fresh": "boolean"),
         ("probe", "add") => params!("code": "string", "mutate": "boolean", "tier": "string"),
@@ -228,6 +229,14 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
 
 /// Structural design operations, selected before queuing a UI edit.
 pub const DESIGN: &[(&str, &str)] = &[
+    ("pick", r#""w":{"type":"integer"},"at":{"type":"string"},"path":{"type":"string"},"window":{"type":"integer"}"#),
+    ("props", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
+    ("locate", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
+    ("apply", r#""w":{"type":"integer"},"path":{"type":"string"},"splash":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("typed", r#""w":{"type":"integer"},"path":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("theme", r#""w":{"type":"integer"},"get":{"type":"boolean"},"set":{"type":"boolean"},"install":{"type":"boolean"},"name":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("states", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"}"#),
+    ("pose", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"},"state":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("open", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("delete", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("duplicate", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),

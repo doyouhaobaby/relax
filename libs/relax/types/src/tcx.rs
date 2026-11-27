@@ -2334,6 +2334,13 @@ impl Tcx {
         }
     }
 
+    /// Lower the current declaration for a live edit, keeping the running declaration cached.
+    pub fn const_ty_fresh(&self, prog: &Program, d: DefId) -> (Option<TyId>, Vec<String>) {
+        let cell = std::sync::OnceLock::new();
+        let decl = self.const_decl(prog, d, &cell);
+        (decl.ty, decl.errors.clone())
+    }
+
     /// An anonymous constant's type is fed by the lowering that meets it (lower_const_arg, as
     /// hir_ty_lowering's feed_anon_const_type): its holder's declared type, signature or body,
     /// which a cold run lowers before anything types the constant. A warm `makepad run` takes

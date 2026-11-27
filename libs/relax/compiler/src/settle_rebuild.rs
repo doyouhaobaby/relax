@@ -281,6 +281,7 @@ fn with_added(prog: &Program, boot: &[crate::preload::PreCrate]) -> Vec<crate::p
         let deps: Vec<(u32, (String, String))> = c.deps.iter().filter(|&&(_, k)| k as usize != ci && (k as usize) < prog.crates.len())
             .map(|&(alias, k)| (k, (prog.syms.str(alias).to_string(), prog.syms.str(prog.crates[k as usize].name).to_string()))).collect();
         pre.push(crate::preload::PreCrate {
+            is_bin: c.is_bin, harness: c.harness,
             name: prog.syms.str(c.name).to_string(), root: c.root_path().to_string(), edition: c.edition, cfg: c.cfg.clone(),
             deps: deps.iter().map(|(_, d)| d.clone()).collect(), proc_macro: c.proc_macro,
             image_deps: deps.iter().map(|&(k, _)| k as usize).collect(), image_dep_names: deps.into_iter().map(|(_, d)| d).collect(),

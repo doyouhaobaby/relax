@@ -1801,7 +1801,7 @@ pub fn set_unwind_hosts(hosts: Vec<Sym>) {
 pub fn may_unwind(c: &Callee, nounwind: &dyn Fn(u32) -> bool) -> bool {
     match c {
         Callee::Fn(id) => !nounwind(*id),
-        Callee::Part | Callee::Indirect(_) => true,
+        Callee::Part(_) | Callee::Indirect(_) => true,
         // a C-unwind call: a panic may cross it (callee facts are per Rust slot, not asked)
         Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
         Callee::Host(a) => UNWIND_HOSTS.get().map_or(false, |v| v.contains(a)),
@@ -6184,6 +6184,39 @@ mod instcombine_tests {
         }
     }
 
+    /// `((a < 5 ? k1 : k2) & m) cc k`: the select-tree compare fold narrows through a low mask of
+    /// any width (`n % 2 == 0` is `n & 1`, one bit) and folds to what the unfolded code computes:
+    /// the masked arms zero-extended also under a signed compare (`(7 & 7) <s 4` is false), and a
+    /// mask with a gap (5, 0x50) not read as the low bits up to its top one.
+    #[test]
+    fn low_mask_compare_of_a_constant_select() {
+        let conds = [(Cond::Eq, false), (Cond::Ne, false), (Cond::Gt, false), (Cond::Lt, true), (Cond::Gt, true), (Cond::Le, true), (Cond::Ge, true)];
+        for (k1, k2) in [(130, 131), (0x1c2, 0x101), (7, 2), (0x5f, 0x20)] {
+            for m in [1, 3, 5, 7, 0x3f, 0x50, 0xff, 0x7ff] {
+                for (cc, signed) in conds {
+                    for k in [-1, 0, 1, 2, 3, 4] {
+                        let mut f = fixture(1, 7, 1);
+                        let [a, c, x1, x2, sel, low, d] = std::array::from_fn::<_, 7, _>(|i| VReg(i as u32));
+                        f.blocks[0].insts = vec![
+                            Inst::ICmpI(Cond::Lt, false, c, a, 5),
+                            Inst::Iconst(x1, k1),
+                            Inst::Iconst(x2, k2),
+                            Inst::Sel(sel, c, x1, x2),
+                            Inst::IBinI(IOp::And, U64, low, sel, m),
+                            Inst::ICmpI(cc, signed, d, low, k),
+                        ];
+                        f.blocks[0].term = Term::Ret(vec![d]);
+                        positions(&mut f);
+                        simplify_ic(&mut f, true);
+                        for (arg, kv) in [(0, k1), (9, k2)] {
+                            assert_eq!(eval(&f, &[arg]), cmp_i(cc, signed, kv & m, k) as i64, "({k1:#x} or {k2:#x}) & {m:#x} {cc:?} signed {signed} {k}, the {kv:#x} arm: {:?}", f.blocks[0].insts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn phi_fixture(narrow: bool, cc: Cond, signed: bool, k: i64) -> Func {
         let mut f = fixture(2, 5, 4);
         f.blocks[0].term = Term::Branch(VReg(0), 1, 2);
@@ -10003,6 +10036,14 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 }
             }
         }
+        // slots handed to a call returning in memory as its result buffer
+        let sret_use: Vec<bool> = (0..ns)
+            .map(|s2| {
+                sc.call_args[s2].iter().any(|&(bi, ii, k)| {
+                    k == 0 && matches!(&f.blocks[bi].insts[ii], Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) if f.sret_callees.contains(id))
+                })
+            })
+            .collect();
         // join the first good candidate per slot pair (slots may sit in several candidates)
         let mut used = vec![false; ns];
         let mut to: Vec<u32> = (0..ns as u32).collect();
@@ -10018,6 +10059,18 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             to[from as usize] = into;
             let al = f.slots[bs as usize].align.max(f.slots[cs as usize].align);
             f.slots[into as usize].align = al;
+            // The joined slot is a call's whole result buffer (`Slot::ret`: every call handed it as
+            // one writes all of it) when one side was and the other is no call's partial one: a
+            // call result moved on whole (`?` hands `rd(..)`'s result to `Try::branch` through
+            // a by-value argument copy, the slot that stays) keeps the flag that spares a guarded
+            // copy's slow call the flush of its result (sroa); a smaller result buffer that
+            // becomes the start of a larger slot is written only in part by its call.
+            let (fr, ir) = (f.slots[from as usize].ret, f.slots[into as usize].ret);
+            f.slots[into as usize].ret = if f.slots[from as usize].size == f.slots[into as usize].size {
+                (fr && (ir || !sret_use[into as usize])) || (ir && !sret_use[from as usize])
+            } else {
+                ir && !sret_use[from as usize]
+            };
             dels.push((cb, ci));
         }
         if dels.is_empty() {

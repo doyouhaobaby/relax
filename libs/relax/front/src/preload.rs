@@ -29,6 +29,10 @@ pub struct PreCrate {
     /// the extern prelude: (name the crate uses, the dependency's crate name)
     pub deps: Vec<(String, String)>,
     pub proc_macro: bool,
+    /// a binary target (CrateInfo::is_bin): carried so a restore sets it as the load does
+    pub is_bin: bool,
+    /// built with `--test` (CrateInfo::harness)
+    pub harness: bool,
     /// Indices in this preload, in Program dependency order (including implicit std).
     pub image_deps: Vec<usize>,
     pub image_dep_names: Vec<(String, String)>,
@@ -990,7 +994,7 @@ fn plain_str(lit: &[u8]) -> Option<String> {
     (raw.is_some() || !body.contains('\\')).then(|| body.to_string())
 }
 
-std::thread_local! {
+thread_local! {
     /// the files an `include!` scan is inside of on this thread (a file that includes itself, a
     /// rustc error, stops at the repeat)
     static INCLUDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2080,7 +2084,7 @@ mod cold_tests {
         let crates: Vec<_> = (0..5).map(|i| {
             let root = dir.join(format!("c{}.rs", i)).to_string_lossy().into_owned();
             std::fs::write(&root, "pub fn f() -> u32 { 1 }").unwrap();
-            PreCrate {  name: format!("c{}", i), root, edition: 2021, cfg: CfgSet::host(sess, &[]), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }
+            PreCrate { is_bin: false, harness: false,  name: format!("c{}", i), root, edition: 2021, cfg: CfgSet::host(sess, &[]), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }
         }).collect();
         let (pool, workers) = start(sess, crates, &MacroTable::default(), None, true, Default::default());
         for ci in 0..5 {

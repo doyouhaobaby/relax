@@ -1290,21 +1290,81 @@ pub fn modified(path: impl AsRef<std::path::Path>) -> Option<std::time::SystemTi
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// What a virtual path's content is fixed by: its mount's store and commit (None on disk, and under
-/// a folder mount: its content names it). Caches that would compare file times compare this
-/// instead.
+/// What a virtual path's content is fixed by: its mount's store and commit, and the edits of it
+/// and below it ([`edits_below`]; None on disk, and under a folder mount: its content names it).
+/// Caches that would compare file times compare this instead: a build script's rerun key (a file
+/// it names), the std a script tool is keyed by. The commit alone kept a script's output across
+/// every overlay edit of what it read.
 pub fn identity(path: &str) -> Option<String> {
+    identity_in(path, false)
+}
+
+/// [`identity`] of a package's folder by cargo's rule for its files: its target folders and
+/// hidden entries at its top are not its files (unitgraph.rs `newest_mtime_pkg`). The rerun key of
+/// a build script that names no input.
+pub fn package_identity(dir: &str) -> Option<String> {
+    identity_in(dir, true)
+}
+
+fn identity_in(path: &str, package: bool) -> Option<String> {
     if !ANY.load(Ordering::Acquire) {
         return None;
     }
     let (m, _) = find(path)?;
-    if whiteout(path) || edited_file(path).is_some() || std_view(path).is_some() {
+    if std_view(path).is_some() {
         return None;
     }
-    Some(match m.store.range {
+    let mount = match m.store.range {
         Some((offset, len)) => format!("{}@{offset}+{len}@{}", m.store.path.display(), store::hex(&m.commit)),
         None => format!("{}@{}", m.store.path.display(), store::hex(&m.commit)),
+    };
+    Some(match edits_below(path, package) {
+        Some(edits) => format!("{mount}+edits {edits}"),
+        None => mount,
     })
+}
+
+/// The edits of virtual `path` and below it as a key, None when it has none: each file the edits
+/// folder holds there with its length and modification time (cargo's key of a package's files),
+/// and each whiteout there. One walk of the edits folder at that place: the few files edited
+/// there, never the store's files, and none read. `package`: not its top's target folders and
+/// hidden entries ([`package_identity`]).
+fn edits_below(path: &str, package: bool) -> Option<String> {
+    let (at, rel) = edit_path(path)?;
+    let dir = EDITS.read().unwrap().clone()?;
+    // (a name below `rel`, by its part below it; None: not below it)
+    fn below<'a>(rel: &str, d: &'a str) -> Option<&'a str> {
+        if rel.is_empty() { Some(d) } else if d == rel { Some("") } else { d.strip_prefix(rel).and_then(|x| x.strip_prefix('/')) }
+    }
+    let kept = |d: &str| below(&rel, d).is_some_and(|x| !package || !(x.starts_with("target") || x.starts_with('.')));
+    let mut lines = Vec::new();
+    let mut todo = vec![(at, rel.clone())];
+    while let Some((p, r)) = todo.pop() {
+        let Ok(m) = std::fs::metadata(&p) else { continue };
+        if m.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&p) else { continue };
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+                // (the run's own records, at the folder's top)
+                if r.is_empty() && name.starts_with(".makepad-run-") {
+                    continue;
+                }
+                let r = if r.is_empty() { name } else { format!("{r}/{name}") };
+                if kept(&r) {
+                    todo.push((e.path(), r));
+                }
+            }
+        } else {
+            let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+            lines.push(format!("e {r} {} {t}", m.len()));
+        }
+    }
+    lines.extend(deleted_paths(&dir).iter().filter(|d| kept(d)).map(|d| format!("d {d}")));
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_unstable();
+    Some(crate::sha256::sha256_hex(lines.join("\n").as_bytes())[..32].to_string())
 }
 
 // ---- the mount table as text (a child process started in a virtual folder mounts the same)
@@ -1691,13 +1751,16 @@ pub fn edits_ledger_stamp() -> Option<(std::time::SystemTime, u64)> {
 }
 
 /// The disk path of `path` in the edits folder when it is an edited file or folder there
-/// (removing or renaming an edited file).
+/// (removing or renaming an edited file). A symlink the run made there is one whether its target
+/// exists or not: removing a dangling one removes the link, as on the disk (it was NotFound, so a
+/// folder holding one could not be removed, 11-25).
 pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
+    let present = |p: &std::path::Path| p.symlink_metadata().is_ok();
     if let Some(disk) = folder_path(path) {
-        return disk.exists().then_some(disk);
+        return present(&disk).then_some(disk);
     }
     let (p, rel) = edit_path(path)?;
-    (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
+    (!rel.starts_with(".makepad-run-") && present(&p)).then_some(p)
 }
 
 /// The disk file a read-only open of the virtual `path` reads, so that it sees later writes as it
@@ -2488,12 +2551,14 @@ mod tests {
         let disk = prepare_edit(&path, true).unwrap();
         assert_eq!(std::fs::read(&disk).unwrap(), bytes);
         std::fs::write(&disk, b"edited").unwrap();
+        let edited_identity = super::identity(&path).unwrap();
+        assert_ne!(edited_identity, identity, "an edit moves the file's identity (a script's rerun key)");
         for root in roots {
             let path = format!("{root}/{file}");
             assert_eq!(read(&path).unwrap(), b"edited");
             assert_eq!(metadata(&path).unwrap().len, 6);
             assert_eq!(edited_disk_path(&path), Some(disk.clone()));
-            assert!(super::identity(&path).is_none());
+            assert_eq!(super::identity(&path).as_ref(), Some(&edited_identity), "{path}: every spelling, one identity");
             assert!(modified(&path).is_some());
             assert_eq!(prepare_edit_dir(&format!("{root}/new-dir")).unwrap(), edits.join("new-dir"));
         }

@@ -38,6 +38,20 @@ use std::time::Duration;
 
 use crate::digest::sha256_hash;
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos", target_os = "ios", target_os = "tvos",
+    target_os = "windows",
+))]
+#[path = "tls_engine.rs"]
+pub(crate) mod engine;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos", target_os = "ios", target_os = "tvos",
+    target_os = "windows",
+))]
+pub use engine::TlsEngine;
+
 pub const KEY_FILE: &str = "tls-key.x963";
 pub const CERT_FILE: &str = "tls-cert.der";
 pub const FINGERPRINT_FILE: &str = "tls-fingerprint.txt";
@@ -234,6 +248,27 @@ pub fn ecdh_p256(key: &[u8; X963_KEY_LEN], peer_point: &[u8]) -> io::Result<[u8;
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected an uncompressed P-256 point"));
     }
     platform::ecdh_p256(key, peer_point)
+}
+
+/// The operating system's keyed AES-128 block cipher in ECB mode, used to build CTR.
+pub struct Aes128Ecb(platform::NativeAes128Ecb);
+
+impl Aes128Ecb {
+    pub fn new(key: &[u8; 16]) -> io::Result<Self> {
+        platform::NativeAes128Ecb::new(key).map(Self)
+    }
+
+    /// Encrypts whole 16-byte blocks in place. A partial block returns `InvalidInput`.
+    pub fn encrypt_blocks(&mut self, blocks: &mut [u8]) -> io::Result<()> {
+        if blocks.len() % 16 != 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // All backends can represent this length, including EVP's signed int.
+        for chunk in blocks.chunks_mut(i32::MAX as usize / 16 * 16) {
+            self.0.encrypt_blocks(chunk)?;
+        }
+        Ok(())
+    }
 }
 
 /// DER ECDSA-SHA256 signature by an X9.63 P-256 key, made by the OS.
@@ -825,20 +860,40 @@ impl Write for TlsStream {
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "backend/apple/tls_server.rs"]
-mod platform;
+pub(crate) mod platform;
 
 #[cfg(target_os = "linux")]
 #[path = "backend/linux/tls_server.rs"]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-mod platform;
+pub(crate) mod platform;
 
 #[cfg(target_os = "windows")]
 #[path = "backend/windows/tls_server.rs"]
 pub(crate) mod platform;
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "windows", target_os = "linux")))]
+mod unsupported_aes {
+    use std::{cell::Cell, io};
+
+    pub(super) struct NativeAes128Ecb {
+        _not_sync: Cell<()>,
+    }
+
+    impl NativeAes128Ecb {
+        pub(super) fn new(_: &[u8; 16]) -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub(super) fn encrypt_blocks(&mut self, _: &mut [u8]) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 mod platform {
     //! The JIT host's registered provider (Java security on the device: backend/android.rs).
+    pub(super) use super::unsupported_aes::NativeAes128Ecb;
     use crate::backend::{platform_crypto, PlatformTlsServer, PlatformTlsSession};
     use std::io::{self, Read, Write};
     use std::net::TcpStream;
@@ -934,6 +989,7 @@ mod platform {
     target_os = "android"
 )))]
 mod platform {
+    pub(super) use super::unsupported_aes::NativeAes128Ecb;
     use std::io;
     use std::net::TcpStream;
 
@@ -1175,7 +1231,7 @@ mod server_tests {
     }
 
     /// A server that writes with a short send timeout to a client that reads slowly, retrying
-    /// each `WouldBlock`/`TimedOut` as Desk Link's `write_all` does: every byte arrives once, in
+    /// each `WouldBlock`/`TimedOut` as the remote desktop link's `write_all` does: every byte arrives once, in
     /// order (Windows: a send that ran into SO_SNDTIMEO had sent part of a record that was then
     /// sent again, and the client's next record failed to decrypt).
     #[test]

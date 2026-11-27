@@ -1,5 +1,5 @@
 //! May this process touch the local network? THE one rule, asked by every code path that would
-//! (fleet AI discovery and its beacons, gateway probes, connections to LAN hosts, Sandbox rooms,
+//! (fleet AI discovery and its beacons, gateway probes, connections to LAN hosts, game rooms,
 //! voice links, motion sinks, asset-server discovery and sync).
 //!
 //! Why it exists: on macOS every such operation (an outgoing TCP connection or UDP send/connect to
@@ -60,12 +60,23 @@ pub fn allowed() -> bool {
         let on = decide(lan.as_deref(), hidden || test);
         if !on {
             crate::socket_audit::start_if_enabled();
-            eprintln!(
-                "lan: local network off ({}): no fleet discovery, LAN hosts or rooms; MAKEPAD_LAN=1 allows it",
-                if lan.as_deref().map(str::trim) == Some("0") { "MAKEPAD_LAN=0" } else if test { "a lane's test instance" } else { "hidden instance" }
-            );
+            eprintln!("lan: local network off ({}): no fleet discovery, LAN hosts or rooms; MAKEPAD_LAN=1 allows it", off_cause(lan.as_deref(), test));
         }
         on
+    })
+}
+
+/// What turned the local network off: `MAKEPAD_LAN=0`, else a lane's test instance or a hidden one.
+fn off_cause(lan: Option<&str>, test: bool) -> &'static str {
+    if lan.map(str::trim) == Some("0") { "MAKEPAD_LAN=0" } else if test { "a lane's test instance" } else { "hidden instance" }
+}
+
+/// Why this process has the local network off ([`allowed`]), for an error that would otherwise
+/// read as the far side's fault (no hub heard, a hub unreachable); `None` while it is on.
+pub fn off_why() -> Option<String> {
+    (!allowed()).then(|| {
+        let test = std::env::var_os("MAKEPAD_TEST_LANE").is_some_and(|l| !l.is_empty());
+        format!("the local network is off for this process ({}): no fleet discovery and no LAN hosts; MAKEPAD_LAN=1 allows it", off_cause(std::env::var("MAKEPAD_LAN").ok().as_deref(), test))
     })
 }
 

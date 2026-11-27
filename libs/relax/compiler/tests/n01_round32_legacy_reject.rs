@@ -1,4 +1,4 @@
-// rejects: invalid legacy const generic argument
+// rejects: invalid argument to a legacy const generic: cannot have const blocks, closures, async blocks or items
 #![cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_slli_epi32 as shift, _mm_set1_epi32};
 

@@ -1,4 +1,5 @@
 use super::*;
+use super::load_step_gate::{hold_load_steps, release_load_step, wait_for_loaders, wait_load_step_held, STEPS_BEGUN};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -74,6 +75,12 @@ fn launch(u: &mut Unit, entry: u64, id: Option<DomainId>, flags: &[AtomicU64; 4]
 }
 
 fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (DomainId, u64, std::thread::JoinHandle<()>) {
+    try_launch_with(u, entry, id, arg, false).unwrap()
+}
+
+fn try_launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, probe: bool)
+    -> Result<(DomainId, u64, std::thread::JoinHandle<()>), Vec<String>>
+{
     let id = prepare(&AppSpec {
         package: "teardown-fixture".into(),
         id,
@@ -82,13 +89,17 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
     .unwrap();
     let loading = Loading(id);
     let base = create(u);
-    let heap = crate::zone_alloc::domain::DomainHeap::new().unwrap();
-    {
-        let mut ds = domains();
-        let d = ds.iter_mut().find(|d| d.info.id == id).unwrap();
-        d.info.base = base;
-        d.heap = Some(heap);
+    let allocator = ProgramAllocatorCtx::resolve(u).expect("resolve the fixture allocator");
+    // A fixture's #[global_allocator] becomes its domain's PA with no provided crate bound (the
+    // test sets the root crate after fixture_of, so Unit::new could not see it): its shims check,
+    // as a routing program's do, before the program's code is made.
+    u.routes_allocator = allocator.is_some();
+    let heap = ProgramHeap::new(base, allocator).unwrap();
+    if probe {
+        // The makepad run host installs its program unit before starting an app domain.
+        unsafe { crate::jit::set_runtime_unit(u); }
     }
+    heap.install(&loading, base, probe)?;
     let h = launch_main(
         u as *mut Unit as usize,
         id,
@@ -101,7 +112,7 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
     )
     .unwrap();
     drop(loading);
-    (id, base, h)
+    Ok((id, base, h))
 }
 
 #[cfg(target_os = "linux")]
@@ -167,6 +178,7 @@ fn teardown_fixture_cycles_and_retiring_thread() {
             (0, 0, 0, 0, 0)
         );
         assert!(!blocks().contains(&base));
+        assert_eq!(id_of_base(base), None, "the released static block has no owning domain after teardown");
         assert!(freed_by_teardown() > before);
         assert!(matches!(dead.state, DomainState::Exited(0)));
         #[cfg(target_os = "linux")]
@@ -300,10 +312,13 @@ fn a_live_domain_only_receives_its_units_statics() {
 // The CPU budget's source and an app whose task pool lives in a static (tests/static_pool/pool.rs).
 // The budget's `#[relax_api]` marks and its `relax_api::option_layouts!` entries name a crate a
 // one-file program does not have; the entries are for its provided build, the fixture runs it as JIT code.
+// So does its `extern crate makepad_thread_local`, whose `thread_local!` is std's in code Relax
+// compiles: without it the budget's thread-locals are std's macro, the same declarations.
 fn static_pool_fixture() -> String {
     let mut budget = include_str!("../../../../libs/cpu_budget/src/lib.rs")
         .replace("use relax_api::relax_api;\n", "")
-        .replace("#[relax_api]\n", "");
+        .replace("#[relax_api]\n", "")
+        .replace("#[macro_use(thread_local)]\nextern crate makepad_thread_local;\n", "");
     while let Some(at) = budget.find("relax_api::option_layouts! {") {
         let end = at + budget[at..].find("\n}\n").expect("an option_layouts! block ends with a `}` line") + 3;
         budget.replace_range(at..end, "");
@@ -369,6 +384,317 @@ fn cancel_during_compile_never_enters_main() {
         assert_eq!(dead.arena_committed, 0);
         domains().retain(|d| d.info.id != id);
     }
+}
+
+struct LoadFixture {
+    dir: std::path::PathBuf,
+    unit: Box<Unit>,
+    cfg: crate::cfg::CfgSet,
+}
+
+impl LoadFixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("relax-domain-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::dirs::set_relax_dir(dir.join("run"));
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let session = std::sync::Arc::new(session);
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let mut prog = crate::program::Program::new(&session);
+        // Domain graphs start after the boot's std crates. Empty one-file versions suffice
+        // for these no_std libraries, whose only function takes and returns a primitive.
+        let std = crate::std_pre_crates(&session, prog.std_simd, prog.std_overflow_checks);
+        for name in std.into_iter().map(|c| c.name).chain(std::iter::once("host".into())) {
+            let path = dir.join(format!("{name}.rs"));
+            std::fs::write(&path, "#![no_std]\n").unwrap();
+            prog.load_crate(&name, path.to_str().unwrap(), 2021, cfg.clone(), vec![]).unwrap();
+        }
+        prog.resolve_imports();
+        assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+        Self { dir, unit: Unit::new(prog, tcx, 0), cfg }
+    }
+
+    fn chain(&self, names: &[&str]) -> TestLoad {
+        self.chain_with(names, "")
+    }
+
+    /// `chain`, with `first` added to the first crate's source.
+    fn chain_with(&self, names: &[&str], first: &str) -> TestLoad {
+        let mut crates = Vec::new();
+        let mut pkg = Vec::new();
+        for (i, &name) in names.iter().enumerate() {
+            let path = self.dir.join(format!("{name}.rs"));
+            let mut deps = Vec::new();
+            let value = if i == 0 {
+                "x".to_owned()
+            } else {
+                let dep = names[i - 1];
+                deps.push((i - 1, dep.to_owned()));
+                format!("{dep}::value(x)")
+            };
+            let extra = if i == 0 { first } else { "" };
+            std::fs::write(&path, format!("#![no_std]\n{extra}pub fn value(x: u32) -> u32 {{ {value} }}\n")).unwrap();
+            crates.push(crate::crates::CrateUnit {
+                name: name.into(), src_path: path.to_str().unwrap().into(), edition: 2021,
+                deps, features: vec![], host: None, proc_macro: false, bin: false, harness: false,
+                build_script: false, version: "0.1.0".into(), registry: false, host_only: false,
+            });
+            pkg.push((self.dir.to_str().unwrap().into(), name.into(), "0.1.0".into()));
+        }
+        let n = names.len();
+        let graph = crate::unitgraph::Graph {
+            crates, root: n - 1, build_scripts: vec![], pkg, cfgs: vec![vec![]; n],
+            env: vec![vec![]; n], link_libs: vec![], link_search: Vec::new(), workspace_root: String::new(), native: None, raw: vec![], bins: vec![],
+        };
+        let order = crate::crates::topo_order(&graph.crates);
+        let cfgs = vec![self.cfg.clone(); n];
+        let idents = identities(&graph, &cfgs, &order);
+        let id = prepare(&AppSpec { package: names[n - 1].into(), ..Default::default() }).unwrap();
+        TestLoad { graph, order, cfgs, idents, id }
+    }
+
+    fn address(&mut self) -> usize { &mut *self.unit as *mut Unit as usize }
+}
+
+impl Drop for LoadFixture {
+    fn drop(&mut self) {
+        LOADED.lock().unwrap().retain(|r| !std::path::Path::new(&r.4).starts_with(&self.dir));
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+}
+
+struct TestLoad {
+    graph: crate::unitgraph::Graph,
+    order: Vec<usize>,
+    cfgs: Vec<crate::cfg::CfgSet>,
+    idents: Vec<u64>,
+    id: DomainId,
+}
+
+impl TestLoad {
+    fn run(&self, up: usize) -> Result<(u32, usize, Vec<String>), Vec<String>> {
+        unsafe { load_graph(up as *mut Unit, &self.graph, &self.order, &self.cfgs, &self.idents, self.id, true) }
+    }
+}
+
+impl Drop for TestLoad {
+    fn drop(&mut self) {
+        drop(Loading(self.id));
+        domains().retain(|d| d.info.id != self.id);
+    }
+}
+
+// Drop inside the thread scope, so a failed assertion also releases the loaders before join.
+struct HoldSteps;
+impl HoldSteps {
+    fn new() -> Self { hold_load_steps(true); Self }
+}
+impl Drop for HoldSteps {
+    fn drop(&mut self) { hold_load_steps(false); }
+}
+
+fn hold_after_first_crate() {
+    assert_eq!(wait_load_step_held(), 0);
+    release_load_step();
+    assert_eq!(wait_load_step_held(), 1);
+}
+
+fn value_def(u: &Unit, krate: u32) -> Option<crate::program::DefId> {
+    u.prog.defs.iter().enumerate().find_map(|(i, d)| {
+        (d.krate == krate && u.prog.syms.str(d.name) == "value").then_some(crate::program::DefId(i as u32))
+    })
+}
+
+fn shared_dependency(u: &Unit, root: u32) -> u32 {
+    u.prog.crates[root as usize].deps.iter().find(|(name, _)| u.prog.syms.str(*name) == "a").unwrap().1
+}
+
+fn records_for(ident: u64) -> usize {
+    LOADED.lock().unwrap().iter().filter(|r| r.0 == ident).count()
+}
+
+#[test]
+fn a_waiting_request_is_served_between_load_steps() {
+    isolated_test!(a_waiting_request_is_served_between_load_steps);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    std::thread::scope(|s| {
+        let _hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        for k in 0..graph.order.len() {
+            assert_eq!(wait_load_step_held(), k);
+            let (tx, rx) = std::sync::mpsc::channel();
+            // This thread's request is queued before the loader is free to post its next one.
+            crate::owner::post(crate::owner::Class::Program, move || tx.send(STEPS_BEGUN.load(Ordering::SeqCst)).unwrap());
+            release_load_step();
+            assert_eq!(rx.recv().unwrap(), k, "a waiting request was overtaken at step {k}");
+        }
+        let (_, reused, new) = loader.join().unwrap().unwrap();
+        assert_eq!((reused, new.len()), (0, 3));
+        assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 3);
+    });
+}
+
+#[test]
+fn a_load_cancelled_between_steps_keeps_only_whole_crates() {
+    isolated_test!(a_load_cancelled_between_steps_keeps_only_whole_crates);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    let err = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        hold_after_first_crate();
+        retire(graph.id).unwrap();
+        drop(hold);
+        loader.join().unwrap().unwrap_err()
+    });
+    assert_eq!(err, ["domain compilation cancelled"]);
+    let a = lookup_loaded(graph.idents[0]).expect("the completed crate is recorded");
+    assert!(value_def(&f.unit, a).is_some(), "the completed crate has its definitions");
+    assert_eq!(lookup_loaded(graph.idents[1]), None, "b started after cancellation");
+    assert_eq!(lookup_loaded(graph.idents[2]), None, "c started after cancellation");
+}
+
+#[test]
+fn a_parse_error_keeps_the_crates_before_it() {
+    isolated_test!(a_parse_error_keeps_the_crates_before_it);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let bad = f.chain(&["a", "b", "c"]);
+    std::fs::write(&bad.graph.crates[1].src_path, "#![no_std]\npub fn broken(\n").unwrap();
+    let up = f.address();
+    let err = std::thread::scope(|s| s.spawn(|| bad.run(up)).join().unwrap().unwrap_err());
+    assert!(err.iter().any(|e| e.contains("b.rs")), "expected a parse error in b: {err:?}");
+    let a = lookup_loaded(bad.idents[0]).expect("a was recorded before b failed");
+    assert_eq!(lookup_loaded(bad.idents[1]), None, "the failing crate was recorded");
+    assert_eq!(lookup_loaded(bad.idents[2]), None, "the load continued past the failing crate");
+
+    let good = f.chain(&["a", "e"]);
+    let (root, reused, _) = std::thread::scope(|s| s.spawn(|| good.run(up)).join().unwrap().unwrap());
+    assert_eq!(reused, 1);
+    assert_eq!(shared_dependency(&f.unit, root), a, "e must depend on the first load's a");
+    assert_eq!(lookup_loaded(good.idents[0]), Some(a));
+    assert_eq!(records_for(good.idents[0]), 1);
+}
+
+#[test]
+fn a_recorded_crate_with_extern_crate_aliases_is_reused() {
+    isolated_test!(a_recorded_crate_with_extern_crate_aliases_is_reused);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    // the alias adds an entry to a's dependency list beside the std crates
+    let alias = "extern crate core as __core;\n";
+    let ab = f.chain_with(&["a", "b"], alias);
+    let up = f.address();
+    std::thread::scope(|s| s.spawn(|| ab.run(up)).join().unwrap().unwrap());
+    let a = lookup_loaded(ab.idents[0]).expect("a was recorded");
+    let ad = f.chain_with(&["a", "d"], alias);
+    let (root, reused, new) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
+    assert_eq!((reused, new.len()), (1, 1), "a was loaded again: {new:?}");
+    assert_eq!(shared_dependency(&f.unit, root), a);
+    assert_eq!(records_for(ab.idents[0]), 1);
+}
+
+#[test]
+fn a_crate_recorded_by_a_cancelled_load_links_for_the_load_that_reuses_it() {
+    isolated_test!(a_crate_recorded_by_a_cancelled_load_links_for_the_load_that_reuses_it);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let link = "#[link(name = \"step_a\")] extern \"C\" {}\n";
+    let abc = f.chain_with(&["a", "b", "c"], link);
+    let up = f.address();
+    let err = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| abc.run(up));
+        hold_after_first_crate();
+        retire(abc.id).unwrap();
+        drop(hold);
+        loader.join().unwrap().unwrap_err()
+    });
+    assert_eq!(err, ["domain compilation cancelled"]);
+    let a = lookup_loaded(abc.idents[0]).expect("a was recorded before the cancel");
+    // the cancelled load never linked: the next domain's link must find a's library
+    let ad = f.chain_with(&["a", "d"], link);
+    let (root, reused, _) = std::thread::scope(|s| s.spawn(|| ad.run(up)).join().unwrap().unwrap());
+    assert_eq!(reused, 1);
+    assert_eq!(shared_dependency(&f.unit, root), a, "d reuses the cancelled load's a");
+    let libs = crate::run::link_attr_libs(&f.unit.prog, Some(&domain_crates(&f.unit.prog, root)));
+    assert_eq!(libs, [("step_a".to_owned(), false)], "the reused crate's library is linked");
+}
+
+#[test]
+fn two_loads_of_a_shared_crate_load_it_once() {
+    isolated_test!(two_loads_of_a_shared_crate_load_it_once);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let ab = f.chain(&["a", "b"]);
+    let ad = f.chain(&["a", "d"]);
+    for load in [&ab, &ad] {
+        use std::io::Write;
+        let root = &load.graph.crates[load.graph.root];
+        let mut file = std::fs::OpenOptions::new().append(true).open(&root.src_path).unwrap();
+        writeln!(file, "#[link(name = \"step_{}\")] extern \"C\" {{}}", root.name).unwrap();
+    }
+    let up = f.address();
+    let (b, d) = std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let first = s.spawn(|| ab.run(up));
+        assert_eq!(wait_load_step_held(), 0);
+        let second = s.spawn(|| ad.run(up));
+        // Both have examined the empty registry. Run the two steps for a before either root.
+        assert_eq!(wait_for_loaders(2), 0);
+        release_load_step();
+        assert_eq!(wait_for_loaders(2), 0);
+        release_load_step();
+        assert_eq!(wait_for_loaders(2), 1);
+        drop(hold);
+        (first.join().unwrap().unwrap(), second.join().unwrap().unwrap())
+    });
+    let a = lookup_loaded(ab.idents[0]).expect("the shared crate was recorded");
+    assert_eq!((b.1, d.1), (0, 1), "the second load reused a");
+    assert_eq!(records_for(ab.idents[0]), 1);
+    assert_eq!(shared_dependency(&f.unit, b.0), a);
+    assert_eq!(shared_dependency(&f.unit, d.0), a);
+    for (root, lib) in [(b.0, "step_b"), (d.0, "step_d")] {
+        let selected = HashSet::from([a, root]);
+        let libs = crate::run::link_attr_libs(&f.unit.prog, Some(&selected));
+        assert_eq!(libs, [(lib.to_owned(), false)], "a domain links only its own root's library");
+    }
+}
+
+#[test]
+fn a_crate_loaded_by_an_earlier_step_compiles_before_the_load_ends() {
+    isolated_test!(a_crate_loaded_by_an_earlier_step_compiles_before_the_load_ends);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = LoadFixture::new();
+    let graph = f.chain(&["a", "b", "c"]);
+    let up = f.address();
+    std::thread::scope(|s| {
+        let hold = HoldSteps::new();
+        let loader = s.spawn(|| graph.run(up));
+        hold_after_first_crate();
+        let a = lookup_loaded(graph.idents[0]).expect("a is already recorded");
+        let installed = crate::owner::call(crate::owner::Class::Program, || unsafe {
+            let up = up as *mut Unit;
+            let def = value_def(&*up, a).expect("a's definition is visible");
+            let slot = (*up).fn_id(crate::jit::FnKey::Inst(def, vec![]));
+            let (code, map, relocs) = crate::jit::compile_fn(up, slot)?;
+            (*up).install(slot, &code, &relocs, map, 0)
+        }).unwrap();
+        assert_ne!(installed, 0);
+        assert_eq!(STEPS_BEGUN.load(Ordering::SeqCst), 1, "the install finished before b began");
+        drop(hold);
+        let (_, _, new) = loader.join().unwrap().unwrap();
+        assert_eq!(new.len(), 3);
+    });
 }
 
 /// A domain loader holds its compile job for the whole load, build scripts included: it waits
@@ -506,15 +832,32 @@ fn a_domain_worker_with_large_allocations_and_borrowed_field_matches() {
 // window). The test uses up the direct slots before anything creates the key, then runs JIT code
 // that reads its thread-local block on the calling thread and on a new one (whose
 // TlsExpansionSlots array is still null: the slow path). Elsewhere it runs the same fixture.
+// Everywhere: a thread-local's destructor at the new thread's end reads the environment as the
+// thread did before (the host's state for that read outlives every destructor: pmhost).
 const TLS_FIXTURE: &str = r#"
 use std::cell::Cell;
 thread_local! { static N: Cell<u64> = const { Cell::new(0) }; }
 fn bump(k: u64) -> u64 {
     N.with(|n| { n.set(n.get() + k); n.get() })
 }
+fn path_hash() -> u64 {
+    std::env::var("PATH").map_or(0, |v| v.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) | 1)
+}
+struct ReadsAtEnd(usize);
+impl Drop for ReadsAtEnd {
+    fn drop(&mut self) { unsafe { *(self.0 as *mut u64).add(3) = path_hash(); } }
+}
+thread_local! { static AT_END: std::cell::RefCell<Option<ReadsAtEnd>> = const { std::cell::RefCell::new(None) }; }
 fn tls_fixture(p: *mut u64) {
     let a = bump(3) + bump(4);
-    let b = std::thread::spawn(|| bump(5) + bump(6)).join().unwrap();
+    let at = p as usize;
+    let b = std::thread::spawn(move || {
+        // registered before the thread's first environment read: its drop comes after the
+        // host's own thread-locals of that read are destroyed
+        AT_END.with(|e| *e.borrow_mut() = Some(ReadsAtEnd(at)));
+        unsafe { *(at as *mut u64).add(2) = path_hash(); }
+        bump(5) + bump(6)
+    }).join().unwrap();
     unsafe { *p = a * 100 + b; *p.add(1) = bump(0); }
 }
 "#;
@@ -532,9 +875,12 @@ fn jit_tls_past_the_direct_slots() {
         }
     }
     let (mut u, entry, root) = fixture_of(TLS_FIXTURE, "tls_fixture");
-    let out = [0u64; 2];
-    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
-    assert_eq!(out, [10 * 100 + 16, 7]);
+    // (written by the JIT through the pointer: a `mut` array, or the reads below fold to zeros)
+    let mut out = [0u64; 4];
+    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_mut_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    assert_eq!(out[..2], [10 * 100 + 16, 7]);
+    assert_ne!(out[2], 0, "the new thread read PATH");
+    assert_eq!(out[3], out[2], "a thread-local's destructor at its thread's end reads the environment as the thread did");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -902,44 +1248,584 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// flags[0]: the thread to hold runs
-const HELD_RUN: &str = r#"
-use std::sync::atomic::{AtomicU64, Ordering};
-fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
-fn fixture(p: *mut u64) {
-    let a = p as usize;
-    std::thread::Builder::new().name("held-for-good".into()).spawn(move || {
-        flags(a)[0].fetch_add(1, Ordering::SeqCst);
-        loop { std::thread::sleep(std::time::Duration::from_millis(20)); }
+/// The domain's main is in the native call with a first-generation return address on its stack.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+const LAYOUT_RETURN: &str = r#"
+pub struct Layout { pub value: u64 }
+#[inline(never)]
+pub fn old(p: *mut u64) {
+    let fields = Layout { value: 7 };
+    let native: extern "C" fn() = unsafe { std::mem::transmute(*p.add(2) as usize) };
+    native();
+    unsafe { *p.add(1) = fields.value; }
+}
+#[inline(never)]
+pub fn live_neighbour(out: *mut u64) { unsafe { *out = 23; } }
+"#;
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_layout_patch_returns_the_native_lock_before_the_stale_frame_parks() {
+    isolated_test!(a_layout_patch_returns_the_native_lock_before_the_stale_frame_parks);
+    // Each stage a held foreign lock could block has this bound; the one stage without it is
+    // the stale report's, which only the disk and the owner can slow down.
+    const BOUND: Duration = Duration::from_secs(2);
+    const UNBOUNDED_REPORT: &str = "the report of the fault and its decision";
+    extern "C" fn native() {
+        crate::os::thread::set_own_name("old-frame");
+        native_holds_a_host_lock();
+    }
+    // Both the driver and its deadline observer belong to the host. They must run while the
+    // fault pauses the program, including when allocating or starting a thread is what stalled.
+    crate::os::thread::set_own_name("run-test-clock");
+    let (stage, progress) = std::sync::mpsc::channel();
+    let driver = std::thread::Builder::new().name("run-test-driver".into()).spawn(move || {
+        std::env::set_var("RELAX_STALE_PARK", "1");
+        crate::borrowck::lazy::disable_gandalf();
+        let (mut u, entry, root) = fixture_of(LAYOUT_RETURN, "old");
+        let up = &mut *u as *mut Unit;
+        let def = |name| crate::program::DefId(u.prog.defs.iter().rposition(|d| u.prog.syms.str(d.name) == name).unwrap() as u32);
+        let (old_def, live_def) = (def("old"), def("live_neighbour"));
+        let file = u.prog.def(old_def).file;
+        let old = u.fn_id(crate::jit::FnKey::Inst(old_def, Vec::new()));
+        let live = u.fn_id(crate::jit::FnKey::Inst(live_def, Vec::new()));
+        let neighbour = u.entry(live);
+        let call_neighbour = || {
+            let mut n = 0u64;
+            unsafe { crate::jit::call_jit(up, neighbour, &mut n as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+            n
+        };
+        assert_eq!(call_neighbour(), 23);
+        let live_code = u.fns[live as usize].code;
+        let flags: [AtomicU64; 4] = Default::default();
+        flags[2].store(native as *const () as usize as u64, Ordering::SeqCst);
+        let (domain, _, main) = launch(&mut u, entry, None, &flags);
+        wait(|| IN_NATIVE.load(Ordering::SeqCst) != 0);
+        let tid = crate::inspect::threads::list().into_iter().find(|t| t.name == "old-frame").expect("the named thread holds the native lock").os_id;
+        assert!(HOST_LOCK.try_lock().is_err());
+        let first = u.fns[old as usize].code;
+        let src = LAYOUT_RETURN.replace("pub value: u64 }", "pub extra: u64, pub value: u64 }").replace("value: 7 }", "extra: 9, value: 7 }");
+        let edit = crate::reload::Edit { file, path: root.join("fixture.rs").to_string_lossy().into_owned(), src: src.into_bytes() };
+        crate::invalid::FRAME_CHECK_MISSES.store(tid, Ordering::Relaxed);
+        let patch = unsafe { crate::reload::apply(up, vec![edit]) };
+        crate::invalid::FRAME_CHECK_MISSES.store(0, Ordering::Relaxed);
+        assert_eq!(patch.rung, crate::reload::Rung::Patch, "{:?}", patch.lines);
+        assert!(patch.lines.iter().any(|l| l.contains("parks when it returns there")), "the install found the old frame: {:?}", patch.lines);
+        stage.send("old's first code is dead").unwrap();
+        assert!(crate::stale::lookup(first).is_some(), "old's first code is dead");
+        stage.send("a live neighbour runs on").unwrap();
+        assert_eq!(u.fns[live as usize].code, live_code, "the neighbour was not rebuilt");
+        assert_eq!(call_neighbour(), 23, "a live neighbour runs on");
+        stage.send("no thread is stopped where it did not choose").unwrap();
+        let held = crate::inspect::instrument::held_now(tid);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let held = held || crate::inspect::threads::is_held(tid);
+        stage.send("the lock came back").unwrap();
+        NATIVE_GO.store(1, Ordering::SeqCst);
+        drop(HOST_LOCK.lock().unwrap());
+        assert!(!held, "no thread is stopped where it did not choose");
+        stage.send("it parked by its fault at the return").unwrap();
+        // the fault side's own record, signal-safe stores before any output
+        wait(|| crate::stale::recorded().iter().any(|(t, name)| *t == tid && name.ends_with("::old")) && crate::stale::stuck_threads() == 1);
+        assert_eq!(flags[1].load(Ordering::SeqCst), 0, "the old layout read never completed");
+        // The watcher's report writes stderr and the flight recorder's file and asks the owner: a
+        // loaded box's disk held those writes past the bound (11-25: btrfs space reservation, the
+        // owner idle), so it is waited for as the file's other sync points are.
+        stage.send(UNBOUNDED_REPORT).unwrap();
+        wait(|| crate::stale::verdicts().iter().any(|v| v.starts_with("stale access:") && v.contains("thread `old-frame`") && v.contains("::old`") && v.contains("its thread is parked")));
+        // The decision exists before teardown starts. Seeing the verdict alone races pause_program.
+        wait(|| crate::inspect::events::parked_now().iter().any(|p| p.1 == tid));
+        stage.send("the allocator and thread creation are free").unwrap();
+        let block = vec![23u8; 1024 * 1024];
+        assert_eq!(std::thread::Builder::new().name("run-alloc-test".into()).spawn(move || std::hint::black_box(block)[1024 * 1024 - 1]).unwrap().join().unwrap(), 23);
+        stage.send("it leaves with its run").unwrap();
+        // The run's end as run_end::end begins it: the parked decision ends with the run (its
+        // pause holds the process's main thread, a program thread) and the domain's end takes
+        // the parked thread.
+        crate::run_threads::run_ends();
+        crate::inspect::events::run_ends();
+        let end = end_run(up, BOUND);
+        assert!(end.left.is_empty(), "it leaves with its run: {:?}", end.left);
+        main.join().unwrap();
+        let dead = info(domain).unwrap();
+        assert_eq!((dead.threads, dead.base), (0, 0), "it leaves with its run");
+        assert_eq!(dead.state, DomainState::Stopped);
+        wait(|| !crate::inspect::instrument::paused());
+        crate::run_threads::begin_run();
+        drop(stage);
+        domains().retain(|d| d.info.id != domain);
+        drop(u);
+        std::fs::remove_dir_all(root).unwrap();
     }).unwrap();
-    loop { std::thread::park(); }
+    if let Ok(mut checking) = progress.recv() {
+        loop {
+            let next = if checking == UNBOUNDED_REPORT { progress.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) } else { progress.recv_timeout(BOUND) };
+            match next {
+                Ok(next) => checking = next,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{checking}: exceeded {BOUND:?}"),
+            }
+        }
+    }
+    if let Err(panic) = driver.join() { std::panic::resume_unwind(panic); }
+}
+
+/// The domain's main waits in libc's condvar through a native call (flags[2]), as a library's
+/// thread does; `reads` uses the layout the patch changes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LAYOUT_LIBC_WAIT: &str = r#"
+pub struct Layout { pub value: u64 }
+#[inline(never)]
+pub fn reads(out: *mut u64) {
+    let fields = Layout { value: 7 };
+    unsafe { *out = fields.value; }
+}
+#[inline(never)]
+pub fn waits(p: *mut u64) {
+    let native: extern "C" fn() = unsafe { std::mem::transmute(*p.add(2) as usize) };
+    native();
+    unsafe { *p.add(1) = 1; }
 }
 "#;
 
-/// A thread held for good (a frame of it in code a layout patch replaced: stale.rs `park_held`)
-/// leaves with its run: once the run's code is gone the end lets it go, and it ends as every other
-/// thread of the run does, its domain's memory back.
+/// A pthread_mutex_t (40 bytes) and, at 64, a pthread_cond_t (48): glibc's initializers are zeros.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIBC_WAIT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static LIBC_WAIT_GO: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" {
+    fn pthread_mutex_lock(m: *mut u64) -> i32;
+    fn pthread_mutex_unlock(m: *mut u64) -> i32;
+    fn pthread_cond_wait(c: *mut u64, m: *mut u64) -> i32;
+    fn pthread_cond_signal(c: *mut u64) -> i32;
+}
+
+/// A native op that waits in libc's condvar until LIBC_WAIT_GO.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" fn native_waits_in_libc() {
+    crate::os::thread::set_own_name("in-libc-wait");
+    let lock = LIBC_WAIT.as_ptr() as *mut u64;
+    unsafe {
+        pthread_mutex_lock(lock);
+        while LIBC_WAIT_GO.load(Ordering::SeqCst) == 0 {
+            pthread_cond_wait(lock.add(8), lock);
+        }
+        pthread_mutex_unlock(lock);
+    }
+}
+
+/// A layout patch reads every program thread's stack before it installs (no frame may run code
+/// built for the old layout). A thread parked in libc's condvar wait (glibc built with frame
+/// pointers, whose early returns remember and restore the CFI state) is walked through libc's
+/// frames to its program frames, and the patch installs. On a Linux box the walk stopped at
+/// pthread_cond_wait, and every layout edit of an app with such a thread was a restart (11-24).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn a_thread_held_for_good_leaves_with_its_run() {
-    isolated_test!(a_thread_held_for_good_leaves_with_its_run);
+fn a_layout_patch_reads_a_thread_parked_in_a_libc_condvar_wait() {
+    isolated_test!(a_layout_patch_reads_a_thread_parked_in_a_libc_condvar_wait);
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut u, entry, root) = fixture_of(HELD_RUN, "fixture");
+    let (mut u, entry, root) = fixture_of(LAYOUT_LIBC_WAIT, "waits");
     let up = &mut *u as *mut Unit;
+    let reads_def = crate::program::DefId(u.prog.defs.iter().rposition(|d| u.prog.syms.str(d.name) == "reads").unwrap() as u32);
+    let file = u.prog.def(reads_def).file;
+    let reads = u.fn_id(crate::jit::FnKey::Inst(reads_def, Vec::new()));
+    let reads_entry = u.entry(reads);
+    let read = || {
+        let mut n = 0u64;
+        unsafe { crate::jit::call_jit(up, reads_entry, &mut n as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        n
+    };
+    assert_eq!(read(), 7);
+    let first = u.fns[reads as usize].code;
     let flags: [AtomicU64; 4] = Default::default();
-    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
-    wait(|| flags[0].load(Ordering::SeqCst) == 1);
-    let held = crate::inspect::threads::list().into_iter().find(|t| t.name == "held-for-good").expect("the fixture's thread");
-    assert!(crate::inspect::instrument::hold_for_good(&held), "the thread is held");
-    let end = end_run(up, Duration::from_secs(10));
-    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    flags[2].store(native_waits_in_libc as *const () as usize as u64, Ordering::SeqCst);
+    let (domain, _, main) = launch(&mut u, entry, None, &flags);
+    // until it blocks in the condvar's futex (syscall 202; its lock is not contended)
+    wait(|| {
+        crate::inspect::threads::list().into_iter().find(|t| t.name == "in-libc-wait").is_some_and(|t| {
+            std::fs::read_to_string(format!("/proc/self/task/{}/syscall", t.os_id)).is_ok_and(|s| s.split_whitespace().next() == Some("202"))
+        })
+    });
+    let src = LAYOUT_LIBC_WAIT.replace("pub value: u64 }", "pub extra: u64, pub value: u64 }").replace("value: 7 }", "extra: 9, value: 7 }");
+    let edit = crate::reload::Edit { file, path: root.join("fixture.rs").to_string_lossy().into_owned(), src: src.into_bytes() };
+    let patch = unsafe { crate::reload::apply(up, vec![edit]) };
+    // the wait ends before any check, so a failed one leaves no thread behind
+    let lock = LIBC_WAIT.as_ptr() as *mut u64;
+    unsafe {
+        pthread_mutex_lock(lock);
+        LIBC_WAIT_GO.store(1, Ordering::SeqCst);
+        pthread_cond_signal(lock.add(8));
+        pthread_mutex_unlock(lock);
+    }
     main.join().unwrap();
+    assert_eq!(patch.rung, crate::reload::Rung::Patch, "the layout patch installs: {:?}", patch.lines);
+    assert_ne!(u.fns[reads as usize].code, first, "reads is rebuilt for the new layout");
+    assert_eq!(read(), 7, "the new layout's code runs");
+    assert_eq!(flags[1].load(Ordering::SeqCst), 1, "the thread went on from its wait");
     wait_thread_done(domain);
-    let dead = info(domain).unwrap();
-    assert_eq!((dead.threads, dead.base), (0, 0));
-    assert_eq!(dead.state, DomainState::Stopped);
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+// The two test layouts have a header. The allocator can be stopped while serving the second.
+const PROGRAM_ALLOCATOR: &str = r#"
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+static FLAGS: AtomicU64 = AtomicU64::new(0);
+struct HeaderAllocator;
+#[global_allocator]
+static ALLOCATOR: HeaderAllocator = HeaderAllocator;
+unsafe impl GlobalAlloc for HeaderAllocator {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if l.align() != 16 || (l.size() != 73 && l.size() != 79) { return System.alloc(l); }
+        let a = &*(FLAGS.load(Ordering::SeqCst) as *const [AtomicU64; 4]);
+        if l.size() == 79 && a[3].load(Ordering::SeqCst) == 1 {
+            a[1].store(1, Ordering::SeqCst);
+            while a[3].load(Ordering::SeqCst) != 0 { std::hint::spin_loop(); }
+        }
+        let raw = System.alloc(Layout::from_size_align_unchecked(l.size() + 16, 16));
+        if raw.is_null() { return raw; }
+        (raw as *mut usize).write(l.size());
+        (raw.add(8) as *mut u64).write(0x714e);
+        raw.add(16)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        if l.align() != 16 || (l.size() != 73 && l.size() != 79) { return System.dealloc(p, l); }
+        let raw = p.sub(16);
+        assert_eq!((raw as *const usize).read(), l.size());
+        assert_eq!((p.sub(8) as *const u64).read(), 0x714e);
+        (p.sub(8) as *mut u64).write(0);
+        let a = &*(FLAGS.load(Ordering::SeqCst) as *const [AtomicU64; 4]);
+        a[2].fetch_add(1, Ordering::SeqCst);
+        System.dealloc(raw, Layout::from_size_align_unchecked(l.size() + 16, 16));
+    }
+}
+fn fixture(p: *mut u64) {
+    FLAGS.store(p as u64, Ordering::SeqCst);
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let op: extern "C" fn() = unsafe { std::mem::transmute(a[0].load(Ordering::SeqCst) as usize) };
+    op();
+    // In the live second run, native code resizes and frees the op's block from outside.
+    while a[3].load(Ordering::SeqCst) == 2 { std::thread::yield_now(); }
+}
+"#;
+
+/// A provided op gets its lock and its allocation back even when the run ends in the allocator.
+/// Its first call also goes through the compile-on-first-call entry while the op holds the lock.
+#[test]
+fn a_run_ends_in_the_program_allocator_of_a_locked_op() {
+    isolated_test!(a_run_ends_in_the_program_allocator_of_a_locked_op);
+    use crate::zone_alloc::{domain::DomainHeap, RelaxAlloc};
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BLOCK: AtomicUsize = AtomicUsize::new(0);
+    static HEAP: AtomicUsize = AtomicUsize::new(0);
+    static RECEIVED: AtomicUsize = AtomicUsize::new(0);
+    static INTACT: AtomicUsize = AtomicUsize::new(0);
+    fn layout(size: usize) -> Layout { Layout::from_size_align(size, 16).unwrap() }
+    extern "C" fn op() {
+        let _lock = LOCK.lock().unwrap();
+        let _run = relax_session::phase::run();
+        unsafe {
+            BLOCK.store(RelaxAlloc.alloc_zeroed(layout(73)) as usize, Ordering::Release);
+            RECEIVED.store(RelaxAlloc.alloc(layout(79)) as usize, Ordering::Release);
+        }
+    }
+    fn drop_provided_block(base: usize, end: usize) {
+        let block = BLOCK.load(Ordering::Acquire);
+        if HEAP.load(Ordering::Acquire) == 0 || !(base..end).contains(&block) { return; }
+        let p = block as *mut u8;
+        // Teardown keeps both the heap and its mappings alive across this hook.
+        unsafe {
+            let heap = &*(HEAP.load(Ordering::Acquire) as *const DomainHeap);
+            let before = heap.stats();
+            RelaxAlloc.dealloc(p, layout(73));
+            let intact = heap.stats() == before && p.sub(8).cast::<u64>().read() == 0x714e && p.read() == 42;
+            INTACT.store(intact as usize, Ordering::Release);
+        }
+    }
+
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(crate::zone_alloc::compiler_arena_enabled(), "run ops route to the domain heap");
+    crate::run_end::set_native_end(|| {}, drop_provided_block);
+    let fixture = || {
+        let (mut u, entry, root) = fixture_of(PROGRAM_ALLOCATOR, "fixture");
+        let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+        crate::layout::set_root_crate(krate);
+        u.tier1 = None;
+        (u, entry, root)
+    };
+    let (mut u, entry, root) = fixture();
+    let alloc = u.core_path(&["heap", "__relax_program_alloc"]).unwrap();
+    let slot = u.fn_id(crate::jit::FnKey::Inst(alloc, Vec::new()));
+    assert!(!u.fns[slot as usize].compiled, "the first op call must compile the allocator entry");
+    let flags: [AtomicU64; 4] = Default::default();
+    flags[0].store(op as *const () as u64, Ordering::SeqCst);
+    flags[3].store(1, Ordering::SeqCst);
+    let (id, _, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[1].load(Ordering::SeqCst) != 0 || main.is_finished());
+    assert_eq!(flags[1].load(Ordering::SeqCst), 1, "the second allocation entered the program allocator: {:?}", state(id));
+    let p = BLOCK.load(Ordering::Acquire) as *mut u8;
+    assert!(!p.is_null(), "the op's first cold allocator call returned a block");
+    unsafe {
+        assert_eq!(p.sub(8).cast::<u64>().read(), 0x714e, "the block has the program allocator's header");
+        assert_eq!(p.read(), 0, "the op received zeroed storage");
+        p.write(42);
+    }
+    let (base, size) = {
+        let ds = domains();
+        let heap = ds.iter().find(|d| d.info.id == id).unwrap().heap.as_deref().unwrap();
+        HEAP.store(std::ptr::from_ref(heap) as usize, Ordering::Release);
+        heap.range()
+    };
+    let end = end_run(&mut *u, Duration::from_secs(10));
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert!(end.abandoned.is_empty() && crate::jit::abandoned_frames().is_empty(), "ending inside the allocator preserved the op's native frames");
+    assert!(LOCK.try_lock().is_ok(), "the op released its lock after allocator recovery");
+    assert!((base..base + size).contains(&RECEIVED.load(Ordering::Acquire)), "the interrupted op received a fallback block from its own heap");
+    assert_eq!(INTACT.load(Ordering::Acquire), 1, "the provided drop in heap_goes preserved the arena and the header block");
+
+    HEAP.store(0, Ordering::Release);
+    // A fresh run uses the same host lock. The caller of realloc and dealloc is outside it.
+    let (mut next, entry, _) = fixture();
+    flags[3].store(2, Ordering::SeqCst);
+    RECEIVED.store(0, Ordering::Release);
+    let (id, _, main) = launch(&mut next, entry, None, &flags);
+    wait(|| RECEIVED.load(Ordering::Acquire) != 0 || main.is_finished());
+    assert_ne!(RECEIVED.load(Ordering::Acquire), 0, "the next run's op allocated successfully");
+    let caller = (current(), crate::zone_alloc::domain::current());
+    unsafe {
+        let p = BLOCK.load(Ordering::Acquire) as *mut u8;
+        p.write(37);
+        let q = RelaxAlloc.realloc(p, layout(73), 79);
+        assert!(!q.is_null() && q.read() == 37, "a loader resize used the owning domain and preserved the block");
+        RelaxAlloc.dealloc(q, layout(79));
+    }
+    assert_eq!(flags[2].load(Ordering::SeqCst), 2, "both foreign frees checked the program allocator's header in its domain");
+    assert_eq!((current(), crate::zone_alloc::domain::current()), caller, "the foreign calls restored the caller's domain");
+    flags[3].store(0, Ordering::SeqCst);
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "the next run exited normally");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The header allocator from the locked-op fixture receives only its own layouts. A kept
+/// buffer of the same layout from a native op must go back through the loader's Counting.
+#[test]
+fn jit_frees_a_counted_loader_buffer() {
+    const CHILD: &str = "RELAX_TEST_JIT_LOADER_BUFFER";
+    let test = "domain::teardown_tests::jit_frees_a_counted_loader_buffer";
+    let Ok(report) = std::env::var(CHILD) else {
+        for report in ["0", "1"] {
+            let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"]).env(CHILD, report).env("RELAX_MEM_REPORT", report));
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed"),
+                "JIT free of a loader buffer passes with accounting={report}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        return;
+    };
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicI64;
+    static BEFORE: AtomicI64 = AtomicI64::new(0);
+    static AFTER: AtomicI64 = AtomicI64::new(-1);
+    extern "C" fn buffer() -> *mut u8 {
+        let _kept = crate::zone_alloc::kept();
+        BEFORE.store(crate::memstat::live_total(), Ordering::Relaxed);
+        unsafe { crate::memstat::Counting.alloc(Layout::from_size_align(73, 16).unwrap()) }
+    }
+    extern "C" fn released() {
+        AFTER.store(crate::memstat::live_total(), Ordering::Relaxed);
+    }
+    let source = String::from(PROGRAM_ALLOCATOR) + r#"
+        fn crossing(p: *mut u64) {
+            FLAGS.store(p as u64, Ordering::SeqCst);
+            let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+            let buffer: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(flags[0].load(Ordering::SeqCst) as usize) };
+            let released: extern "C" fn() = unsafe { std::mem::transmute(flags[1].load(Ordering::SeqCst) as usize) };
+            let layout = Layout::from_size_align(73, 16).unwrap();
+            // Warm the lazy free path before comparing the process-wide accounting total.
+            for _ in 0..2 {
+                let b = buffer();
+                assert!(!b.is_null());
+                unsafe { std::alloc::dealloc(b, layout); }
+                released();
+            }
+        }
+    "#;
+    assert_eq!(crate::memstat::enabled(), report == "1", "the child uses the requested accounting mode");
+    let (mut u, entry, root) = fixture_of(&source, "crossing");
+    let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "crossing").unwrap().krate;
+    crate::layout::set_root_crate(krate);
+    u.tier1 = None;
+    let flags = [AtomicU64::new(buffer as *const () as u64), AtomicU64::new(released as *const () as u64),
+        AtomicU64::new(0), AtomicU64::new(0)];
+    let (id, _, main) = try_launch_with(&mut u, entry, None, flags.as_ptr() as u64, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "the program exits normally after freeing the loader buffer");
+    assert_eq!(flags[2].load(Ordering::SeqCst), 0, "freeing a loader buffer did not call the header allocator's dealloc");
+    assert_eq!(AFTER.load(Ordering::Relaxed), BEFORE.load(Ordering::Relaxed), "JIT dealloc returns counted live bytes to their pre-op total");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// The same native op as the locked-op fixture, with a PA that can serve a static page,
+// decline large requests, or take a particular layout from the real process malloc.
+#[test]
+fn allocator_ranges_are_checked_before_main_and_at_the_op() {
+    const LATE: &str = "RELAX_TEST_LATE_ALLOCATOR_BLOCK";
+    const REFUSED: &str = "RELAX_TEST_REFUSED_ALLOCATOR_PROBE";
+    isolated_test!(allocator_ranges_are_checked_before_main_and_at_the_op);
+    use crate::zone_alloc::RelaxAlloc;
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+    extern "C" {
+        fn malloc(size: usize) -> *mut core::ffi::c_void;
+        fn free(p: *mut core::ffi::c_void);
+    }
+    static BAD_SIZE: AtomicUsize = AtomicUsize::new(0);
+    static OUTSIDE: AtomicUsize = AtomicUsize::new(0);
+    static OUTSIDE_FREES: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn free_outside(p: *mut u8) {
+        OUTSIDE_FREES.fetch_add(1, Ordering::Relaxed);
+        unsafe { free(p.cast()) };
+    }
+    static SAW_STATIC: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn outside(size: usize) -> *mut u8 {
+        if size != BAD_SIZE.load(Ordering::Acquire) { return std::ptr::null_mut(); }
+        let p = unsafe { malloc(size) }.cast::<u8>();
+        OUTSIDE.store(p as usize, Ordering::Release);
+        p
+    }
+    extern "C" fn op(page: usize, probes: usize) {
+        let _run = relax_session::phase::run();
+        let layout = Layout::from_size_align(73, 8).unwrap();
+        unsafe {
+            let p = RelaxAlloc.alloc(layout);
+            if p as usize == page { SAW_STATIC.store(probes, Ordering::Release); }
+            if !p.is_null() { RelaxAlloc.dealloc(p, layout); }
+        }
+    }
+    let late = std::env::var(LATE).ok();
+    let refused = std::env::var_os(REFUSED).is_some();
+    let source = r#"
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static mut PAGE: [u8; 8192] = [0; 8192];
+        static IN_USE: AtomicBool = AtomicBool::new(false);
+        static PROBED: AtomicUsize = AtomicUsize::new(0);
+        fn page() -> usize { ((&raw mut PAGE as usize) + 4095) & !4095usize }
+        struct PageAllocator;
+        #[global_allocator]
+        static ALLOCATOR: PageAllocator = PageAllocator;
+        unsafe impl GlobalAlloc for PageAllocator {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                if NESTED && l.size() == 73 {
+                    // A loader allocation asks its PA for 73 bytes. Its own bookkeeping grows
+                    // through JIT realloc, which must check the new 64-byte allocation.
+                    let mut book = Vec::<u64>::with_capacity(4);
+                    book.push(73);
+                    book.reserve_exact(7);
+                    std::hint::black_box(book);
+                }
+                let outside: extern "C" fn(usize) -> *mut u8 = std::mem::transmute(OUTSIDE_FNusize);
+                let p = outside(l.size());
+                if !p.is_null() { return p; }
+                let bit = match (l.size(), l.align()) {
+                    (16, 8) => 1, (4096, 8) => 2, (4096, 4096) => 4,
+                    (262144, 8) => 8, (4194304, 8) => 16, _ => 0,
+                };
+                PROBED.fetch_or(bit, Ordering::SeqCst);
+                if bit >= 8 { return std::ptr::null_mut(); }
+                if l.size() <= 4096 && l.align() <= 4096 && !IN_USE.swap(true, Ordering::SeqCst) {
+                    return page() as *mut u8;
+                }
+                System.alloc(l)
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                if p as usize == page() { IN_USE.store(false, Ordering::SeqCst); }
+                else if p as usize == (*(OUTSIDE_ADDRusize as *const AtomicUsize)).load(Ordering::Acquire) {
+                    let free: extern "C" fn(*mut u8) = std::mem::transmute(FREE_FNusize);
+                    free(p);
+                } else { System.dealloc(p, l); }
+            }
+        }
+        fn fixture(arg: usize) {
+            SCENARIO
+            let op: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(arg) };
+            op(page(), PROBED.load(Ordering::SeqCst));
+        }
+    "#.replace("OUTSIDE_FN", &(outside as *const () as usize).to_string())
+        .replace("FREE_FN", &(free_outside as *const () as usize).to_string())
+        .replace("NESTED", if late.as_deref() == Some("nested") { "true" } else { "false" })
+        .replace("SCENARIO", match late.as_deref() {
+            Some("jit") => "unsafe { let l = Layout::from_size_align_unchecked(96, 8); std::hint::black_box(std::alloc::alloc(l)); }",
+            Some("resize") => "unsafe { let l = Layout::from_size_align_unchecked(32, 8); let p = std::alloc::alloc(l); std::hint::black_box(std::alloc::realloc(p, l, 96)); }",
+            _ if refused => "unsafe { let l = Layout::from_size_align_unchecked(16, 8); let p = std::alloc::alloc(l); assert!(!p.is_null()); std::alloc::dealloc(p, l); }",
+            _ => "",
+        })
+        .replace("OUTSIDE_ADDR", &(std::ptr::from_ref(&OUTSIDE) as usize).to_string());
+    let (mut u, entry, root) = fixture_of(&source, "fixture");
+    let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+    crate::layout::set_root_crate(krate);
+    u.tier1 = None;
+    let path = u.prog.def_path(u.global_allocator_static().expect("the fixture binds its PA"));
+    let arg = op as *const () as u64;
+    if let Some(case) = &late {
+        BAD_SIZE.store(match case.as_str() { "op" => 73, "nested" => 64, "jit" | "resize" => 96, _ => unreachable!() }, Ordering::Release);
+        let (_, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
+        main.join().unwrap();
+        panic!("a late outside allocation returned to the op");
+    }
+    if refused {
+        BAD_SIZE.store(16, Ordering::Release);
+        let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).expect("a refused probe does not stop the run");
+        main.join().unwrap();
+        wait_thread_done(id);
+        assert_ne!(OUTSIDE.load(Ordering::Acquire), 0, "the probe exercised the process malloc");
+        assert_eq!(OUTSIDE_FREES.load(Ordering::Relaxed), 2, "the PA freed its outside probe block and its subsequent outside JIT allocation");
+        assert_eq!(state(id), Some(DomainState::Exited(0)), "the run goes on after a refused probe");
+        assert_eq!(SAW_STATIC.load(Ordering::Acquire), 0, "after a refused probe the op allocates in the domain's heap, not through the allocator");
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    BAD_SIZE.store(0, Ordering::Release);
+    let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "a static PA starts");
+    assert_eq!(SAW_STATIC.load(Ordering::Acquire), 31, "all five probes ran before the op received its static block");
+    std::fs::remove_dir_all(root).unwrap();
+
+    let test = "domain::teardown_tests::allocator_ranges_are_checked_before_main_and_at_the_op";
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"]).env(REFUSED, "1"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a refused probe leaves the run going: {err}");
+    let prefix = format!("relax: the program's #[global_allocator] `{path}` returned 0x");
+    let suffix = " for a 16-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it";
+    assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
+        .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "a refused probe says so in one line, with the address: {err}");
+    assert!(!err.contains("the process ends"), "routing-off allocations continue without the late diagnostic: {err}");
+    for (case, size) in [("op", 73), ("jit", 96), ("resize", 96), ("nested", 64)] {
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"]).env(LATE, case));
+        let err = String::from_utf8_lossy(&out.stderr);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(6), "{case}: an outside PA result aborts the child: {err}");
+        #[cfg(not(unix))]
+        assert!(!out.status.success(), "{case}: an outside PA result ends the child abnormally: {err}");
+        let suffix = format!(" ({size} bytes, align 8), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends");
+        assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix.as_str()))
+            .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "{case}: late refusal names the allocator, address and layout: {err}");
+    }
 }
 
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.
@@ -1534,20 +2420,75 @@ fn end_process(pid: u32) {
         }
         unsafe { kill(pid as i32, 9) };
     }
+    // (and waits for its end: a handle closed on a child that ended is when the runtime lets go
+    // of its own)
     #[cfg(windows)]
     {
-        use crate::os::win32::{CloseHandle, OpenProcess, TerminateProcess};
+        use crate::os::win32::{CloseHandle, OpenProcess, TerminateProcess, WaitForSingleObject};
         unsafe {
-            let h = OpenProcess(0x0001, 0, pid);
+            let h = OpenProcess(0x0001 | 0x0010_0000, 0, pid);
             TerminateProcess(h, 1);
+            WaitForSingleObject(h, u32::MAX);
             CloseHandle(h);
         }
     }
 }
 
+/// A function the runtime this test runs under provides, found as a program finds it (through its
+/// loader); None in a native run.
+fn runtime_fn(name: &std::ffi::CStr) -> Option<usize> {
+    #[cfg(unix)]
+    let f = {
+        // (as os/proc.rs declares it)
+        extern "C" {
+            fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
+        }
+        #[cfg(target_vendor = "apple")]
+        let default = -2isize as *mut u8;
+        #[cfg(not(target_vendor = "apple"))]
+        let default = std::ptr::null_mut();
+        unsafe { dlsym(default, name.as_ptr() as *const u8) as usize }
+    };
+    #[cfg(windows)]
+    let f = {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetProcAddress(module: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe { GetProcAddress(GetModuleHandleW(std::ptr::null()), name.as_ptr()) as usize }
+    };
+    (f != 0).then_some(f)
+}
+
+/// Under a runtime: from now on it records what this program holds (`relax_track_handles`).
+fn track_held() {
+    if let Some(f) = runtime_fn(c"relax_track_handles") {
+        let track: extern "C" fn() = unsafe { std::mem::transmute(f) };
+        track();
+    }
+}
+
+/// What the runtime this test runs under records the program holding (`relax_held_handles`);
+/// None with no runtime under the test.
+fn held_by_the_program() -> Option<Vec<u64>> {
+    let f = runtime_fn(c"relax_held_handles")?;
+    let held: extern "C" fn(*mut u64, usize) -> usize = unsafe { std::mem::transmute(f) };
+    let mut out = Vec::new();
+    loop {
+        let n = held(out.as_mut_ptr(), out.len());
+        assert_ne!(n, usize::MAX, "the runtime tracks no handles of this program's");
+        if n <= out.len() {
+            out.truncate(n);
+            return Some(out);
+        }
+        out.resize(n, 0);
+    }
+}
+
 /// The path the Unix socket `fd` is bound to, as `getsockname` gives it (a connection a listener
 /// accepted has the listener's). None for another descriptor or an unnamed socket.
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn socket_path(fd: i32) -> Option<String> {
     extern "C" {
         fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
@@ -1570,9 +2511,9 @@ fn socket_path(fd: i32) -> Option<String> {
 
 /// What the process has open now: each descriptor and the file it names ("" for a pipe or a
 /// socket where the system names none; a Unix socket with the path it is bound to), but the
-/// listing's own; on Windows, one row per handle.
+/// listing's own; on Windows, each handle with its object type, a disk file with its path).
 fn open_now() -> Vec<(u64, String)> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     return std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).map(|e| {
         let fd = e.file_name().to_string_lossy().parse().unwrap_or(u64::MAX);
         let file = std::fs::read_link(e.path()).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1592,12 +2533,65 @@ fn open_now() -> Vec<(u64, String)> {
             (fd as u64, if named { String::from_utf8_lossy(&buf[..end]).into_owned() } else { socket_path(fd).unwrap_or_default() })
         }).filter(|(_, file)| file != "/dev/fd").collect();
     }
+    // each handle by its value, named by its object type and, for a disk file, its path (a
+    // pipe's name is never asked: that query can block)
     #[cfg(windows)]
     {
         use crate::os::win32::{GetCurrentProcess, GetProcessHandleCount};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetHandleInformation(h: usize, flags: *mut u32) -> i32;
+            fn GetFileType(h: usize) -> u32;
+            fn GetFinalPathNameByHandleW(h: usize, path: *mut u16, len: u32, flags: u32) -> u32;
+            fn GetProcessId(h: usize) -> u32;
+            fn GetThreadId(h: usize) -> u32;
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQueryObject(h: usize, class: u32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+        }
+        const OBJECT_TYPE_INFORMATION: u32 = 2;
+        const FILE_TYPE_DISK: u32 = 1;
+        let describe = |h: usize| -> String {
+            // OBJECT_TYPE_INFORMATION begins with the type's UNICODE_STRING (length in bytes, buffer)
+            let mut info = [0u64; 128];
+            let mut kind = String::new();
+            if unsafe { NtQueryObject(h, OBJECT_TYPE_INFORMATION, info.as_mut_ptr() as *mut u8, 1024, std::ptr::null_mut()) } >= 0 {
+                let len = (info[0] & 0xffff) as usize / 2;
+                let buf = info[1] as *const u16;
+                if !buf.is_null() {
+                    kind = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(buf, len) });
+                }
+            }
+            if kind == "File" && unsafe { GetFileType(h) } == FILE_TYPE_DISK {
+                let mut path = [0u16; 1024];
+                let n = unsafe { GetFinalPathNameByHandleW(h, path.as_mut_ptr(), path.len() as u32, 0) } as usize;
+                if n > 0 && n < path.len() {
+                    return format!("File {}", String::from_utf16_lossy(&path[..n]));
+                }
+            }
+            match kind.as_str() {
+                "Process" => format!("Process {}", unsafe { GetProcessId(h) }),
+                "Thread" => format!("Thread {}", unsafe { GetThreadId(h) }),
+                _ => kind,
+            }
+        };
         let mut n = 0;
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-        (0..n as u64).map(|i| (i, String::new())).collect()
+        // handle values are multiples of 4: walk them until every counted handle is found, or
+        // past a long run of unused values (the count can move while this walks)
+        let (mut open, mut h, mut unused) = (Vec::new(), 4usize, 0u32);
+        while open.len() < n as usize && unused < 1 << 16 {
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(h, &mut flags) } != 0 {
+                open.push((h as u64, describe(h)));
+                unused = 0;
+            } else {
+                unused += 1;
+            }
+            h += 4;
+        }
+        open
     }
 }
 
@@ -1619,13 +2613,15 @@ fn the_endpoints(file: &str) -> bool {
 }
 
 /// The run's end gives back what the run held, though it never did: the next run binds the same
-/// port, and round after round the run leaves nothing open.
+/// port, and leaves nothing open. (A second run is the first a leak shows in: the first run's lazy
+/// compiles open what stays open for the whole process.)
 #[test]
 fn a_run_ends_with_what_it_held_given_back() {
     isolated_test!(a_run_ends_with_what_it_held_given_back);
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (mut counts, mut lefts) = (Vec::new(), Vec::new());
-    for _ in 0..3 {
+    track_held();
+    for _ in 0..2 {
         let (mut u, entry, root) = fixture_of(HOLDS, "fixture");
         u.tier1 = None;
         let up = &mut *u as *mut Unit;
@@ -1668,8 +2664,12 @@ fn a_run_ends_with_what_it_held_given_back() {
             }
             assert_eq!(unsafe { signal(SIGUSR2, 0) }, 0, "the run's handler stayed");
         }
-        // what the round left open, by what it names: not a count of the whole process
-        let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1)).collect();
+        // what the round left open, by what it names: not a count of the whole process. Under a
+        // runtime (`makepad run` running this test), of that what the runtime records the program
+        // holding: its own threads at work (a sleep's timer, a look at the process's threads)
+        // hold handles for moments, and they are no one's leak. Natively nothing else runs here.
+        let held = held_by_the_program();
+        let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1) && held.as_ref().is_none_or(|h| h.contains(&f.0))).collect();
         counts.push(left.len());
         lefts.push(left);
         domains().retain(|d| d.info.id != domain);
@@ -1677,8 +2677,543 @@ fn a_run_ends_with_what_it_held_given_back() {
         std::fs::remove_dir_all(root).unwrap();
     }
     // (the first round's lazy compiles open what stays open for the whole process)
-    assert_eq!(&counts[1..], &[0, 0], "left open: {lefts:?}");
+    assert_eq!(&counts[1..], &[0], "left open: {lefts:?}");
 }
+
+/// A child the main program starts leaves no handle of the runtime's behind. The runtime keeps
+/// its own copy of a child's process handle, to end a run's children with their run; it made that
+/// copy before asking whether a run records the child, and for the main program none does: the
+/// copy was never closed, one process (and its pid) held per child for the life of the process.
+#[cfg(windows)]
+#[test]
+fn a_main_programs_child_leaves_no_handle_behind() {
+    isolated_test!(a_main_programs_child_leaves_no_handle_behind);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(MAIN_CHILD, "fixture");
+    let out = [0u64; 1];
+    // (on this thread, in no run: where the main program runs)
+    unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    let child = format!("Process {}", out[0]);
+    let held: Vec<_> = open_now().into_iter().filter(|(_, name)| *name == child).collect();
+    assert!(held.is_empty(), "the ended child's process is still held: {held:?}");
+    drop(u);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+const MAIN_CHILD: &str = r#"
+fn fixture(p: *mut u64) {
+    let mut child = std::process::Command::new("cmd").args(["/c", "exit 0"]).spawn().unwrap();
+    unsafe { *p = child.id() as u64 };
+    child.wait().unwrap();
+}
+"#;
+
+/// A handle the program closes through its copy (DuplicateHandle with DUPLICATE_CLOSE_SOURCE), or
+/// through the native API's NtClose, is no longer the run's: the run's end closes nothing under its
+/// number. Its record stayed, and the end closed whatever had that number by then, a handle of the
+/// process's or of another run's.
+#[cfg(windows)]
+#[test]
+fn a_handle_closed_through_its_copy_is_not_given_back() {
+    isolated_test!(a_handle_closed_through_its_copy_is_not_given_back);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(CLOSED_THROUGH_ITS_COPY, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let replaced = crate::domain_res::replaced_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files, 0, "the run's end closed a handle the program had closed: {:?}", end.released);
+    // (a record left by a close the runtime did not see is replaced when the number comes back)
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 0, "a close went unseen, its record replaced");
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+const CLOSED_THROUGH_ITS_COPY: &str = r#"
+use std::os::windows::io::IntoRawHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn DuplicateHandle(sp: isize, s: isize, tp: isize, t: *mut isize, access: u32, inherit: i32, options: u32) -> i32;
+    fn CloseHandle(h: isize) -> i32;
+    fn NtClose(h: isize) -> i32;
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    // closed through the native API
+    let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap().into_raw_handle() as isize;
+    assert!(unsafe { NtClose(file) } >= 0);
+    let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap().into_raw_handle() as isize;
+    let me = unsafe { GetCurrentProcess() };
+    let mut copy = 0;
+    // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS: the copy, and the file's first handle closed
+    assert!(unsafe { DuplicateHandle(me, file, me, &mut copy, 0, 0, 1 | 2) } != 0);
+    assert!(unsafe { CloseHandle(copy) } != 0);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// What a run opens through the native API (NtCreateFile, NtOpenFile, NtCreateNamedPipeFile) and
+/// through kernel32's other creators (CreateFile2, ReOpenFile, OpenFileById) is the run's: its end
+/// gives it back. The fixture makes a pipe as real std makes a child's, the pipe file system
+/// opened once into a static (natively once per process; under a runtime each run's statics are
+/// its own); a second run in the same process opens its own, pipes again, and gives it back too.
+#[cfg(windows)]
+#[test]
+fn a_run_gives_back_what_the_native_api_opened() {
+    isolated_test!(a_run_gives_back_what_the_native_api_opened);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    track_held();
+    for round in 0..2 {
+        let (mut u, entry, root) = fixture_of(NATIVE_API_OPENS, "fixture");
+        u.tier1 = None;
+        let up = &mut *u as *mut Unit;
+        let flags: [AtomicU64; 4] = Default::default();
+        let open_before = open_now();
+        let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+        wait(|| {
+            if let Some(DomainState::Crashed(why)) = state(domain) { panic!("round {round}: the fixture crashed: {why}"); }
+            flags[0].load(Ordering::SeqCst) == 1
+        });
+        let held = flags[1].load(Ordering::SeqCst);
+        let end = end_run(up, Duration::from_secs(10));
+        assert!(end.left.is_empty(), "left: {:?}", end.left);
+        main.join().unwrap();
+        wait_thread_done(domain);
+        assert_eq!(end.released.files as u64, held, "round {round}: the run's end gave back what it held: {:?}", end.released);
+        // (the first round's lazy compiles open what stays open for the whole process)
+        if round > 0 {
+            let recorded = held_by_the_program();
+            let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1) && !the_endpoints(&f.1) && recorded.as_ref().is_none_or(|h| h.contains(&f.0))).collect();
+            assert!(left.is_empty(), "round {round} left open: {left:?}");
+        }
+        domains().retain(|d| d.info.id != domain);
+        drop(u);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(windows)]
+const NATIVE_API_OPENS: &str = r#"
+use std::ptr::null;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::SeqCst};
+#[repr(C)]
+struct UnicodeString { len: u16, max: u16, buf: *const u16 }
+#[repr(C)]
+struct ObjectAttributes { len: u32, root: isize, name: *const UnicodeString, attrs: u32, sd: *const u8, qos: *const u8 }
+#[repr(C)]
+#[derive(Default)]
+struct IoStatus { status: usize, info: usize }
+/// FILE_ID_DESCRIPTOR, of FileIdType
+#[repr(C)]
+struct FileId { size: u32, kind: i32, id: [u64; 2] }
+extern "system" {
+    fn NtOpenFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, share: u32, options: u32) -> i32;
+    fn NtCreateFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> i32;
+    fn NtCreateNamedPipeFile(h: *mut isize, access: u32, attrs: *const ObjectAttributes, io: *mut IoStatus, share: u32, disposition: u32, options: u32, pipe_type: u32, read_mode: u32, completion: u32, instances: u32, inbound: u32, outbound: u32, timeout: *const i64) -> i32;
+    fn CreateFile2(name: *const u16, access: u32, share: u32, disposition: u32, params: *const u8) -> isize;
+    fn ReOpenFile(h: isize, access: u32, share: u32, flags: u32) -> isize;
+    fn OpenFileById(volume: isize, id: *const FileId, access: u32, share: u32, security: *const u8, flags: u32) -> isize;
+    fn GetFileInformationByHandle(h: isize, info: *mut [u32; 13]) -> i32;
+}
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+const SHARE_ALL: u32 = 7;
+/// FILE_SYNCHRONOUS_IO_NONALERT, FILE_NON_DIRECTORY_FILE
+const SYNC_IO: u32 = 0x20;
+const NON_DIRECTORY: u32 = 0x40;
+const INVALID: isize = -1;
+/// the pipe file system, opened once into a static, as real std's child pipes keep it
+static PIPE_FS: AtomicIsize = AtomicIsize::new(0);
+fn counted(s: &[u16]) -> UnicodeString { UnicodeString { len: (s.len() * 2) as u16, max: (s.len() * 2) as u16, buf: s.as_ptr() } }
+fn attrs(root: isize, name: &UnicodeString) -> ObjectAttributes {
+    ObjectAttributes { len: std::mem::size_of::<ObjectAttributes>() as u32, root, name, attrs: 0, sd: null(), qos: null() }
+}
+fn pipe_fs() -> isize {
+    let h = PIPE_FS.load(SeqCst);
+    if h != 0 { return h; }
+    let path: Vec<u16> = r"\Device\NamedPipe\".encode_utf16().collect();
+    let (mut h, mut io) = (0, IoStatus::default());
+    let st = unsafe { NtOpenFile(&mut h, SYNCHRONIZE | GENERIC_READ, &attrs(0, &counted(&path)), &mut io, 3, SYNC_IO) };
+    assert!(st >= 0, "NtOpenFile of the pipe file system: {st:#x}");
+    PIPE_FS.store(h, SeqCst);
+    h
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = exe.to_str().unwrap();
+    let mut io = IoStatus::default();
+    // a pipe as real std makes a child's: our end under the pipe file system (FILE_CREATE, one
+    // instance, byte stream), theirs opened through ours
+    let empty = UnicodeString { len: 0, max: 0, buf: null() };
+    let timeout = -50i64 * 10_000;
+    let mut ours = 0;
+    let st = unsafe { NtCreateNamedPipeFile(&mut ours, SYNCHRONIZE | GENERIC_READ, &attrs(pipe_fs(), &empty), &mut io, 2, 2, 0, 0, 0, 0, 1, 4096, 4096, &timeout) };
+    assert!(st >= 0, "NtCreateNamedPipeFile: {st:#x}");
+    let mut theirs = 0;
+    let st = unsafe { NtOpenFile(&mut theirs, SYNCHRONIZE | GENERIC_WRITE | FILE_READ_ATTRIBUTES, &attrs(ours, &empty), &mut io, 0, NON_DIRECTORY | SYNC_IO) };
+    assert!(st >= 0, "NtOpenFile of the pipe's other end: {st:#x}");
+    // the program's own file through the native API (FILE_OPEN; an NT path: \??\ and the DOS one)
+    let nt: Vec<u16> = format!(r"\??\{}", exe.trim_start_matches(r"\\?\")).encode_utf16().collect();
+    let mut file = 0;
+    let st = unsafe { NtCreateFile(&mut file, SYNCHRONIZE | GENERIC_READ, &attrs(0, &counted(&nt)), &mut io, null(), 0, SHARE_ALL, 1, NON_DIRECTORY | SYNC_IO, null(), 0) };
+    assert!(st >= 0, "NtCreateFile: {st:#x}");
+    // and through kernel32's other creators (OPEN_EXISTING)
+    let wide: Vec<u16> = exe.encode_utf16().chain([0]).collect();
+    let second = unsafe { CreateFile2(wide.as_ptr(), GENERIC_READ, SHARE_ALL, 3, null()) };
+    assert_ne!(second, INVALID, "CreateFile2");
+    let third = unsafe { ReOpenFile(second, GENERIC_READ, SHARE_ALL, 0) };
+    assert_ne!(third, INVALID, "ReOpenFile");
+    let mut info = [0u32; 13];
+    assert!(unsafe { GetFileInformationByHandle(second, &mut info) } != 0, "the file's id");
+    let id = FileId { size: std::mem::size_of::<FileId>() as u32, kind: 0, id: [((info[11] as u64) << 32) | info[12] as u64, 0] };
+    let fourth = unsafe { OpenFileById(second, &id, GENERIC_READ, SHARE_ALL, null(), 0) };
+    assert_ne!(fourth, INVALID, "OpenFileById");
+    // held: the pipe file system, the pipe's two ends, and four of the file
+    a[1].store(7, SeqCst);
+    a[0].store(1, SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A number the system gives out again while the runtime still records it means its earlier
+/// close went by a path the runtime does not see (here the C library's own close, inside
+/// `fclose` or `_close`): the new record replaces the old one, the replacement is counted, and
+/// the run's end closes the number once, for its new owner. With both records kept, the end
+/// closed it twice, and whatever had the number by the second close lost it.
+#[test]
+fn a_number_given_out_again_replaces_its_record() {
+    isolated_test!(a_number_given_out_again_replaces_its_record);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(GIVEN_OUT_AGAIN, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let replaced = crate::domain_res::replaced_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 1, "the number's earlier record was replaced, and counted");
+    assert_eq!(end.released.files, 1, "the number's new owner, closed once: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+const GIVEN_OUT_AGAIN: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+mod native {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    extern "C" {
+        fn fdopen(fd: i32, mode: *const u8) -> *mut u8;
+        fn fclose(f: *mut u8) -> i32;
+    }
+    pub fn number(f: &std::fs::File) -> u64 { f.as_raw_fd() as u64 }
+    /// closed the way native code closes it: the C library's own close, inside fclose
+    pub fn close(f: std::fs::File) { unsafe { fclose(fdopen(f.into_raw_fd(), b"r\0".as_ptr())) }; }
+}
+#[cfg(windows)]
+mod native {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    extern "C" {
+        fn _open_osfhandle(h: isize, flags: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+    }
+    pub fn number(f: &std::fs::File) -> u64 { f.as_raw_handle() as u64 }
+    /// closed the way native code closes it: the C runtime's own close, inside _close
+    pub fn close(f: std::fs::File) { unsafe { _close(_open_osfhandle(f.into_raw_handle() as isize, 0)) }; }
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let first = std::fs::File::open(&exe).unwrap();
+    let n = native::number(&first);
+    native::close(first);
+    // opened again until the system gives that number out (on unix the next open: the lowest free fd)
+    let mut others = Vec::new();
+    let again = loop {
+        let f = std::fs::File::open(&exe).unwrap();
+        if native::number(&f) == n { break f; }
+        others.push(f);
+    };
+    drop(others);
+    std::mem::forget(again);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A program's signal handler that opens and closes (both async-signal-safe) while the main flow
+/// holds many records, the table growing under it: its opens take the table's spare room (an
+/// insert in a handler never grows a map, which could wait on the allocator the handler
+/// interrupted), none is left out, and the run's end gives back what each side still holds.
+#[cfg(unix)]
+#[test]
+fn opens_in_a_signal_handler_are_recorded_and_given_back() {
+    isolated_test!(opens_in_a_signal_handler_are_recorded_and_given_back);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(HANDLER_OPENS, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (made, left_out) = crate::domain_res::handler_records();
+    let replaced = crate::domain_res::replaced_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let (held, opens) = (flags[1].load(Ordering::SeqCst), flags[2].load(Ordering::SeqCst));
+    let (made_now, left_out_now) = crate::domain_res::handler_records();
+    assert!(held >= 100 && opens >= 50, "the main flow held {held}, the handler opened {opens}");
+    assert_eq!(made_now - made, opens, "every open in the handler was made in it (its thread marked)");
+    assert_eq!(left_out_now - left_out, 0, "an open in the handler found no spare room");
+    assert_eq!(crate::domain_res::replaced_records() - replaced, 0, "a close in the handler was not seen");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files as u64, held + 1, "what the main flow held and the handler's last open: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+const HANDLER_OPENS: &str = r#"
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
+extern "C" {
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    fn close(fd: i32) -> i32;
+    fn signal(sig: i32, h: usize) -> usize;
+    fn raise(sig: i32) -> i32;
+    fn getrlimit(r: i32, l: *mut [u64; 2]) -> i32;
+    fn setrlimit(r: i32, l: *const [u64; 2]) -> i32;
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOFILE: i32 = 7;
+#[cfg(target_vendor = "apple")]
+const NOFILE: i32 = 8;
+/// `want` descriptors, or what the soft limit has room for (raised toward the hard one first)
+fn room(want: u64) -> u64 {
+    let mut l = [0u64; 2];
+    unsafe {
+        getrlimit(NOFILE, &mut l);
+        let up = [l[1].min(want + 256), l[1]];
+        if up[0] > l[0] { setrlimit(NOFILE, &up); }
+        getrlimit(NOFILE, &mut l);
+    }
+    want.min(l[0].saturating_sub(64))
+}
+static PATH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static LAST: AtomicI32 = AtomicI32::new(-1);
+static OPENS: AtomicU64 = AtomicU64::new(0);
+/// the program's handler: opens the file again and closes what its last run opened
+extern "C" fn on_usr1(_: i32) {
+    let fd = unsafe { open(PATH.load(Ordering::SeqCst), 0) };
+    if fd < 0 { return; }
+    OPENS.fetch_add(1, Ordering::SeqCst);
+    let last = LAST.swap(fd, Ordering::SeqCst);
+    if last >= 0 { unsafe { close(last) }; }
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(exe.as_os_str())).unwrap();
+    PATH.store(exe.into_raw() as *mut u8, Ordering::SeqCst);
+    unsafe { signal(SIGUSR1, on_usr1 as *const () as usize) };
+    let many = room(1000);
+    let mut held = Vec::new();
+    for i in 0..many {
+        let fd = unsafe { open(PATH.load(Ordering::SeqCst), 0) };
+        assert!(fd >= 0, "open {i} of {many}");
+        held.push(fd);
+        if i % 2 == 0 { unsafe { raise(SIGUSR1) }; }
+    }
+    a[1].store(held.len() as u64, Ordering::SeqCst);
+    a[2].store(OPENS.load(Ordering::SeqCst), Ordering::SeqCst);
+    a[0].store(1, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A program's handler left by siglongjmp, once on the thread's own stack and once on an
+/// alternate stack (SA_ONSTACK, as std's own guard handler is) mapped above the thread's, where a
+/// plain stack-pointer compare would never clear the handler's mark: its open is made in a handler,
+/// and the opens after the jump are the main flow's, the mark cleared.
+#[cfg(unix)]
+#[test]
+fn a_handler_left_by_siglongjmp_leaves_its_thread_outside_handlers() {
+    isolated_test!(a_handler_left_by_siglongjmp_leaves_its_thread_outside_handlers);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(LEFT_BY_JUMP, "fixture");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (made, left_out) = crate::domain_res::handler_records();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    let (on_alt, after) = (flags[1].load(Ordering::SeqCst), flags[2].load(Ordering::SeqCst));
+    let (made_now, left_out_now) = crate::domain_res::handler_records();
+    assert_eq!(on_alt, 0b10, "the first handler ran on the thread's own stack, the second on the alternate one");
+    assert_eq!(made_now - made, 2, "each handler's own open was made in it, and none of the {after} opens after its jump");
+    assert_eq!(left_out_now - left_out, 0, "an open found no spare room");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.files as u64, 2 + after, "the handlers' opens and the main flow's: {:?}", end.released);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+const LEFT_BY_JUMP: &str = r#"
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering::SeqCst};
+use std::ptr::{null, null_mut};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct SigAction { handler: usize, mask: [u64; 16], flags: i32, pad: i32, restorer: usize }
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct SigAction { handler: usize, mask: u32, flags: i32 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct StackT { sp: *mut u8, flags: i32, pad: i32, size: usize }
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct StackT { sp: *mut u8, size: usize, flags: i32 }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SA_ONSTACK: i32 = 0x0800_0000;
+#[cfg(target_vendor = "apple")]
+const SA_ONSTACK: i32 = 0x1;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAP_PRIVATE_ANON: i32 = 0x22;
+#[cfg(target_vendor = "apple")]
+const MAP_PRIVATE_ANON: i32 = 0x1002;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;
+const SS_ONSTACK: i32 = 1;
+const STACK: usize = 1 << 18;
+extern "C" {
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+    fn raise(sig: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    #[cfg_attr(target_os = "linux", link_name = "__sigsetjmp")]
+    fn sigsetjmp(env: *mut u8, savemask: i32) -> i32;
+    fn siglongjmp(env: *mut u8, val: i32) -> !;
+}
+#[repr(C, align(16))]
+struct Jmp([u8; 1024]);
+static mut JMP: Jmp = Jmp([0; 1024]);
+static PATH: AtomicPtr<u8> = AtomicPtr::new(null_mut());
+static PHASE: AtomicU64 = AtomicU64::new(0);
+static ON_ALT: AtomicU64 = AtomicU64::new(0);
+static OPENED: AtomicI32 = AtomicI32::new(-1);
+fn jmp() -> *mut u8 { unsafe { std::ptr::addr_of_mut!(JMP.0).cast() } }
+/// the program's handler: notes the stack it runs on, opens the file, and leaves by siglongjmp
+extern "C" fn leave(_: i32) {
+    let mut ss: StackT = unsafe { std::mem::zeroed() };
+    unsafe { sigaltstack(null(), &mut ss) };
+    if ss.flags & SS_ONSTACK != 0 { ON_ALT.fetch_or(1 << PHASE.load(SeqCst), SeqCst); }
+    OPENED.store(unsafe { open(PATH.load(SeqCst), 0) }, SeqCst);
+    unsafe { siglongjmp(jmp(), 1) }
+}
+/// raises SIGUSR1: true once its handler jumped back here
+#[inline(never)]
+fn left_by_jump() -> bool {
+    if unsafe { sigsetjmp(jmp(), 1) } != 0 { return true; }
+    unsafe { raise(SIGUSR1) };
+    false
+}
+/// a stack mapped above the calling thread's
+fn stack_above() -> *mut u8 {
+    let mark = 0u8;
+    let here = &mark as *const u8 as usize;
+    for shift in 28..40 {
+        let hint = (here + (1usize << shift)) & !(STACK - 1);
+        let p = unsafe { mmap(hint as *mut u8, STACK, 3, MAP_PRIVATE_ANON, -1, 0) };
+        if p as isize == -1 { continue; }
+        if p as usize > here { return p; }
+        unsafe { munmap(p, STACK) };
+    }
+    panic!("no stack could be mapped above the thread's");
+}
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let exe = std::env::current_exe().unwrap();
+    let exe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(exe.as_os_str())).unwrap();
+    PATH.store(exe.into_raw() as *mut u8, SeqCst);
+    let mut after = 0u64;
+    for phase in 0..2u64 {
+        PHASE.store(phase, SeqCst);
+        let mut act: SigAction = unsafe { std::mem::zeroed() };
+        act.handler = leave as *const () as usize;
+        act.flags = if phase == 1 { SA_ONSTACK } else { 0 };
+        assert_eq!(unsafe { sigaction(SIGUSR1, &act, null_mut()) }, 0, "the handler's installation");
+        let mut old: StackT = unsafe { std::mem::zeroed() };
+        let mut alt = null_mut();
+        if phase == 1 {
+            alt = stack_above();
+            let mut ss: StackT = unsafe { std::mem::zeroed() };
+            ss.sp = alt;
+            ss.size = STACK;
+            assert_eq!(unsafe { sigaltstack(&ss, &mut old) }, 0, "the alternate stack");
+        }
+        assert!(left_by_jump(), "the handler left by siglongjmp");
+        assert!(OPENED.load(SeqCst) >= 0, "the handler's open");
+        // the main flow's opens, after the jump
+        for _ in 0..4 {
+            assert!(unsafe { open(PATH.load(SeqCst), 0) } >= 0, "an open after the jump");
+            after += 1;
+        }
+        if phase == 1 {
+            assert_eq!(unsafe { sigaltstack(&old, null_mut()) }, 0, "the thread's alternate stack back");
+            unsafe { munmap(alt, STACK) };
+        }
+    }
+    a[1].store(ON_ALT.load(SeqCst), SeqCst);
+    a[2].store(after, SeqCst);
+    a[0].store(1, SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
 
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1778,4 +3313,63 @@ fn a_run_with_no_unit_ends_with_nothing_to_end() {
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let end = end_run(std::ptr::null_mut(), Duration::from_millis(100));
     assert_eq!((end.threads, end.left.len()), (0, 0), "{}", end.line());
+}
+
+const REMOTE_SERVICES: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+extern "C" {
+    fn relax_register_remote_service(name: *const u8, len: usize, version: u32, open: extern "C" fn(*const u8, usize, usize, *mut u8) -> usize, close: extern "C" fn(usize));
+}
+extern "C" fn open(_: *const u8, _: usize, _: usize, _: *mut u8) -> usize { 0 }
+extern "C" fn close(_: usize) {}
+fn fixture(p: *mut u64) {
+    let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+    unsafe { relax_register_remote_service(b"frames".as_ptr(), 6, 1, open, close) };
+    flags[0].store(1, Ordering::SeqCst);
+    while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+}
+"#;
+
+/// A JIT run's remote endpoint is the app's own local one, as a native run's is (an app link that
+/// takes only an app's own local endpoint finds it): its discovery entry names this process, its
+/// socket is in the user's socket dir (Windows: the loopback carrier), and once the program has
+/// registered its `frames` service the entry's caps hold `cmd` and `frames`. The run's own fields
+/// (its log, its cache dir) describe the run; no field routes it elsewhere.
+#[test]
+fn a_jit_runs_endpoint_is_the_apps_own_local_one() {
+    isolated_test!(a_jit_runs_endpoint_is_the_apps_own_local_one);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("RELAX_INSPECT");
+    crate::inspect::start("endpoint-fixture");
+    let (mut u, entry, root) = fixture_of(REMOTE_SERVICES, "fixture");
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) != 0);
+    let pid = std::process::id();
+    let registry = makepad_remote::discovery::registry_dir();
+    let apps = makepad_remote::discovery::apps_in(&registry);
+    let app = apps.iter().find(|a| a.pid == pid).unwrap_or_else(|| panic!("the run announced itself under its own pid {pid} in {}: {apps:?}", registry.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = std::path::Path::new(&app.socket);
+        assert_eq!(socket.parent(), Some(makepad_remote::carrier::unix::socket_dir().as_path()), "the socket is in the user's socket dir: {app:?}");
+        assert!(std::fs::symlink_metadata(socket).is_ok_and(|m| m.file_type().is_socket()), "the socket is there: {app:?}");
+    }
+    #[cfg(windows)]
+    assert!(app.socket.starts_with("tcp:127.0.0.1:"), "the loopback carrier: {app:?}");
+    assert!(app.unreachable().is_none() && app.serves("cmd") && app.serves("frames"), "it serves the app's commands and its frames: {app:?}");
+    for key in ["via", "relay", "route", "hub", "host"] {
+        assert!(!app.fields.iter().any(|f| f.0 == key), "no `{key}` field routes it elsewhere: {app:?}");
+    }
+    assert!(!app.serves("route") && !app.serves("relay"), "it serves no route: {app:?}");
+    flags[1].store(1, Ordering::SeqCst);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    domains().retain(|d| d.info.id != domain);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(root).unwrap();
 }

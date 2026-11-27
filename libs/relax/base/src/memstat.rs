@@ -89,14 +89,17 @@ pub enum Tag {
     Patterns,
     /// building and transforming a body's MIR for the borrow checker
     Mir,
+    /// `makepad run`'s background check of the crates' items (typeck_bg.rs ItemPass): its own
+    /// blocks; what the phases under it tag (sigs, typeck, ..) stays theirs
+    ItemPass,
 }
 
-pub const N_TAGS: usize = 39;
+pub const N_TAGS: usize = 40;
 pub const TAG_NAMES: [&str; N_TAGS] = [
     "other", "boot", "parse", "parse-body", "derive", "macro_rules", "fmt", "mac-other", "load", "resolve", "syms", "sigs", "types",
     "typeck", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
     "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output", "planner",
-    "body-lints", "patterns", "mir",
+    "body-lints", "patterns", "mir", "item-pass",
 ];
 
 /// 0 undecided, 1 off, 2 on (decided at the first allocation, never changed)
@@ -310,12 +313,7 @@ unsafe impl GlobalAlloc for Counting {
             return p;
         }
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-        {
-            let p = crate::zone_alloc::domain::run_alloc(l, false);
-            if !p.is_null() {
-                return p;
-            }
-        }
+        if let Some(p) = crate::zone_alloc::domain::run_alloc(l, false) { return p; }
         let h = hdr(l.align());
         let b = outside_domains(|| System.alloc(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR))));
         if b.is_null() {
@@ -342,12 +340,7 @@ unsafe impl GlobalAlloc for Counting {
             return p;
         }
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-        {
-            let p = crate::zone_alloc::domain::run_alloc(l, true);
-            if !p.is_null() {
-                return p;
-            }
-        }
+        if let Some(p) = crate::zone_alloc::domain::run_alloc(l, true) { return p; }
         let h = hdr(l.align());
         let b = outside_domains(|| System.alloc_zeroed(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR))));
         if b.is_null() {
@@ -425,13 +418,12 @@ impl Counting {
         // A counted block an op grows moves into the op's domain heap, headerless, as a new one
         // would be there.
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-        {
-            let q = crate::zone_alloc::domain::run_alloc(Layout::from_size_align_unchecked(new, l.align()), false);
+        if let Some(q) = crate::zone_alloc::domain::run_alloc(Layout::from_size_align_unchecked(new, l.align()), false) {
             if !q.is_null() {
                 std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
                 self.dealloc_counted(p, l);
-                return q;
             }
+            return q;
         }
         let h = hdr(l.align());
         let b = p.sub(h);

@@ -9,7 +9,7 @@
 # "supertrait_assoc_dep: ok" or "supertrait_assoc_dep: FAILED" (exit 1); the expected line is
 # `cargo run -p sad-app`'s.
 H=$(cd "$(dirname "$0")" && pwd)
-D=$(mktemp -d) || exit 1
+D=$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX") || exit 1
 trap 'rm -rf "$D"' EXIT
 reg=libs/cache/.cargo/registry/src/index-0/sad-list-0.1.0
 cp -R "$H/app" "$H/Cargo.toml" "$D/" && mkdir -p "$D/${reg%/*}" && cp -R "$H/list" "$D/$reg" || exit 1

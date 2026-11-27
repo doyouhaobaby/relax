@@ -20,17 +20,36 @@ pub fn stop_all() { STOPPED.store(true, Ordering::SeqCst); }
 pub fn is_stopped() -> bool { STOPPED.load(Ordering::Acquire) }
 
 static WRITERS: AtomicUsize = AtomicUsize::new(0);
-/// Work the person waits for is queued (a live edit's borrow check): threads doing background
-/// work of that kind that opted in (`Yields`) stop at their next point, as for a writer.
-static URGENT: AtomicBool = AtomicBool::new(false);
+/// Bit 0 marks queued urgent work (a live edit's borrow check). Each UI wait adds 2.
+static URGENT: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static YIELDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether work the person waits for is queued (`URGENT`); the queue that holds it sets and clears it.
-pub fn set_urgent(on: bool) { URGENT.store(on, Ordering::SeqCst); }
-pub fn urgent() -> bool { URGENT.load(Ordering::Relaxed) }
+pub fn set_urgent(on: bool) {
+    if on { URGENT.fetch_or(1, Ordering::SeqCst); } else { URGENT.fetch_and(!1, Ordering::SeqCst); }
+}
+pub fn urgent() -> bool { URGENT.load(Ordering::Relaxed) != 0 }
+
+/// The program's UI thread waits for work beside it (its first frame for the app check):
+/// background work that yields (`Yields`) gives way at its next point, as to urgent work,
+/// until every such guard drops. Guards nest.
+pub struct UiWaits(());
+impl UiWaits {
+    pub fn new() -> Self {
+        URGENT.fetch_add(2, Ordering::SeqCst);
+        UiWaits(())
+    }
+}
+impl Drop for UiWaits {
+    fn drop(&mut self) {
+        URGENT.fetch_sub(2, Ordering::SeqCst);
+    }
+}
+
+pub fn ui_waits() -> bool { URGENT.load(Ordering::Relaxed) >> 1 != 0 }
 
 /// The calling thread's preemptible work in this scope is background work that gives way to
 /// urgent work as well (`set_urgent`).
@@ -86,7 +105,7 @@ impl Drop for Preemptible {
 /// threads that also yield to urgent work while it is queued.
 #[inline]
 pub fn point() {
-    let urgent = URGENT.load(Ordering::Relaxed);
+    let urgent = URGENT.load(Ordering::Relaxed) != 0;
     if (WRITERS.load(Ordering::Relaxed) != 0 || is_stopped() || urgent) && ON.try_with(|c| c.get()).unwrap_or(false)
         && (!urgent || WRITERS.load(Ordering::Relaxed) != 0 || is_stopped() || YIELDS.try_with(|c| c.get()).unwrap_or(false))
     {
@@ -168,7 +187,23 @@ mod tests {
         super::set_urgent(false);
         assert!(plain, "a thread that does not yield to urgent work was preempted by it");
         assert!(r.is_err_and(|p| super::is_preempted(&*p)));
+        let ui = super::UiWaits::new();
+        assert!(super::ui_waits());
+        super::point();
         let _y = super::Yields::on();
+        assert!(std::panic::catch_unwind(super::point).is_err_and(|p| super::is_preempted(&*p)));
+        drop(ui);
+        assert!(!super::ui_waits());
+        super::point();
+
+        super::set_urgent(true);
+        let ui = super::UiWaits::new();
+        super::set_urgent(false);
+        drop(super::UiWaits::new());
+        assert!(super::ui_waits() && super::urgent(), "the outer UI wait must still be in force");
+        assert!(std::panic::catch_unwind(super::point).is_err_and(|p| super::is_preempted(&*p)));
+        drop(ui);
+        assert!(!super::ui_waits() && !super::urgent());
         super::point();
     }
 }
@@ -178,5 +213,5 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&STOPPED, AtomicBool::new(false));
     reset(&WRITERS, AtomicUsize::new(0));
-    reset(&URGENT, AtomicBool::new(false));
+    reset(&URGENT, AtomicUsize::new(0));
 }

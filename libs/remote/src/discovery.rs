@@ -5,6 +5,29 @@
 //! works it would pick their app (one that drives a real printer, say) for whoever mistypes a
 //! command. So those reach only what the [`Caller`] started, and everything else is named by pid.
 
+use std::path::{Path, PathBuf};
+
+/// The startup line that tells a caller how to reach this app.
+pub fn startup_line(tool: &str, pid: u32, app: &str, socket: &Path) -> String {
+    format!("[{tool}-remote] pid={pid} app={app} socket={}", socket.display())
+}
+
+/// Reads a [`startup_line`], keeping the entire socket path, including spaces.
+pub fn parse_startup_line(line: &str) -> Option<(u32, String, PathBuf)> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (tag, fields) = line.strip_prefix('[')?.split_once(']')?;
+    let tool = tag.strip_suffix("-remote")?;
+    if tool.is_empty() || tool.contains(char::is_whitespace) {
+        return None;
+    }
+    let (pid, fields) = fields.strip_prefix(" pid=")?.split_once(" app=")?;
+    let (app, socket) = fields.split_once(" socket=")?;
+    if app.is_empty() || socket.is_empty() {
+        return None;
+    }
+    Some((pid.parse().ok()?, app.to_owned(), PathBuf::from(socket)))
+}
+
 /// Marks every process a lease's runs start: a process that moved to its own session is still
 /// stopped with the lease, a WM with it is a lane's test desktop, not its node's, and an app with
 /// it says so in its discovery file (`lease`), which makes it that lease's own.
@@ -87,6 +110,18 @@ impl App {
         let raw = &self.fields.iter().find(|f| f.0 == key)?.1;
         let mut i = 0;
         string(raw.as_bytes(), &mut i)
+    }
+
+    /// Main window title as supplied by the application, without the remote marker.
+    pub fn title(&self) -> Option<String> { self.text("title") }
+
+    /// Visible window IDs and their titles, in window order. Older endpoints advertise none.
+    pub fn visible_windows(&self) -> Vec<(usize, String)> {
+        let Some((_, raw)) = self.fields.iter().find(|(key, _)| key == "windows") else { return Vec::new() };
+        let mut windows: Vec<_> = fields(raw).into_iter().filter_map(|(id, title)|
+            Some((id.parse().ok()?, string(title.as_bytes(), &mut 0)?))).collect();
+        windows.sort_by_key(|(id, _)| *id);
+        windows
     }
 
     /// Whether the endpoint serves `service` (any version).
@@ -250,16 +285,55 @@ pub fn parse(text: &str) -> Option<App> {
 /// Replaces the `caps` of a discovery file (a service registered after the endpoint started
 /// listening): written to a temporary file and renamed, so a reader never sees half a file.
 pub(crate) fn rewrite_caps(file: &std::path::Path, caps: &[String]) {
-    let Ok(text) = std::fs::read_to_string(file) else { return };
-    let Some(at) = text.find("\"caps\":[") else { return };
-    let start = at + "\"caps\":[".len();
-    let Some(len) = text[start..].find(']') else { return };
-    let list: Vec<String> = caps.iter().map(|c| crate::cmd::json_str(c)).collect();
-    let new = format!("{}{}{}", &text[..start], list.join(","), &text[start + len..]);
+    let list = caps.iter().map(|c| crate::cmd::json_str(c)).collect::<Vec<_>>().join(",");
+    let _ = rewrite_fields(file, &[("caps", format!("[{list}]"))]);
+}
+
+fn window_fields(title: Option<&str>, windows: &[(usize, String)]) -> [(&'static str, String); 2] {
+    let windows = windows.iter().map(|(id, title)| format!(r#""{id}":{}"#, crate::cmd::json_str(title)))
+        .collect::<Vec<_>>().join(",");
+    [("title", title.map_or_else(|| "null".into(), crate::cmd::json_str)), ("windows", format!("{{{windows}}}"))]
+}
+
+/// Publish a window snapshot in this process's discovery file. Call off the UI thread.
+pub fn publish_windows(title: Option<&str>, windows: &[(usize, String)]) -> std::io::Result<()> {
+    let file = crate::carrier::unix::paths(std::process::id()).1;
+    rewrite_fields(&file, &window_fields(title, windows))
+}
+
+fn rewrite_fields(file: &Path, updates: &[(&str, String)]) -> std::io::Result<()> {
+    use std::io::Write;
+    // In a hosted run, the endpoint and the application may hold different copies of this
+    // library. Serialize their read-modify-renames so a late registration preserves the windows.
+    #[cfg(unix)]
+    let dir = crate::carrier::unix::own_socket_dir()?;
+    #[cfg(not(unix))]
+    let dir = crate::carrier::unix::socket_dir();
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(dir.join(".discovery-write.lock"))?;
+    lock.lock()?;
+    let mut entries = fields(&std::fs::read_to_string(file)?);
+    entries.retain(|(name, _)| !updates.iter().any(|(key, _)| name == key));
+    entries.extend(updates.iter().map(|(key, value)| (key.to_string(), value.clone())));
+    let body = entries.iter().map(|(key, value)| format!("{}:{value}", crate::cmd::json_str(key)))
+        .collect::<Vec<_>>().join(",");
     let tmp = file.with_extension("json.new");
-    if std::fs::write(&tmp, new).is_ok() {
-        let _ = std::fs::rename(&tmp, file);
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    // A previous writer can have exited before its rename.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    let mut out = options.open(&tmp)?;
+    let result = writeln!(out, "{{{body}}}");
+    drop(out);
+    let result = result.and_then(|()| std::fs::rename(&tmp, file));
+    if result.is_err() { let _ = std::fs::remove_file(tmp); }
+    result
 }
 
 /// Where every process of this user registers its endpoint: one directory whatever the
@@ -374,6 +448,11 @@ pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
     if spec.starts_with("tcp:") {
         return list.into_iter().rfind(|a| a.socket == spec).ok_or_else(|| no_endpoint(spec));
     }
+    // an endpoint file an app published in a directory it owns ([`publish`]): like a pid, an
+    // explicit choice, so any caller may use it
+    if is_endpoint_file(spec) {
+        return published(std::path::Path::new(spec), &list);
+    }
     let app = match spec.parse::<u32>() {
         Ok(pid) => list.into_iter().find(|a| a.answers_to(pid)).ok_or_else(|| no_endpoint(spec)),
         Err(_) => named(&list, spec, caller),
@@ -381,6 +460,119 @@ pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
     match app.unreachable() {
         Some(why) => Err(why),
         None => Ok(app),
+    }
+}
+
+/// Whether a target names an endpoint file (a path) rather than a pid, a name or a socket.
+pub fn is_endpoint_file(spec: &str) -> bool {
+    (spec.contains('/') || spec.contains('\\')) && !is_socket_path(spec)
+}
+
+/// Whether a target is an endpoint's socket: a path ending in `.sock` (as [`crate::carrier::unix`]
+/// names them), or one that is a socket on disk.
+pub fn is_socket_path(spec: &str) -> bool {
+    if spec.ends_with(".sock") {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = std::fs::metadata(spec) {
+            return meta.file_type().is_socket();
+        }
+    }
+    false
+}
+
+/// Writes `path`, a file naming this process's endpoint (its pid, app and start time), for an app
+/// that owns a directory (a home it holds the lock of) so that callers can find "the instance of
+/// this home" across restarts by naming the file as their target. Another instance with another
+/// home can't be confused with it, and a reused pid doesn't match the start time. Written beside
+/// and renamed, so a reader never sees half a file; 0600 on Unix. Not a secret: any process of the
+/// user can read it, as it can list the registry.
+pub fn publish(path: &std::path::Path) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let me = apps()
+        .into_iter()
+        .find(|a| a.pid == pid)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "this process has no remote endpoint yet"))?;
+    let tmp = path.with_extension("new");
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, published_line(&me).as_bytes())?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// The line [`publish`] writes for `app`.
+fn published_line(app: &App) -> String {
+    let [(_, title), (_, windows)] = window_fields(app.title().as_deref(), &app.visible_windows());
+    format!("{{\"pid\":{},\"app\":{},\"started_ms\":{},\"title\":{title},\"windows\":{windows}}}\n", app.pid, crate::cmd::json_str(&app.app), app.started_ms)
+}
+
+/// The running endpoint an endpoint file names: the same pid and the same start time.
+fn published(path: &std::path::Path, list: &[App]) -> Result<App, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("no endpoint file {}: {e}", path.display()))?;
+    let named = parse(text.lines().next().unwrap_or("")).ok_or_else(|| format!("{} is not an endpoint file", path.display()))?;
+    let app = list
+        .iter()
+        .find(|a| a.pid == named.pid && a.started_ms == named.started_ms)
+        .cloned()
+        .ok_or_else(|| format!("the {} that wrote {} (pid {}) is not running", named.app, path.display(), named.pid))?;
+    match app.unreachable() {
+        Some(why) => Err(why),
+        None => Ok(app),
+    }
+}
+
+#[cfg(test)]
+mod published_tests {
+    use super::*;
+
+    #[test]
+    fn startup_line_identifies_the_remote_endpoint() {
+        let socket = Path::new("/tmp/app logs/test.sock");
+        assert_eq!(
+            startup_line("makepad", 42, "test", socket),
+            "[makepad-remote] pid=42 app=test socket=/tmp/app logs/test.sock",
+            "Makepad prints the documented startup line"
+        );
+        assert_eq!(
+            parse_startup_line(&startup_line("relax", 42, "test", socket)),
+            Some((42, "test".into(), socket.to_owned())),
+            "another tool round-trips the full socket path with spaces"
+        );
+        assert_eq!(
+            parse_startup_line("[makepad-remote] run=40 pid=42"),
+            None,
+            "the restart parent's line is separate from the startup line"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_file_reaches_its_own_instance_only() {
+        let line = |pid: u32, started: u64| format!("{{\"pid\":{pid},\"app\":\"create\",\"socket\":\"/s{pid}\",\"started_ms\":{started},\"caps\":[]}}\n");
+        let list = vec![parse(&line(41, 1000)).unwrap(), parse(&line(42, 2000)).unwrap()];
+        let dir = crate::carrier::unix::test_root().join(format!("published-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("endpoint");
+        let written = published_line(&list[1]);
+        assert_eq!(parse(&written).map(|a| (a.pid, a.started_ms, a.app)), Some((42, 2000, "create".into())), "the line round-trips");
+        std::fs::write(&file, &written).unwrap();
+        let spec = file.to_str().unwrap();
+        assert!(is_endpoint_file(spec) && !is_endpoint_file("42") && !is_endpoint_file("create"), "paths only");
+        assert!(!is_endpoint_file("/run/user/x/makepad-remote-42.sock"), "a socket path is not an endpoint file");
+        assert_eq!(published(&file, &list).map(|a| a.pid), Ok(42), "the instance that wrote it");
+        let reused = vec![parse(&line(42, 3000)).unwrap()];
+        assert!(published(&file, &reused).unwrap_err().contains("not running"), "a reused pid is not that instance");
+        std::fs::write(&file, "not json").unwrap();
+        assert!(published(&file, &list).unwrap_err().contains("not an endpoint file"), "garbage is refused");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(published(&file, &list).unwrap_err().contains("no endpoint file"), "a missing file says so");
     }
 }
 
@@ -439,9 +631,19 @@ mod rewrite_tests {
     fn caps_follow_a_later_registration() {
         let file = std::env::temp_dir().join(format!("makepad-remote-caps-test-{}.json", std::process::id()));
         std::fs::write(&file, "{\"pid\":1,\"app\":\"x\",\"socket\":\"/s\",\"started_ms\":2,\"caps\":[\"cmd/1\"],\"extra\":3}\n").unwrap();
+        let read = || super::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(read().title().is_none() && read().visible_windows().is_empty(), "an older entry has no advertised windows");
+        let windows = vec![(2, "Board ]".into()), (7, "Editor · \"notes\"".into())];
+        super::rewrite_fields(&file, &super::window_fields(Some("Board ]"), &windows)).unwrap();
         super::rewrite_caps(&file, &["cmd/1".into(), "app/1".into()]);
         let app = super::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert!(app.serves("app") && app.serves("cmd"));
+        for app in [read(), super::parse(&super::published_line(&app)).unwrap()] {
+            assert_eq!(app.title().as_deref(), Some("Board ]"));
+            assert_eq!(app.visible_windows(), windows);
+        }
+        super::rewrite_fields(&file, &super::window_fields(None, &[])).unwrap();
+        assert!(read().visible_windows().is_empty() && read().serves("app"));
         assert_eq!(app.text("app").as_deref(), Some("x"));
         std::fs::remove_file(&file).unwrap();
     }

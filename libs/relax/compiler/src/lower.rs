@@ -810,6 +810,29 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// A call or fn pointer of JIT-compiled code naming a fn its provided crate keeps for the
+    /// loader's code (`#[relax_api(loader = "..")]`): refused here, at the use, with the crate's
+    /// text (the op to call instead, or that the fn is the loader's alone). Compiled from source,
+    /// the fn would fail later and further in, at a static its body reaches.
+    fn check_loader_only(&mut self, callee: u32) {
+        // (a lowering ahead's temporary callee identity names its key there: it has no slot yet)
+        let key = crate::jit::lower_ahead_fn_key(callee).unwrap_or_else(|| self.u.fns[callee as usize].key.clone());
+        let FnKey::Inst(d, args) = key else { return };
+        if !args.is_empty() {
+            return;
+        }
+        let krate = self.u.prog.def(d).krate;
+        let Some((_, pc)) = self.u.provided.iter().find(|(k, _)| *k == krate) else { return };
+        if pc.loader.is_empty() {
+            return;
+        }
+        let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
+        if let Some(text) = pc.loader.get(key.as_str()) {
+            let msg = format!("`{key}` of provided crate `{}` is the loader's alone (#[relax_api(loader)]): {text}", pc.name);
+            self.provided_err(krate, msg);
+        }
+    }
+
     /// An error of JIT-compiled code reaching into provided crate `krate` the way it cannot
     /// (check_provided_*): also a violation row of the boundary audit when one runs.
     fn provided_err(&mut self, krate: u32, msg: String) {
@@ -957,7 +980,7 @@ impl<'a> Lcx<'a> {
             // every Relax callee may unwind here: whether one was compiled (and found nounwind)
             // before this body is lowered depends on build order; the optimiser demotes the
             // invokes of the build's inline candidates found nounwind (opt::demote_invokes)
-            Callee::Part | Callee::Fn(_) => true,
+            Callee::Part(_) | Callee::Fn(_) => true,
             Callee::Indirect(_) => true,
             Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
             Callee::Host(a) => *a == self.u.rs.panic_site || *a == self.u.rs.panic_bounds || *a == self.u.rs.panic_impl,
@@ -1156,7 +1179,7 @@ impl<'a> Lcx<'a> {
         match crate::syms::read_leaf(self.u, at, lf.mem) {
             relax_backend::passes::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
             relax_backend::passes::RoRead::Ptr(t) => Some(self.sym_val(t)),
-            relax_backend::passes::RoRead::No | relax_backend::passes::RoRead::Range(_) => None,
+            relax_backend::passes::RoRead::No | relax_backend::passes::RoRead::Range(_) | relax_backend::passes::RoRead::Fn(_) => None,
         }
     }
     fn addr_add(&mut self, base: VReg, off: i32) -> VReg {
@@ -9493,6 +9516,7 @@ impl<'a> Lcx<'a> {
         }
         let instance = Instance::resolve_for_fn_ptr(&self.u.tcx, &self.u.prog, d, &args).expect("fn pointer instance");
         let id = self.u.instance_fn_id(instance);
+        self.check_loader_only(id);
         self.emit(Inst::FnAddr(r, id));
         r
     }
@@ -10617,6 +10641,36 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// Every local guard `g` declares, at any depth, in source order: its `let` chain's, and those
+    /// of the `let` statements, `match` arms, `if let`s and loops inside it. Not a closure's, an
+    /// async block's or an inline const's: those bodies are lowered on their own.
+    fn guard_binding_locals(&self, g: ExprId, out: &mut Vec<u32>) {
+        use relax_types::ast_visit::{walk_expr, Visitor};
+        struct Pats<'a> {
+            ast: &'a Ast,
+            pats: Vec<PatId>,
+        }
+        impl<'a> Visitor<'a> for Pats<'a> {
+            fn ast(&self) -> &'a Ast {
+                self.ast
+            }
+            // a binding pattern as a whole (pat_binding_locals walks into it)
+            fn pat(&mut self, p: PatId) {
+                self.pats.push(p);
+            }
+            fn expr(&mut self, e: ExprId) {
+                if !matches!(self.ast.expr(e).kind, ExprKind::Closure(_) | ExprKind::Async(..) | ExprKind::ConstBlock(_)) {
+                    walk_expr(self, e);
+                }
+            }
+        }
+        let mut v = Pats { ast: self.ast(), pats: Vec::new() };
+        v.expr(g);
+        for p in v.pats {
+            self.pat_binding_locals(p, out);
+        }
+    }
+
     /// Does an `if` condition bind (`let` alone or in a `&&` chain)?
     fn cond_has_let(&self, c: ExprId) -> bool {
         match &self.ast().expr(c).kind {
@@ -11115,6 +11169,15 @@ impl<'a> Lcx<'a> {
             // the guard's `let` bindings: a scope of their own, dropped before the guard's
             // temporaries and the pattern's bindings (rustc if-let guard scopes)
             self.push_scope();
+            // the storage of every local the guard declares too, here, where every candidate's
+            // path passes: a slot made while the first candidate's guard was lowered had its
+            // address computed on that path alone, and a later candidate's guard bound into an
+            // address never set
+            let mut guard_lis = Vec::new();
+            self.guard_binding_locals(g, &mut guard_lis);
+            for li in guard_lis {
+                self.local_place(li);
+            }
             let n = combos.len();
             if n > 1 {
                 // Each candidate lowers the guard again, sharing the locals it binds.
@@ -11578,6 +11641,7 @@ impl<'a> Lcx<'a> {
         if let Callee::Fn(id) = &callee {
             crate::boundary::note_call(self.u, self.b.def, &self.b.args, *id);
             self.check_provided_ownership(*id);
+            self.check_loader_only(*id);
         }
         // a #[track_caller] callee gets the caller location (this fn's own when it tracks too)
         if let Callee::Fn(id) = &callee {
@@ -11729,7 +11793,11 @@ impl<'a> Lcx<'a> {
                     };
                     let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
                     rt_host_notes(u, &types, RtBoundary::Foreign, |name| self.rt_note(name));
-                    Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi)))
+                    let mut cs = crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi);
+                    // core's libm declarations, the float methods' math: LLVM intrinsics in rustc
+                    // (CSig::math); one the program declares is a plain C call
+                    cs.math = u.prog.def(d).krate == u.core_crate && u.prog.def_path(d).starts_with("core::libm::");
+                    Callee::CHost(address, Box::new(cs))
                 } else if sig.header.abi.is_c_like() {
                     let cs = crate::cabi::c_sig(self.u, &types, ret, None, sig.header.abi);
                     Callee::CFn(self.u.instance_fn_id(instance), Box::new(cs))
@@ -13100,13 +13168,22 @@ impl<'a> Lcx<'a> {
 
     /// The allocator shim (rustc_codegen_ssa base.rs allocator_shim / codegen_allocator: `__rust_<op>`
     /// calls `__rg_<op>` of the program's `#[global_allocator]`, else the default `__rdl_<op>`):
-    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args).
+    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args). A program whose
+    /// domains route to its allocator calls the checked `__rg_checked_<op>` instead, except for
+    /// the loader's own `loader_<op>` calls.
     fn allocator_shim(&mut self, op: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
         let mut args = vals.to_vec();
+        // the loader's own calls (rust_loader_*) are never checked; the program's are when its
+        // domains route to its allocator (Unit::routes_allocator)
+        let (op, checked) = match op.strip_prefix("loader_") {
+            Some(op) => (op, false),
+            None => (op, self.u.routes_allocator),
+        };
         let id = match self.u.global_allocator() {
             Some((s, a)) => {
-                let Some(shim) = self.u.core_path(&["heap", &format!("__rg_{op}")]) else {
-                    self.err(self.pos, format!("core has no heap::__rg_{op} (the global allocator shim)"));
+                let name = if checked { format!("__rg_checked_{op}") } else { format!("__rg_{op}") };
+                let Some(shim) = self.u.core_path(&["heap", &name]) else {
+                    self.err(self.pos, format!("core has no heap::{name} (the global allocator shim)"));
                     return self.dummy_val(t);
                 };
                 // the static as a place, as a path to it lowers (lower_def_value)
@@ -13153,7 +13230,7 @@ impl<'a> Lcx<'a> {
         if let Some(v) = self.mem_intrinsic(&name, gargs, vals, t) {
             return Some(v);
         }
-        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc")) {
+        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc" | "loader_alloc" | "loader_alloc_zeroed" | "loader_dealloc")) {
             return Some(self.allocator_shim(op, vals, t));
         }
         let mut a = Vec::new();

@@ -6,11 +6,70 @@
 //! - `jit_offset(key, emit)`: the value of `Env::tls_key` for this OS (`emit` places glue code
 //!   and returns its address). Linux x86-64 reads a native runtime's static-TLS cell via fs;
 //!   under Relax it then reads this runtime's word in that block. macOS uses the TSD slot
-//!   (checked against pthread_getspecific), Android bionic's TLS_SLOT_APP.
+//!   (checked against pthread_getspecific), Android bionic's TLS_SLOT_APP; under Relax on
+//!   Android this runtime's word in the block that slot holds.
 //! - `static_tls_*`: Linux x86-64's reserve of static TLS for programs' `#[thread_local]` statics.
 
 include!("../rt_abi.rs");
 pub use imp::*;
+
+#[cfg(relax)]
+extern "C" {
+    pub(crate) fn __relax_tls_cell(key: u64) -> u64;
+}
+
+/// The words a runtime under Relax handed to its programs' runtimes (jit.rs relax_tls_cell).
+/// Each key names a word in the outermost runtime's block. A run's end frees its words for
+/// reuse, and a thread that stays clears them before entering the next run (jit.rs fresh_thread_now).
+#[cfg(any(relax, test))]
+pub struct Words {
+    /// (key, in use)
+    keys: Vec<(u64, bool)>,
+}
+
+#[cfg(any(relax, test))]
+impl Words {
+    pub const fn new() -> Words {
+        Words { keys: Vec::new() }
+    }
+
+    /// Takes a free word, asking the runtime above for a fresh one when all are in use.
+    /// A zero key means that runtime hands out no word.
+    pub fn take(&mut self, fresh: impl FnOnce() -> u64) -> u64 {
+        for (key, in_use) in &mut self.keys {
+            if !*in_use {
+                *in_use = true;
+                return *key;
+            }
+        }
+        let key = fresh();
+        if key != 0 {
+            self.keys.push((key, true));
+        }
+        key
+    }
+
+    /// The programs that took the words are gone. Every word is free for the next run.
+    pub fn run_ended(&mut self) {
+        for (_, in_use) in &mut self.keys {
+            *in_use = false;
+        }
+    }
+
+    /// Clears every word on the calling thread. Each address is its writable word there, or zero.
+    pub fn clear(&self, addr: impl Fn(u64) -> u64) {
+        for &(key, _) in &self.keys {
+            let word = addr(key) as *mut u64;
+            if !word.is_null() {
+                unsafe { word.write_volatile(0) };
+            }
+        }
+    }
+}
+
+/// This runtime keeps its words across runs so the next run's runtimes can reuse them.
+#[cfg(relax)]
+pub static NESTED_WORDS: relax_session::sync::Mutex<Words> = relax_session::sync::Mutex::new(Words::new());
 
 #[cfg(unix)]
 mod unix {
@@ -87,11 +146,6 @@ mod imp {
         ((cell_offset() as i32 as u32 as u64) << 32) | off as u64
     }
 
-    #[cfg(relax)]
-    extern "C" {
-        fn __relax_tls_cell(key: u64) -> u64;
-    }
-
     /// This runtime runs under Relax: the key of its word in the outermost runtime's thread-local
     /// block (`__relax_tls_cell`, jit.rs relax_tls_cell), taken once per process: a run's end keeps
     /// it (each run would take one more word).
@@ -100,7 +154,7 @@ mod imp {
 
     #[cfg(relax)]
     fn cell() -> u64 {
-        *CELL.get_or_init(|| unsafe { __relax_tls_cell(0) })
+        *CELL.get_or_init(|| unsafe { super::__relax_tls_cell(0) })
     }
 
     #[cfg(relax)]
@@ -110,7 +164,7 @@ mod imp {
         }
         let c = cell();
         if c != 0 {
-            let w = unsafe { __relax_tls_cell(c) };
+            let w = unsafe { super::__relax_tls_cell(c) };
             if w != 0 {
                 unsafe { (w as *mut u64).write_volatile(b as u64) };
             }
@@ -250,17 +304,20 @@ mod imp {
     pub use super::unix::{get, key_create};
 
     /// bionic TLS_SLOT_APP: word 2 of the slot array tpidr_el0 points at, "available for use by
-    /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; our minSdk is
-    /// 30). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
+    /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; the run host's
+    /// minSdk is 29, cargo-makepad android HOST_MIN_SDK). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
     /// stays for its thread-exit destructor; JIT code reads the slot (codegen arm64 tls_addr).
+    #[cfg(not(relax))]
     const TLS_SLOT_APP: u64 = 2;
 
+    #[cfg(not(relax))]
     fn slot() -> *mut u64 {
         let tp: u64;
         unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack, preserves_flags)); }
         (tp as *mut u64).wrapping_add(TLS_SLOT_APP as usize)
     }
 
+    #[cfg(not(relax))]
     pub fn set(key: u64, block: *mut u8) {
         unsafe {
             super::unix::pthread_setspecific(key as usize, block);
@@ -269,6 +326,7 @@ mod imp {
     }
 
     /// The slot index JIT code reads (`Env::tls_key`), checked through the emitted reader.
+    #[cfg(not(relax))]
     pub fn jit_offset(key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
         let reader = emit(&relax_backend::arm64::tsd_reader());
         let read: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(reader as usize) };
@@ -280,6 +338,60 @@ mod imp {
             panic!("thread-local fast path: bionic TLS_SLOT_APP reads {:#x}", seen);
         }
         TLS_SLOT_APP
+    }
+
+    /// The key of word `off` of this runtime's thread-local block, for a runtime it runs under
+    /// Relax (jit.rs relax_tls_cell): TLS_SLOT_APP's byte offset from tpidr_el0 in the high half,
+    /// `off` in the low half (arm64::TLS_TWO_LOAD).
+    #[cfg(not(relax))]
+    pub fn cell_key(off: u32) -> u64 {
+        ((TLS_SLOT_APP * 8) << 32) | off as u64
+    }
+
+    /// This runtime runs under Relax: the key of its word in the outermost runtime's thread-local
+    /// block (`__relax_tls_cell`, jit.rs relax_tls_cell), taken once per process: a run's end keeps
+    /// it (each run would take one more word). TLS_SLOT_APP is the outermost runtime's.
+    #[cfg(relax)]
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    #[cfg(relax)]
+    fn cell() -> u64 {
+        *CELL.get_or_init(|| unsafe { super::__relax_tls_cell(0) })
+    }
+
+    #[cfg(relax)]
+    pub fn set(key: u64, b: *mut u8) {
+        unsafe {
+            super::unix::pthread_setspecific(key as usize, b);
+        }
+        let c = cell();
+        if c != 0 {
+            let w = unsafe { super::__relax_tls_cell(c) };
+            if w != 0 {
+                unsafe { (w as *mut u64).write_volatile(b as u64) };
+            }
+        }
+    }
+
+    /// Under Relax: the two-load key of this runtime's word in the outermost runtime's block,
+    /// checked through the emitted two-load reader (relax_backend arm64::tls2_reader).
+    #[cfg(relax)]
+    pub fn jit_offset(key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
+        let c = cell();
+        if c == 0 {
+            eprintln!("relax: the runtime that runs this one hands out no thread-local block word (__relax_tls_cell), so JIT code cannot reach this runtime's thread-local block");
+            std::process::exit(2);
+        }
+        let reader = emit(&relax_backend::arm64::tls2_reader());
+        let read: rt_fn_ty!(fn(u64) -> u64) = unsafe { std::mem::transmute(reader as usize) };
+        let old = get(key);
+        set(key, 0x5a5a_0000 as *mut u8);
+        let seen = read(c);
+        set(key, old);
+        if seen != 0x5a5a_0000 {
+            panic!("thread-local fast path: block word {:#x} (tpidr_el0[{:#x}] + {:#x}) reads {:#x}", c, c >> 32, c as u32, seen);
+        }
+        c
     }
 }
 
@@ -380,17 +492,23 @@ mod imp {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     fixed::reset_statics();
+    // run_end.rs ends the unit before reset_all. Its programs are gone, so the next run's
+    // runtimes can take their words.
+    #[cfg(relax)]
+    NESTED_WORDS.lock().unwrap_or_else(|e| e.into_inner()).run_ended();
 }
 
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(test, any(all(target_os = "linux", target_arch = "x86_64"), target_os = "android")))]
 mod tests {
     /// relax#263: runtimes nested under Relax at any depth each keep their thread's block pointer
     /// in a word of the outermost runtime's thread-local block. Four words, as four nested
     /// runtimes take them: on each of two threads the block pointers written at the words'
-    /// addresses read back through the two-load reader JIT code inlines (the block cell at a
-    /// negative fs offset: `sar`), each thread its own, and lead to a variable of that runtime's
-    /// block; a thread with no block, then a block with no word set, reads nulls. Under Relax the
-    /// same requests go through the forward.
+    /// addresses read back through the two-load reader JIT code inlines (Linux x86-64: the block
+    /// cell at a negative fs offset, `sar`; Android arm64: bionic's TLS_SLOT_APP), each thread its
+    /// own, and lead to a variable of that runtime's block; a thread with no block, then a block
+    /// with no word set, reads nulls. Under Relax the same requests go through the forward. A
+    /// run's end frees the words a runtime handed out for its next runtimes, and a staying thread
+    /// reads them as nulls after clearing.
     #[test]
     fn nested_runtimes_each_reach_their_word() {
         let keys: Vec<u64> = (0..4).map(|_| crate::jit::relax_tls_cell(0)).collect();
@@ -398,12 +516,19 @@ mod tests {
             assert_ne!(key, 0, "runtime {i} needs a nonzero key");
             assert!(!keys[..i].contains(&key), "runtime {i} shares key {key:#x} with an earlier runtime");
             let hi = (key >> 32) as i32;
+            #[cfg(target_os = "linux")]
             assert!(hi < 0, "runtime {i}'s outer block cell needs a negative fs offset, got {hi}");
+            #[cfg(target_os = "android")]
+            assert_eq!(hi, 16, "runtime {i}'s outer block must be bionic's TLS_SLOT_APP (byte 16 of the slot array)");
             assert_eq!(hi, (keys[0] >> 32) as i32, "runtime {i} must use the same outer block cell");
             assert_eq!((key as u32) % 8, 0, "runtime {i}'s word must be 8-byte aligned");
         }
 
-        let code = relax_backend::exec::Code::new(&relax_backend::x64::tls2_reader()).expect("executable memory");
+        #[cfg(target_os = "linux")]
+        let reader = relax_backend::x64::tls2_reader();
+        #[cfg(target_os = "android")]
+        let reader = relax_backend::arm64::tls2_reader();
+        let code = relax_backend::exec::Code::new(&reader).expect("executable memory");
         let read: rt_fn_ty!(fn(u64) -> u64) = unsafe { std::mem::transmute(code.ptr()) };
         // Each word holds what a nested runtime keeps there: its thread's block (here a buffer per
         // thread and runtime), whose variables its JIT code reads at an offset after the two loads.
@@ -445,5 +570,40 @@ mod tests {
                 }
             });
         });
+
+        let mut words = super::Words::new();
+        let fresh = || crate::jit::relax_tls_cell(0);
+        let a = words.take(fresh);
+        let b = words.take(fresh);
+        assert_ne!(a, 0, "the first runtime needs a word");
+        assert_ne!(b, 0, "the second runtime needs a word");
+        assert_ne!(a, b, "two live runtimes must have distinct words");
+        std::thread::spawn(move || {
+            for (key, value) in [(a, 11), (b, 22)] {
+                let word = crate::jit::relax_tls_cell(key) as *mut u64;
+                assert!(!word.is_null(), "the staying thread needs an address for key {key:#x}");
+                unsafe { word.write_volatile(value) };
+            }
+            assert_eq!(read(a), 11, "the staying thread must see the first runtime's value");
+            assert_eq!(read(b), 22, "the staying thread must see the second runtime's value");
+
+            words.run_ended();
+            let first = words.take(fresh);
+            let second = words.take(fresh);
+            assert!((first, second) == (a, b) || (first, second) == (b, a), "both ended runtimes' words must be reused");
+            let third = words.take(fresh);
+            assert_ne!(third, 0, "the third runtime needs a word");
+            assert!(third != a && third != b, "the third runtime must get a fresh word while both reused words are in use");
+
+            words.clear(|key| crate::jit::relax_tls_cell(key));
+            for key in [a, b, third] {
+                assert_eq!(read(key), 0, "the staying thread must read null for key {key:#x} after clearing");
+            }
+        }).join().unwrap();
+
+        let mut words = super::Words::new();
+        assert_eq!(words.take(|| 0), 0, "a runtime that hands out no word must return zero");
+        words.run_ended();
+        assert_eq!(words.take(|| 7), 7, "a zero key must never be kept for reuse");
     }
 }

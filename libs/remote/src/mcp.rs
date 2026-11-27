@@ -5,19 +5,22 @@
 //! target's manifests (its AI services and the built-in ui/edit/logs/inspect, unless
 //! `--no-builtins`) as `<service>__<tool>`; `tools/call` is one `app` call. The client-side
 //! commands (`ui__grab`, `ui__gseq`, `edit__tweak_grab`) run here and return the PNG as an
-//! image. Approvals are the MCP client's: it sees each tool's risk in its description.
+//! image. The client sees the risk in the description; the app confirms destructive tools on screen.
 //!
 //! `--caller-env NAME` passes the capability in that environment variable with every call (an
 //! agent lane's `MAKEPAD_SCOPE_MCP_TOKEN`); the app checks it.
 //!
-//! The target is a pid, an app name or `<host>:<pid>` (through the hub). With `--launch
-//! <program> [args..]` an app that is not running is started (detached) when a request needs it.
+//! The target is a pid, an app name, `<host>:<pid>` (through the hub) or an endpoint file an app
+//! published in a directory it owns (`discovery::publish`): the instance of that home, found again
+//! when it restarts. With `--launch <program> [args..]` an app that is not running is started
+//! (detached) when a request needs it.
 
-use crate::conn::{Event, CLOSE_LINK_LOST, CLOSE_NORMAL};
+use crate::conn::{ChannelTx, Event, CLOSE_LINK_LOST, CLOSE_NORMAL};
 use crate::link::{Client, Error};
 use makepad_strict_json::{self as json, Value};
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 
 /// Protocol versions spoken, newest first.
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -53,21 +56,72 @@ struct Tool {
 struct Adapter {
     opts: Options,
     client: Option<Client>,
+    active: Option<Arc<Mutex<Cancellation>>>,
+}
+
+#[derive(Default)]
+struct Cancellation {
+    cancelled: bool,
+    channel: Option<ChannelTx>,
+}
+
+impl Cancellation {
+    fn cancel(token: &Mutex<Self>) {
+        let channel = {
+            let mut state = token.lock().unwrap();
+            state.cancelled = true;
+            state.channel.take()
+        };
+        if let Some(ch) = channel { ch.close(CLOSE_NORMAL, "the caller cancelled"); }
+    }
+}
+
+type RequestLine = (String, Option<Arc<Mutex<Cancellation>>>);
+
+// Only this reader touches stdin. A cancellation can close its own channel while the
+// dispatcher is waiting. Ordinary requests keep their input order, including queued calls.
+fn read_requests(input: impl BufRead, tx: mpsc::Sender<RequestLine>) {
+    let mut calls: Vec<(Value, Weak<Mutex<Cancellation>>)> = Vec::new();
+    for line in input.lines().map_while(Result::ok) {
+        if line.trim().is_empty() { continue }
+        calls.retain(|(_, token)| token.strong_count() != 0);
+        let msg = json::parse_depth(line.as_bytes(), DEPTH).ok();
+        let method = msg.as_ref().and_then(|m| m.get("method")).and_then(Value::as_str);
+        let id = msg.as_ref().and_then(|m| m.get("id"));
+        if method == Some("notifications/cancelled") && id.is_none() {
+            let target = msg.as_ref().and_then(|m| m.get("params")?.get("requestId"));
+            if let Some(token) = calls.iter().find(|(id, _)| Some(id) == target).and_then(|(_, t)| t.upgrade()) {
+                Cancellation::cancel(&token);
+            }
+            continue
+        }
+        let token = id.filter(|_| method == Some("tools/call")).map(|id| {
+            let token = Arc::new(Mutex::new(Cancellation::default()));
+            calls.push((id.clone(), Arc::downgrade(&token)));
+            token
+        });
+        if tx.send((line, token)).is_err() { break }
+    }
+    for (_, token) in calls {
+        if let Some(token) = token.upgrade() { Cancellation::cancel(&token); }
+    }
 }
 
 pub fn serve(opts: Options) -> i32 {
-    let mut a = Adapter { opts, client: None };
-    let stdin = std::io::stdin();
+    let (tx, rx) = mpsc::channel();
+    if let Err(err) = std::thread::Builder::new().name("mcp-stdin".into())
+        .spawn(move || read_requests(std::io::stdin().lock(), tx)) {
+        eprintln!("cannot read MCP requests: {err}");
+        return 1;
+    }
+    let mut adapter = Adapter { opts, client: None, active: None };
     let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = a.handle(&line) {
-            if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() {
-                break;
-            }
+    for (line, token) in rx {
+        adapter.active = token;
+        let reply = adapter.handle(&line);
+        adapter.active = None;
+        if let Some(reply) = reply {
+            if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() { break }
         }
     }
     0
@@ -160,7 +214,8 @@ impl Adapter {
 
     fn tools(&mut self) -> Result<Vec<Tool>, String> {
         let client = self.client()?;
-        let lines = app_request(&client, "list")?;
+        drop(client);
+        let lines = self.app("list")?;
         let mut tools: Vec<Tool> = Vec::new();
         for l in lines {
             let Some(manifest) = l.get("Instance").and_then(|i| i.get("manifest")) else { continue };
@@ -200,7 +255,8 @@ impl Adapter {
             Some(c) => format!(" caller={c}"),
             None => String::new(),
         };
-        let lines = app_request(&client, &format!("call {service}.{tool}{caller}\n{args}"))?;
+        drop(client);
+        let lines = self.app(&format!("call {service}.{tool}{caller}\n{args}"))?;
         let result = lines.iter().find_map(|l| l.get("Result").and_then(|r| match r {
             Value::Arr(a) => a.first().cloned(),
             other => Some(other.clone()),
@@ -230,7 +286,7 @@ impl Adapter {
 
 /// A local endpoint by pid / app name, or `<host>:<app|pid>` through the hub.
 fn connect(target: &str) -> Result<Client, String> {
-    if target.contains(':') && !target.contains('/') {
+    if target.contains(':') && !crate::discovery::is_endpoint_file(target) {
         #[cfg(unix)]
         {
             let relax = std::env::var_os("RELAX_BIN").map(std::path::PathBuf::from);
@@ -255,26 +311,86 @@ fn has_window(client: &Client) -> bool {
     client.cmd("status").map(|lines| lines.filter_map(Result::ok).any(|l| l.contains("\"w\":[{"))).unwrap_or(false)
 }
 
+/// Why an `app` request failed.
+enum Failure {
+    /// The channel never opened: the link is gone (the app quit or restarted), nothing ran.
+    NotOpened(String),
+    /// The link dropped while the request was out: it may have run.
+    LinkLost(String),
+    Other(String),
+}
+
 /// One `app` request: its answer lines, parsed.
-fn app_request(client: &Client, args: &str) -> Result<Vec<Value>, String> {
+fn app_request(client: &Client, args: &str, token: Option<&Mutex<Cancellation>>) -> Result<Vec<Value>, Failure> {
+    if token.is_some_and(|t| t.lock().unwrap().cancelled) {
+        return Err(Failure::Other("the caller cancelled".into()));
+    }
     let ch = client.open("app", args).map_err(|e| match e {
-        Error::Refused(_, why) if why.contains("unsupported service") => "this process serves no `app` service".to_string(),
-        e => e.to_string(),
+        Error::Refused(_, why) if why.contains("unsupported service") => Failure::Other("this process serves no `app` service".to_string()),
+        Error::Refused(_, why) => Failure::Other(why),
+        e => Failure::NotOpened(e.to_string()),
     })?;
+    if let Some(token) = token {
+        let mut state = token.lock().unwrap();
+        if state.cancelled {
+            drop(state);
+            ch.close(CLOSE_NORMAL, "the caller cancelled");
+            return Err(Failure::Other("the caller cancelled".into()));
+        }
+        state.channel = Some(ch.tx());
+    }
     let mut lines = Vec::new();
     loop {
-        match ch.recv_timeout(CALL_WAIT) {
+        let event = ch.recv_timeout(CALL_WAIT);
+        if token.is_some_and(|t| t.lock().unwrap().cancelled) {
+            return Err(Failure::Other("the caller cancelled".into()));
+        }
+        match event {
             Ok(Event::Data(d)) => {
                 for l in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
-                    lines.push(json::parse_depth(l.as_bytes(), DEPTH).map_err(|e| format!("an answer line I cannot read ({e})"))?);
+                    let line = json::parse_depth(l.as_bytes(), DEPTH).map_err(|e| Failure::Other(format!("an answer line I cannot read ({e})")))?;
+                    // Progress renews the silence wait. Only results and manifests are returned.
+                    if line.get("Progress").is_none() { lines.push(line); }
                 }
             }
             Ok(Event::Closed(CLOSE_NORMAL, _)) => return Ok(lines),
-            Ok(Event::Closed(CLOSE_LINK_LOST, why)) => return Err(format!("link lost: {why}")),
-            Ok(Event::Closed(_, why)) => return Err(why),
+            Ok(Event::Closed(CLOSE_LINK_LOST, why)) => return Err(Failure::LinkLost(why)),
+            Ok(Event::Closed(_, why)) => return Err(Failure::Other(why)),
             Ok(Event::Opened(_)) => {}
-            Err(true) => return Err("no answer in time".into()),
-            Err(false) => return Err("the channel closed".into()),
+            Err(true) => return Err(Failure::Other("no answer in time".into())),
+            Err(false) => return Err(Failure::LinkLost("the channel closed".into())),
+        }
+    }
+}
+
+impl Adapter {
+    /// One `app` request on the target. A link that is gone is dropped and the target found
+    /// again, once: an app name or an endpoint file then reaches the instance that runs now (an
+    /// app restarted in place). A request cut off mid-way is not repeated, since it may have run;
+    /// the next request reconnects.
+    fn app(&mut self, args: &str) -> Result<Vec<Value>, String> {
+        let client = self.client()?;
+        let failure = match app_request(&client, args, self.active.as_deref()) {
+            Ok(lines) => return Ok(lines),
+            Err(f) => f,
+        };
+        match failure {
+            Failure::Other(why) => Err(why),
+            Failure::LinkLost(why) => {
+                self.client = None;
+                Err(format!("link lost: {why}"))
+            }
+            Failure::NotOpened(_) => {
+                self.client = None;
+                let client = self.client()?;
+                app_request(&client, args, self.active.as_deref()).map_err(|f| match f {
+                    Failure::NotOpened(why) | Failure::LinkLost(why) => {
+                        self.client = None;
+                        format!("link lost: {why}")
+                    }
+                    Failure::Other(why) => why,
+                })
+            }
         }
     }
 }
@@ -334,7 +450,7 @@ fn tool_json(t: &Tool) -> Value {
 
 // This adapter sits below the AI hub (platform depends on remote), so sniff
 // the wire prefix here without linking a provider or decoding any pixels.
-fn picture_media_type(data: &str) -> Result<&'static str, String> {
+pub(crate) fn picture_media_type(data: &str) -> Result<&'static str, String> {
     let head = data.get(..12).ok_or("tool picture is too short")?;
     let bytes = makepad_base64::base64_decode(head.as_bytes())
         .map_err(|_| "tool picture is not base64")?;
@@ -378,7 +494,7 @@ mod tests {
 
     #[test]
     fn the_handshake_and_errors_need_no_app() {
-        let mut a = Adapter { opts: Options { target: "nobody-runs-this-app".into(), builtins: true, launch: Vec::new(), caller: None }, client: None };
+        let mut a = Adapter { opts: Options { target: "nobody-runs-this-app".into(), builtins: true, launch: Vec::new(), caller: None }, client: None, active: None };
         let init = a.handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
         assert!(init.contains(r#""protocolVersion":"2025-03-26""#) && init.contains(r#""tools":{}"#), "{init}");
         assert!(a.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
@@ -386,6 +502,48 @@ mod tests {
         let list = a.handle(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         assert!(list.contains(r#""error""#) && list.contains("nobody-runs-this-app"), "{list}");
         assert!(a.handle(r#"{"jsonrpc":"2.0","id":3,"method":"bogus"}"#).unwrap().contains("-32601"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_cancels_the_held_channel_and_keeps_the_next_request_in_order() {
+        use crate::{endpoint::Endpoint, link::Target};
+        use std::{io::BufReader, os::unix::net::UnixStream, thread};
+
+        let app = Endpoint::new("confirmation-test");
+        let (opened, channel) = mpsc::channel();
+        app.register("app", 1, Arc::new(move |_, open| {
+            opened.send(open.channel).unwrap();
+            Ok(())
+        }));
+        let key = crate::carrier::loopback::new_token().unwrap();
+        let addr = crate::carrier::loopback::serve(&app, &key).unwrap().to_string();
+        let client = Client::new(Target::Loopback(addr, key), "test");
+        let (mut input, reader) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let read = thread::spawn(move || read_requests(BufReader::new(reader), tx));
+        writeln!(input, r#"{{"id":1,"method":"tools/call","params":{{"name":"example__change"}}}}"#).unwrap();
+        let (line, token) = rx.recv().unwrap();
+        let call = thread::spawn(move || {
+            let mut adapter = Adapter { opts: Options { target: String::new(), builtins: false,
+                launch: vec![], caller: None }, client: Some(client), active: token };
+            let reply = adapter.handle(&line).unwrap();
+            adapter.active = None;
+            (adapter, reply)
+        });
+        let held = channel.recv().unwrap();
+        held.send(b"{\"Progress\":{\"note\":\"waiting\"}}\n".to_vec()).unwrap();
+        writeln!(input, r#"{{"id":"next","method":"ping"}}"#).unwrap();
+        writeln!(input, r#"{{"method":"notifications/cancelled","params":{{"requestId":"other"}}}}"#).unwrap();
+        writeln!(input, r#"{{"method":"notifications/cancelled","params":{{"requestId":1}}}}"#).unwrap();
+        let end = held.recv();
+        assert!(matches!(&end, Some(Event::Closed(_, why)) if why == "the caller cancelled"), "app saw {end:?}");
+        let (mut adapter, reply) = call.join().unwrap();
+        assert!(reply.contains("the caller cancelled"));
+        let (next, _) = rx.recv().unwrap();
+        assert!(adapter.handle(&next).unwrap().contains(r#""id":"next","result":{}"#));
+        drop(input);
+        read.join().unwrap();
     }
 
     #[test]

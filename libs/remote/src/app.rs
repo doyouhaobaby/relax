@@ -10,15 +10,20 @@
 //! - `tweak final`: the app's answer, plus `"png"` (the composited window) when the user drew
 //! - `tools`: the app's AI services and their tools (the `app` service's `list`)
 //! - `call <service>.<tool> [<instance>] [<json args>]`: one AI tool call (progress lines, then
-//!   the result)
+//!   the result). Pictures are written to files and their paths come back in `image_files`.
 
 use crate::discovery;
 use crate::frames::{self, Record};
 use crate::link::{Client, Error};
+use makepad_strict_json::{self as json, Value};
+use std::borrow::Cow;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Frames of one folder kept per window (older ones are deleted when a new one is written).
 const KEPT_PER_WINDOW: usize = 64;
+const KEPT_CALL_FILES: usize = 64;
 
 /// The `app` service request (the app's AI tools) of a command line, when it is one: `tools`
 /// (the service's `list`) or `call <service>.<tool> [<instance>] [<json args>]`, the arguments
@@ -138,6 +143,177 @@ fn get<'a>(kv: &'a [(String, String)], keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| kv.iter().find(|x| x.0 == *k).map(|x| x.1.as_str()))
 }
 
+/// `makepad-remote app <pid|app|socket> <command> [k=v ...]`: prints the answer's lines; exit
+/// status 1 when the answer had an error, 2 when the app cannot be reached.
+pub fn run_command_line(spec: &str, argv: &[String]) -> i32 {
+    if let Some(("--reconnect", call)) = argv.split_first().map(|(flag, rest)| (flag.as_str(), rest)) {
+        return match reconnect_call(spec, call, &mut |line| println!("{line}")) {
+            Ok(false) => 0,
+            Ok(true) => 1,
+            Err(e) => { eprintln!("makepad-remote app: {e}"); 1 }
+        }
+    }
+    // `<host>:<app|pid>` goes through the hub to an app on another machine (a phone that dials in)
+    #[cfg(unix)]
+    let routed = (spec.contains(':') && !spec.contains('/')).then(|| {
+        let bin = std::env::var_os("RELAX_BIN").map(PathBuf::from);
+        crate::hub::connect(bin.as_deref()).map(|hub| crate::Client::routed(&hub, spec))
+    });
+    #[cfg(not(unix))]
+    let routed: Option<Result<crate::Client, String>> = None;
+    let connected = match routed {
+        Some(Ok(c)) => Ok(c),
+        Some(Err(e)) => { eprintln!("makepad-remote app: {e}"); return 2; }
+        None => crate::Client::connect_as(spec, &crate::discovery::Caller::command_line()),
+    };
+    let client = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            return 2;
+        }
+    };
+    let argv = if argv.is_empty() { vec!["help".to_string()] } else { argv.to_vec() };
+    match run_printed(&client, &argv, &mut |l| {
+        println!("{l}");
+        true
+    }) {
+        Ok(false) => 0,
+        Ok(true) => 1,
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            2
+        }
+    }
+}
+
+/// [`run`] as a command line prints it: a tool result's inline pictures are written to files in
+/// the app's grab folder and the line names them instead (`image_files`, [`call_image_line`]), so
+/// a shell or a coding agent reads paths, not megabytes of base64. A library caller of [`run`]
+/// (a test, the MCP bridge) keeps the inline `images`.
+pub fn run_printed(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    let dir = std::cell::LazyCell::new(|| grab_dir(client));
+    run(client, argv, &mut |l| each(&call_image_line(l, || (*dir).clone())))
+}
+
+/// Run a caller-declared replayable tool call. Only the endpoint file is stable across
+/// restarts; never redial a cached socket or retry after receiving a definitive result.
+pub fn reconnect_call(spec: &str, argv: &[String], print: &mut dyn FnMut(&str)) -> Result<bool, Error> {
+    if !discovery::is_endpoint_file(spec) || argv.first().map(String::as_str) != Some("call") {
+        return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "--reconnect requires an endpoint file and a replayable call")))
+    }
+    let caller = discovery::Caller::command_line();
+    replay_call(argv, print, || Client::connect_as(spec, &caller), || std::thread::sleep(std::time::Duration::from_secs(1)))
+}
+
+fn replay_call(argv: &[String], print: &mut dyn FnMut(&str), mut connect: impl FnMut() -> Result<Client, Error>, mut pause: impl FnMut()) -> Result<bool, Error> {
+    loop {
+        let run = connect().and_then(|client| {
+            let mut outcome = None;
+            let failed = run_printed(&client, argv, &mut |line| {
+                if let Ok(value) = json::parse_depth(line.as_bytes(), json::TOOL_JSON_DEPTH) {
+                    if value.get("Progress").is_some() { return true }
+                    if let Some(result) = value.get("Result") {
+                        let result = result.as_arr().and_then(|items| items.first()).unwrap_or(result);
+                        let status = result.get("outcome");
+                        if status.is_some_and(|s| s.get("Unavailable").is_some()) { return false }
+                        outcome = Some(status.is_none_or(|s| s.get("Ok").is_none()));
+                    }
+                }
+                print(line);
+                outcome.get_or_insert(true);
+                false
+            })?;
+            Ok(outcome.or(failed.then_some(true)))
+        });
+        match run {
+            Ok(Some(failed)) => return Ok(failed),
+            Ok(None) | Err(Error::LinkLost(_) | Error::Refused(crate::conn::CLOSE_LINK_LOST, _)) => pause(),
+            Err(why) => return Err(why),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn replay_a_held_call_after_disconnect_and_stop_on_its_result() {
+    use crate::conn::{Open, CLOSE_NORMAL};
+    use crate::endpoint::Endpoint;
+    use std::{os::unix::net::UnixListener, sync::{mpsc, Arc}, time::Duration};
+
+    let root = crate::carrier::unix::test_root().join(format!("replay-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let reference = root.join("endpoint");
+    let serving = |name: &str| {
+        let path = root.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        let ep = Endpoint::new(name);
+        let (tx, rx) = mpsc::channel();
+        ep.register("app", 1, Arc::new(move |conn, open| {
+            tx.send((conn.clone(), open)).unwrap();
+            Ok(())
+        }));
+        let server = std::thread::spawn(move || {
+            let sock = listener.accept().unwrap().0;
+            ep.serve(crate::frame::FrameReader::new(Box::new(sock.try_clone().unwrap())),
+                Box::new(sock.try_clone().unwrap()), Box::new(move || { let _ = sock.shutdown(std::net::Shutdown::Both); })).unwrap()
+        });
+        fs::write(&reference, path.to_str().unwrap()).unwrap();
+        (server, rx)
+    };
+    let (first, opened) = serving("first.sock");
+    let (lost, missing) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let run = |file: PathBuf, pause: &mut dyn FnMut()| {
+        let mut output = Vec::new();
+        let argv = ["call".into(), "sample.wait".into(), "{}".into()];
+        let failed = replay_call(&argv, &mut |s| output.push(s.to_owned()), || {
+            let path = fs::read_to_string(&file).map_err(|e| Error::LinkLost(e.to_string()))?;
+            Client::connect(&path)
+        }, pause).unwrap();
+        (failed, output)
+    };
+    let file = reference.clone();
+    let waiter = std::thread::spawn(move || run(file.clone(), &mut || {
+        // The listener and reference are gone; resume only when their replacement exists.
+        assert!(!file.exists());
+        lost.send(()).unwrap();
+        resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let (conn, request) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(request.args, "call sample.wait\n{}");
+    fs::remove_file(&reference).unwrap();
+    conn.close("server stopped");
+    first.join().unwrap();
+    missing.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (second, opened) = serving("second.sock");
+    resume.send(()).unwrap();
+    let (_, Open { channel, args, .. }) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(args, request.args);
+    let success = r#"{"Result":[{"outcome":{"Ok":[]},"text":"pending line"}]}"#;
+    channel.send(success.as_bytes().to_vec()).unwrap();
+    channel.close(CLOSE_NORMAL, "done");
+    assert_eq!(waiter.join().unwrap(), (false, vec![success.to_owned()]));
+    second.join().unwrap();
+
+    let (last, opened) = serving("last.sock");
+    let file = reference.clone();
+    let refused = std::thread::spawn(move || run(file, &mut || panic!("a definitive refusal was retried")));
+    let (_, request) = opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    let ended = r#"{"Result":[{"outcome":{"Refused":[]},"text":"ended"}]}"#;
+    request.channel.send(ended.as_bytes().to_vec()).unwrap();
+    request.channel.close(CLOSE_NORMAL, "done");
+    assert_eq!(refused.join().unwrap(), (true, vec![ended.to_owned()]));
+    last.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [`run_line`] as a command line prints it ([`run_printed`]).
+pub fn run_line_printed(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    let dir = std::cell::LazyCell::new(|| grab_dir(client));
+    run_line(client, line, &mut |l| each(&call_image_line(l, || (*dir).clone())))
+}
+
 /// Like [`run`] for a request typed as one line (words split on spaces).
 pub fn run_line(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
     // a JSON request goes as it is (its values keep their spaces and `=`)
@@ -236,6 +412,96 @@ fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mu
         }
     }
     Ok((err, lines.end().map(str::to_string)))
+}
+
+/// The printed form of a tool result: its inline pictures replaced with paths ([`run_printed`]).
+/// Only a result with pictures needs a folder.
+fn call_image_line(line: &str, dir: impl FnOnce() -> Result<PathBuf, String>) -> Cow<'_, str> {
+    let Ok(Value::Obj(mut envelope)) = json::parse_depth(line.as_bytes(), json::TOOL_JSON_DEPTH) else { return Cow::Borrowed(line) };
+    let result = envelope.iter_mut().find(|(key, _)| key == "Result").and_then(|(_, value)| match value {
+        Value::Arr(items) => items.first_mut(),
+        object => Some(object),
+    });
+    let Some(Value::Obj(fields)) = result else { return Cow::Borrowed(line) };
+    let Some((key, Value::Arr(images))) = fields.iter_mut().find(|(key, _)| key == "images") else { return Cow::Borrowed(line) };
+    if images.is_empty() {
+        return Cow::Borrowed(line);
+    }
+
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    if let Err(why) = dir().and_then(|dir| write_call_images(&dir, images, &mut files, &mut errors).map_err(|e| e.to_string())) {
+        errors.extend((0..images.len()).map(|i| json::s(format!("image {i}: {why}"))));
+    }
+    *key = "image_files".into();
+    *images = files;
+    if !errors.is_empty() {
+        fields.push(("image_errors".into(), Value::Arr(errors)));
+    }
+    Cow::Owned(Value::Obj(envelope).to_json())
+}
+
+fn call_file_number(path: &Path) -> Option<(u64, usize)> {
+    if !matches!(path.extension()?.to_str()?, "png" | "jpg") {
+        return None;
+    }
+    let (seq, index) = path.file_stem()?.to_str()?.strip_prefix("call-")?.split_once('-')?;
+    Some((seq.parse().ok()?, index.parse().ok()?))
+}
+
+fn write_call_images(dir: &Path, images: &[Value], files: &mut Vec<Value>, errors: &mut Vec<Value>) -> io::Result<()> {
+    let dir = std::path::absolute(dir)?;
+    if dir.to_str().is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "picture folder path is not UTF-8"));
+    }
+    // Two CLI processes can receive pictures from the same app at once. Assign and prune under one lock.
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(".call-images.lock"))?;
+    lock.lock()?;
+    let mut existing = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(number) = call_file_number(&path) {
+            if entry.file_type()?.is_file() {
+                existing.push((number, path));
+            }
+        }
+    }
+    existing.sort_unstable();
+    let last = existing.last().map_or(0, |((seq, _), _)| *seq);
+    let seq = last.checked_add(1).ok_or_else(|| io::Error::other("call picture sequence exhausted"))?;
+    for (i, image) in images.iter().enumerate() {
+        match write_call_image(&dir, seq, i, image) {
+            Ok(path) => {
+                files.push(json::s(path.to_string_lossy()));
+                existing.push(((seq, i), path));
+            }
+            Err(why) => errors.push(json::s(format!("image {i}: {why}"))),
+        }
+    }
+    let expired = existing.len().saturating_sub(KEPT_CALL_FILES);
+    for (_, path) in existing.into_iter().take(expired) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn write_call_image(dir: &Path, seq: u64, index: usize, image: &Value) -> Result<PathBuf, String> {
+    let data = image.as_str().ok_or("expected a base64 string")?;
+    let ext = match crate::mcp::picture_media_type(data)? {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        _ => return Err("unsupported picture format".into()),
+    };
+    let bytes = makepad_base64::base64_decode(data.as_bytes()).map_err(|e| format!("invalid base64 ({e:?})"))?;
+    let path = dir.join(format!("call-{seq:05}-{index}.{ext}"));
+    let mut file = fs::File::create_new(&path).map_err(|e| format!("write {}: {e}", path.display()))?;
+    if let Err(e) = file.write_all(&bytes) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("write {}: {e}", path.display()));
+    }
+    Ok(path)
 }
 
 /// One request of the `app` service (the app's AI tools): its answer lines, as they come. The
@@ -612,10 +878,64 @@ fn tweak_final(client: &Client, words: &[String], kv: &[(String, String)], each:
 
 #[cfg(test)]
 mod tests {
-    use super::{client_side, typed_line};
+    use super::{call_image_line, client_side, typed_line};
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn call_pictures_become_files() {
+        use makepad_base64::{base64_encode, BASE64_STANDARD};
+        use makepad_strict_json::{self as json, Value};
+        use std::{fs, path::Path};
+
+        let dir = std::env::temp_dir().join(format!("call_pictures_become_files-{}-{}", std::process::id(), crate::cmd::wall_ms()));
+        fs::create_dir(&dir).expect("create fresh picture folder");
+        for i in 0..64 {
+            fs::write(dir.join(format!("call-00003-{i}.png")), []).expect("seed older call pictures");
+        }
+        let grab = dir.join("grab-w0-00001.png");
+        fs::write(&grab, []).expect("seed a window grab");
+
+        let png = b"\x89PNG\r\n\x1a\n";
+        let jpg = b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff";
+        let encode = |bytes: &[u8]| String::from_utf8(base64_encode(bytes, &BASE64_STANDARD)).unwrap();
+        let line = format!(r#"{{"Result":{{"text":"rendered","call_id":"abc","images":["{}","{}"]}}}}"#, encode(png), encode(jpg));
+        let output = call_image_line(&line, || Ok(dir.clone()));
+        let parsed = json::parse(output.as_bytes()).expect("rewritten result is JSON");
+        let result = parsed.get("Result").expect("keep result envelope");
+        assert!(result.get("images").is_none(), "remove inline pictures");
+        assert_eq!(result.get("text").and_then(Value::as_str), Some("rendered"), "preserve result text");
+        assert_eq!(result.get("call_id").and_then(Value::as_str), Some("abc"), "preserve call ID");
+        let files = result.get("image_files").and_then(Value::as_arr).expect("return a list of picture paths");
+        assert_eq!(files.len(), 2, "return one path per picture");
+        for (i, (ext, bytes)) in [("png", png.as_slice()), ("jpg", jpg.as_slice())].into_iter().enumerate() {
+            let path = Path::new(files[i].as_str().expect("picture path is a string"));
+            assert!(path.is_absolute(), "picture {i} has an absolute path");
+            assert_eq!(path, dir.join(format!("call-00004-{i}.{ext}")), "picture {i} uses the next sequence, its index and its format");
+            assert_eq!(fs::read(path).expect("returned picture path exists"), bytes, "picture {i} holds the decoded bytes");
+        }
+        assert!(!dir.join("call-00003-0.png").exists() && !dir.join("call-00003-1.png").exists(), "expire the two oldest call pictures");
+        assert!(dir.join("call-00003-2.png").exists() && grab.exists(), "keep the 64th newest call picture and the window grab");
+
+        for line in [r#"{ "Progress": {"text":"waiting"} }"#, r#"{ "Result": {"text":"done"} }"#, r#"{ "Result": [{"images":[]}] }"#, r#"{ "err": "busy" }"#, "plain text"] {
+            assert_eq!(call_image_line(line, || panic!("only pictures need the folder")), line, "pass this line through byte for byte: {line}");
+        }
+
+        let bad = format!("{}!!!!", encode(jpg));
+        let line = format!(r#"{{"Result":[{{"images":["{bad}","{}"]}}]}}"#, encode(png));
+        let output = call_image_line(&line, || Ok(dir.clone()));
+        assert!(!output.contains(&bad), "omit the invalid base64 payload from the answer");
+        let parsed = json::parse(output.as_bytes()).expect("mixed success and failure is JSON");
+        let result = &parsed.get("Result").and_then(Value::as_arr).expect("keep the wrapped result")[0];
+        let errors = result.get("image_errors").and_then(Value::as_arr).expect("report picture errors");
+        assert_eq!(errors.len(), 1, "report one error for the invalid picture");
+        assert!(errors[0].as_str().unwrap().contains("base64"), "explain the decoding failure");
+        let files = result.get("image_files").and_then(Value::as_arr).expect("keep the successful picture");
+        assert_eq!(files.len(), 1, "return only the successful path");
+        assert_eq!(Path::new(files[0].as_str().unwrap()), dir.join("call-00005-1.png"), "a failed picture preserves the next picture's index");
+        fs::remove_dir_all(dir).expect("remove the test's picture folder");
     }
 
     #[test]

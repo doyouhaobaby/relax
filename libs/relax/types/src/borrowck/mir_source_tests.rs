@@ -86,22 +86,31 @@ pub(super) fn borrowck_source_checked(source: &str, edition: u16) -> (Vec<String
 }
 
 fn borrowck_source_checked_named(source: &str, edition: u16, crate_name: &str, validate: bool) -> (Vec<String>, Vec<String>) {
+    let (type_errors, errors, unchecked) = borrowck_source_with_typeck_errors(source, edition, crate_name, validate);
+    assert!(type_errors.is_empty(), "typeck: {type_errors:?}");
+    (errors, unchecked)
+}
+
+fn borrowck_source_with_typeck_errors(source: &str, edition: u16, crate_name: &str, validate: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (mut prog, tcx, user) = load_source(source, edition, crate_name);
     prog.crates[user as usize].validate = validate;
-    let (mut errors, mut unchecked) = (vec![], vec![]);
+    let (mut type_errors, mut errors, mut unchecked) = (vec![], vec![], vec![]);
     for owner in crate::borrowck::body::owners(&prog) {
         if prog.def(owner.owner).krate != user { continue; }
         let state = EvalState::new();
         let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
         let body = tcx.typeck(&prog, owner.owner);
-        assert!(body.errors.is_empty(), "typeck: {:?}", body.errors);
+        if !body.errors.is_empty() {
+            type_errors.extend(body.errors.iter().cloned());
+            continue;
+        }
         if std::env::var_os("PROBE").is_some() { for (ce, c) in body.min_captures.iter() { eprintln!("PROBE closure {ce:?} kind {:?} captures {:?}", c.kind, c.captures.iter().map(|c| (c.info.kind, c.place.projections.len())).collect::<Vec<_>>()); } }
         let v = crate::borrowck::driver::check_root(&cx, &prog, &tcx, &body, None);
         errors.extend(v.errors.iter().map(|e| format!("{} {} {}:{} {:?} {:?}", e.code, e.message, e.line, e.col, e.labels, e.notes)));
         unchecked.extend(v.unchecked);
     }
     let _ = DefId(0);
-    (errors, unchecked)
+    (type_errors, errors, unchecked)
 }
 
 #[test]
@@ -329,6 +338,15 @@ fn bodies_naming_constants_are_checked_with_their_qualifs() {
         pub fn g() -> &'static P { &EMPTY }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+
+    let (type_errors, errors, unchecked) = borrowck_source_with_typeck_errors(r#"
+        pub const LIMIT: u32 = "three";
+        pub struct Buffer(pub [u8; LIMIT as usize]);
+        pub fn f() -> u32 { LIMIT }
+        pub fn h() -> &'static u32 { &LIMIT }"#, 2021, "repro", true);
+    assert!(unchecked.is_empty(), "ill-typed LIMIT left readers unchecked: {unchecked:?}");
+    assert!(errors.is_empty(), "ill-typed LIMIT caused reader borrow errors: {errors:?}");
+    assert!(type_errors.len() == 1 && type_errors[0].contains("E0308"), "ill-typed LIMIT initializer: {type_errors:?}");
 }
 
 #[test]
@@ -1082,6 +1100,22 @@ fn the_witness_of_another_fns_future_is_made_on_demand() {
         pub fn user() { needs_send(holds()); needs_send(fine()); }", 2021);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("Rc<u8") && errors[0].contains("is used across an await at"), "{errors:?}");
+}
+
+/// Errors after the parse in a local macro's expansion are where rustc reports them: a type
+/// error on a token the body wrote at its place in the definition (1:43), with the call as a
+/// note (rustc's `in this macro invocation`, 3:21); one on a substituted argument at that
+/// argument (4:27), with no note. (The check's structured records hold the notes.)
+#[test]
+fn errors_in_a_local_macros_expansion_are_where_rustc_reports_them() {
+    crate::diag::enable();
+    let errors = typeck_errors_checked("macro_rules! body { () => {{ let v: u32 = \"text\"; v }} }\nmacro_rules! frag { ($e:expr) => {{ let v: u32 = $e; v }} }\npub fn a() -> u32 { body!() }\npub fn b() -> u32 { frag!(\"text\") }\n", 2021);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    let notes = |e: &String| crate::diag::recorded(e).map(|d| d.notes).unwrap_or_default();
+    let body = errors.iter().find(|e| e.contains(":1:43: ")).unwrap_or_else(|| panic!("the body's error at 1:43: {errors:?}"));
+    assert!(notes(body).iter().any(|n| n.starts_with("in this macro invocation: ") && n.ends_with(":3:21")), "{:?}", notes(body));
+    let arg = errors.iter().find(|e| e.contains(":4:27: ")).unwrap_or_else(|| panic!("the argument's error at 4:27: {errors:?}"));
+    assert!(!notes(arg).iter().any(|n| n.starts_with("in this macro invocation")), "{:?}", notes(arg));
 }
 
 #[test]

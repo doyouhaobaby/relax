@@ -390,6 +390,19 @@ pub fn inherited_mount_serves(words: &[String], table: &str) -> bool {
     })
 }
 
+/// The names of a parent run's mount (relax-base progenv.rs MOUNT) this run drops at its start:
+/// every one when the mount does not serve it ([`inherited_mount_serves`]), except an export's
+/// RELAX_EDITS. `makepad export <git url>` writes that folder's files over its snapshot (its help):
+/// the export's own input, which a program sets on the command it starts (the runner, for an app's
+/// native build), not a parent's mount.
+pub fn dropped_mount_names(words: &[String], table: &str) -> Vec<&'static [u8]> {
+    if inherited_mount_serves(words, table) {
+        return Vec::new();
+    }
+    let export = words.first().is_some_and(|w| w == "export");
+    relax_compiler::progenv::MOUNT.into_iter().filter(|n| !(export && *n == relax_compiler::progenv::EDITS)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +424,13 @@ mod tests {
         assert!(!serves(&["run", "https://example.com/org/repo", "pkg"]), "a git URL run mounts its own");
         assert!(!serves(&["app", "calculator"]) && !serves(&[]), "a launch record names its own workspace");
         assert!(serves(&["export", "--mounted", "out"]), "export --mounted writes the inherited mount out");
+        use relax_compiler::progenv::{EDITS, MOUNT, VFS, WORKSPACE};
+        let dropped = |w: &[&str]| dropped_mount_names(&s(w), table);
+        assert_eq!(dropped(&["export", "--cached", "https://example.com/org/repo", "out"]), vec![WORKSPACE, VFS],
+            "an export of a git URL keeps RELAX_EDITS, the edits folder it writes over its snapshot");
+        assert_eq!(dropped(&["run", "https://example.com/org/repo", "pkg"]), MOUNT.to_vec(), "a git URL run drops the whole mount, edits folder too");
+        assert!(dropped(&["run", "pkg"]).is_empty(), "a run the mount serves keeps all of it");
+        assert!(dropped(&["app", "calculator"]).contains(&EDITS), "a launch record's run drops the parent's edits folder");
     }
     #[test]
     fn export_refuses_paths_outside_its_folder() {
@@ -763,7 +783,11 @@ mod tests {
         let g = graph(&[]).unwrap();
         let (id, src) = unit(&g, "gdep");
         assert_eq!(id, format!("git+{dep}?branch=dev#gdep@0.3.0"));
-        assert!(src.contains("/vfs/git/dep-") && src.ends_with(&format!("{}/crates/gdep/src/lib.rs", &c2[..12])), "{src}");
+        // A unit's source path is native, as cargo's unit graph has it (backslashes on Windows):
+        // compare components, not one separator.
+        let parts: Vec<_> = Path::new(&src).components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        assert!(parts.windows(3).any(|w| w[0] == "vfs" && w[1] == "git" && w[2].starts_with("dep-"))
+            && Path::new(&src).ends_with(Path::new(&c2[..12]).join("crates").join("gdep").join("src").join("lib.rs")), "{src}");
         assert_eq!(body(&src), "pub fn gdep() -> u32 { 2 }\n");
         // the path dependency inside the repository shares its source; the patched and the
         // inherited git dependency are one package

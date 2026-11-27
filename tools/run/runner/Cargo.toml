@@ -19,6 +19,8 @@ name = "relax"
 path = "src/bin/relax.rs"
 
 [dependencies]
+makepad-loader-switch = { path = "../../../libs/loader_switch" }
+relax-base = { workspace = true }
 relax-compiler = { workspace = true }
 # a provided crate's read of the program's environment (relax-api env), pointed at the program's
 relax-api = { workspace = true }
@@ -28,3 +30,4 @@ makepad-remote = { workspace = true }
 # system's HTTP stack
 makepad-network = { path = "../../../platform/network" }
 makepad-core-util = { path = "../../../libs/core_util" }
+makepad-filesystem-watcher = { path = "../../../libs/filesystem_watcher" }

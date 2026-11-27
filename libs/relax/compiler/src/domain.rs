@@ -297,6 +297,8 @@ pub struct ForeignSaved {
 }
 
 impl ForeignSaved {
+    const NONE: Self = Self { base: 0, heap: std::ptr::null(), entered: false };
+
     /// As plain words (a host hook that cannot name this type carries it so).
     pub fn into_words(self) -> [u64; 3] {
         [self.base, self.heap as u64, self.entered as u64]
@@ -307,19 +309,24 @@ impl ForeignSaved {
 }
 
 /// Puts the calling thread (any: a realtime audio thread, a driver's worker) in the domain of
-/// `scope` (`foreign_scope`) for a call into its code. Realtime safe: no lock, no allocation but
-/// the thread's own thread-local block on its first call into JIT code (as that first call
-/// would anyway). Nests; `foreign_leave` puts back what it found.
+/// `scope` (`foreign_scope`) for a call into its code. A switch of arenas
+/// briefly takes their chunk locks. Staying in the same domain takes no lock or allocation.
+/// A thread's first call into JIT code sets up its TLS. `foreign_leave` restores nested scopes.
 #[inline]
 pub fn foreign_enter(scope: u64) -> ForeignSaved {
-    let none = ForeignSaved { base: 0, heap: std::ptr::null(), entered: false };
-    if scope == 0 {
-        return none;
-    }
+    enter_foreign_scope(scope, false).unwrap_or(ForeignSaved::NONE)
+}
+
+/// An allocator call already in its owner's domain keeps the calling thread's current TLS.
+/// An unpublished scope has no code to enter, even when the unit still hosts other domains.
+pub(crate) fn enter_foreign_scope(scope: u64, keep_current: bool) -> Option<ForeignSaved> {
+    if scope == 0 { return None; }
     let s = unsafe { &*(scope as *const ForeignScope) };
     let base = s.base.load(std::sync::atomic::Ordering::Acquire);
-    if base == 0 {
-        return none;
+    if base == 0 { return None; }
+    if keep_current && crate::zone_alloc::domain::current() == s.heap {
+        let slot = crate::jit::tls_block_if_any();
+        if slot != 0 && unsafe { *(slot as *const u64) } == base { return Some(ForeignSaved::NONE); }
     }
     crate::jit::fresh_thread();
     let slot = crate::jit::tls_block() as *mut u64;
@@ -329,7 +336,7 @@ pub fn foreign_enter(scope: u64) -> ForeignSaved {
         if heap != s.heap {
             crate::zone_alloc::domain::restore(s.heap);
         }
-        ForeignSaved { base: prev, heap, entered: true }
+        Some(ForeignSaved { base: prev, heap, entered: true })
     }
 }
 
@@ -587,16 +594,26 @@ pub fn create(u: &Unit) -> u64 {
         let _kept = crate::zone_alloc::kept();
         BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((base, u.syms.dom0()));
     }
+    // (a program's signal handler then finds room in the resource table from its first create)
+    crate::domain_res::make_room();
     base
 }
 
 /// Gives a domain's block back (every thread of the domain is gone).
 pub fn destroy(base: u64) {
+    unpublish(base);
+    release(base);
+}
+
+fn unpublish(base: u64) {
     for sc in SCOPES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let _ = sc.base.compare_exchange(base, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
     }
     forget_tls_keys(base);
     BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(b, _)| b != base);
+}
+
+fn release(base: u64) {
     if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
@@ -714,6 +731,178 @@ impl DomainThread {
     }
 }
 
+/// The heap and its owner leases keep this context alive. The unit can be retired while native
+/// callers still hold blocks, so keep the end flag independently of the unit.
+struct ProgramAllocatorCtx {
+    alloc: unsafe extern "C" fn(usize, usize, bool) -> *mut u8,
+    dealloc: unsafe extern "C" fn(*mut u8, usize, usize),
+    path: String,
+    heap: std::sync::atomic::AtomicPtr<crate::zone_alloc::domain::Heap>,
+    scope: std::sync::atomic::AtomicU64,
+    code_ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProgramAllocatorCtx {
+    fn resolve(u: &Unit) -> Result<Option<std::sync::Arc<Self>>, String> {
+        let Some(allocator) = u.global_allocator_static() else { return Ok(None) };
+        if u.global_allocator().is_none() {
+            return Err(format!("cannot resolve global allocator {}", u.prog.def_path(allocator)));
+        }
+        let entry = |name| {
+            u.core_path(&["heap", name])
+                .map(|d| u.entry(u.fn_id(crate::jit::FnKey::Inst(d, Vec::new()))) as usize)
+                .filter(|addr| *addr != 0)
+                .ok_or_else(|| format!("cannot make {name} entry for global allocator {}", u.prog.def_path(allocator)))
+        };
+        // Each core entry is extern "C" with the corresponding field's signature.
+        let alloc = entry("__relax_program_alloc")?;
+        let dealloc = entry("__relax_program_dealloc")?;
+        Ok(Some(crate::zone_alloc::kept_with(|| unsafe {
+            std::sync::Arc::new(Self {
+                alloc: std::mem::transmute(alloc),
+                dealloc: std::mem::transmute(dealloc),
+                path: u.prog.def_path(allocator),
+                heap: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                scope: std::sync::atomic::AtomicU64::new(0),
+                code_ended: u.code_ended.clone(),
+            })
+        })))
+    }
+
+    /// Both native trampolines dispatch without locking or allocating on a thread already
+    /// in the block's domain. A cross-domain call switches arenas, taking their chunk locks
+    /// briefly as a cross-domain free does. The recovery point lets the native op return even
+    /// when the run ends inside the allocator.
+    fn call<F: FnOnce()>(&self, f: F) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.code_ended.load(Acquire) { return false; }
+        unsafe extern "C" fn thunk<F: FnOnce()>(data: *mut u8) {
+            if let Some(f) = unsafe { &mut *data.cast::<Option<F>>() }.take() { f(); }
+        }
+        let mut call = Some(f);
+        crate::jit::app_call_scoped(Some(self.scope.load(Acquire)), thunk::<F>, std::ptr::from_mut(&mut call).cast())
+    }
+
+    fn checked_alloc(&self, size: usize, align: usize, zeroed: bool, result: impl FnOnce(*mut u8, bool)) -> bool {
+        self.call(|| unsafe {
+            let p = (self.alloc)(size, align, zeroed);
+            let valid = p.is_null() || crate::zone_alloc::domain::heap_owns(self.heap.load(std::sync::atomic::Ordering::Relaxed), p);
+            result(p, valid);
+        })
+    }
+
+    unsafe extern "C" fn alloc(ctx: usize, size: usize, align: usize, zeroed: bool, out: *mut *mut u8) -> bool {
+        let ctx = unsafe { &*(ctx as *const Self) };
+        ctx.checked_alloc(size, align, zeroed, |p, valid| {
+            if !valid {
+                unsafe { Self::outside(std::ptr::from_ref(ctx) as usize, p, size, align) };
+            }
+            unsafe { out.write(p) };
+        })
+    }
+
+    unsafe extern "C" fn outside(ctx: usize, p: *mut u8, size: usize, align: usize) -> ! {
+        let ctx = unsafe { &*(ctx as *const Self) };
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "relax: the program's #[global_allocator] `{}` returned {:#x} ({size} bytes, align {align}), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends", ctx.path, p as usize);
+        crate::os::fault::die_by(6)
+    }
+
+    unsafe extern "C" fn dealloc(ctx: usize, p: *mut u8, size: usize, align: usize) -> bool {
+        let ctx = unsafe { &*(ctx as *const Self) };
+        ctx.call(|| unsafe { (ctx.dealloc)(p, size, align) })
+    }
+
+    // The probe is a heuristic. The check at every routed allocation is the rule. Ok(Some(line)):
+    // a probe block was outside the memory the domain owns (an allocator over its own mappings,
+    // sbrk or another process-wide heap), so nothing may route through the allocator.
+    fn probe(&self) -> Result<Option<String>, String> {
+        let interrupted = || format!("global allocator `{}` probe interrupted", self.path);
+        for (size, align) in [(16, 8), (4096, 8), (4096, 4096), (256 << 10, 8), (4 << 20, 8)] {
+            let mut block = std::ptr::null_mut();
+            let mut owned = false;
+            if !self.checked_alloc(size, align, false, |p, valid| { block = p; owned = valid; }) {
+                return Err(interrupted());
+            }
+            if block.is_null() { continue; }
+            // The allocator that made this probe block can free it directly, including on refusal.
+            let freed = unsafe { Self::dealloc(std::ptr::from_ref(self) as usize, block, size, align) };
+            if !freed { return Err(interrupted()); }
+            if !owned {
+                return Ok(Some(format!("relax: the program's #[global_allocator] `{}` returned {:#x} for a {size}-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it", self.path, block as usize)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Field drop order unregisters the heap and drains owner leases before freeing their context,
+/// including if a provided crate unwinds from its teardown hook.
+struct ProgramHeap {
+    heap: Box<crate::zone_alloc::domain::DomainHeap>,
+    allocator: Option<std::sync::Arc<ProgramAllocatorCtx>>,
+}
+
+impl ProgramHeap {
+    fn new(base: u64, allocator: Option<std::sync::Arc<ProgramAllocatorCtx>>) -> Option<Self> {
+        use crate::zone_alloc::domain::{raw, DomainHeap, ProgramAllocator};
+        let program = allocator.as_deref().map(|ctx| ProgramAllocator {
+            ctx: std::ptr::from_ref(ctx) as usize,
+            alloc: ProgramAllocatorCtx::alloc,
+            dealloc: ProgramAllocatorCtx::dealloc,
+            outside: ProgramAllocatorCtx::outside,
+        });
+        let heap = crate::zone_alloc::kept_with(|| unsafe { DomainHeap::new(program, (base as usize, BLOCK_SIZE)) })?;
+        if let Some(ctx) = &allocator {
+            ctx.heap.store(heap.as_ptr().cast_mut(), std::sync::atomic::Ordering::Relaxed);
+            ctx.scope.store(scope_record(base, raw(&*heap)), std::sync::atomic::Ordering::Release);
+        }
+        Some(Self { heap, allocator })
+    }
+
+    fn install(self, loading: &Loading, base: u64, probe: bool) -> Result<DomainId, Vec<String>> {
+        let allocator = self.allocator.as_ref().filter(|_| probe).cloned();
+        {
+            let mut ds = domains();
+            let d = ds.iter_mut().find(|d| d.info.id == loading.0).expect("loading domain");
+            d.info.base = base;
+            d.heap = Some(self);
+        }
+        // Loading keeps the registered heap alive. A lazy probe entry can compile or call
+        // native code, so run it outside the domain lock and the compiler owner request.
+        if let Some(allocator) = allocator {
+            match allocator.probe() {
+                Err(error) => return fail(loading.0, vec![error]),
+                // Nothing was routed yet: the heap goes on as one without a program allocator,
+                // as before routing existed (a mapping allocator, an app's large blocks on macOS)
+                Ok(Some(line)) => {
+                    eprintln!("{line}");
+                    let ds = domains();
+                    if let Some(heap) = ds.iter().find(|d| d.info.id == loading.0).and_then(|d| d.heap.as_ref()) {
+                        heap.stop_routing();
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
+        Ok(loading.0)
+    }
+}
+
+impl std::ops::Deref for ProgramHeap {
+    type Target = crate::zone_alloc::domain::DomainHeap;
+    fn deref(&self) -> &Self::Target { &self.heap }
+}
+
+impl Drop for ProgramHeap {
+    fn drop(&mut self) {
+        if self.heap.retains_statics_on_drop() {
+            // A plain fork child keeps the heap registered, including its allocator entries.
+            std::mem::forget(self.allocator.take());
+        }
+    }
+}
+
 struct Domain {
     info: DomainInfo,
     started: std::time::Instant,
@@ -723,7 +912,7 @@ struct Domain {
     thread_done: bool,
     /// the main's thread token (its row in `threads`; 0: none started)
     main: u64,
-    /// the main is held for good (a stale access's fault, a frame in code a layout patch replaced):
+    /// the main is parked at a stale fault:
     /// it leaves only at its run's end, so a stop does not wait for it to return
     main_held: bool,
     compiling: bool,
@@ -735,7 +924,7 @@ struct Domain {
     /// the unit whose code it runs (0: not started on one yet)
     unit: usize,
     threads: Vec<DomainThread>,
-    heap: Option<Box<crate::zone_alloc::domain::DomainHeap>>,
+    heap: Option<ProgramHeap>,
 }
 
 /// The argv of the domain whose block is at `base` (None: the process's own).
@@ -960,7 +1149,7 @@ pub fn stop(id: DomainId, _how: Stop) -> Result<(), String> {
 }
 
 /// Until the domain's main has returned and no teardown is under way (or the domain is gone). A
-/// main held for good returns only at its run's end, which comes after this: it is not waited for.
+/// main parked at a stale fault returns only at its run's end, which comes after this: it is not waited for.
 /// (A quit waited for a main held at a stale access, and the access waited for the run's end: the
 /// app ignored SIGTERM, 11-08.)
 fn wait_app_thread(id: DomainId) {
@@ -975,9 +1164,8 @@ fn wait_app_thread(id: DomainId) {
     }
 }
 
-/// Thread `os_id` is held for good (stale.rs: a fault's thread parked until its run ends, or one
-/// held out of code a layout patch replaced): when it is a domain's main, that domain's stop no
-/// longer waits for it.
+/// Thread `os_id` parked at a stale fault until its run ends. A domain's stop no longer waits
+/// for its main once the main has parked there.
 pub(crate) fn held_for_good(os_id: u64) {
     if os_id == 0 { return; }
     let mut ds = domains();
@@ -1100,9 +1288,6 @@ pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let callbacks = crate::domain_res::take_back_callbacks(&bases);
     if !up.is_null() {
         unsafe { (*up).end_code() };
-        // (a thread held for good at a layout patch leaves as the others do now: no frame of it
-        // can run the code it was held out of)
-        crate::inspect::instrument::release_held_for_good();
     }
     let mut backoff = std::time::Duration::from_millis(1);
     let end = |left, ms| RunEnd {
@@ -1219,23 +1404,33 @@ fn teardown(id: DomainId) {
     drop(ds);
     // Unmapping and dropping tables can take time. Registry readers (including the UI) must
     // not wait behind those operations, and stop must not report completion ahead of them.
+    // An address the heap owns must stay mapped until the heap is unregistered and its
+    // owner leases have drained. Otherwise a loader free could reach a reused static address.
     let mut freed = 0;
     if base != 0 {
-        freed += block_committed(base);
-        destroy(base);
+        unpublish(base);
     }
-    if let Some(heap) = heap {
-        let ranges: Vec<(usize, usize)> = heap.ranges().collect();
+    let ranges = heap.as_ref().map(|heap| heap.ranges().collect::<Vec<_>>()).unwrap_or_default();
+    if let Some(heap) = heap.as_ref() {
         for &(base, size) in &ranges {
             crate::run_end::heap_goes(base..base + size);
             crate::inspect::heap::forget_range(base, size);
         }
         freed += (heap.stats().1 + heap.metadata_bytes()) as u64;
-        drop(heap);
-        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-        for (base, size) in ranges {
-            crate::run_end::leftovers::heap_gone(base, size);
-        }
+    }
+    if base != 0 {
+        crate::run_end::heap_goes(base as usize..base as usize + BLOCK_SIZE);
+    }
+    // A plain fork child keeps inherited PA heaps registered, including their static ranges.
+    let retain_statics = heap.as_ref().is_some_and(|h| h.retains_statics_on_drop());
+    drop(heap);
+    if base != 0 && !retain_statics {
+        freed += block_committed(base);
+        release(base);
+    }
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    for (base, size) in ranges {
+        crate::run_end::leftovers::heap_gone(base, size);
     }
     drop((args, threads, crates));
     // The process heap keeps what the domain's threads freed in their malloc arenas (free but
@@ -1569,7 +1764,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let _job = crate::jit::compile_job();
     let _z = crate::zone_alloc::compiler_thread();
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} start_prepared at t={:.1} ms", crate::clock::ms_since_start()); }
-    let _loading = Loading(id);
+    let loading = Loading(id);
     if let Some(d) = domains().iter_mut().find(|d| d.info.id == id) { d.unit = up as usize; }
     let t0 = std::time::Instant::now();
     // The app's first start takes the boot's resolved package (same process, same instant). Taken
@@ -1601,9 +1796,8 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let idents = identities(&g, &cfgs, &order);
     let t1 = std::time::Instant::now();
     let upn = up as usize;
-    // the owner thread: the program's tables change there
-    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id, !from_boot) });
-    let (root, n_reused, new_names, first_file) = match loaded {
+    let loaded = unsafe { load_graph(up, &g, &order, &cfgs, &idents, id, !from_boot) };
+    let (root, n_reused, new_names) = match loaded {
         Ok(x) => x,
         Err(e) => return fail(id, e),
     };
@@ -1614,18 +1808,12 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let t2 = std::time::Instant::now();
     // the libraries the new crates link; the native library's callbacks are the fns of the
     // domain's crates (its root and what that depends on)
-    let crates = {
-        let prog = unsafe { &(*up).prog };
-        let mut seen = std::collections::HashSet::from([root]);
-        let mut todo = vec![root];
-        while let Some(k) = todo.pop() {
-            for &(_, d) in &prog.crates[k as usize].deps {
-                if seen.insert(d) { todo.push(d); }
-            }
-        }
-        seen
+    let linked = {
+        let read = crate::jit::front_read("domain link");
+        let (prog, _) = read.unit(up);
+        crate::run::link_libraries(prog, &g.link_libs, &g.link_search, g.native.as_ref(), Some(&domain_crates(prog, root)))
     };
-    let (_, missing, callbacks) = match crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file, Some(&crates)) {
+    let (_, missing, callbacks) = match linked {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("relax domain: {error}");
@@ -1653,23 +1841,30 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         crate::wasm_export::entry(u.wasm_export_id, fid);
         let entry = u.entry(fid);
         let (target, arg) = crate::run::main_call(u, main_def, entry)?;
-        Ok::<_, String>((target, arg, create(u)))
+        // Hosted domains share the unit's allocator shim. A different allocator in the hosted
+        // package is already ignored by its JIT code.
+        let allocator = ProgramAllocatorCtx::resolve(u)?;
+        // Only a run op (`#[relax_api(run)]`) allocates in the program's heap, so only a program
+        // that binds a crate with one is probed, or ever routes to its allocator. Any other
+        // program, with whatever allocator, runs as it does without provided crates, and its
+        // allocator shims check nothing (Unit::routes_allocator).
+        let probe = u.routes_allocator;
+        Ok::<_, String>((target, arg, create(u), allocator, probe))
     });
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} main prepared at t={:.1} ms", crate::clock::ms_since_start()); }
-    let (target, arg, base) = match prepared {
+    let (target, arg, base, allocator, probe) = match prepared {
         Ok(x) => x,
         Err(e) => return fail(id, vec![e]),
     };
     // the domain's arena is program memory: the kept heap
-    let heap = match crate::zone_alloc::kept_with(crate::zone_alloc::domain::DomainHeap::new) {
+    let heap = match ProgramHeap::new(base, allocator.filter(|_| probe)) {
         Some(h) => h,
         None => { destroy(base); return fail(id, vec!["reserving domain heap".into()]); }
     };
+    heap.install(&loading, base, probe)?;
     {
         let mut d = domains();
         if let Some(x) = d.iter_mut().find(|x| x.info.id == id) {
-            x.heap = Some(heap);
-            x.info.base = base;
             x.info.crates = g.crates.len();
             x.info.reused = n_reused;
             x.info.loaded = new_names.len();
@@ -1862,113 +2057,186 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
     start(up, spec)
 }
 
-/// On the owner thread: gets the crates of `g` into the program (shared ones are reused) and
-/// returns (root crate, crates reused, names of the crates loaded, first file index of the load).
-unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
-    use crate::modules::{Dep, NewCrate};
-    let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd, u.prog.std_overflow_checks).len();
-    let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
-    let mut crate_of = vec![u32::MAX; g.crates.len()];
-    let mut batch_of = vec![usize::MAX; g.crates.len()];
-    let mut batch: Vec<NewCrate> = Vec::new();
-    let mut batch_ci: Vec<usize> = Vec::new();
-    let mut reused = 0;
-    let mut why_new: Vec<String> = Vec::new();
-    // A layout/signature edit cannot reuse the old compiled crate just because its package
-    // identity stayed the same. Keep unchanged code shared; load changed crates and their
-    // dependants as a new revision. Other domains can still finish using their old revision.
-    // A domain that resolved its own package compares every loaded file of a shared crate with the
-    // disk. The app's first start takes the boot's graph, whose files this process read a moment
-    // ago: nothing to compare (a save after that is the live watcher's, which stamped them before
-    // the load).
-    let mut changed = HashSet::new();
-    if reread {
-        let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
-        let mut current = std::collections::BTreeMap::new();
-        for module in &u.prog.mods {
-            let file = module.file as usize;
-            let Some(&krate) = u.prog.file_crate.get(file) else { continue };
-            if candidates.contains(&krate) {
-                if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
-            }
+/// The crates of a domain: its root and everything that depends on, std's included.
+pub(crate) fn domain_crates(prog: &crate::program::Program, root: u32) -> HashSet<u32> {
+    let mut seen = HashSet::from([root]);
+    let mut todo = vec![root];
+    while let Some(k) = todo.pop() {
+        for &(_, d) in &prog.crates[k as usize].deps {
+            if seen.insert(d) { todo.push(d); }
         }
-        // every changed file, with the bytes on disk now: the program's source registry keeps the
-        // first snapshot of a path for good (source ids name paths across revisions), so the new
-        // revision reads these through an overlay -- without it a second relaunch after an edit
-        // loaded the first relaunch's text again
-        let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
-        for ((krate, path), file) in current {
-            if path.is_empty() { continue; }
-            let pf = &u.prog.files[file];
-            match crate::vfs::read(path) {
-                Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
-                Ok(src) => {
-                    changed.insert(krate);
-                    if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
-                }
-                Err(_) => { changed.insert(krate); }
-            }
+    }
+    seen
+}
+
+#[cfg(test)]
+mod load_step_gate {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::thread::ThreadId;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    pub(super) static STEPS_BEGUN: AtomicUsize = AtomicUsize::new(0);
+    // A loader occupies one place in arrival order until the test releases it.
+    static HELD: Mutex<VecDeque<(ThreadId, usize)>> = Mutex::new(VecDeque::new());
+    static CHANGED: Condvar = Condvar::new();
+
+    pub(super) fn hold_load_steps(on: bool) {
+        let mut held = HELD.lock().unwrap();
+        if on { STEPS_BEGUN.store(0, Ordering::SeqCst); }
+        ON.store(on, Ordering::Relaxed);
+        if !on { held.clear(); }
+        CHANGED.notify_all();
+    }
+
+    pub(super) fn before_step(k: usize) {
+        if !ON.load(Ordering::Relaxed) { return; }
+        let mut held = HELD.lock().unwrap();
+        if !ON.load(Ordering::Relaxed) { return; }
+        let loader = std::thread::current().id();
+        held.push_back((loader, k));
+        CHANGED.notify_all();
+        drop(CHANGED.wait_while(held, |q| q.iter().any(|h| h.0 == loader)).unwrap());
+    }
+
+    pub(super) fn wait_for_loaders(n: usize) -> usize {
+        let held = CHANGED.wait_while(HELD.lock().unwrap(), |q| q.len() < n).unwrap();
+        held[0].1
+    }
+
+    pub(super) fn wait_load_step_held() -> usize { wait_for_loaders(1) }
+
+    pub(super) fn release_load_step() {
+        HELD.lock().unwrap().pop_front().expect("a loader at the gate");
+        CHANGED.notify_all();
+    }
+}
+
+/// Compare the current revision of each shared crate with disk. A changed crate and the
+/// dependants built against its old revision must load again. Called on the owner.
+unsafe fn reread_loaded(up: *mut Unit, idents: &[u64], changed: &mut HashSet<u32>) {
+    let prog = &(*up).prog;
+    let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
+    let mut current = std::collections::BTreeMap::new();
+    for module in &prog.mods {
+        let file = module.file as usize;
+        let Some(&krate) = prog.file_crate.get(file) else { continue };
+        if candidates.contains(&krate) {
+            if let Some(path) = prog.file_paths.get(file) { current.insert((krate, path), file); }
         }
+    }
+    // every changed file, with the bytes on disk now: the program's source registry keeps the
+    // first snapshot of a path for good (source ids name paths across revisions), so the new
+    // revision reads these through an overlay -- without it a second relaunch after an edit
+    // loaded the first relaunch's text again
+    let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
+    for ((krate, path), file) in current {
+        if path.is_empty() { continue; }
+        let pf = &prog.files[file];
+        match crate::vfs::read(path) {
+            Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
+            Ok(src) => {
+                changed.insert(krate);
+                if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
+            }
+            Err(_) => { changed.insert(krate); }
+        }
+    }
+    if !fresh.is_empty() {
+        let _fw = crate::jit::front_write();
+        let sources = &mut (*up).prog.sources;
         for (path, src) in fresh {
-            u.prog.sources = std::sync::Arc::new(u.prog.sources.overlay(&path, src.into()));
+            *sources = std::sync::Arc::new(sources.overlay(&path, src.into()));
         }
     }
+}
+
+/// The loader asks the owner for one complete crate at a time. Between requests the crate
+/// indices belong to the loader and the program can serve other domains.
+unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>), Vec<String>> {
+    use crate::modules::{Dep, NewCrate};
+    use crate::owner::{call, Class::Program};
+    let epochs = || (crate::reload::program_edits(), crate::jit::patch_epoch());
+    let mut changed = HashSet::new();
+    let (std_deps, mut checked) = call(Program, || {
+        let checked = epochs();
+        // The boot graph was just read. A later edit invalidates that shortcut too.
+        if reread { reread_loaded(up, idents, &mut changed); }
+        let prog = &(*up).prog;
+        let std_count = crate::std_pre_crates(&prog.session, prog.std_simd, prog.std_overflow_checks).len();
+        let deps: Vec<_> = (0..std_count).map(|k| (prog.syms.str(prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
+        (deps, checked)
+    });
+    let mut crate_of = vec![u32::MAX; g.crates.len()];
+    let mut reused = 0;
+    let mut why_new = Vec::new();
+    let mut errs = Vec::new();
     for &ci in order {
-        let dependency_changed = g.crates[ci].deps.iter().any(|(d, _)| batch_of[*d] != usize::MAX);
-        if let Some(k) = lookup_loaded(idents[ci]).filter(|k| !dependency_changed && !changed.contains(k)) {
-            crate_of[ci] = k;
-            reused += 1;
-            continue;
-        }
-        let c = &g.crates[ci];
-        why_new.push(namesake_diff(c, &cfgs[ci]).unwrap_or_else(|| c.name.clone()));
-        let mut deps = std_deps.clone();
-        for (d, ext) in &c.deps {
-            if crate_of[*d] != u32::MAX {
-                deps.push((ext.clone(), Dep::Existing(crate_of[*d])));
-            } else if batch_of[*d] != usize::MAX {
-                deps.push((ext.clone(), Dep::New(batch_of[*d])));
+        #[cfg(test)]
+        load_step_gate::before_step(reused + why_new.len());
+        call(Program, || {
+            #[cfg(test)]
+            load_step_gate::STEPS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if cancelled(id) { return Err(vec!["domain compilation cancelled".to_string()]); }
+            let now = epochs();
+            if now != checked {
+                reread_loaded(up, idents, &mut changed);
+                checked = now;
             }
-        }
-        batch_of[ci] = batch.len();
-        batch_ci.push(ci);
-        batch.push(NewCrate { name: c.name.clone(), path: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps, proc_macro: c.proc_macro });
-        // (env!() looks a crate up by name: a second crate of a name replaces the first one's
-        // environment, which differs here by definition of a new identity)
-        crate::crates::set_crate_env(&c.name, g.env[ci].clone());
+
+            let c = &g.crates[ci];
+            let graph_deps = c.deps.iter().filter(|(d, _)| crate_of[*d] != u32::MAX);
+            if let Some(k) = lookup_loaded(idents[ci]) {
+                // A concurrent loader may have published either this crate or its dependencies.
+                // The identity names the package graph; the indices name the actual revisions:
+                // the record is reused when it was built against every crate this load selected
+                // for its dependencies. Its list holds more than those (the std crates, and an
+                // entry per `extern crate .. as ..` alias, ahead of them), so membership, not
+                // position, decides.
+                let prog = &(*up).prog;
+                let deps = &prog.crates[k as usize].deps;
+                let dependency_changed = graph_deps.clone().any(|(d, _)| !deps.iter().any(|&(_, dep)| dep == crate_of[*d]));
+                if !dependency_changed && !changed.contains(&k) {
+                    crate_of[ci] = k;
+                    reused += 1;
+                    return Ok(());
+                }
+            }
+
+            if why_new.is_empty() { compile_phase(id, "load").map_err(|e| vec![e])?; }
+            why_new.push(namesake_diff(c, &cfgs[ci]).unwrap_or_else(|| c.name.clone()));
+            let mut deps = std_deps.clone();
+            deps.extend(graph_deps.map(|(d, ext)| (ext.clone(), Dep::Existing(crate_of[*d]))));
+            let nc = NewCrate { name: c.name.clone(), path: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps, proc_macro: c.proc_macro };
+            crate::crates::set_crate_env(&c.name, g.env[ci].clone());
+            let added = crate::modules::add_crates(up, &[nc], true, Some(id))?;
+            // Even when stop arrived during collection, publish the completed crate.
+            crate_of[ci] = added.crates[0];
+            {
+                let _fw = crate::jit::front_write();
+                record_loaded(idents[ci], added.crates[0], c, &cfgs[ci]);
+                (*up).bind_added_provided(&added.crates);
+            }
+            errs.extend(added.errs);
+            Ok(())
+        })?;
     }
-    let first_file = u.prog.files.len();
-    if !batch.is_empty() {
-        compile_phase(id, "load").map_err(|e| vec![e])?;
-        let added = crate::modules::add_crates(up, &batch, true, Some(id))?;
-        // Loaded crates remain reusable even when stop arrived during collection.
-        // As for a boot: unresolved imports and signature errors are reported, the load goes on
-        // (only a crate that does not parse is refused).
-        if !added.errs.is_empty() {
-            if crate::run_state::observed() {
-                for e in &added.errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
-            }
-            let max: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-            eprintln!("relax domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
-            for e in added.errs.iter().take(max) {
-                eprintln!("  {}", e);
-            }
+    // As for boot, unresolved imports and signature errors are reported and the load goes on.
+    if !errs.is_empty() {
+        if crate::run_state::observed() {
+            for e in &errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
         }
-        for (b, &ci) in batch_ci.iter().enumerate() {
-            crate_of[ci] = added.crates[b];
-            record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
-        }
-        // provided crates (rustc-built into the loader) that only this app brings, like the
-        // compute crate for an app, bind their ops now, as the booted program's do
-        { let _fw = crate::jit::front_write(); u.bind_added_provided(&added.crates); }
+        let max: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        eprintln!("relax domain: {} diagnostics in the loaded crates (first {}):", errs.len(), max.min(errs.len()));
+        for e in errs.iter().take(max) { eprintln!("  {}", e); }
     }
     if cancelled(id) { return Err(vec!["domain compilation cancelled".into()]); }
     let root = crate_of[g.root];
     if root == u32::MAX {
         return Err(vec![format!("the package root {} did not load", g.crates[g.root].name)]);
     }
-    Ok((root, reused, why_new, first_file))
+    Ok((root, reused, why_new))
 }
 
 // ---- the test vehicle: `makepad run <package> --domain <package2> ..`
@@ -2280,12 +2548,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A quit's stop waits for the app's main to return. A main held for good (its stale access
+    /// A quit's stop waits for the app's main to return. A main parked at a fault (its stale access
     /// parked until the run's end, which comes after that wait) never does: the stop waits no more
-    /// once it is held. (The quit waited for it and the app ignored SIGTERM, 11-08.)
+    /// once it parks. (The quit waited for it and the app ignored SIGTERM, 11-08.)
     #[test]
-    fn a_stop_does_not_wait_for_a_main_held_for_good() {
-        isolated_test!(a_stop_does_not_wait_for_a_main_held_for_good);
+    fn a_stop_does_not_wait_for_a_main_parked_at_a_fault() {
+        isolated_test!(a_stop_does_not_wait_for_a_main_parked_at_a_fault);
         let (id, main_os_id): (DomainId, u64) = (77, 4242);
         domains().push(Domain {
             info: DomainInfo { id, package: "held".into(), parent: None, state: DomainState::Running, base: 0x7000_0000, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), arena_reserved: 0, static_committed: 0 },
@@ -2301,16 +2569,16 @@ mod tests {
         let stop = std::thread::spawn(move || wait_app_thread(id));
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!stop.is_finished(), "the stop waits for a main that runs");
-        // a worker held for good holds nothing up: the stop still waits for the main
+        // a worker parked at a fault leaves the main running: the stop still waits for the main
         held_for_good(4343);
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!stop.is_finished(), "a held worker is not the main");
+        assert!(!stop.is_finished(), "a parked worker is not the main");
         held_for_good(main_os_id);
         let t0 = std::time::Instant::now();
         while !stop.is_finished() && t0.elapsed().as_secs() < 10 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(stop.is_finished(), "the stop waits no more for a main held for good");
+        assert!(stop.is_finished(), "the stop no longer waits for the main parked at a fault");
         stop.join().unwrap();
         domains().retain(|d| d.info.id != id);
     }

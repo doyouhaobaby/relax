@@ -741,6 +741,15 @@ impl SlotsPtr {
     pub fn callable(&self, id: u32) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { (*self.0).callable(id) } }
     }
+    /// The slot's replaceable target word (SlotTable::body).
+    pub fn body(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).body(id) } }
+    }
+    /// The table word names an entry wrapper and a second word the body (a live test session's
+    /// reach marks): a call through the body word goes past the wrapper (`Reloc::Body`).
+    pub fn wrapped(&self) -> bool {
+        !self.0.is_null() && unsafe { (*self.0).table_stride() } > 8
+    }
 }
 
 /// Writes every relocated field of `code`, to run at address `base`. Backends emit the fields
@@ -856,8 +865,14 @@ pub enum Reloc {
     /// a slot as a call target: its thunk (`SlotTable::thunk`), which jumps to the slot's current
     /// code (a direct branch the runtime keeps in step with the table word)
     Call(u32),
+    /// a slot's body word (`SlotTable::body`): a hot call site of O3 code calls through it
+    /// (`call [word]`), past the entry wrapper a live test session's table word names (its reach
+    /// mark). The embedder counts the slot as reached by the calling code. Without a wrapper it
+    /// is the table word.
+    Body(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
-    /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`)
+    /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`,
+    /// as Android under Relax has, `arm64::TLS_TWO_LOAD`)
     TlsKey,
     /// `Env::tls_slow`
     TlsSlow,
@@ -887,7 +902,10 @@ pub enum Callee {
     Asm(Box<AsmBlock>),
     /// Direct call to this native build's outlined part, with the Relax calling convention.
     /// The joiner resolves it within the body. It may capture arguments, access memory and unwind.
-    Part,
+    /// `Some(id)` calls an outlined exit with the record as its only RIR argument. The backend
+    /// passes `id` in the next integer argument register, as the part's second parameter.
+    /// `None` is the whole-body stub: it forwards the host's arguments and passes no exit ID.
+    Part(Option<u32>),
 }
 
 /// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
@@ -986,6 +1004,12 @@ pub struct CSig {
     /// the call has an unwind edge, as a Rust call does. Other C-family ABIs abort a panic
     /// leaving their body.
     pub unwinds: bool,
+    /// a math function as Relax's core declares it for the float methods (`f64::sin` calls
+    /// core's libm `sin`), where rustc emits an LLVM math intrinsic (`llvm.sin`: no memory read
+    /// or written, so loads merge across it and a sin and a cos of one value pair:
+    /// passes::fuse_sincos). A C function the program declares itself (`extern "C" { fn sin }`)
+    /// stays a call that may write errno for LLVM, never paired.
+    pub math: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1350,7 +1374,9 @@ pub struct Slot {
     pub born: bool,
     /// made by lowering as a call's result buffer (a result returned in memory), of the result
     /// type's size: that call writes all of it (opt::slot_colors checks it is still passed to
-    /// one call only)
+    /// one call only). Every call handed the slot as its result buffer writes all of it: a slot
+    /// joined along a whole copy keeps the flag of either side, one that a smaller result buffer
+    /// becomes the start of loses it (opt::coalesce_slot_copies).
     pub ret: bool,
 }
 
@@ -1535,8 +1561,32 @@ pub struct BodyDigest {
 /// Numbers by first occurrence (`Func::lowering_digest`).
 #[derive(Default)]
 struct FirstSeen {
-    ix: std::collections::HashMap<u32, u32>,
+    ix: std::collections::HashMap<u32, u32, std::hash::BuildHasherDefault<IdHash>>,
     order: Vec<u32>,
+}
+
+/// FirstSeen's hasher: its keys are slot and symbol ids, looked up at each occurrence in a body
+/// (a digest is taken of every body lowered); the multiply-rotate mix of rustc's FxHasher.
+#[derive(Default)]
+struct IdHash(u64);
+
+impl std::hash::Hasher for IdHash {
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.write_u64(x as u64);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(x as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl FirstSeen {
@@ -1727,7 +1777,7 @@ impl Func {
         fn callee(c: &Callee, h: &mut relax_session::sip::Sip128, sl: &mut FirstSeen, sy: &mut FirstSeen) {
             std::mem::discriminant(c).hash(h);
             match c {
-                Callee::Part => {}
+                Callee::Part(id) => id.hash(h),
                 Callee::Fn(x) => sl.get(*x).hash(h),
                 Callee::CFn(x, g) => {
                     sl.get(*x).hash(h);
@@ -2437,7 +2487,7 @@ impl Func {
                     if *t >= nb || *u >= nb {
                         return Err(format!("{}: bad invoke target", self.name));
                     }
-                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part(_) | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
                         return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
                     }
                 }
@@ -2581,14 +2631,16 @@ fn fma_nan(a: u64, b: u64, c: u64, m: u32, e: u32, is_nan: bool) -> Option<u64> 
     }
 }
 
+/// `v` as a value of `it`: its low `it.bits` bits, extended by the type's sign. Any width below 64,
+/// not only the integer types': the select-tree compare fold narrows through low masks
+/// (`n % 2 == 0` reads `n & 1`, one bit wide), and a constant kept unmasked there compared both
+/// arms of `if c { 130 } else { 131 }` as odd. 64 bits and wider are the value itself.
 pub fn extend_const(v: i64, it: IntTy) -> i64 {
-    match (it.bits, it.signed) {
-        (8, true) => v as i8 as i64,
-        (8, false) => v as u8 as i64,
-        (16, true) => v as i16 as i64,
-        (16, false) => v as u16 as i64,
-        (32, true) => v as i32 as i64,
-        (32, false) => v as u32 as i64,
+    match it.bits {
+        1..=63 => {
+            let sh = 64 - it.bits as u32;
+            if it.signed { (v << sh) >> sh } else { ((v as u64) << sh >> sh) as i64 }
+        }
         _ => v,
     }
 }
@@ -2871,7 +2923,7 @@ mod join_part_tests {
         f.blocks[0].term = Term::Ret(vec![sum]);
         if host {
             let result = f.vreg(Cls::I);
-            f.blocks[0].insts.push(Inst::Call(Callee::Part, vec![sum], vec![result]));
+            f.blocks[0].insts.push(Inst::Call(Callee::Part(None), vec![sum], vec![result]));
             f.blocks[0].pos.push(4);
             if relocated {
                 let (normal, pad) = (f.block(), f.block());

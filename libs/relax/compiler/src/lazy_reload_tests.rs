@@ -31,6 +31,7 @@ fn deferred_reexport_signatures() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let mut prog = Program::new(&session);
     prog.preload(vec![crate::preload::PreCrate {
+        is_bin: false, harness: false,
         name: "lazy_reexport".into(), root: root.clone(), edition: 2021, cfg: cfg.clone(),
         deps: Vec::new(),  proc_macro: false,
         image_deps: Vec::new(), image_dep_names: Vec::new(),
@@ -1137,7 +1138,8 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
         ("path+file://", "widgets", "widgets/core/src/lib.rs", false),
         ("path+file://", "math", "libs/math/src/lib.rs", false),
         ("path+file://", "relax_base", "libs/relax/base/src/lib.rs", false),
-        ("path+file://", "engine", "apps/commercial/engine/motion/src/lib.rs", false),
+        ("path+file://", "engine", "apps/commercial/engine/track_engine/src/lib.rs", false),
+        ("path+file://", "open_engine", "apps/apps/engine/motion/src/lib.rs", false),
         ("path+file://", "external", "../external/src/lib.rs", false),
         ("path+file://", "prefix", "../gandalf-project-extra/src/lib.rs", false),
         ("path+file://", "app_lib", "apps/app/libs/helper/src/lib.rs", true),
@@ -1195,6 +1197,11 @@ fn app_scope_live_layout_edits() {
         pub enum Ease { Linear, Pow(f64), Curve(f32, f32, f32, f32) }
         pub enum Yoyo { Invert, Ease(Ease) }
         pub enum Held { Nothing, Has(Yoyo) }
+        pub struct Report { pub steps: u64, pub tol: f64 }
+        pub fn report() -> Report { Report { steps: 3, tol: 0.5 } }
+        pub fn tol_check(out: &mut u64) { let r = report(); let near = |x: f64| x <= 10.0 * r.tol; *out = near(4.0) as u64 * 10 + r.steps + (r.tol * 4.0) as u64 * 100; }
+        pub fn checker(steps: u64) -> impl FnMut(f64) -> u64 { let mut calls = 0; move |x| { calls += 1; let r = report(); (x <= 10.0 * r.tol) as u64 * 10 + r.steps + steps + calls } }
+        pub fn run_checker(out: &mut u64) { let mut c = checker(100); *out = c(4.0); }
     "#;
     // enums whose values the program holds, for in-place variant edits (M84): E's values in a
     // Vec, in Options and in Options of Options; F's in Option<F> and in W, which keeps its own
@@ -1286,6 +1293,8 @@ fn app_scope_live_layout_edits() {
     let size = def("size", lib);
     let measured = def("measured", lib);
     let add_dyn = def("add_dyn", lib);
+    let tol_check = def("tol_check", lib);
+    let run_checker = def("run_checker", lib);
     let mixed_def = def("Mixed", lib);
     let enums = [def("Ease", lib), def("Yoyo", lib), def("Held", lib)];
     let enum_fns = (case == "enums").then(|| [def("make", lib), def("step", lib), def("read", lib), def("transient", lib)]);
@@ -1332,6 +1341,8 @@ fn app_scope_live_layout_edits() {
     let size = entry(&mut u, size);
     let measured = entry(&mut u, measured);
     let add_dyn = entry(&mut u, add_dyn);
+    let tol_check = entry(&mut u, tol_check);
+    let run_checker = entry(&mut u, run_checker);
     let layout = u.layout_of(ty).clone();
     assert_eq!((layout.size, &layout.fields[..]), (8, &[0][..]), "State");
     // an enum is laid out as rustc lays it in a live session too (M84: a tagged layout with no
@@ -1530,6 +1541,38 @@ fn app_scope_live_layout_edits() {
     assert_eq!(pure.rung, Rung::Patch, "{:?}", pure.lines);
     assert!(pure.lines.iter().any(|l| l.contains("struct `app_lib::Dormant` takes its new layout")), "{:?}", pure.lines);
     assert!(pure.names.is_empty(), "{:?}", pure.names);
+    // fields inserted before another: Report's `tol` moves to a later index (an integer field
+    // takes its old one) and offset. Code whose text no edit changes reads it at its new place,
+    // in a closure and in its fn. (`checker` returns an opaque type, so rebuilt it is replaced;
+    // its old closure, which inlined the changed `report`, was once built again from its frozen
+    // old body in the new layout: `tol` read at its old index, an integer load fed a float
+    // multiply, and the patch failed to verify.)
+    let mut n = 0u64;
+    call(tol_check, &mut n as *mut u64 as u64);
+    assert_eq!(n, 213, "tol_check before the edit");
+    call(run_checker, &mut n as *mut u64 as u64);
+    assert_eq!(n, 114, "run_checker before the edit");
+    let inserted = dormant.replace("pub struct Report { pub steps: u64, pub tol: f64 }", "pub struct Report { pub steps: u64, pub anchor_steps: usize, pub anchored: bool, pub tol: f64 }")
+        .replace("Report { steps: 3, tol: 0.5 }", "Report { steps: 3, anchor_steps: 9, anchored: true, tol: 0.5 }");
+    let moved = apply(&inserted);
+    assert_eq!(moved.rung, Rung::Patch, "fields inserted before `tol`: {:?}", moved.lines);
+    assert!(moved.lines.iter().any(|l| l.contains("struct `app_lib::Report` takes its new layout")), "{:?}", moved.lines);
+    call(tol_check, &mut n as *mut u64 as u64);
+    assert_eq!(n, 213, "tol_check reads `tol` at its new place (rebuilt: {:?})", moved.names);
+    call(run_checker, &mut n as *mut u64 as u64);
+    assert_eq!(n, 114, "run_checker after the fields inserted before `tol` (rebuilt: {:?})", moved.names);
+    // a second field inserted before `tol`, with the texts of tol_check and of checker's closure
+    // edited in the same patch: each build reads `tol` where the new layout has it
+    let again = inserted.replace("pub anchored: bool, pub tol: f64 }", "pub anchored: bool, pub extra: usize, pub tol: f64 }")
+        .replace("anchored: true, tol: 0.5 }", "anchored: true, extra: 5, tol: 0.5 }")
+        .replace("(r.tol * 4.0) as u64 * 100; }", "(r.tol * 4.0) as u64 * 100 + 1000; }");
+    let again = again.replace("+ r.steps + steps + calls } }", "+ r.steps + steps + calls + r.extra as u64 * 1000 } }");
+    let moved = apply(&again);
+    assert_eq!(moved.rung, Rung::Patch, "a second field inserted before `tol`: {:?}", moved.lines);
+    call(tol_check, &mut n as *mut u64 as u64);
+    assert_eq!(n, 1213, "tol_check after the second insertion (rebuilt: {:?})", moved.names);
+    call(run_checker, &mut n as *mut u64 as u64);
+    assert_eq!(n, 5114, "run_checker after the second insertion (rebuilt: {:?})", moved.names);
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -2584,7 +2627,7 @@ fn realtime_reach_reads_the_installed_code() {
         f.normal_rir = None;
         f.lowering = None;
         let mut callees: Vec<u32> = relocs.iter().filter_map(|r| match r.target {
-            relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Slot(c) if c != run => Some(c),
+            relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Body(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Slot(c) if c != run => Some(c),
             _ => None,
         }).collect();
         callees.sort_unstable();
@@ -3775,8 +3818,13 @@ impl KeptRig {
     /// O3 code for every instance of fn `name` that has code (one for a fn that is not generic;
     /// tiering is otherwise off: no count reaches the threshold): their slots.
     fn tier_up(&mut self, name: &str) -> Vec<u32> {
+        self.tier_up_with(name, |_| {})
+    }
+
+    /// tier_up, with the O3 tier's config set by `set` (a no-inline set of the lower tiers only)
+    fn tier_up_with(&mut self, name: &str, set: impl FnOnce(&mut crate::jit::Tier1Cfg)) -> Vec<u32> {
         let session = unsafe { crate::jit::unit_session(self.up) };
-        self.unit.tier1 = crate::jit::Tier1Cfg::from_options(&session.options).map(|mut t| { t.threshold = u64::MAX; t });
+        self.unit.tier1 = crate::jit::Tier1Cfg::from_options(&session.options).map(|mut t| { t.threshold = u64::MAX; set(&mut t); t });
         let u = &self.unit;
         let slots: Vec<u32> = (0..u.fns.len() as u32).filter(|&s| u.fns[s as usize].compiled && matches!(&u.fns[s as usize].key, crate::jit::FnKey::Inst(d, _) if u.prog.name(*d) == name)).collect();
         for &s in &slots {
@@ -3945,7 +3993,7 @@ pub fn start(p: *mut u64) {
 /// held for a restart only once the old code makes that box (`late_held`, the live loop's look),
 /// and the box runs the old text, its inner closures included. (O1 inlines nothing
 /// into `pump` and no closure anywhere, so its first code calls the closure; O3 inlines as a
-/// session does.)
+/// session does: the no-inline set is the lower tiers' only.)
 #[test]
 fn a_frame_over_a_kept_closure_blocks_a_layout_patch() {
     isolated_test!(a_frame_over_a_kept_closure_blocks_a_layout_patch);
@@ -3995,8 +4043,12 @@ pub fn start(p: *mut u64) {
     assert_eq!(old.len(), 1, "the closure has code");
     // named as a refused edit names a closure: by the fn that makes it and its place
     let name = rig.shown(old[0]);
-    // (the frame of the first wait stays in the instance's first code)
-    let pumps = rig.tier_up("pump");
+    // (the frame of the first wait stays in the instance's first code; its O3 build takes no
+    // no-inline set)
+    let pumps = rig.tier_up_with("pump", |t| {
+        t.noinl = None;
+        t.noinl_callee = None;
+    });
     assert_eq!(pumps.len(), 1, "one instance of pump");
     let o3 = rig.unit.fns[pumps[0] as usize].code;
     let copied = rig.unit.code.read().unwrap().inlined_at(o3).is_some_and(|l| l.contains(&old[0]));

@@ -637,10 +637,29 @@ pub(crate) fn frame_fields_no_owner(u: &Unit, pc: u64) -> Option<(String, String
     ))
 }
 
-/// JIT code that is no fn body: a slot's thunk (what calls branch to), its lazy stub, or a veneer
+/// A report uses the slot's stored diagnostic name; resolving its display name needs the owner.
+pub(super) fn report_name(u: &Unit, pc: u64) -> Option<String> {
+    let t = u.code.try_read().ok()?;
+    let Some((start, _, id)) = t.entry_at(pc) else {
+        return t.glue_at(pc).map(|(_, name)| name.to_string());
+    };
+    let name = crate::jit::slot_name(id)?;
+    Some(format!("{name} (slot#{id}+{:#x})", pc - start))
+}
+
+/// JIT code that is no fn body: a shared runtime entry, a slot's thunk, its lazy stub, or a veneer
 /// (a branch to a host function or a far target): (name, module label). A profile sample on one
 /// is the cost of reaching the callee (a fetch of a thunk line that is not in the i-cache).
 pub(crate) fn glue_name(u: &Unit, pc: u64) -> Option<(String, &'static str)> {
+    if let Some((_, name)) = u.code.read().unwrap_or_else(|e| e.into_inner()).glue_at(pc) {
+        return Some((name.to_string(), "jit/glue"));
+    }
+    // the hop between a slot's table word and its body word: the live harness's entry mark, or
+    // an aux unit's plain thunk
+    if let Some((id, _, marked)) = u.entry_thunk_at(pc).filter(|e| (e.0 as usize) < u.fns.len()) {
+        let name = super::display_name(u, id, 0);
+        return Some(if marked { (format!("[entry mark of {}]", name), "jit/glue entry mark") } else { (format!("[entry thunk of {}]", name), "jit/glue entry") });
+    }
     for (kind, what, module) in [(0usize, "thunk of", "jit/glue thunk"), (1, "lazy stub of", "jit/glue stub")] {
         if let Some((id, _)) = u.slots.find(kind, pc).filter(|(id, _)| (*id as usize) < u.fns.len()) {
             return Some((format!("[{} {}]", what, super::display_name(u, id, 0)), module));
@@ -933,7 +952,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
         for (n, q, t, slots) in pins {
             out.line(&format!("{{\"pin\":\"pin{}\",\"fn\":{},\"tier\":\"{}\",\"slots\":{:?}}}", n, json_str(&q), t, slots));
         }
-        out.line("{\"usage\":\"tier <fn|file:line> o1|o3|auto [fresh=1]\"}");
+        out.line("{\"usage\":\"tier <fn|file:line|@slot> o1|o3|auto [fresh=1]\"}");
         return;
     };
     let level: &'static str = match level.to_ascii_lowercase().as_str() {
@@ -952,7 +971,12 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
     let r = crate::owner::call_within(crate::owner::Class::Program, 30_000, move || -> Result<(Vec<String>, Vec<u32>), String> {
         let _kept = crate::zone_alloc::kept();
         let u = unsafe { &mut *up };
-        let mut found: Vec<(u32, Option<u32>)> = super::instrument::find_all(u, &qq, 16).into_iter().map(|x| (x.0, x.1)).collect();
+        // `@slot`: one slot by number (a shim, or a name with spaces the request splits)
+        let mut found: Vec<(u32, Option<u32>)> = match qq.strip_prefix('@').and_then(|s| s.parse::<u32>().ok()) {
+            Some(id) if (id as usize) < u.fns.len() => vec![(id, None)],
+            Some(id) => return Err(format!("no slot @{} (have @0..@{})", id, u.fns.len().saturating_sub(1))),
+            None => super::instrument::find_all(u, &qq, 16).into_iter().map(|x| (x.0, x.1)).collect(),
+        };
         if found.is_empty() {
             return Err(format!("no fn or line matches `{}`{}", qq, super::instrument::closest(u, &qq)));
         }

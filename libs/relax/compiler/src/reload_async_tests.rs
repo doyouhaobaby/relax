@@ -44,7 +44,10 @@ pub(crate) fn live_app(tag: &str, files: &[(&str, &str)], names: &[&str], run: i
     let mut session = crate::Session::default();
     session.options.live = true;
     let session = Arc::new(session);
-    let (prog, core, app_crate) = crate::load_with_std(&session, &lib, "live_app", false).unwrap();
+    let (mut prog, core, app_crate) = crate::load_with_std(&session, &lib, "live_app", false).unwrap();
+    // the app's crate is the run's own, as a run marks it (run.rs app_crates): its edits get the
+    // checks a fresh run gives it (reload.rs edit_crate_level_errors)
+    prog.crates[app_crate as usize].validate = true;
     crate::borrowck::event::set_app_scope(vec![lib.clone()]);
     let entries_of: Vec<_> = names.iter().map(|name| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -71,8 +74,11 @@ pub(crate) fn live_app(tag: &str, files: &[(&str, &str)], names: &[&str], run: i
             assert!(text.contains(from), "{file}: {from}");
             *text = text.replace(from, to);
         }
-        let p = path(file);
-        let index = unsafe { (*up).prog.current_source_files(|q| q == p)[&p] };
+        // (found as a path, not a string: on Windows the program spells a `mod` file's path
+        // otherwise than this join does -- `#[path]` files and the root as given)
+        let p = crate::vfs::normalize_path(&path(file));
+        let found = unsafe { (*up).prog.current_source_files(|q| crate::vfs::normalize_path(q) == p) };
+        let (p, index) = found.into_iter().next().unwrap_or_else(|| panic!("{file}: no source file of the program is {p}"));
         unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: index, path: p, src: text.clone().into_bytes() }]) }
     };
     run(&call, &mut edit);

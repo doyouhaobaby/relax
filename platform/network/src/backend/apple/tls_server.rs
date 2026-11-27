@@ -3,7 +3,7 @@
 //! DER, joined by SecIdentityCreate, so nothing touches a keychain.
 
 use std::ffi::c_void;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::TcpStream;
 use std::ptr;
 
@@ -13,7 +13,20 @@ use makepad_apple_sys::{
     SecIdentityRef, SecKeyCreateWithData, SecKeyRef,
 };
 
-use crate::socket_stream::apple_impl::SecureTransportStream;
+use crate::socket_stream::apple_impl::NativeEngine;
+
+// CommonCrypto is part of libSystem.
+extern "C" {
+    fn CCCryptorCreate(
+        operation: u32, algorithm: u32, options: u32, key: *const u8, key_len: usize,
+        iv: *const u8, cryptor: *mut *mut c_void,
+    ) -> i32;
+    fn CCCryptorUpdate(
+        cryptor: *mut c_void, input: *const u8, input_len: usize, output: *mut u8,
+        output_len: usize, written: *mut usize,
+    ) -> i32;
+    fn CCCryptorRelease(cryptor: *mut c_void) -> i32;
+}
 
 #[link(name = "Security", kind = "framework")]
 extern "C" {
@@ -176,6 +189,55 @@ pub fn ecdh_p256(key: &[u8; 97], peer_point: &[u8]) -> io::Result<[u8; 32]> {
     }
 }
 
+pub(super) struct NativeAes128Ecb(*mut c_void);
+
+// SAFETY: CommonCrypto permits sequential use across threads. The handle is exclusively owned.
+unsafe impl Send for NativeAes128Ecb {}
+
+impl NativeAes128Ecb {
+    pub(super) fn new(key: &[u8; 16]) -> io::Result<Self> {
+        const CC_ENCRYPT: u32 = 0;
+        const CC_ALGORITHM_AES: u32 = 0;
+        const CC_OPTION_ECB_MODE: u32 = 2;
+        let mut handle = ptr::null_mut();
+        // SAFETY: CommonCrypto reads the 16-byte key and writes the new handle. ECB needs no IV.
+        let status = unsafe {
+            CCCryptorCreate(CC_ENCRYPT, CC_ALGORITHM_AES, CC_OPTION_ECB_MODE,
+                key.as_ptr(), key.len(), ptr::null(), &mut handle)
+        };
+        if status != 0 {
+            return Err(io_other(format!("CCCryptorCreate failed: {status}")));
+        }
+        Ok(Self(handle))
+    }
+
+    pub(super) fn encrypt_blocks(&mut self, blocks: &mut [u8]) -> io::Result<()> {
+        // CCCryptorUpdate requires disjoint input and output for ECB.
+        let mut output = [0u8; 64 * 16];
+        for chunk in blocks.chunks_mut(output.len()) {
+            let mut written = 0;
+            // SAFETY: the buffers are separate and live for the call. With no padding or
+            // pending partial block, the encrypted whole blocks fit in output.
+            let status = unsafe {
+                CCCryptorUpdate(self.0, chunk.as_ptr(), chunk.len(), output.as_mut_ptr(),
+                    output.len(), &mut written)
+            };
+            if status != 0 || written != chunk.len() {
+                return Err(io_other(format!("CCCryptorUpdate failed: {status}, wrote {written} bytes")));
+            }
+            chunk.copy_from_slice(&output[..written]);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeAes128Ecb {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the handle from CCCryptorCreate and releases it once.
+        unsafe { CCCryptorRelease(self.0) };
+    }
+}
+
 pub fn sign_p256_sha256(key: &[u8; 97], msg: &[u8]) -> io::Result<Vec<u8>> {
     let key = load_key(key)?;
     unsafe {
@@ -248,8 +310,13 @@ impl ServerConfig {
         }
     }
 
+    pub(crate) fn engine(&self, strict: bool) -> io::Result<NativeEngine> {
+        NativeEngine::server(self.identity, strict)
+    }
+
     pub fn accept(&self, tcp: TcpStream) -> io::Result<ServerStream> {
-        Ok(ServerStream(SecureTransportStream::accept(tcp, self.identity)?))
+        let engine = crate::tls::TlsEngine::start(self.engine(false)?, None, false, None)?;
+        ServerStream::handshake(tcp, engine, None)
     }
 }
 
@@ -259,37 +326,4 @@ impl Drop for ServerConfig {
     }
 }
 
-pub struct ServerStream(SecureTransportStream);
-
-impl ServerStream {
-    pub fn tcp(&self) -> &TcpStream {
-        self.0.tcp()
-    }
-
-    /// Plaintext the TLS layer holds already: a read returns it without
-    /// waiting on the socket. A reader that waits for input on the socket
-    /// (`try_clone_tcp`, `peek`) reads first while this is above zero.
-    pub fn buffered(&self) -> usize {
-        self.0.buffered()
-    }
-
-    pub fn shutdown(&mut self) {
-        self.0.shutdown();
-    }
-}
-
-impl Read for ServerStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for ServerStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
+pub(crate) type ServerStream = crate::tls::engine::SocketPump;

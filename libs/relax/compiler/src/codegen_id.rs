@@ -17,7 +17,7 @@
 //! a store of another rustc was read with this one's type layouts, and a check panicked on garbage
 //! tree ids after a rustc upgrade on a Mac node (2026-10-31).
 //!
-//! Anything else linked into the binary (devhub, platform glue, Desk Link, the loader's UI) is
+//! Anything else linked into the binary (devhub, platform glue, the remote desktop link, the loader's UI) is
 //! not in it: changing it keeps every stored build. Provided crates (provided.rs) are keyed by
 //! their binding identity (provided.rs binding_identity; cache/items.rs apply_bound), their source
 //! is checked against the loader's at bind time. Stored
@@ -78,7 +78,8 @@ pub fn id() -> u128 {
         h.str("relax-codegen-id");
         h.str(&compiled_by());
         // a runtime Relax compiled emits another thread-local block fetch than a native one of the
-        // same source (relax_backend x64::TLS_TWO_LOAD): their stored code never mixes
+        // same source (relax_backend x64::TLS_TWO_LOAD, arm64::TLS_TWO_LOAD): their stored code
+        // never mixes
         h.u8(cfg!(relax) as u8);
         for (name, stamp) in CODEGEN_PARTS {
             h.str(name);

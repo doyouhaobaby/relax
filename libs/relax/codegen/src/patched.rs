@@ -257,9 +257,8 @@ fn record_exit(f: &mut Func, p: &mut Func, e: &ExitLayout, slot: u32, bases: &[V
         }
     }
     unpack.extend(e.remakes.iter().cloned());
-    let id = f.vreg(Cls::I);
     let results: Vec<_> = p.rets.iter().map(|&c| f.vreg(c)).collect();
-    pack.extend([Inst::Iconst(id, e.id.into()), Inst::Call(Callee::Part, vec![record, id], results.clone())]);
+    pack.push(Inst::Call(Callee::Part(Some(e.id)), vec![record], results.clone()));
     let block = |insts: Vec<Inst>, term| Block { pos: vec![pos; insts.len()], insts, term, term_pos: pos, count: f.blocks[e.block as usize].count };
     (block(pack, Term::Ret(results)), block(unpack, Term::Jump(target)))
 }
@@ -409,7 +408,7 @@ pub fn extract_patched_part(f: &mut Func, layout: SplitLayout, body: OutlineBody
     }
     for (bi, b) in f.blocks.iter().enumerate() {
         let inside = region.contains(&bi);
-        if b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Part, ..))) { return Err("nested part"); }
+        if b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Part(_), ..))) { return Err("nested part"); }
         if inside && b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Asm(_), ..))) { return Err("frame-sensitive assembly"); }
         if bi >= region.end && old_exit[bi - region.end] { continue; }
         if b.term.succs().any(|t| t as usize >= f.blocks.len() || region.contains(&(t as usize)) != inside) { return Err("edge across patched region"); }
@@ -616,31 +615,23 @@ pub fn verify_outline(f: &Func, out: &OutlinedPart) -> Result<(), &'static str> 
 
     let reach = relax_backend::regalloc::reachable(f);
     let addresses = slot_offsets(f);
-    let mut constants = vec![None; f.vregs.len()];
-    let mut defs = vec![0u8; f.vregs.len()];
     let mut pad = vec![false; f.blocks.len()];
-    for v in &f.params { defs[v.0 as usize] = 1; }
     for (_, b) in f.blocks.iter().enumerate().filter(|(b, _)| reach[*b]) {
         if let Term::Invoke(_, cleanup) = b.term { pad[cleanup as usize] = true; }
-        for i in &b.insts {
-            for_defs(i, |v| defs[v.0 as usize] = defs[v.0 as usize].saturating_add(1));
-            if let Inst::Iconst(d, k) = *i { constants[d.0 as usize] = u32::try_from(k).ok(); }
-        }
     }
     let mut record = None;
     let mut sites = vec![None; f.blocks.len()];
     for (bi, b) in f.blocks.iter().enumerate().filter(|(b, _)| reach[*b]) {
         for (ii, i) in b.insts.iter().enumerate() {
-            let Inst::Call(Callee::Part, args, results) = i else { continue };
-            let [a, id] = args[..] else { return Err("invalid part arguments") };
+            let Inst::Call(Callee::Part(id), args, results) = i else { continue };
+            let Some(id) = id else { return Err("part call without an exit ID") };
+            let [a] = args[..] else { return Err("invalid part arguments") };
             let ai = a.0 as usize;
-            let di = id.0 as usize;
             let Some((s, 0)) = addresses[ai] else { return Err("invalid record address"); };
-            if f.vregs[ai] != Cls::I || f.vregs[di] != Cls::I
+            if f.vregs[ai] != Cls::I
                 || !f.slots.get(s as usize).is_some_and(|s| s.align >= 16 && s.size >= out.record_size)
                 || record.replace(s).is_some_and(|old| old != s) { return Err("invalid record address"); }
-            let k = constants[di].filter(|_| defs[di] == 1).ok_or("nonconstant exit ID")?;
-            let index = out.exits.binary_search_by_key(&k, |e| e.id).map_err(|_| "unknown exit ID")?;
+            let index = out.exits.binary_search_by_key(id, |e| e.id).map_err(|_| "unknown exit ID")?;
             if sites[bi].replace(index).is_some() || pad[bi] || matches!(b.term, Term::Invoke(..)) ||
                 !results.iter().map(|v| f.vregs[v.0 as usize]).eq(f.rets.iter().copied()) ||
                 !relax_backend::tail::returns_results(f, bi, ii + 1, results) { return Err("part call must return exactly and have no pad"); }
@@ -671,7 +662,7 @@ pub fn verify_outline(f: &Func, out: &OutlinedPart) -> Result<(), &'static str> 
                 Inst::VStore(a, off, v) if carries(a) && f.vregs[v.0 as usize] == Cls::V128 => (a, off, 16),
                 Inst::Copy(d, a, n) if carries(d) && !carries(a) => (d, 0, n),
                 Inst::Mov(d, a) | Inst::IBinI(IOp::Add, IntTy { bits: 64, .. }, d, a, _) if carries(a) && carries(d) => continue,
-                Inst::Call(Callee::Part, ref args, _) if carries(args[0]) && !carries(args[1]) => continue,
+                Inst::Call(Callee::Part(Some(_)), ref args, _) if carries(args[0]) => continue,
                 Inst::SlotAddr(d, s) if s == record => {
                     if !carries(d) { return Err("ambiguous record address"); }
                     continue;
@@ -2587,6 +2578,7 @@ mod tests {
     const SIX_FLAG: Sym = Sym { id: 10, off: 16 };
     const WORD: Sym = Sym { id: 11, off: 24 };
     const M8: Mem = Mem::Int(8, false);
+    const M1: Mem = Mem::Int(1, false);
 
     /// `fn(x) -> x + 1 + 3` (positions in its own body), patchable by `flag`
     fn leaf(name: &str, flag: Option<Sym>) -> Func {
@@ -2693,8 +2685,14 @@ mod tests {
             f.dbg.push(DbgVar { ctx: 0, local: local as u32, loc, k: vec![] });
         }
         for _ in 0..5 { f.block(); }
+        // The tuple is constructed by cells, but copied whole both into the captured
+        // slot and out to the caller. Its exit field therefore spans all 16 bytes.
+        let (builder, tuple) = (f.slot(16, 8), f.slot(16, 8));
+        let (build, pair, flag) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
         f.blocks[0].insts = vec![Inst::SlotAddr(a, shared), Inst::Store(M8, a, 0, arm),
-            Inst::SlotAddr(private, cell), Inst::IBinI(IOp::Add, U64, cell_addr, private, off.into()), Inst::Store(M8, cell_addr, 0, arm)];
+            Inst::SlotAddr(private, cell), Inst::IBinI(IOp::Add, U64, cell_addr, private, off.into()), Inst::Store(M8, cell_addr, 0, arm),
+            Inst::SlotAddr(build, builder), Inst::SlotAddr(pair, tuple), Inst::ICmpI(Cond::Eq, false, flag, arm, 1),
+            Inst::Store(M8, build, 0, arm), Inst::Store(M1, build, 8, flag), Inst::Copy(pair, build, 16)];
         f.blocks[0].term = Term::Branch(arm, 1, 2);
         f.blocks[1].insts.push(Inst::ICmpI(Cond::Eq, false, test, arm, 1));
         f.blocks[1].term = Term::Branch(test, 3, 4);
@@ -2703,6 +2701,8 @@ mod tests {
                 Inst::Call(Callee::Fn(1), vec![arm], vec![v]), Inst::IBinI(IOp::Add, U64, v, v, 10 * b as i64),
                 if indirect { Inst::AtomicLoad(M8, AtomOrd::Relaxed, seen, cell_addr) } else { Inst::Load(M8, seen, cell_addr, 0) },
                 Inst::IBin(IOp::Add, U64, v, v, seen),
+                Inst::Copy(buf, pair, 16), Inst::Load(M8, seen, buf, 0), Inst::IBin(IOp::Add, U64, v, v, seen),
+                Inst::Load(M1, seen, buf, 8), Inst::IBin(IOp::Add, U64, v, v, seen),
                 Inst::Store(M8, a, 0, v), Inst::Load(M8, seen, alias, 0)];
             f.blocks[b].term = if indirect {
                 f.blocks[b].insts.extend([Inst::Store(M8, buf, 0, seen), Inst::Store(M8, buf, 8, arm)]);
@@ -2763,12 +2763,18 @@ mod tests {
             let off = if indirect { 8 } else { 0 };
             assert!(layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Fill { offset, kind, .. } if *kind == fill && *offset == off))));
             assert_eq!(indirect, layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Register { result_buffer: true, .. }))));
-            let split = compile(&f);
+            assert!(layout.exits.iter().all(|e| e.fields.iter().any(|(_, v)| matches!(v, RecordValue::Fill { kind: FillKind::Bytes(16), .. }))),
+                "each exit must carry the entire tuple");
+            let mut split = f.clone();
+            assert!(relax_backend::passes::sroa(&mut split), "scalarise the in-function split");
+            let split = compile(&split);
             let out = extract_patched_part(&mut f, layout, OutlineBody::Native).unwrap();
             assert!(matches!(out.part.dbg[0].loc, DbgLoc::Mem(v, 0) if v != DBG_NONE));
             assert!(matches!(out.part.dbg[1].loc, DbgLoc::Slot(s, o) if s != NONE && i64::from(o) == off));
             assert!(matches!(&out.part.dbg[2].loc, DbgLoc::Regs(v) if v[0] != DBG_NONE && v[0] != f.params[1]));
             assert_eq!(out.part.inl, f.inl);
+            assert!(relax_backend::passes::sroa(&mut f), "scalarise the outlined host");
+            verify_outline(&f, &out).expect("the scalarised tuple covers its exit field");
             let joined = target::join_part(compile(&f), compile(&out.part)).unwrap();
             for mut image in [split, joined] {
                 // Direct slot calls are PC-relative: put the replacement in the
@@ -2788,7 +2794,7 @@ mod tests {
                     flag.store(patched, Relaxed);
                     word.store(version, Relaxed);
                     for arm in 0..3u64 {
-                        let expected = 2 * arm + 10 * (arm + 2) + add;
+                        let expected = 3 * arm + u64::from(arm == 1) + 10 * (arm + 2) + add;
                         let mut buf = [u64::MAX; 2];
                         if indirect {
                             let call: relax_backend::host_fn_ptr!(fn(*mut u64, u64)) = unsafe { std::mem::transmute(code.ptr()) };
@@ -2815,7 +2821,7 @@ mod tests {
         let out = extract_patched_part(&mut f, layout, OutlineBody::Native).unwrap();
         verify_outline(&f, &out).unwrap();
         let mut sites: Vec<_> = f.blocks.iter().enumerate().filter_map(|(b, blk)| {
-            let Inst::Call(Callee::Part, _, _) = blk.insts.last()? else { return None };
+            let Inst::Call(Callee::Part(Some(_)), _, _) = blk.insts.last()? else { return None };
             assert!(matches!(blk.term, Term::Ret(_)));
             Some(b)
         }).collect();
@@ -2825,6 +2831,66 @@ mod tests {
         let i = f.blocks[site].insts.remove(write);
         assert_eq!(verify_outline(&f, &out), Err("missing record field"));
         f.blocks[site].insts.insert(write, i);
+        let Some(Inst::Call(Callee::Part(Some(id)), args, _)) = f.blocks[site].insts.last() else { unreachable!() };
+        let record = args[0];
+        let exit = out.exits.iter().find(|e| e.id == *id).unwrap();
+        let cell = exit.fields.iter().find(|(_, v)| matches!(v, RecordValue::Fill { kind: FillKind::Cell(M8), .. })).unwrap().0;
+        let store = f.blocks[site].insts.iter().position(|i| matches!(*i, Inst::Store(M8, a, off, _) if a == record && off == cell as i32)).unwrap();
+        let Inst::Store(_, a, off, v) = f.blocks[site].insts[store] else { unreachable!() };
+        f.blocks[site].insts[store] = Inst::Store(M1, a, off, v);
+        assert_eq!(verify_outline(&f, &out), Err("missing record field"), "narrowing a word Cell must fail coverage");
+        f.blocks[site].insts[store] = Inst::Store(M8, a, off, v);
+
+        let dst = f.blocks[site].insts.iter().find_map(|i| match *i { Inst::Copy(d, _, 16) => Some(d), _ => None }).unwrap();
+        let build = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| match *i {
+            Inst::Store(M1, a, 8, _) => Some(a), _ => None,
+        }).unwrap();
+        // Keep the captured Bytes(16) layout frozen, as it is during O3. The same
+        // whole-slot copy can carry a tuple, just a variant tag, or no writes at all.
+        for defined in [9, 8, 0] {
+            let mut host = f.clone();
+            for b in &mut host.blocks {
+                for k in (0..b.insts.len()).rev() {
+                    if matches!(b.insts[k], Inst::Store(_, a, off, _) if a == build && off >= defined) {
+                        b.insts.remove(k);
+                        b.pos.remove(k);
+                    }
+                }
+            }
+            assert!(relax_backend::passes::sroa(&mut host), "promote the {defined}-byte source");
+            assert!(!host.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Copy(..))), "a whole copy survived promotion");
+            verify_outline(&host, &out).expect("every byte of the frozen field should be written");
+            let insts = &host.blocks[site].insts;
+            let zeros: Vec<_> = insts.iter().filter_map(|i| match *i { Inst::Iconst(v, 0) => Some(v), _ => None }).collect();
+            assert_eq!(zeros.len(), 1, "one exit-local zero per copy with gaps");
+            let mut filled = Vec::new();
+            for i in insts {
+                if let Inst::Store(m, a, off, v) = *i {
+                    if a == dst && (0..16).contains(&off) && v == zeros[0] {
+                        filled.extend(off..off + relax_backend::passes::mem_size(m));
+                    }
+                }
+            }
+            assert_eq!(filled, (defined..16).collect::<Vec<_>>(), "only bytes outside the {defined}-byte value are zeroed");
+            if defined == 9 {
+                for off in [8, 9] {
+                    let k = host.blocks[site].insts.iter().position(|i| matches!(*i, Inst::Store(M1, a, o, _) if a == dst && o == off)).unwrap();
+                    let i = host.blocks[site].insts.remove(k);
+                    let p = host.blocks[site].pos.remove(k);
+                    assert_eq!(verify_outline(&host, &out), Err("missing record field"), "the store at {off} is required");
+                    host.blocks[site].insts.insert(k, i);
+                    host.blocks[site].pos.insert(k, p);
+                }
+                let buf = host.params[0];
+                let writes: Vec<_> = host.blocks.iter().filter_map(|b| {
+                    let cells: Vec<_> = b.insts.iter().filter_map(|i| match *i {
+                        Inst::Store(m, a, off, _) if a == buf => Some((off, m)), _ => None,
+                    }).collect();
+                    (!cells.is_empty()).then_some(cells)
+                }).collect();
+                assert_eq!(writes, vec![vec![(0, M8), (8, M1)]; 3], "each ordinary destination gets just the two data stores");
+            }
+        }
         let Inst::SlotAddr(_, slot) = f.blocks[site].insts[0] else { panic!("record address") };
         let (a, src, vector) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::V128));
         let data = f.slot(16, 16);
@@ -2871,7 +2937,7 @@ mod tests {
         out.part.blocks[site as usize].term = Term::Jump(normal);
         assert_eq!(verify_outline(&f, &out), Err("missing part unwind edge"));
         out.part.blocks[site as usize].term = Term::Invoke(normal, pad);
-        let exit = f.blocks.iter().position(|b| matches!(b.insts.last(), Some(Inst::Call(Callee::Part, ..)))).unwrap();
+        let exit = f.blocks.iter().position(|b| matches!(b.insts.last(), Some(Inst::Call(Callee::Part(Some(_)), ..)))).unwrap();
         let normal = f.block();
         f.blocks[normal as usize].term = f.blocks[exit].term.clone();
         f.blocks[exit].term = Term::Invoke(normal, normal);
