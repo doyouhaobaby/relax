@@ -6000,7 +6000,11 @@ impl<'a> Fcx<'a> {
                     return arr;
                 }
                 let usize_ = self.tcx.tys.usize_;
-                self.check_expr(*n, Some(usize_));
+                // the count is a body of type `usize` (rustc type-checks it as an anonymous constant
+                // and coerces its value to that type): `16 * 16 * 4` is a usize product, its literals
+                // too, though a binary operator's left operand takes no expectation
+                let tn = self.check_expr(*n, Some(usize_));
+                self.coerce_or_unify(tn, usize_, Some(*n), self.ast().expr(*n).lo);
                 // hir_ty_lowering/mod.rs:2390: retain the repeat body's identity;
                 // fulfillment evaluates it through the same query as array types.
                 let lowered = self.tcx.lower_const_arg(self.prog, self.file, &self.env, *n, usize_);

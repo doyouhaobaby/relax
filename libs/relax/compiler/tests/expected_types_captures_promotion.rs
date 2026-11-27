@@ -104,6 +104,20 @@ fn try_operands_of_operators_keep_their_reference() {
     println!("| {:?} {:?} {:?} {:?} {:?}", flipped(&[4]), flipped(&[]), weighted(&[1.0, 2.0], &[0.5, 0.25]), weighted(&[1.0], &[0.5, 0.25]), solved(&[1.0, 2.0], &[3.0, 4.0]));
     println!("| {:?} {:?} {} {} {} {}", shifted(&[3]), sliced(&[[1, 2]]), matched(&[4]), matched(&[]), chosen(&[3, 5], true), chosen(&[3, 5], false));
     println!("| {} {} {:?}", shifted_arm(&[3, 5], false), blocked(&[3]), scaled_by_a_closure_parameter(-2.0));
+    println!("| {:?}", literal_left_operands(3.0, 5, 0x1234));
+}
+
+/// A literal left operand of a built-in operator takes the right operand's type, and a repeat
+/// count's literals are usize, though the left operand gets no expected type (rustc op.rs
+/// enforce_builtin_binop_types; a repeat count is a usize body).
+fn literal_left_operands(x: f32, n: u32, b: u16) -> (f32, u64, u16, usize, usize, u8) {
+    let scaled: f32 = 2.0 * x;
+    let bit: u64 = 1 << n;
+    let low: u16 = 0xff & b;
+    let codes = [0i32; 32 + 1];
+    let image = [127u8; 16 * 16 * 4];
+    let small: u8 = (200 * 2u32) as u8;
+    (scaled, bit, low, codes.len(), image.len(), small)
 }
 
 #[derive(Debug, Clone, Copy)]
