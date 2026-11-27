@@ -610,6 +610,11 @@ pub struct Program {
     pub glob_amb_cache: crate::conc::MemoMap<(u32, Sym, bool, bool), u8>,
     /// precise lookups of a name in a glob's module (what `glob_ambiguity` compares) once imports are resolved
     pub glob_prec_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
+    /// The module bindings `define` replaced with another item of the same name in the same
+    /// namespace (a duplicate, E0428), by the def that replaced them: (module, type namespace,
+    /// name, the def it was). When that def is unbound (a refused live edit's added item), the
+    /// live def it displaced has the name again (`unbind_defs`).
+    displaced: HashMap<DefId, Vec<(u32, bool, Sym, DefId)>>,
     /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
     pub own_crates: Vec<bool>,
     /// rustc's glob ambiguities in the checked crates (the import replay, program/rsim.rs):
@@ -977,6 +982,7 @@ impl Program {
             glob_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             glob_amb_cache: Default::default(),
             glob_prec_cache: Default::default(),
+            displaced: Default::default(),
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_own: Vec::new(),
@@ -2809,6 +2815,22 @@ impl Program {
                 if let Some(items) = self.traits.get_mut(ti) { items.retain(|x| *x != d); }
             }
         }
+        // a def that took a live def's name in its module (a duplicate, E0428: a refused live
+        // edit added it, and its define replaced the binding) gives the name back: without it the
+        // running item's name bound nothing after the refusal, and the code that names it kept
+        // calling the code of before every later patch of it
+        if !self.displaced.is_empty() {
+            for &d in defs {
+                let Some(was) = self.displaced.remove(&d) else { continue };
+                for (module, ns_type, name, w) in was {
+                    if defs.contains(&w) || !self.is_current_version(self.defs[w.0 as usize].file) { continue; }
+                    let m = &self.mods[module as usize];
+                    if (if ns_type { &m.types } else { &m.values }).get(&name).is_none() {
+                        self.define(module, ns_type, name, w);
+                    }
+                }
+            }
+        }
         self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
@@ -3105,10 +3127,9 @@ impl Program {
             self.scope_cache.clear();
         }
         let m = &mut self.mods[module as usize];
-        if ns_type {
-            m.types.insert(name, d);
-        } else {
-            m.values.insert(name, d);
+        let was = if ns_type { m.types.insert(name, d) } else { m.values.insert(name, d) };
+        if let Some(was) = was.filter(|&w| w != d) {
+            self.displaced.entry(d).or_default().push((module, ns_type, name, was));
         }
     }
 
