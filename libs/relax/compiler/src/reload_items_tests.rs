@@ -291,6 +291,15 @@ fn edits_of_items_apply_live() {
             // a `Drop` impl removed: its type is no longer dropped by it
             patch(&mut *edit, "lib.rs", &[("impl Drop for Noisy {\n    fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }\n}\n", "")]);
             assert_eq!(call("drops"), 1, "no more drop");
+            // a static keeps its running value through patches of the code that reads it, of its
+            // initializer's text and of the code that writes it (a live patch seemed to empty an
+            // app's static once, 11-22; none of these reproduces it)
+            patch(&mut *edit, "lib.rs", &[("    *out = DROPS.load(Ordering::Relaxed);", "    *out = DROPS.load(Ordering::Relaxed) + 100;")]);
+            assert_eq!(call("drops"), 101, "the patched reader reads the running value");
+            patch(&mut *edit, "lib.rs", &[("AtomicU64::new(0);", "AtomicU64::new(/* drops */ 0);")]);
+            assert_eq!(call("drops"), 101, "the respelled initializer does not run again");
+            patch(&mut *edit, "lib.rs", &[("pub struct Noisy;\n", "pub struct Noisy;\nimpl Drop for Noisy {\n    fn drop(&mut self) { DROPS.fetch_add(10, Ordering::Relaxed); }\n}\n")]);
+            assert_eq!(call("drops"), 111, "the patched writer adds onto the running value");
             // a `let` with a statement attribute in a match arm's block
             assert_eq!(call("cfg_let"), 1);
             patch(&mut *edit, "lib.rs", &[("            let mut v = vec![1u64];\n            #[cfg(feature = \"absent\")]\n            v.push(2);\n            v.len() as u64", "            let v = vec![1u64];\n            // a crate without the feature keeps the vector\n            #[cfg(feature = \"absent\")]\n            let v = { let mut v = v; v.push(2); v };\n            v.len() as u64 + 10")]);
