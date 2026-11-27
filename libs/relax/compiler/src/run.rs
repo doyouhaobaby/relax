@@ -1494,7 +1494,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if harness || plain_test {
             // a run that hangs answers `devhub inspect <node>/<pid> why-hung`
             crate::inspect::start_for_test(&package);
-        } else if !hosted {
+        } else if !hosted && crate::inspect::remote_request() != makepad_remote::ask::Request::Off {
+            // (as the app built natively: off unless `--remote`, MAKEPAD_REMOTE or the per-user
+            // setting asks; a refused form is the app's to say, at its start)
             crate::inspect::start(&package);
         }
     }

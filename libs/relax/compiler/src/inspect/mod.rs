@@ -145,6 +145,14 @@ pub fn say_teardown_threads(domain: u32, pending: &[(String, u64)]) {
     for note in partial { eprintln!("relax domain: {domain}: {note}"); }
 }
 
+/// What the run's command line, `MAKEPAD_REMOTE` and the per-user setting ask of its endpoint: the
+/// one rule a native build's app reads too ([`makepad_remote::ask`]), so `makepad run` opens it
+/// exactly when the same app built natively would.
+pub fn remote_request() -> makepad_remote::ask::Request {
+    let args = crate::os::proc::args_bytes().into_iter().map(|a| String::from_utf8_lossy(&a).into_owned());
+    makepad_remote::ask::request_for(args, std::env::var("MAKEPAD_REMOTE").ok().as_deref())
+}
+
 /// Starts the inspect thread for program `app` (once per process; RELAX_INSPECT=0: off).
 pub fn start(app: &str) {
     if std::env::var("RELAX_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
