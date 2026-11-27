@@ -28998,6 +28998,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_register_inspect" => Some(crate::inspect::relax_register_inspect as *const () as usize),
         b"relax_inspect_asker" => Some(crate::inspect::relax_inspect_asker as *const () as usize),
         b"relax_register_remote_service" => Some(crate::inspect::relax_register_remote_service as *const () as usize),
+        b"relax_register_remote_service_data" => Some(crate::inspect::relax_register_remote_service_data as *const () as usize),
         b"relax_gpu_span" => Some(crate::inspect::timeline::relax_gpu_span as *const () as usize),
         b"relax_flight_mark" => Some(crate::inspect::flightrec::relax_flight_mark as *const () as usize),
         b"relax_flight_input" => Some(crate::inspect::flightrec::relax_flight_input as *const () as usize),
