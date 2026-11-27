@@ -795,12 +795,17 @@ impl ProgramAllocatorCtx {
         let ctx = unsafe { &*(ctx as *const Self) };
         ctx.checked_alloc(size, align, zeroed, |p, valid| {
             if !valid {
-                use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "relax: the program's #[global_allocator] `{}` returned {:#x} ({size} bytes, align {align}), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends", ctx.path, p as usize);
-                crate::os::fault::die_by(6);
+                unsafe { Self::outside(std::ptr::from_ref(ctx) as usize, p, size, align) };
             }
             unsafe { out.write(p) };
         })
+    }
+
+    unsafe extern "C" fn outside(ctx: usize, p: *mut u8, size: usize, align: usize) -> ! {
+        let ctx = unsafe { &*(ctx as *const Self) };
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "relax: the program's #[global_allocator] `{}` returned {:#x} ({size} bytes, align {align}), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends", ctx.path, p as usize);
+        crate::os::fault::die_by(6)
     }
 
     unsafe extern "C" fn dealloc(ctx: usize, p: *mut u8, size: usize, align: usize) -> bool {
@@ -845,6 +850,7 @@ impl ProgramHeap {
             ctx: std::ptr::from_ref(ctx) as usize,
             alloc: ProgramAllocatorCtx::alloc,
             dealloc: ProgramAllocatorCtx::dealloc,
+            outside: ProgramAllocatorCtx::outside,
         });
         let heap = crate::zone_alloc::kept_with(|| unsafe { DomainHeap::new(program, (base as usize, BLOCK_SIZE)) })?;
         if let Some(ctx) = &allocator {
@@ -1840,8 +1846,9 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         let allocator = ProgramAllocatorCtx::resolve(u)?;
         // Only a run op (`#[relax_api(run)]`) allocates in the program's heap, so only a program
         // that binds a crate with one is probed, or ever routes to its allocator. Any other
-        // program, with whatever allocator, runs as it does without provided crates.
-        let probe = u.provided.iter().any(|(_, p)| p.runs_in_program());
+        // program, with whatever allocator, runs as it does without provided crates, and its
+        // allocator shims check nothing (Unit::routes_allocator).
+        let probe = u.routes_allocator;
         Ok::<_, String>((target, arg, create(u), allocator, probe))
     });
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} main prepared at t={:.1} ms", crate::clock::ms_since_start()); }

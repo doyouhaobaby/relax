@@ -90,6 +90,10 @@ fn try_launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, pro
     let loading = Loading(id);
     let base = create(u);
     let allocator = ProgramAllocatorCtx::resolve(u).expect("resolve the fixture allocator");
+    // A fixture's #[global_allocator] becomes its domain's PA with no provided crate bound (the
+    // test sets the root crate after fixture_of, so Unit::new could not see it): its shims check,
+    // as a routing program's do, before the program's code is made.
+    u.routes_allocator = allocator.is_some();
     let heap = ProgramHeap::new(base, allocator).unwrap();
     if probe {
         // The makepad run host installs its program unit before starting an app domain.
@@ -1612,6 +1616,65 @@ fn a_run_ends_in_the_program_allocator_of_a_locked_op() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// The header allocator from the locked-op fixture receives only its own layouts. A kept
+/// buffer of the same layout from a native op must go back through the loader's Counting.
+#[test]
+fn jit_frees_a_counted_loader_buffer() {
+    const CHILD: &str = "RELAX_TEST_JIT_LOADER_BUFFER";
+    let test = "domain::teardown_tests::jit_frees_a_counted_loader_buffer";
+    let Ok(report) = std::env::var(CHILD) else {
+        for report in ["0", "1"] {
+            let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"]).env(CHILD, report).env("RELAX_MEM_REPORT", report));
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed"),
+                "JIT free of a loader buffer passes with accounting={report}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        return;
+    };
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicI64;
+    static BEFORE: AtomicI64 = AtomicI64::new(0);
+    static AFTER: AtomicI64 = AtomicI64::new(-1);
+    extern "C" fn buffer() -> *mut u8 {
+        let _kept = crate::zone_alloc::kept();
+        BEFORE.store(crate::memstat::live_total(), Ordering::Relaxed);
+        unsafe { crate::memstat::Counting.alloc(Layout::from_size_align(73, 16).unwrap()) }
+    }
+    extern "C" fn released() {
+        AFTER.store(crate::memstat::live_total(), Ordering::Relaxed);
+    }
+    let source = String::from(PROGRAM_ALLOCATOR) + r#"
+        fn crossing(p: *mut u64) {
+            FLAGS.store(p as u64, Ordering::SeqCst);
+            let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+            let buffer: extern "C" fn() -> *mut u8 = unsafe { std::mem::transmute(flags[0].load(Ordering::SeqCst) as usize) };
+            let released: extern "C" fn() = unsafe { std::mem::transmute(flags[1].load(Ordering::SeqCst) as usize) };
+            let layout = Layout::from_size_align(73, 16).unwrap();
+            // Warm the lazy free path before comparing the process-wide accounting total.
+            for _ in 0..2 {
+                let b = buffer();
+                assert!(!b.is_null());
+                unsafe { std::alloc::dealloc(b, layout); }
+                released();
+            }
+        }
+    "#;
+    assert_eq!(crate::memstat::enabled(), report == "1", "the child uses the requested accounting mode");
+    let (mut u, entry, root) = fixture_of(&source, "crossing");
+    let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "crossing").unwrap().krate;
+    crate::layout::set_root_crate(krate);
+    u.tier1 = None;
+    let flags = [AtomicU64::new(buffer as *const () as u64), AtomicU64::new(released as *const () as u64),
+        AtomicU64::new(0), AtomicU64::new(0)];
+    let (id, _, main) = try_launch_with(&mut u, entry, None, flags.as_ptr() as u64, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "the program exits normally after freeing the loader buffer");
+    assert_eq!(flags[2].load(Ordering::SeqCst), 0, "freeing a loader buffer did not call the header allocator's dealloc");
+    assert_eq!(AFTER.load(Ordering::Relaxed), BEFORE.load(Ordering::Relaxed), "JIT dealloc returns counted live bytes to their pre-op total");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // The same native op as the locked-op fixture, with a PA that can serve a static page,
 // decline large requests, or take a particular layout from the real process malloc.
 #[test]
@@ -1628,6 +1691,11 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
     }
     static BAD_SIZE: AtomicUsize = AtomicUsize::new(0);
     static OUTSIDE: AtomicUsize = AtomicUsize::new(0);
+    static OUTSIDE_FREES: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn free_outside(p: *mut u8) {
+        OUTSIDE_FREES.fetch_add(1, Ordering::Relaxed);
+        unsafe { free(p.cast()) };
+    }
     static SAW_STATIC: AtomicUsize = AtomicUsize::new(0);
     extern "C" fn outside(size: usize) -> *mut u8 {
         if size != BAD_SIZE.load(Ordering::Acquire) { return std::ptr::null_mut(); }
@@ -1644,6 +1712,8 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
             if !p.is_null() { RelaxAlloc.dealloc(p, layout); }
         }
     }
+    let late = std::env::var(LATE).ok();
+    let refused = std::env::var_os(REFUSED).is_some();
     let source = r#"
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1656,6 +1726,14 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
         static ALLOCATOR: PageAllocator = PageAllocator;
         unsafe impl GlobalAlloc for PageAllocator {
             unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                if NESTED && l.size() == 73 {
+                    // A loader allocation asks its PA for 73 bytes. Its own bookkeeping grows
+                    // through JIT realloc, which must check the new 64-byte allocation.
+                    let mut book = Vec::<u64>::with_capacity(4);
+                    book.push(73);
+                    book.reserve_exact(7);
+                    std::hint::black_box(book);
+                }
                 let outside: extern "C" fn(usize) -> *mut u8 = std::mem::transmute(OUTSIDE_FNusize);
                 let p = outside(l.size());
                 if !p.is_null() { return p; }
@@ -1679,11 +1757,19 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
             }
         }
         fn fixture(arg: usize) {
+            SCENARIO
             let op: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(arg) };
             op(page(), PROBED.load(Ordering::SeqCst));
         }
     "#.replace("OUTSIDE_FN", &(outside as *const () as usize).to_string())
-        .replace("FREE_FN", &(free as *const () as usize).to_string())
+        .replace("FREE_FN", &(free_outside as *const () as usize).to_string())
+        .replace("NESTED", if late.as_deref() == Some("nested") { "true" } else { "false" })
+        .replace("SCENARIO", match late.as_deref() {
+            Some("jit") => "unsafe { let l = Layout::from_size_align_unchecked(96, 8); std::hint::black_box(std::alloc::alloc(l)); }",
+            Some("resize") => "unsafe { let l = Layout::from_size_align_unchecked(32, 8); let p = std::alloc::alloc(l); std::hint::black_box(std::alloc::realloc(p, l, 96)); }",
+            _ if refused => "unsafe { let l = Layout::from_size_align_unchecked(16, 8); let p = std::alloc::alloc(l); assert!(!p.is_null()); std::alloc::dealloc(p, l); }",
+            _ => "",
+        })
         .replace("OUTSIDE_ADDR", &(std::ptr::from_ref(&OUTSIDE) as usize).to_string());
     let (mut u, entry, root) = fixture_of(&source, "fixture");
     let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
@@ -1691,18 +1777,19 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
     u.tier1 = None;
     let path = u.prog.def_path(u.global_allocator_static().expect("the fixture binds its PA"));
     let arg = op as *const () as u64;
-    if std::env::var_os(LATE).is_some() {
-        BAD_SIZE.store(73, Ordering::Release);
+    if let Some(case) = &late {
+        BAD_SIZE.store(match case.as_str() { "op" => 73, "nested" => 64, "jit" | "resize" => 96, _ => unreachable!() }, Ordering::Release);
         let (_, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
         main.join().unwrap();
         panic!("a late outside allocation returned to the op");
     }
-    if std::env::var_os(REFUSED).is_some() {
+    if refused {
         BAD_SIZE.store(16, Ordering::Release);
         let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).expect("a refused probe does not stop the run");
         main.join().unwrap();
         wait_thread_done(id);
         assert_ne!(OUTSIDE.load(Ordering::Acquire), 0, "the probe exercised the process malloc");
+        assert_eq!(OUTSIDE_FREES.load(Ordering::Relaxed), 2, "the PA freed its outside probe block and its subsequent outside JIT allocation");
         assert_eq!(state(id), Some(DomainState::Exited(0)), "the run goes on after a refused probe");
         assert_eq!(SAW_STATIC.load(Ordering::Acquire), 0, "after a refused probe the op allocates in the domain's heap, not through the allocator");
         std::fs::remove_dir_all(root).unwrap();
@@ -1726,17 +1813,19 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
     let suffix = " for a 16-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it";
     assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
         .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "a refused probe says so in one line, with the address: {err}");
-    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"]).env(LATE, "1"));
-    let err = String::from_utf8_lossy(&out.stderr);
-    #[cfg(unix)]
-    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(6), "late refusal aborts the child: {err}");
-    #[cfg(not(unix))]
-    assert!(!out.status.success(), "late refusal ends the child abnormally: {err}");
-    let prefix = format!("relax: the program's #[global_allocator] `{path}` returned 0x");
-    let suffix = " (73 bytes, align 8), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends";
-    assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
-        .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "late refusal prints the address, op layout and allocator diagnostic: {err}");
+    assert!(!err.contains("the process ends"), "routing-off allocations continue without the late diagnostic: {err}");
+    for (case, size) in [("op", 73), ("jit", 96), ("resize", 96), ("nested", 64)] {
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"]).env(LATE, case));
+        let err = String::from_utf8_lossy(&out.stderr);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(6), "{case}: an outside PA result aborts the child: {err}");
+        #[cfg(not(unix))]
+        assert!(!out.status.success(), "{case}: an outside PA result ends the child abnormally: {err}");
+        let suffix = format!(" ({size} bytes, align 8), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends");
+        assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix.as_str()))
+            .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "{case}: late refusal names the allocator, address and layout: {err}");
+    }
 }
 
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.

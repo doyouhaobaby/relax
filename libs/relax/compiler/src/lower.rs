@@ -13147,13 +13147,22 @@ impl<'a> Lcx<'a> {
 
     /// The allocator shim (rustc_codegen_ssa base.rs allocator_shim / codegen_allocator: `__rust_<op>`
     /// calls `__rg_<op>` of the program's `#[global_allocator]`, else the default `__rdl_<op>`):
-    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args).
+    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args). A program whose
+    /// domains route to its allocator calls the checked `__rg_checked_<op>` instead, except for
+    /// the loader's own `loader_<op>` calls.
     fn allocator_shim(&mut self, op: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
         let mut args = vals.to_vec();
+        // the loader's own calls (rust_loader_*) are never checked; the program's are when its
+        // domains route to its allocator (Unit::routes_allocator)
+        let (op, checked) = match op.strip_prefix("loader_") {
+            Some(op) => (op, false),
+            None => (op, self.u.routes_allocator),
+        };
         let id = match self.u.global_allocator() {
             Some((s, a)) => {
-                let Some(shim) = self.u.core_path(&["heap", &format!("__rg_{op}")]) else {
-                    self.err(self.pos, format!("core has no heap::__rg_{op} (the global allocator shim)"));
+                let name = if checked { format!("__rg_checked_{op}") } else { format!("__rg_{op}") };
+                let Some(shim) = self.u.core_path(&["heap", &name]) else {
+                    self.err(self.pos, format!("core has no heap::{name} (the global allocator shim)"));
                     return self.dummy_val(t);
                 };
                 // the static as a place, as a path to it lowers (lower_def_value)
@@ -13200,7 +13209,7 @@ impl<'a> Lcx<'a> {
         if let Some(v) = self.mem_intrinsic(&name, gargs, vals, t) {
             return Some(v);
         }
-        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc")) {
+        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc" | "loader_alloc" | "loader_alloc_zeroed" | "loader_dealloc")) {
             return Some(self.allocator_shim(op, vals, t));
         }
         let mut a = Vec::new();

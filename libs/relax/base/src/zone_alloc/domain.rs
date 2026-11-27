@@ -10,13 +10,22 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The program's Rust allocator, called by the loader in the owning domain's scope.
-/// Each entry returns false when the program's code has ended and the call did not run.
+/// The alloc and dealloc entries return false when the program's code has ended and the call did not run.
 /// Otherwise alloc writes the program's result to `out`, including null on refusal.
 #[derive(Clone, Copy)]
 pub struct ProgramAllocator {
     pub ctx: usize,
     pub alloc: unsafe extern "C" fn(ctx: usize, size: usize, align: usize, zeroed: bool, out: *mut *mut u8) -> bool,
     pub dealloc: unsafe extern "C" fn(ctx: usize, p: *mut u8, size: usize, align: usize) -> bool,
+    pub outside: unsafe extern "C" fn(ctx: usize, p: *mut u8, size: usize, align: usize) -> !,
+}
+
+// A region's routing pointer addresses the first field. It also identifies the heap
+// without a registry lookup, including when this thread is in a later region.
+#[repr(C)]
+struct RegisteredAllocator {
+    entries: ProgramAllocator,
+    heap: *const Heap,
 }
 
 pub struct DomainHeap {
@@ -25,7 +34,7 @@ pub struct DomainHeap {
 /// Backing storage kept alive by the domain and by outstanding owner leases.
 pub struct Heap {
     arena: Box<Arena>,
-    program: Option<ProgramAllocator>,
+    program: Option<RegisteredAllocator>,
     statics: (usize, usize),
     next: UnsafeCell<*mut Heap>,
 }
@@ -87,9 +96,9 @@ impl DomainHeap {
     pub unsafe fn new(program: Option<ProgramAllocator>, statics: (usize, usize)) -> Option<Box<Self>> {
         let arena = Arena::create()?;
         let heap = Box::new(Self {
-            inner: Arc::new(Heap {
+            inner: Arc::new_cyclic(|owner| Heap {
                 arena,
-                program,
+                program: program.map(|entries| RegisteredAllocator { entries, heap: owner.as_ptr() }),
                 statics,
                 next: UnsafeCell::new(std::ptr::null_mut()),
             }),
@@ -97,7 +106,7 @@ impl DomainHeap {
         let _registry = Registry::for_create();
         if let Some(pa) = &heap.inner.program {
             // The Arc keeps the entries at this address for the lifetime of every region.
-            heap.inner.arena.program.store(std::ptr::from_ref(pa).cast_mut(), Ordering::Relaxed);
+            heap.inner.arena.program.store(std::ptr::from_ref(pa).cast_mut().cast(), Ordering::Relaxed);
             if statics.1 != 0 {
                 STATICS_LOW.fetch_min(statics.0, Ordering::Release);
                 STATICS_HIGH.fetch_max(statics.0 + statics.1, Ordering::Release);
@@ -536,8 +545,32 @@ pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut
 /// The loader consults these entries only for run allocations and Rust blocks owned by this
 /// heap. The JIT's System and C allocation ABIs use the underlying regions directly.
 #[inline]
-fn program_allocator(arena: &Arena) -> Option<&ProgramAllocator> {
-    unsafe { arena.program.load(Ordering::Relaxed).as_ref() }
+fn program_allocator(arena: &Arena) -> Option<&RegisteredAllocator> {
+    unsafe { arena.program.load(Ordering::Acquire).cast::<RegisteredAllocator>().as_ref() }
+}
+
+/// A JIT shim checks only while its current heap routes through a program allocator.
+pub unsafe extern "C" fn program_owns(p: *mut u8) -> bool {
+    let Some(pa) = compiler::domain_here().and_then(program_allocator) else { return true };
+    heap_owns(pa.heap, p)
+}
+
+/// Called after program_owns rejected a non-null result on this thread.
+pub unsafe extern "C" fn program_outside(p: *mut u8, size: usize, align: usize) -> ! {
+    if let Some(pa) = compiler::domain_here().and_then(program_allocator) {
+        (pa.entries.outside)(pa.entries.ctx, p, size, align)
+    }
+    std::process::abort()
+}
+
+/// A block the program's allocator cannot own is the loader's (a host op's buffer).
+/// The loader frees it as its own code would drop it, including its accounting header.
+pub unsafe extern "C" fn loader_dealloc(p: *mut u8, size: usize, align: usize) {
+    crate::memstat::Counting.dealloc(p, Layout::from_size_align_unchecked(size, align));
+}
+
+pub unsafe extern "C" fn loader_realloc(p: *mut u8, old: usize, align: usize, new: usize) -> *mut u8 {
+    crate::memstat::Counting.realloc(p, Layout::from_size_align_unchecked(old, align), new)
 }
 
 #[inline]
@@ -552,6 +585,7 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> Option<*mut u8> {
     if !relax_session::phase::in_run() { return None; }
     let arena = compiler::domain_here()?;
     if let Some(pa) = program_allocator(arena) {
+        let pa = &pa.entries;
         if super::arenas_closed() { return Some(child_alloc(l, zeroed)); }
         let mut out = std::ptr::null_mut();
         if (pa.alloc)(pa.ctx, l.size(), l.align(), zeroed, &mut out) { return Some(out); }
@@ -564,6 +598,7 @@ pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> Option<*mut u8> {
 #[inline]
 unsafe fn program_free_layout(arena: &Arena, p: *mut u8, l: Layout) -> bool {
     let Some(pa) = program_allocator(arena) else { return false };
+    let pa = &pa.entries;
     if !super::arenas_closed() {
         // After code end the block stays live until whole-heap release.
         (pa.dealloc)(pa.ctx, p, l.size(), l.align());
@@ -625,6 +660,7 @@ unsafe extern "C" fn dealloc_owned(p: *mut u8, size: usize, align: usize) {
 unsafe fn resize_layout<const LOADER: bool>(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
     if LOADER {
         if let Some(pa) = program_allocator(a) {
+            let pa = &pa.entries;
             let new = Layout::from_size_align_unchecked(size, l.align());
             let mut q = std::ptr::null_mut();
             // GlobalAlloc permits the loader to resize by alloc, copy, free. It never calls the
@@ -798,6 +834,10 @@ pub unsafe extern "C" fn program_pressure_relief(zone: *const u8, goal: usize) -
 pub fn symbol(name: &[u8]) -> Option<usize> {
     compiler::bind_program_tls();
     Some(match name {
+        b"relax_program_owns" => program_owns as *const () as usize,
+        b"relax_program_outside" => program_outside as *const () as usize,
+        b"relax_loader_dealloc" => loader_dealloc as *const () as usize,
+        b"relax_loader_realloc" => loader_realloc as *const () as usize,
         b"relax_alloc" => program_alloc as *const () as usize,
         b"relax_alloc_zeroed" => program_alloc_zeroed as *const () as usize,
         b"relax_dealloc" => program_dealloc as *const () as usize,

@@ -1223,6 +1223,7 @@ mod routing_tests {
             pa.retire(p, size);
             true
         }
+        unsafe extern "C" fn outside(_: usize, _: *mut u8, _: usize, _: usize) -> ! { std::process::abort() }
         let _s = serial();
         assert!(compiler_arena_enabled(), "run routing is enabled for the test");
         domain::symbol(b"relax_alloc"); // Bind the raw program ABI's fast TLS, as the loader does.
@@ -1240,13 +1241,24 @@ mod routing_tests {
             assert!(!base.is_null(), "System provides the fixture's static block");
             let pa = Probe { base: base as usize, end: base.add(storage.size()) as usize, next: AtomicUsize::new(base as usize),
                 allocs: 0.into(), frees: 0.into(), allocs_at_last_free: 0.into(), refuse: false.into(), ended: false.into() };
-            let entries = domain::ProgramAllocator { ctx: std::ptr::from_ref(&pa) as usize, alloc, dealloc };
+            let entries = domain::ProgramAllocator { ctx: std::ptr::from_ref(&pa) as usize, alloc, dealloc, outside };
             let heap = domain::DomainHeap::new(Some(entries), (pa.base, storage.size())).unwrap();
             assert!(domain::heap_owns(heap.as_ptr(), base), "the static block belongs to its heap");
             assert!(!domain::heap_owns(heap.as_ptr(), kept), "a loader block outside both ranges is rejected");
             assert!(!domain::system_owned(base), "the first static address belongs to the registered PA heap");
             let outer = domain::current();
+            domain::restore(std::ptr::null());
+            assert!(domain::program_owns(kept), "outside a domain the program allocator may free any block");
             domain::enter(&*heap);
+            assert!(domain::program_owns(base), "a routed program may free its static block");
+            assert!(!domain::program_owns(kept), "a routed program leaves a loader block to the loader");
+            let before = crate::memstat::live_total();
+            let foreign = Counting.alloc(l);
+            assert!(!foreign.is_null(), "the loader allocated the incoming block");
+            assert_eq!(crate::memstat::live_total() - before, if counted { l.size() as i64 } else { 0 },
+                "only a counted incoming block adds live bytes");
+            domain::loader_dealloc(foreign, l.size(), l.align());
+            assert_eq!(crate::memstat::live_total(), before, "the loader free restores counted bytes");
             let in_heap = |p: *mut u8| heap.ranges().any(|(at, len)| (p as usize).wrapping_sub(at) < len);
             let (p, zero) = {
                 let _run = relax_session::phase::run();
@@ -1276,6 +1288,7 @@ mod routing_tests {
             let words = Layout::new::<Header>();
             let raw_size = words.size() + l.size();
             let raw = domain::program_alloc(raw_size, words.align());
+            assert!(domain::program_owns(raw), "a routed program may free its region block");
             assert!(domain::heap_owns(heap.as_ptr(), raw), "a region block belongs to its heap");
             assert!(in_heap(raw), "the program System ABI allocates directly in the PA heap");
             raw.cast::<Header>().write([MAGIC, l.size()]);
@@ -1331,12 +1344,20 @@ mod routing_tests {
             assert_eq!(heap.stats().0, live, "ended frees leave the arena's live bytes unchanged");
             assert!(all_eq(direct, l.size(), 0x72), "ended dealloc leaves the payload untouched");
             assert_eq!(pa.counts(), (before.0 + 2, before.1 + 2), "ended alloc, resize and frees attempt the allocator entries");
+            domain::enter(&*heap);
+            let system = System.alloc(l);
+            assert!(!system.is_null() && !domain::program_owns(system), "a live System block is outside the routed heap");
+            heap.stop_routing();
+            assert!(domain::program_owns(system), "after stop_routing even a System address goes to the program allocator");
+            System.dealloc(system, l);
+            domain::restore(outer);
             drop(heap);
             assert!(domain::system_owned(base), "the first static address has no owner after the PA heap is dropped");
             System.dealloc(base, storage);
 
             let plain = domain::DomainHeap::new(None, (0, 0)).unwrap();
             domain::enter(&*plain);
+            assert!(domain::program_owns(std::ptr::from_ref(&pa).cast_mut().cast()), "a heap without a PA accepts any address");
             let p = { let _run = relax_session::phase::run(); Counting.alloc(l) };
             assert!(plain.ranges().any(|(at, len)| (p as usize).wrapping_sub(at) < len), "a no-PA run allocation uses its arena");
             Counting.dealloc(p, l);

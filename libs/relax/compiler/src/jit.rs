@@ -416,6 +416,12 @@ pub struct Unit {
     pub tcx: Tcx,
     /// provided crates (provided.rs): crate index -> its shims
     pub provided: Vec<(u32, crate::provided::ProvidedCrate)>,
+    /// Whether the boot program binds a crate with a run op (`ProvidedCrate::runs_in_program`):
+    /// only then is a domain's #[global_allocator] probed and routed to, and only then do the
+    /// allocator shims check its blocks (core::heap `__rg_checked_*`). Fixed at `Unit::new`:
+    /// code made unchecked stays so, and a crate bound later (`bind_added_provided`) does not
+    /// route a domain through it.
+    pub routes_allocator: bool,
     /// Loader static address ranges, built on the first unattributed constant pointer.
     pub(crate) provided_static_index: std::sync::OnceLock<crate::provided::SharedStaticIndex>,
     /// their opaque types: drop shim address (0: no drop)
@@ -6419,6 +6425,7 @@ impl Unit {
             prog,
             tcx,
             provided_shared: std::sync::OnceLock::new(),
+            routes_allocator: provided.iter().any(|(_, p)| p.runs_in_program()),
             provided,
             provided_static_index: std::sync::OnceLock::new(),
             provided_types,
@@ -7626,11 +7633,12 @@ impl Unit {
     }
 
     /// Whether `d` is one of the fns whose bodies call the allocator shim (core::heap's alloc,
-    /// alloc_zeroed, dealloc, realloc): their code depends on the program's global allocator.
+    /// alloc_zeroed, dealloc, realloc, and the loader's entries `__relax_program_alloc` and
+    /// `__relax_program_dealloc`): their code depends on the program's global allocator.
     pub fn calls_allocator_shim(&self, d: DefId) -> bool {
         let def = self.prog.def(d);
-        def.krate == self.core_crate && def.kind == DefKind::Fn && matches!(self.prog.name(d), "alloc" | "alloc_zeroed" | "dealloc" | "realloc")
-            && ["alloc", "alloc_zeroed", "dealloc", "realloc"].iter().any(|n| self.core_path(&["heap", n]) == Some(d))
+        def.krate == self.core_crate && def.kind == DefKind::Fn && matches!(self.prog.name(d), "alloc" | "alloc_zeroed" | "dealloc" | "realloc" | "__relax_program_alloc" | "__relax_program_dealloc")
+            && ["alloc", "alloc_zeroed", "dealloc", "realloc", "__relax_program_alloc", "__relax_program_dealloc"].iter().any(|n| self.core_path(&["heap", n]) == Some(d))
     }
 
     /// Deferred diagnostic items and Relax runtime helpers, not language-item identities.
@@ -29055,6 +29063,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"pthread_get_stacksize_np" => Some(crate::program_os::pthread_get_stacksize_np as *const () as usize),
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         b"mallinfo2" => Some(crate::program_os::mallinfo2 as *const () as usize),
+        b"relax_program_owns" | b"relax_program_outside" | b"relax_loader_dealloc" | b"relax_loader_realloc" => crate::zone_alloc::domain::symbol(name),
         // the program's request for its allocator's free pages also trims its domain heap
         b"malloc_trim" | b"malloc_zone_pressure_relief" => crate::zone_alloc::domain::symbol(name),
         // the web target's runtime and its embedder's page side (web.rs), then run-time modules
