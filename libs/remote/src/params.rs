@@ -229,13 +229,13 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
 
 /// Structural design operations, selected before queuing a UI edit.
 pub const DESIGN: &[(&str, &str)] = &[
-    ("pick", r#""at":{"type":"string"},"path":{"type":"string"},"window":{"type":"integer"}"#),
-    ("props", r#""path":{"type":"string"}"#),
-    ("locate", r#""path":{"type":"string"}"#),
-    ("apply", r#""path":{"type":"string"},"splash":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
-    ("theme", r#""get":{"type":"boolean"},"set":{"type":"boolean"},"install":{"type":"boolean"},"name":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
-    ("states", r#""path":{"type":"string"},"layer":{"type":"string"}"#),
-    ("pose", r#""path":{"type":"string"},"layer":{"type":"string"},"state":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("pick", r#""w":{"type":"integer"},"at":{"type":"string"},"path":{"type":"string"},"window":{"type":"integer"}"#),
+    ("props", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
+    ("locate", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
+    ("apply", r#""w":{"type":"integer"},"path":{"type":"string"},"splash":{"type":"string"},"prop":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("theme", r#""w":{"type":"integer"},"get":{"type":"boolean"},"set":{"type":"boolean"},"install":{"type":"boolean"},"name":{"type":"string"},"value":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("states", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"}"#),
+    ("pose", r#""w":{"type":"integer"},"path":{"type":"string"},"layer":{"type":"string"},"state":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("open", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("delete", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
     ("duplicate", r#""path":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
