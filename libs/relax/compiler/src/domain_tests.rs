@@ -2945,3 +2945,62 @@ fn a_run_with_no_unit_ends_with_nothing_to_end() {
     let end = end_run(std::ptr::null_mut(), Duration::from_millis(100));
     assert_eq!((end.threads, end.left.len()), (0, 0), "{}", end.line());
 }
+
+const REMOTE_SERVICES: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+extern "C" {
+    fn relax_register_remote_service(name: *const u8, len: usize, version: u32, open: extern "C" fn(*const u8, usize, usize, *mut u8) -> usize, close: extern "C" fn(usize));
+}
+extern "C" fn open(_: *const u8, _: usize, _: usize, _: *mut u8) -> usize { 0 }
+extern "C" fn close(_: usize) {}
+fn fixture(p: *mut u64) {
+    let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+    unsafe { relax_register_remote_service(b"frames".as_ptr(), 6, 1, open, close) };
+    flags[0].store(1, Ordering::SeqCst);
+    while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+}
+"#;
+
+/// A JIT run's remote endpoint is the app's own local one, as a native run's is (an app link that
+/// takes only an app's own local endpoint finds it): its discovery entry names this process, its
+/// socket is in the user's socket dir (Windows: the loopback carrier), and once the program has
+/// registered its `frames` service the entry's caps hold `cmd` and `frames`. The run's own fields
+/// (its log, its cache dir) describe the run; no field routes it elsewhere.
+#[test]
+fn a_jit_runs_endpoint_is_the_apps_own_local_one() {
+    isolated_test!(a_jit_runs_endpoint_is_the_apps_own_local_one);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("RELAX_INSPECT");
+    crate::inspect::start("endpoint-fixture");
+    let (mut u, entry, root) = fixture_of(REMOTE_SERVICES, "fixture");
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) != 0);
+    let pid = std::process::id();
+    let registry = makepad_remote::discovery::registry_dir();
+    let apps = makepad_remote::discovery::apps_in(&registry);
+    let app = apps.iter().find(|a| a.pid == pid).unwrap_or_else(|| panic!("the run announced itself under its own pid {pid} in {}: {apps:?}", registry.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = std::path::Path::new(&app.socket);
+        assert_eq!(socket.parent(), Some(makepad_remote::carrier::unix::socket_dir().as_path()), "the socket is in the user's socket dir: {app:?}");
+        assert!(std::fs::symlink_metadata(socket).is_ok_and(|m| m.file_type().is_socket()), "the socket is there: {app:?}");
+    }
+    #[cfg(windows)]
+    assert!(app.socket.starts_with("tcp:127.0.0.1:"), "the loopback carrier: {app:?}");
+    assert!(app.unreachable().is_none() && app.serves("cmd") && app.serves("frames"), "it serves the app's commands and its frames: {app:?}");
+    for key in ["via", "relay", "route", "hub", "host"] {
+        assert!(!app.fields.iter().any(|f| f.0 == key), "no `{key}` field routes it elsewhere: {app:?}");
+    }
+    assert!(!app.serves("route") && !app.serves("relay"), "it serves no route: {app:?}");
+    flags[1].store(1, Ordering::SeqCst);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    domains().retain(|d| d.info.id != domain);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
