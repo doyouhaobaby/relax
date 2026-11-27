@@ -1635,9 +1635,13 @@ pub(crate) fn attribute_target(prog: &Program, d: DefId) -> Option<(&'static str
 /// rustc_codegen_ssa / rustc_monomorphize: two definitions of the checked crates that export
 /// one symbol (`#[no_mangle]` names it after the item, `#[export_name = ".."]` as given) are
 /// "symbol `x` is already defined". The second, in definition order, is reported.
-pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
+/// They clash only where they meet: in one crate, or in two crates one of `binaries` links. A
+/// crate and its own test harness (`--tests`: its files built twice, into binaries cargo links
+/// apart) export the same symbols and never clash.
+pub fn duplicate_symbols(prog: &Program, own: &[bool], binaries: &[u32]) -> Vec<String> {
     use crate::program::DefKind as K;
-    let mut seen: crate::fxhash::HashMap<Vec<u8>, DefId> = Default::default();
+    let meet = |a: u32, b: u32| a == b || binaries.iter().any(|&bin| prog.crate_sees(bin, a) && prog.crate_sees(bin, b));
+    let mut seen: crate::fxhash::HashMap<Vec<u8>, Vec<DefId>> = Default::default();
     let mut errors = Vec::new();
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
@@ -1666,11 +1670,12 @@ pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
             }
         }
         let Some(sym) = symbol else { continue };
-        match seen.get(&sym) {
-            Some(&first) if first != d => errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", format!("symbol `{}` is already defined", String::from_utf8_lossy(&sym)))),
-            Some(_) => {}
-            None => { seen.insert(sym, d); }
+        let earlier = seen.entry(sym.clone()).or_default();
+        if earlier.contains(&d) { continue; }
+        if earlier.iter().any(|&first| meet(prog.def(first).krate, def.krate)) {
+            errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", format!("symbol `{}` is already defined", String::from_utf8_lossy(&sym))));
         }
+        earlier.push(d);
     }
     errors
 }

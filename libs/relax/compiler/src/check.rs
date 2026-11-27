@@ -1974,7 +1974,7 @@ fn crate_level(prog: &Program, tcx: &Tcx, judged: relax_front::program::Judged, 
     add(Stage::new(Phase::Early, 0), ic::param_attributes(prog, judged), "param_attributes");
     add(Stage::new(Phase::Early, 0), ic::foreign_blocks(prog, judged), "foreign_blocks");
     if let Some(w) = &whole {
-        add(Stage::new(Phase::Attrs, 0), ic::duplicate_symbols(prog, w.all), "duplicate_symbols");
+        add(Stage::new(Phase::Attrs, 0), ic::duplicate_symbols(prog, w.all, w.binaries), "duplicate_symbols");
         add(Stage::new(Phase::Attrs, 0), ic::global_allocators_and_lang_items(prog, w.all, w.binaries), "global_allocators_and_lang_items");
         add(Stage::new(Phase::Early, 0), relax_types::proc_macro_harness::check(prog, tcx, w.own), "proc_macro_harness");
         if let Some(root) = w.entry {

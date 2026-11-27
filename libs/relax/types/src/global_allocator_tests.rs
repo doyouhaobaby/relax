@@ -1,7 +1,8 @@
 //! Item checks of a crate (item_checks.rs). rustc_metadata creader.rs inject_allocator_crate: one
 //! `#[global_allocator]` per crate and one per compiled binary (the binary and the crates it links).
 //! Each test target is its own binary, so two targets of a package that each define one do not
-//! conflict. And E0428, two items of one name in one module or block.
+//! conflict. Exported symbols clash the same way: in one crate or one binary. And E0428, two items
+//! of one name in one module or block.
 use crate::program::Program;
 
 fn load(prog: &mut Program, name: &str, source: &str, deps: &[u32]) -> u32 {
@@ -51,6 +52,40 @@ fn one_global_allocator_per_crate_and_per_binary() {
     assert!(e[0].ends_with("cannot define multiple global allocators"), "{e:?}");
     // all of them at once (`makepad test` checks every test target of a package together)
     assert_eq!(check(&[t1, t2, t3, t4]).len(), 2);
+}
+
+/// rustc_codegen_ssa: "symbol `x` is already defined" where two exports of one name meet, in one
+/// crate or in one binary. A crate and its own test harness (`check --tests`: its files built
+/// twice, into binaries cargo links apart) export the same symbols and do not clash: every
+/// `#[no_mangle]` static of relax-compiler was refused in its own `--tests` check (11-27).
+#[test]
+fn one_exported_symbol_per_crate_and_per_binary() {
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let mut prog = Program::new(sess);
+    let export = "#[no_mangle]\npub static S: u8 = 0;\n";
+    let lib = load(&mut prog, "lib", export, &[]);
+    // the lib's own test harness, and an integration test that links the lib
+    let harness = load(&mut prog, "lib_harness", export, &[]);
+    let integration = load(&mut prog, "integration", "pub fn f() {}\n", &[lib]);
+    // a binary that links the lib and exports the name too
+    let bin = load(&mut prog, "bin", export, &[lib]);
+    // a crate that exports it twice itself, the second under `#[export_name]`
+    let twice = load(&mut prog, "twice", "#[no_mangle]\npub static S: u8 = 0;\nmod n {\n    #[export_name = \"S\"]\n    pub static T: u8 = 0;\n}\n", &[]);
+    prog.resolve_imports();
+    let own_of = |ks: &[u32]| {
+        let mut own = vec![false; prog.crates.len()];
+        for &k in ks { own[k as usize] = true; }
+        own
+    };
+    let check = |ks: &[u32], binaries: &[u32]| crate::item_checks::duplicate_symbols(&prog, &own_of(ks), binaries);
+    assert_eq!(check(&[lib, harness, integration], &[harness, integration]), Vec::<String>::new(), "a crate and its own test harness");
+    assert_eq!(check(&[lib, harness], &[]), Vec::<String>::new(), "two libs checked with no binary");
+    let e = check(&[lib, bin], &[bin]);
+    assert_eq!(e.len(), 1, "a binary and a crate it links: {e:?}");
+    assert!(e[0].ends_with("symbol `S` is already defined"), "{e:?}");
+    let e = check(&[twice], &[]);
+    assert_eq!(e.len(), 1, "two exports in one crate: {e:?}");
+    assert!(e[0].ends_with("symbol `S` is already defined"), "{e:?}");
 }
 
 /// A test target may be named `alloc` (tests/alloc.rs): that is not the sysroot crate of the name
