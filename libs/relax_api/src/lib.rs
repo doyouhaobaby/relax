@@ -260,6 +260,10 @@ pub const fn option_layout<X>() -> [u64; 6] {
 #[repr(C)]
 pub struct Entry {
     pub kind: u32,
+    /// OP: marked `run` (`#[relax_api(run)]`), so what it allocates is the program's: its heap, or
+    /// under `makepad run` its `#[global_allocator]`. The loader probes and routes to a program's
+    /// allocator only when a provided crate it binds has such an op. False for every other entry.
+    pub run: bool,
     /// `module_path!()` where the item is marked (its crate is the first segment)
     pub module: &'static str,
     /// OP: `core::any::type_name` of the fn item (`<f32 as krate::traits::ScriptNew>::script_new`,
@@ -458,7 +462,7 @@ const fn anchor() -> Entry {
     fn none() -> &'static str {
         ""
     }
-    Entry { kind: 0, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }
+    Entry { kind: 0, run: false, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }
 }
 
 #[allow(dead_code)]

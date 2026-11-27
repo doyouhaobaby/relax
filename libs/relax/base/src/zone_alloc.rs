@@ -821,14 +821,7 @@ impl RelaxAlloc {
             }
         }
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-        if relax_session::phase::in_run() {
-            if let Some(a) = compiler::domain_here() {
-                let p = a.alloc(l);
-                if !p.is_null() {
-                    return p;
-                }
-            }
-        }
+        if let Some(p) = domain::run_alloc(l, false) { return p; }
         #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc(l.size(), l.align());
@@ -863,14 +856,7 @@ impl RelaxAlloc {
             }
         }
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
-        if relax_session::phase::in_run() {
-            if let Some(a) = compiler::domain_here() {
-                let p = a.alloc_zeroed(l);
-                if !p.is_null() {
-                    return p;
-                }
-            }
-        }
+        if let Some(p) = domain::run_alloc(l, true) { return p; }
         #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc_zeroed(l.size(), l.align());
@@ -1072,7 +1058,7 @@ mod routing_tests {
             assert!(!compiler::owns(heap_block));
             let heap_block = heap_block as usize;
             let _ = domain::symbol(b"relax_alloc");
-            let domain_heap = domain::DomainHeap::new().unwrap();
+            let domain_heap = domain::DomainHeap::new(None, (0, 0)).unwrap();
             domain::enter(&*domain_heap);
             let dl = Layout::from_size_align(101, 16).unwrap();
             let dp = domain::program_alloc(dl.size(), dl.align());
@@ -1164,6 +1150,198 @@ mod routing_tests {
             domain::program_dealloc(dg as *mut u8, dl.size(), dl.align());
             #[cfg(unix)]
             domain::program_free(c_block as *mut u8);
+        }
+    }
+
+    #[test]
+    fn program_allocator_routes_run_ops_and_owns_rust_blocks_by_address() {
+        use crate::memstat::Counting;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+
+        // Counting selects its header format once per process. Exercise both normal entry paths.
+        const CHILD: &str = "RELAX_TEST_PROGRAM_ALLOCATOR";
+        let Ok(report) = std::env::var(CHILD) else {
+            for report in ["0", "1"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "zone_alloc::routing_tests::program_allocator_routes_run_ops_and_owns_rust_blocks_by_address", "--nocapture"])
+                    .env(CHILD, report).env("RELAX_MEM_REPORT", report).output().unwrap();
+                assert!(result.status.success() && String::from_utf8_lossy(&result.stdout).contains("test result: ok. 1 passed"),
+                    "program allocator routing with accounting={report}: {}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            }
+            return;
+        };
+
+        // A native PA over a System reservation standing in for the static image. The two words
+        // immediately before each payload belong to the PA, even when a counted op owns it.
+        const MAGIC: usize = 0x51a7cafe;
+        type Header = [usize; 2];
+        struct Probe {
+            base: usize,
+            end: usize,
+            next: AtomicUsize,
+            allocs: AtomicUsize,
+            frees: AtomicUsize,
+            allocs_at_last_free: AtomicUsize,
+            refuse: AtomicBool,
+            ended: AtomicBool,
+        }
+        impl Probe {
+            unsafe fn block(&self, size: usize, align: usize, zero: bool) -> *mut u8 {
+                let amount = std::mem::size_of::<Header>() + align.max(std::mem::align_of::<Header>()) - 1 + size;
+                let raw = self.next.fetch_add(amount, Relaxed);
+                assert!(raw + amount <= self.end, "fixture reservation holds every test block");
+                let p = (raw + std::mem::size_of::<Header>()).next_multiple_of(align.max(std::mem::align_of::<Header>())) as *mut u8;
+                p.cast::<Header>().sub(1).write([MAGIC, size]);
+                p.write_bytes(if zero { 0 } else { 0x5a }, size);
+                p
+            }
+            unsafe fn retire(&self, p: *mut u8, size: usize) {
+                let h = p.cast::<Header>().sub(1);
+                assert_eq!(h.read(), [MAGIC, size], "PA receives the original pointer and layout with its canary intact");
+                h.write([!MAGIC, 0]);
+                if !(self.base..self.end).contains(&(p as usize)) {
+                    // An incoming program block: System inside the JIT uses this raw allocator ABI.
+                    domain::program_dealloc(h.cast(), size + std::mem::size_of::<Header>(), std::mem::align_of::<Header>());
+                }
+            }
+            fn counts(&self) -> (usize, usize) {
+                (self.allocs.load(Relaxed), self.frees.load(Relaxed))
+            }
+        }
+        unsafe extern "C" fn alloc(ctx: usize, size: usize, align: usize, zero: bool, out: *mut *mut u8) -> bool {
+            let pa = &*(ctx as *const Probe);
+            pa.allocs.fetch_add(1, Relaxed);
+            if pa.ended.load(Relaxed) { return false; }
+            out.write(if pa.refuse.load(Relaxed) { std::ptr::null_mut() } else { pa.block(size, align, zero) });
+            true
+        }
+        unsafe extern "C" fn dealloc(ctx: usize, p: *mut u8, size: usize, _: usize) -> bool {
+            let pa = &*(ctx as *const Probe);
+            pa.frees.fetch_add(1, Relaxed);
+            pa.allocs_at_last_free.store(pa.allocs.load(Relaxed), Relaxed);
+            if pa.ended.load(Relaxed) { return false; }
+            pa.retire(p, size);
+            true
+        }
+        let _s = serial();
+        assert!(compiler_arena_enabled(), "run routing is enabled for the test");
+        domain::symbol(b"relax_alloc"); // Bind the raw program ABI's fast TLS, as the loader does.
+        unsafe {
+            let l = Layout::from_size_align(24, 32).unwrap();
+            let larger = Layout::from_size_align(57, l.align()).unwrap();
+            let kept = Counting.alloc(l);
+            assert!(!kept.is_null(), "kept allocation supplies the counted realloc source");
+            kept.write_bytes(0x31, l.size());
+            let counted = report == "1";
+            assert_eq!(crate::memstat::enabled(), counted, "child uses the requested accounting mode");
+
+            let storage = Layout::from_size_align(4096, 64).unwrap();
+            let base = System.alloc(storage);
+            assert!(!base.is_null(), "System provides the fixture's static block");
+            let pa = Probe { base: base as usize, end: base.add(storage.size()) as usize, next: AtomicUsize::new(base as usize),
+                allocs: 0.into(), frees: 0.into(), allocs_at_last_free: 0.into(), refuse: false.into(), ended: false.into() };
+            let entries = domain::ProgramAllocator { ctx: std::ptr::from_ref(&pa) as usize, alloc, dealloc };
+            let heap = domain::DomainHeap::new(Some(entries), (pa.base, storage.size())).unwrap();
+            assert!(domain::heap_owns(heap.as_ptr(), base), "the static block belongs to its heap");
+            assert!(!domain::heap_owns(heap.as_ptr(), kept), "a loader block outside both ranges is rejected");
+            assert!(!domain::system_owned(base), "the first static address belongs to the registered PA heap");
+            let outer = domain::current();
+            domain::enter(&*heap);
+            let in_heap = |p: *mut u8| heap.ranges().any(|(at, len)| (p as usize).wrapping_sub(at) < len);
+            let (p, zero) = {
+                let _run = relax_session::phase::run();
+                (Counting.alloc(l), Counting.alloc_zeroed(l))
+            };
+            assert_eq!(pa.counts(), (2, 0), "alloc and alloc_zeroed reach the PA once each");
+            assert!(!p.is_null() && all_eq(p, l.size(), 0x5a) && p as usize % l.align() == 0, "alloc returns the aligned PA payload");
+            assert!(!zero.is_null() && all_eq(zero, l.size(), 0), "alloc_zeroed forwards zeroing to the PA");
+            p.write_bytes(0x37, l.size());
+            let q = {
+                let _run = relax_session::phase::run();
+                Counting.realloc(p, l, larger.size())
+            };
+            assert_eq!(pa.counts(), (3, 1), "a PA resize calls alloc and dealloc once each");
+            assert_eq!(pa.allocs_at_last_free.load(Relaxed), 3, "resize allocates the new block before freeing the old one");
+            assert!(!q.is_null() && all_eq(q, l.size(), 0x37), "run realloc preserves the PA payload");
+            domain::restore(outer);
+            let addr = q as usize;
+            std::thread::spawn(move || Counting.dealloc(addr as *mut u8, larger)).join().unwrap();
+            let q = Counting.realloc(zero, l, larger.size());
+            assert!(!q.is_null() && all_eq(q, l.size(), 0), "kept resize finds the static block without a current domain");
+            Counting.dealloc(q, larger);
+            assert_eq!(pa.counts(), (4, 4), "foreign free and kept resize and free reach the static block's PA");
+
+            domain::enter(&*heap);
+            // An inward crossing in a heap region, independent of any allocation by the loader.
+            let words = Layout::new::<Header>();
+            let raw_size = words.size() + l.size();
+            let raw = domain::program_alloc(raw_size, words.align());
+            assert!(domain::heap_owns(heap.as_ptr(), raw), "a region block belongs to its heap");
+            assert!(in_heap(raw), "the program System ABI allocates directly in the PA heap");
+            raw.cast::<Header>().write([MAGIC, l.size()]);
+            let payload = raw.add(words.size());
+            let incoming = Layout::from_size_align(l.size(), words.align()).unwrap();
+            {
+                let _run = relax_session::phase::run();
+                Counting.dealloc(payload, incoming);
+            }
+            assert_eq!(pa.counts(), (4, 5), "own-region free reaches the PA before the arena sees the interior pointer");
+
+            pa.refuse.store(true, Relaxed);
+            let used = (pa.next.load(Relaxed), heap.stats().0);
+            {
+                let _run = relax_session::phase::run();
+                assert!(Counting.alloc(l).is_null(), "PA alloc refusal reaches the caller as null");
+                assert!(Counting.alloc_zeroed(l).is_null(), "PA zeroed refusal reaches the caller as null");
+                if counted {
+                    assert!(Counting.realloc(kept, l, larger.size()).is_null(), "counted realloc returns the destination PA's null");
+                    assert!(all_eq(kept, l.size(), 0x31), "a refused counted realloc retains the original block");
+                }
+            }
+            assert_eq!((pa.next.load(Relaxed), heap.stats().0), used, "refusals leave no hidden PA or domain block");
+            pa.refuse.store(false, Relaxed);
+            if counted {
+                let q = { let _run = relax_session::phase::run(); Counting.realloc(kept, l, larger.size()) };
+                assert!(!q.is_null() && (pa.base..pa.end).contains(&(q as usize)) && all_eq(q, l.size(), 0x31),
+                    "counted realloc moves a tagged kept block into a headerless PA block");
+                Counting.dealloc(q, larger);
+            } else {
+                Counting.dealloc(kept, l);
+            }
+
+            let old = { let _run = relax_session::phase::run(); Counting.alloc(l) };
+            pa.refuse.store(true, Relaxed);
+            old.write_bytes(0x68, l.size());
+            assert!(Counting.realloc(old, l, larger.size()).is_null(), "a null PA allocation makes resize return null");
+            assert!(all_eq(old, l.size(), 0x68) && old.cast::<Header>().sub(1).read() == [MAGIC, l.size()],
+                "a null PA allocation leaves the old resize source live and intact");
+            pa.ended.store(true, Relaxed);
+            let before = pa.counts();
+            let direct = { let _run = relax_session::phase::run(); Counting.alloc_zeroed(l) };
+            assert!(in_heap(direct) && all_eq(direct, l.size(), 0), "ended alloc serves a zeroed block from the owning heap");
+            direct.write_bytes(0x72, l.size());
+            domain::restore(outer);
+            let q = Counting.realloc(old, l, larger.size());
+            assert!(in_heap(q) && all_eq(q, l.size(), 0x68), "ended static realloc copies into the owning heap");
+            assert!(all_eq(old, l.size(), 0x68) && old.cast::<Header>().sub(1).read() == [MAGIC, l.size()],
+                "ended realloc leaves the old payload and header intact");
+            let live = heap.stats().0;
+            Counting.dealloc(direct, l);
+            Counting.dealloc(q, larger);
+            assert_eq!(heap.stats().0, live, "ended frees leave the arena's live bytes unchanged");
+            assert!(all_eq(direct, l.size(), 0x72), "ended dealloc leaves the payload untouched");
+            assert_eq!(pa.counts(), (before.0 + 2, before.1 + 2), "ended alloc, resize and frees attempt the allocator entries");
+            drop(heap);
+            assert!(domain::system_owned(base), "the first static address has no owner after the PA heap is dropped");
+            System.dealloc(base, storage);
+
+            let plain = domain::DomainHeap::new(None, (0, 0)).unwrap();
+            domain::enter(&*plain);
+            let p = { let _run = relax_session::phase::run(); Counting.alloc(l) };
+            assert!(plain.ranges().any(|(at, len)| (p as usize).wrapping_sub(at) < len), "a no-PA run allocation uses its arena");
+            Counting.dealloc(p, l);
+            assert_eq!(plain.stats().0, 0, "a no-PA free returns the block to its arena");
+            domain::restore(outer);
         }
     }
 

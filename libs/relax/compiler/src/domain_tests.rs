@@ -75,6 +75,12 @@ fn launch(u: &mut Unit, entry: u64, id: Option<DomainId>, flags: &[AtomicU64; 4]
 }
 
 fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (DomainId, u64, std::thread::JoinHandle<()>) {
+    try_launch_with(u, entry, id, arg, false).unwrap()
+}
+
+fn try_launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, probe: bool)
+    -> Result<(DomainId, u64, std::thread::JoinHandle<()>), Vec<String>>
+{
     let id = prepare(&AppSpec {
         package: "teardown-fixture".into(),
         id,
@@ -83,13 +89,13 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
     .unwrap();
     let loading = Loading(id);
     let base = create(u);
-    let heap = crate::zone_alloc::domain::DomainHeap::new().unwrap();
-    {
-        let mut ds = domains();
-        let d = ds.iter_mut().find(|d| d.info.id == id).unwrap();
-        d.info.base = base;
-        d.heap = Some(heap);
+    let allocator = ProgramAllocatorCtx::resolve(u).expect("resolve the fixture allocator");
+    let heap = ProgramHeap::new(base, allocator).unwrap();
+    if probe {
+        // The makepad run host installs its program unit before starting an app domain.
+        unsafe { crate::jit::set_runtime_unit(u); }
     }
+    heap.install(&loading, base, probe)?;
     let h = launch_main(
         u as *mut Unit as usize,
         id,
@@ -102,7 +108,7 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
     )
     .unwrap();
     drop(loading);
-    (id, base, h)
+    Ok((id, base, h))
 }
 
 #[cfg(target_os = "linux")]
@@ -168,6 +174,7 @@ fn teardown_fixture_cycles_and_retiring_thread() {
             (0, 0, 0, 0, 0)
         );
         assert!(!blocks().contains(&base));
+        assert_eq!(id_of_base(base), None, "the released static block has no owning domain after teardown");
         assert!(freed_by_teardown() > before);
         assert!(matches!(dead.state, DomainState::Exited(0)));
         #[cfg(target_os = "linux")]
@@ -1457,6 +1464,265 @@ fn a_layout_patch_reads_a_thread_parked_in_a_libc_condvar_wait() {
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+// The two test layouts have a header. The allocator can be stopped while serving the second.
+const PROGRAM_ALLOCATOR: &str = r#"
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+static FLAGS: AtomicU64 = AtomicU64::new(0);
+struct HeaderAllocator;
+#[global_allocator]
+static ALLOCATOR: HeaderAllocator = HeaderAllocator;
+unsafe impl GlobalAlloc for HeaderAllocator {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if l.align() != 16 || (l.size() != 73 && l.size() != 79) { return System.alloc(l); }
+        let a = &*(FLAGS.load(Ordering::SeqCst) as *const [AtomicU64; 4]);
+        if l.size() == 79 && a[3].load(Ordering::SeqCst) == 1 {
+            a[1].store(1, Ordering::SeqCst);
+            while a[3].load(Ordering::SeqCst) != 0 { std::hint::spin_loop(); }
+        }
+        let raw = System.alloc(Layout::from_size_align_unchecked(l.size() + 16, 16));
+        if raw.is_null() { return raw; }
+        (raw as *mut usize).write(l.size());
+        (raw.add(8) as *mut u64).write(0x714e);
+        raw.add(16)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        if l.align() != 16 || (l.size() != 73 && l.size() != 79) { return System.dealloc(p, l); }
+        let raw = p.sub(16);
+        assert_eq!((raw as *const usize).read(), l.size());
+        assert_eq!((p.sub(8) as *const u64).read(), 0x714e);
+        (p.sub(8) as *mut u64).write(0);
+        let a = &*(FLAGS.load(Ordering::SeqCst) as *const [AtomicU64; 4]);
+        a[2].fetch_add(1, Ordering::SeqCst);
+        System.dealloc(raw, Layout::from_size_align_unchecked(l.size() + 16, 16));
+    }
+}
+fn fixture(p: *mut u64) {
+    FLAGS.store(p as u64, Ordering::SeqCst);
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let op: extern "C" fn() = unsafe { std::mem::transmute(a[0].load(Ordering::SeqCst) as usize) };
+    op();
+    // In the live second run, native code resizes and frees the op's block from outside.
+    while a[3].load(Ordering::SeqCst) == 2 { std::thread::yield_now(); }
+}
+"#;
+
+/// A provided op gets its lock and its allocation back even when the run ends in the allocator.
+/// Its first call also goes through the compile-on-first-call entry while the op holds the lock.
+#[test]
+fn a_run_ends_in_the_program_allocator_of_a_locked_op() {
+    isolated_test!(a_run_ends_in_the_program_allocator_of_a_locked_op);
+    use crate::zone_alloc::{domain::DomainHeap, RelaxAlloc};
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BLOCK: AtomicUsize = AtomicUsize::new(0);
+    static HEAP: AtomicUsize = AtomicUsize::new(0);
+    static RECEIVED: AtomicUsize = AtomicUsize::new(0);
+    static INTACT: AtomicUsize = AtomicUsize::new(0);
+    fn layout(size: usize) -> Layout { Layout::from_size_align(size, 16).unwrap() }
+    extern "C" fn op() {
+        let _lock = LOCK.lock().unwrap();
+        let _run = relax_session::phase::run();
+        unsafe {
+            BLOCK.store(RelaxAlloc.alloc_zeroed(layout(73)) as usize, Ordering::Release);
+            RECEIVED.store(RelaxAlloc.alloc(layout(79)) as usize, Ordering::Release);
+        }
+    }
+    fn drop_provided_block(base: usize, end: usize) {
+        let block = BLOCK.load(Ordering::Acquire);
+        if HEAP.load(Ordering::Acquire) == 0 || !(base..end).contains(&block) { return; }
+        let p = block as *mut u8;
+        // Teardown keeps both the heap and its mappings alive across this hook.
+        unsafe {
+            let heap = &*(HEAP.load(Ordering::Acquire) as *const DomainHeap);
+            let before = heap.stats();
+            RelaxAlloc.dealloc(p, layout(73));
+            let intact = heap.stats() == before && p.sub(8).cast::<u64>().read() == 0x714e && p.read() == 42;
+            INTACT.store(intact as usize, Ordering::Release);
+        }
+    }
+
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(crate::zone_alloc::compiler_arena_enabled(), "run ops route to the domain heap");
+    crate::run_end::set_native_end(|| {}, drop_provided_block);
+    let fixture = || {
+        let (mut u, entry, root) = fixture_of(PROGRAM_ALLOCATOR, "fixture");
+        let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+        crate::layout::set_root_crate(krate);
+        u.tier1 = None;
+        (u, entry, root)
+    };
+    let (mut u, entry, root) = fixture();
+    let alloc = u.core_path(&["heap", "__relax_program_alloc"]).unwrap();
+    let slot = u.fn_id(crate::jit::FnKey::Inst(alloc, Vec::new()));
+    assert!(!u.fns[slot as usize].compiled, "the first op call must compile the allocator entry");
+    let flags: [AtomicU64; 4] = Default::default();
+    flags[0].store(op as *const () as u64, Ordering::SeqCst);
+    flags[3].store(1, Ordering::SeqCst);
+    let (id, _, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[1].load(Ordering::SeqCst) != 0 || main.is_finished());
+    assert_eq!(flags[1].load(Ordering::SeqCst), 1, "the second allocation entered the program allocator: {:?}", state(id));
+    let p = BLOCK.load(Ordering::Acquire) as *mut u8;
+    assert!(!p.is_null(), "the op's first cold allocator call returned a block");
+    unsafe {
+        assert_eq!(p.sub(8).cast::<u64>().read(), 0x714e, "the block has the program allocator's header");
+        assert_eq!(p.read(), 0, "the op received zeroed storage");
+        p.write(42);
+    }
+    let (base, size) = {
+        let ds = domains();
+        let heap = ds.iter().find(|d| d.info.id == id).unwrap().heap.as_deref().unwrap();
+        HEAP.store(std::ptr::from_ref(heap) as usize, Ordering::Release);
+        heap.range()
+    };
+    let end = end_run(&mut *u, Duration::from_secs(10));
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert!(end.abandoned.is_empty() && crate::jit::abandoned_frames().is_empty(), "ending inside the allocator preserved the op's native frames");
+    assert!(LOCK.try_lock().is_ok(), "the op released its lock after allocator recovery");
+    assert!((base..base + size).contains(&RECEIVED.load(Ordering::Acquire)), "the interrupted op received a fallback block from its own heap");
+    assert_eq!(INTACT.load(Ordering::Acquire), 1, "the provided drop in heap_goes preserved the arena and the header block");
+
+    HEAP.store(0, Ordering::Release);
+    // A fresh run uses the same host lock. The caller of realloc and dealloc is outside it.
+    let (mut next, entry, _) = fixture();
+    flags[3].store(2, Ordering::SeqCst);
+    RECEIVED.store(0, Ordering::Release);
+    let (id, _, main) = launch(&mut next, entry, None, &flags);
+    wait(|| RECEIVED.load(Ordering::Acquire) != 0 || main.is_finished());
+    assert_ne!(RECEIVED.load(Ordering::Acquire), 0, "the next run's op allocated successfully");
+    let caller = (current(), crate::zone_alloc::domain::current());
+    unsafe {
+        let p = BLOCK.load(Ordering::Acquire) as *mut u8;
+        p.write(37);
+        let q = RelaxAlloc.realloc(p, layout(73), 79);
+        assert!(!q.is_null() && q.read() == 37, "a loader resize used the owning domain and preserved the block");
+        RelaxAlloc.dealloc(q, layout(79));
+    }
+    assert_eq!(flags[2].load(Ordering::SeqCst), 2, "both foreign frees checked the program allocator's header in its domain");
+    assert_eq!((current(), crate::zone_alloc::domain::current()), caller, "the foreign calls restored the caller's domain");
+    flags[3].store(0, Ordering::SeqCst);
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "the next run exited normally");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// The same native op as the locked-op fixture, with a PA that can serve a static page,
+// decline large requests, or take a particular layout from the real process malloc.
+#[test]
+fn allocator_ranges_are_checked_before_main_and_at_the_op() {
+    const LATE: &str = "RELAX_TEST_LATE_ALLOCATOR_BLOCK";
+    isolated_test!(allocator_ranges_are_checked_before_main_and_at_the_op);
+    use crate::zone_alloc::RelaxAlloc;
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+    extern "C" {
+        fn malloc(size: usize) -> *mut core::ffi::c_void;
+        fn free(p: *mut core::ffi::c_void);
+    }
+    static BAD_SIZE: AtomicUsize = AtomicUsize::new(0);
+    static OUTSIDE: AtomicUsize = AtomicUsize::new(0);
+    static SAW_STATIC: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn outside(size: usize) -> *mut u8 {
+        if size != BAD_SIZE.load(Ordering::Acquire) { return std::ptr::null_mut(); }
+        let p = unsafe { malloc(size) }.cast::<u8>();
+        OUTSIDE.store(p as usize, Ordering::Release);
+        p
+    }
+    extern "C" fn op(page: usize, probes: usize) {
+        let _run = relax_session::phase::run();
+        let layout = Layout::from_size_align(73, 8).unwrap();
+        unsafe {
+            let p = RelaxAlloc.alloc(layout);
+            if p as usize == page { SAW_STATIC.store(probes, Ordering::Release); }
+            if !p.is_null() { RelaxAlloc.dealloc(p, layout); }
+        }
+    }
+    let source = r#"
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static mut PAGE: [u8; 8192] = [0; 8192];
+        static IN_USE: AtomicBool = AtomicBool::new(false);
+        static PROBED: AtomicUsize = AtomicUsize::new(0);
+        fn page() -> usize { ((&raw mut PAGE as usize) + 4095) & !4095usize }
+        struct PageAllocator;
+        #[global_allocator]
+        static ALLOCATOR: PageAllocator = PageAllocator;
+        unsafe impl GlobalAlloc for PageAllocator {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                let outside: extern "C" fn(usize) -> *mut u8 = std::mem::transmute(OUTSIDE_FNusize);
+                let p = outside(l.size());
+                if !p.is_null() { return p; }
+                let bit = match (l.size(), l.align()) {
+                    (16, 8) => 1, (4096, 8) => 2, (4096, 4096) => 4,
+                    (262144, 8) => 8, (4194304, 8) => 16, _ => 0,
+                };
+                PROBED.fetch_or(bit, Ordering::SeqCst);
+                if bit >= 8 { return std::ptr::null_mut(); }
+                if l.size() <= 4096 && l.align() <= 4096 && !IN_USE.swap(true, Ordering::SeqCst) {
+                    return page() as *mut u8;
+                }
+                System.alloc(l)
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                if p as usize == page() { IN_USE.store(false, Ordering::SeqCst); }
+                else if p as usize == (*(OUTSIDE_ADDRusize as *const AtomicUsize)).load(Ordering::Acquire) {
+                    let free: extern "C" fn(*mut u8) = std::mem::transmute(FREE_FNusize);
+                    free(p);
+                } else { System.dealloc(p, l); }
+            }
+        }
+        fn fixture(arg: usize) {
+            let op: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(arg) };
+            op(page(), PROBED.load(Ordering::SeqCst));
+        }
+    "#.replace("OUTSIDE_FN", &(outside as *const () as usize).to_string())
+        .replace("FREE_FN", &(free as *const () as usize).to_string())
+        .replace("OUTSIDE_ADDR", &(std::ptr::from_ref(&OUTSIDE) as usize).to_string());
+    let (mut u, entry, root) = fixture_of(&source, "fixture");
+    let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+    crate::layout::set_root_crate(krate);
+    u.tier1 = None;
+    let path = u.prog.def_path(u.global_allocator_static().expect("the fixture binds its PA"));
+    let arg = op as *const () as u64;
+    if std::env::var_os(LATE).is_some() {
+        BAD_SIZE.store(73, Ordering::Release);
+        let (_, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
+        main.join().unwrap();
+        panic!("a late outside allocation returned to the op");
+    }
+    BAD_SIZE.store(16, Ordering::Release);
+    let errors = try_launch_with(&mut u, entry, None, arg, true).unwrap_err();
+    let p = OUTSIDE.load(Ordering::Acquire);
+    assert_ne!(p, 0, "the probe exercised the process malloc");
+    assert_eq!(errors, [format!("relax: the program's #[global_allocator] `{path}` returned {p:#x} for a 16-byte probe, outside the memory its domain owns (its heap and its statics): an allocator over its own mappings, sbrk or another process-wide heap cannot serve the loader's ops under `makepad run`; the run does not start")],
+        "an outside probe block fails startup with the allocator diagnostic");
+
+    BAD_SIZE.store(0, Ordering::Release);
+    let (id, _, main) = try_launch_with(&mut u, entry, None, arg, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)), "a static PA starts after the rejected domain");
+    assert_eq!(SAW_STATIC.load(Ordering::Acquire), 31, "all five probes ran before the op received its static block");
+    std::fs::remove_dir_all(root).unwrap();
+
+    let test = "domain::teardown_tests::allocator_ranges_are_checked_before_main_and_at_the_op";
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"]).env(LATE, "1"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    #[cfg(unix)]
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(6), "late refusal aborts the child: {err}");
+    #[cfg(not(unix))]
+    assert!(!out.status.success(), "late refusal ends the child abnormally: {err}");
+    let prefix = format!("relax: the program's #[global_allocator] `{path}` returned 0x");
+    let suffix = " (73 bytes, align 8), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends";
+    assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
+        .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "late refusal prints the address, op layout and allocator diagnostic: {err}");
 }
 
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.

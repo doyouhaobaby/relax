@@ -185,6 +185,18 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
     { crate::intrinsics_rt::rust_realloc(ptr, layout.size, layout.align(), new_size) }
 }
 
+/// Allocates for a provided crate's op through the program's global allocator. The loader's
+/// `zone_alloc::domain::ProgramAllocator` supplies a nonzero layout to these entries.
+pub unsafe extern "C" fn __relax_program_alloc(size: usize, align: usize, zeroed: bool) -> *mut u8 {
+    let layout = Layout::from_size_align_unchecked(size, align);
+    if zeroed { alloc_zeroed(layout) } else { alloc(layout) }
+}
+
+/// Frees a provided crate's block through the program's global allocator.
+pub unsafe extern "C" fn __relax_program_dealloc(p: *mut u8, size: usize, align: usize) {
+    dealloc(p, Layout::from_size_align_unchecked(size, align))
+}
+
 /// rustc's `__rust_alloc_error_handler` with std's default hook (library/std/src/alloc.rs
 /// rust_oom, default_alloc_error_hook @1.100.0): the message on stderr, then the process ends with
 /// SIGABRT, which no catch_unwind catches. The JIT's runtime does both (relax_alloc_error, its

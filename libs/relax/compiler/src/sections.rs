@@ -233,10 +233,11 @@ fn loader_table(u: &mut Unit, d: DefId, p: usize) -> Option<bool> {
     // Entry's every field, as the offsets below list them: this stops building when a field is
     // added to Entry and not here (a missed field reads every program's table as laid out otherwise)
     fn _listed(e: &Entry) {
-        let Entry { kind: _, module: _, key: _, sig: _, shim: _, slots: _, size: _, align: _, offsets: _, enum_layout: _, drop: _, addr: _ } = e;
+        let Entry { kind: _, run: _, module: _, key: _, sig: _, shim: _, slots: _, size: _, align: _, offsets: _, enum_layout: _, drop: _, addr: _ } = e;
     }
     let rustc = [
         std::mem::offset_of!(Entry, kind),
+        std::mem::offset_of!(Entry, run),
         std::mem::offset_of!(Entry, module),
         std::mem::offset_of!(Entry, key),
         std::mem::offset_of!(Entry, sig),

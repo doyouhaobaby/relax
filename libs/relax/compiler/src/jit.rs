@@ -564,7 +564,7 @@ pub struct Unit {
     /// thread found in the ended code gets out. (0: no code of its own: no-codegen mode)
     pub(crate) glue_end: u64,
     /// `end_code` ran
-    pub(crate) code_ended: AtomicBool,
+    pub(crate) code_ended: std::sync::Arc<AtomicBool>,
     /// Set once its code ended: the program's waits end with it (domain_threads.rs `waits`).
     #[cfg(windows)]
     pub(crate) end_event: os::win32::HANDLE,
@@ -3567,25 +3567,35 @@ pub(crate) fn kick_app_callers(bases: &[u64]) -> bool {
 /// `thunk(data)` runs under a recovery point of its own: false when the run ended under it, and all
 /// the caller's frames go on from here with what they hold. On a thread in no domain the call is
 /// the run's app's: its statics, its heap (a thread a scope put in a domain stays in that one).
-/// Realtime safe: no lock, no allocation. A panic in the callback is the abort of any `extern "C"`
-/// callback.
+/// Dispatch within the domain takes no lock and allocates nothing. A panic in the callback is
+/// the abort of any `extern "C"` callback.
 pub fn app_call(thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
+    app_call_scoped(None, thunk, data)
+}
+
+/// With an explicit scope, call in the block owner's domain. Dispatch on a thread already in
+/// that domain takes no lock and allocates nothing. Switching domains takes the arenas' chunk
+/// locks briefly on entry and return, as a cross-domain free does. A new JIT thread also needs
+/// its initial TLS block. Without an explicit scope, use `app_call`'s run-domain rule.
+pub(crate) fn app_call_scoped(scope: Option<u64>, thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
     let enter = APP_ENTER.load(Ordering::Acquire);
-    // (out of an op: JIT code and the runtime it calls run in the kept phase)
     let _kept = crate::zone_alloc::kept();
-    fresh_thread();
+    if scope.is_none() { fresh_thread(); }
     unsafe {
         if enter == 0 {
+            if scope.is_some() { return false; }
             thunk(data);
             return true;
         }
-        // a thread in no domain (native code started it: a device's, the inspect server's; a scope
-        // put none around the call) is in the compile domain (`rt_tls_block`), whose statics and
-        // heap are not the app's: the call runs in the run's app domain and leaves it after
-        let b = tls_block_if_any();
-        let here = if b == 0 { 0 } else { *(b as *const u64) };
-        let none = here == 0 || here == crate::domain::default_base();
-        let scoped = crate::domain::foreign_enter(if none { crate::domain::run_scope() } else { 0 });
+        let scoped = if let Some(scope) = scope {
+            let Some(saved) = crate::domain::enter_foreign_scope(scope, true) else { return false };
+            saved
+        } else {
+            let b = tls_block_if_any();
+            let here = if b == 0 { 0 } else { *(b as *const u64) };
+            let none = here == 0 || here == crate::domain::default_base();
+            crate::domain::foreign_enter(if none { crate::domain::run_scope() } else { 0 })
+        };
         let ok = recovered_call(enter, thunk, data);
         crate::domain::foreign_leave(scoped);
         ok
@@ -6480,7 +6490,7 @@ impl Unit {
             enter: 0,
             leave: 0,
             glue_end: 0,
-            code_ended: AtomicBool::new(false),
+            code_ended: crate::zone_alloc::kept_with(|| std::sync::Arc::new(AtomicBool::new(false))),
             #[cfg(windows)]
             end_event: unsafe { os::win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
             code_next: AtomicU64::new(misc),

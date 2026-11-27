@@ -51,7 +51,7 @@ fn loader_code(id: u64, key: &str, text: &str, cfg: &[String]) -> String {
     let own = if cfg.is_empty() { String::new() } else { format!("#[cfg(all({}))]", cfg.join(", ")) };
     format!(
         "{CFG} {own} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_l{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::LOADER, module: module_path!(), key: {key}, sig: {{ fn s() -> &'static str {{ {text} }} s }},
+  kind: ::relax_api::LOADER, run: false, module: module_path!(), key: {key}, sig: {{ fn s() -> &'static str {{ {text} }} s }},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
     )
 }
@@ -536,7 +536,7 @@ fn option_code(id: u64, options: &OptionSpellings, explicit: bool) -> String {
         extra.push_str(&format!(
             "\n{CFG} #[cfg(any({conditions}))] {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)]
 static __relax_api_o{id:016x}_{n}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::OPTION, module: module_path!(),
+  kind: ::relax_api::OPTION, run: false, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name::<::core::option::Option<{payload}>>() }} k }},
   sig: {{ fn s() -> &'static str {{ \"{origin}\" }} s }},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[],
@@ -594,15 +594,22 @@ fn type_option_code(toks: &[TokenTree], body_start: usize, is_struct: bool, id: 
 /// host's, for a crate that holds what outlives a program or keeps nothing of one and frees what
 /// a program held at its own end.
 fn op_phase(args: &[String]) -> &'static str {
-    if args.iter().any(|a| a == "run") {
+    if op_runs(args) {
         "let _phase = ::relax_api::run_op();"
     } else {
         "let _phase = ::relax_api::host_op();"
     }
 }
 
+/// `#[relax_api(run)]`: the op's entry says so (`Entry::run`), and the loader reads from the table
+/// which provided crates allocate in the program's heap.
+fn op_runs(args: &[String]) -> bool {
+    args.iter().any(|a| a == "run")
+}
+
 /// The wrapper and the entry of one op.
-fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
+fn op_code(o: &Owner, s: &Sig, args: &[String]) -> String {
+    let (phase, run) = (op_phase(args), op_runs(args));
     let path = call_path(o, &s.name);
     let id = fnv(&format!("{} {} {}", text(&o.self_ty, None), o.trait_.as_ref().map_or(String::new(), |t| text(t, None)), s.name));
     let mut options = OptionSpellings::new();
@@ -664,7 +671,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
     let mut extra = format!(
         "{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe, clippy::all)] unsafe extern \"C\" fn {w}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = r; {phase} {body} }}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static {w}_E: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::OP, module: module_path!(),
+  kind: ::relax_api::OP, run: {run}, module: module_path!(),
   key: {key},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<{fnptr}>() }} s }},
   shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};",
@@ -688,7 +695,7 @@ fn expand_fn(toks: &[TokenTree], args: &[String], loader: Option<String>) -> Res
         let id = fnv(&format!("loader fn {}", s.name));
         return Ok((toks.iter().cloned().collect(), loader_code(id, &key_code(&o, &s.name), &text, &s.cfg)));
     }
-    let extra = op_code(&o, &s, op_phase(args));
+    let extra = op_code(&o, &s, args);
     Ok((toks.iter().cloned().collect(), extra))
 }
 
@@ -833,7 +840,7 @@ fn expand_impl(toks: &[TokenTree], args: &[String], impl_loader: Option<String>)
             }
             continue;
         }
-        extra.push_str(&op_code(&owner, s, op_phase(args)));
+        extra.push_str(&op_code(&owner, s, args));
         extra.push('\n');
     }
     // the impl, its fns' own marks stripped
@@ -902,7 +909,7 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
         let extra = format!(
             "{marker}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
+  kind: ::relax_api::PER_SIDE, run: false, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
         );
         return Ok((toks.iter().cloned().collect(), extra));
@@ -931,7 +938,7 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
     let extra = format!(
         "{marker}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::SHARED, module: module_path!(), key: {key}, sig: {none},
+  kind: ::relax_api::SHARED, run: false, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
   offsets: &[], enum_layout: &[], drop: None, addr: Some({{ fn a() -> usize {{ (&raw const {name}) as usize }} a }}) }};"
     );
@@ -1188,7 +1195,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     if plain {
         extra.push_str(&format!(
             "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::PLAIN, module: module_path!(), key: {key}, sig: {none},
+  kind: ::relax_api::PLAIN, run: false, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
   offsets: &[{}], enum_layout: {enum_layout}, drop: None, addr: None }};",
             offsets.join(", ")
@@ -1197,7 +1204,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
         extra.push_str(&format!(
             "{CFG} #[doc(hidden)] #[allow(non_snake_case)] unsafe extern \"C\" fn __relax_api_d{id:016x}(p: *mut u8) {{ let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ ::core::ptr::drop_in_place(p as *mut {ty}) }})); }}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::HANDLE, module: module_path!(), key: {key}, sig: {none},
+  kind: ::relax_api::HANDLE, run: false, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
   offsets: &[{}], enum_layout: {enum_layout}, drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }}, addr: None }};",
             offsets.join(", ")
@@ -1205,11 +1212,11 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
         if args.iter().any(|a| a == "default") {
             // a derived Default: an ordinary op (JIT code may not build the handle itself)
             let h = fnv(&format!("{name} default"));
-            let phase = op_phase(args);
+            let (phase, run) = (op_phase(args), op_runs(args));
             extra.push_str(&format!(
                 "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = a; {phase} match ::std::panic::catch_unwind(<{ty} as ::core::default::Default>::default) {{ Ok(v) => {{ ::core::ptr::write(r as *mut {ty}, v); 0 }} Err(p) => ::relax_api::caught(p) }} }}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::OP, module: module_path!(),
+  kind: ::relax_api::OP, run: {run}, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name_of_val(&<{ty} as ::core::default::Default>::default) }} k }},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<fn() -> {ty}>() }} s }},
   shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
@@ -1218,11 +1225,11 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
         // the handle's trait ops, under the keys Relax's bridges look up
         let mut helper = |tag: &str, trait_key: &str, call: String| {
             let h = fnv(&format!("{name} {tag}"));
-            let phase = op_phase(args);
+            let (phase, run) = (op_phase(args), op_runs(args));
             extra.push_str(&format!(
                 "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ {phase} match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ ::core::ptr::write(r as *mut _, v); 0 }} Err(p) => ::relax_api::caught(p) }} }}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
-  kind: ::relax_api::OP, module: module_path!(),
+  kind: ::relax_api::OP, run: {run}, module: module_path!(),
   key: {{ fn k() -> &'static str {{ concat!(\"<\", module_path!(), \"::{name} as {trait_key}\") }} k }}, sig: {none},
   shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
             ));

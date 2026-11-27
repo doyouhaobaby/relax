@@ -6,14 +6,27 @@
 use super::compiler::{self, Arena};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// The program's Rust allocator, called by the loader in the owning domain's scope.
+/// Each entry returns false when the program's code has ended and the call did not run.
+/// Otherwise alloc writes the program's result to `out`, including null on refusal.
+#[derive(Clone, Copy)]
+pub struct ProgramAllocator {
+    pub ctx: usize,
+    pub alloc: unsafe extern "C" fn(ctx: usize, size: usize, align: usize, zeroed: bool, out: *mut *mut u8) -> bool,
+    pub dealloc: unsafe extern "C" fn(ctx: usize, p: *mut u8, size: usize, align: usize) -> bool,
+}
 
 pub struct DomainHeap {
     inner: Arc<Heap>,
 }
-struct Heap {
+/// Backing storage kept alive by the domain and by outstanding owner leases.
+pub struct Heap {
     arena: Box<Arena>,
+    program: Option<ProgramAllocator>,
+    statics: (usize, usize),
     next: UnsafeCell<*mut Heap>,
 }
 unsafe impl Send for Heap {}
@@ -21,6 +34,9 @@ unsafe impl Sync for Heap {}
 
 static HELD: AtomicBool = AtomicBool::new(false);
 static HEAD: AtomicPtr<Heap> = AtomicPtr::new(std::ptr::null_mut());
+static PA_HEAPS: AtomicUsize = AtomicUsize::new(0);
+static STATICS_LOW: AtomicUsize = AtomicUsize::new(usize::MAX);
+static STATICS_HIGH: AtomicUsize = AtomicUsize::new(0);
 struct Registry;
 impl Registry {
     fn try_lock() -> Option<Self> {
@@ -61,21 +77,48 @@ impl Drop for Registry {
 }
 
 impl DomainHeap {
-    pub fn new() -> Option<Box<Self>> {
+    /// `statics` is the domain's fixed (base, length), or (0, 0) for a heap with no static block.
+    ///
+    /// # Safety
+    /// With a program allocator, its entries and context must service this heap's Rust
+    /// layouts on any calling thread until drop drains its leases. The static range must be
+    /// reserved exclusively for this domain and stay mapped through that drain. With None
+    /// there are no additional requirements.
+    pub unsafe fn new(program: Option<ProgramAllocator>, statics: (usize, usize)) -> Option<Box<Self>> {
         let arena = Arena::create()?;
         let heap = Box::new(Self {
             inner: Arc::new(Heap {
                 arena,
+                program,
+                statics,
                 next: UnsafeCell::new(std::ptr::null_mut()),
             }),
         });
         let _registry = Registry::for_create();
+        if let Some(pa) = &heap.inner.program {
+            // The Arc keeps the entries at this address for the lifetime of every region.
+            heap.inner.arena.program.store(std::ptr::from_ref(pa).cast_mut(), Ordering::Relaxed);
+            if statics.1 != 0 {
+                STATICS_LOW.fetch_min(statics.0, Ordering::Release);
+                STATICS_HIGH.fetch_max(statics.0 + statics.1, Ordering::Release);
+            }
+            PA_HEAPS.fetch_add(1, Ordering::Release);
+        }
         unsafe {
             *heap.inner.next.get() = HEAD.load(Ordering::Relaxed);
             // The registry owns a strong reference; a matching free clones it under the lock.
             HEAD.store(Arc::into_raw(heap.inner.clone()) as *mut Heap, Ordering::Release);
         }
         Some(heap)
+    }
+    /// The backing storage for `heap_owns`, stable through the last owner lease.
+    pub fn as_ptr(&self) -> *const Heap {
+        Arc::as_ptr(&self.inner)
+    }
+    /// A fork child cannot drain inherited leases. Its still-registered heap keeps its PA
+    /// static block mapped just as it keeps its arena regions.
+    pub fn retains_statics_on_drop(&self) -> bool {
+        super::arenas_closed() && self.inner.program.is_some() && self.inner.statics.1 != 0
     }
     /// (bytes in use, bytes committed), over all regions.
     pub fn stats(&self) -> (usize, usize) {
@@ -122,6 +165,9 @@ impl Drop for DomainHeap {
                     if std::ptr::eq(*link, Arc::as_ptr(&self.inner)) {
                         removed = Some(Arc::from_raw(*link));
                         *link = *self.inner.next.get();
+                        if self.inner.program.is_some() {
+                            PA_HEAPS.fetch_sub(1, Ordering::Release);
+                        }
                         break;
                     }
                     link = (**link).next.get();
@@ -166,6 +212,15 @@ pub unsafe fn restore(heap: *const ()) {
 /// `enter`'s heap as `current` names it, for a scoped entry that switches without the registry.
 pub fn raw(heap: *const DomainHeap) -> *const () {
     unsafe { heap.as_ref() }.map_or(std::ptr::null(), |h| &*h.inner.arena as *const Arena as *const ())
+}
+
+/// Checks a PA result against its own statics and arena regions without locking.
+///
+/// # Safety
+/// The domain or an owner lease must keep `heap` alive for the call.
+pub unsafe fn heap_owns(heap: *const Heap, p: *mut u8) -> bool {
+    let heap = &*heap;
+    (p as usize).wrapping_sub(heap.statics.0) < heap.statics.1 || heap.arena.region_of(p).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -225,19 +280,34 @@ pub(super) fn hold_registry() -> impl Drop { Registry::lock() }
 
 /// Whether the owner lookup places `p` in the system heap (a test's look at a fork child's free).
 #[cfg(test)]
-pub(super) unsafe fn system_owned(p: *mut u8) -> bool { owner(p).is_none() }
+pub(super) unsafe fn system_owned(p: *mut u8) -> bool { owner::<true>(p).is_none() }
 
-/// The heap holding `p` and its region, kept alive by the lease.
-unsafe fn owner(p: *mut u8) -> Owner {
+// Outside the arena bounds, ordinary loader frees pay just the count load without a PA.
+// With a PA, only a candidate for one of its other ranges needs the registry lock.
+#[inline]
+fn may_be_program_memory(p: *mut u8) -> bool {
+    PA_HEAPS.load(Ordering::Acquire) != 0 && p as usize >= STATICS_LOW.load(Ordering::Acquire)
+        && (p as usize) < STATICS_HIGH.load(Ordering::Acquire)
+}
+
+/// The heap holding `p` and its region, kept alive by the lease. For non-arena program
+/// memory the first region serves allocations after the program's code ends.
+#[inline]
+unsafe fn owner<const LOADER: bool>(p: *mut u8) -> Owner {
     // Conservative bounds only widen: ordinary native frees need no registry lock. Actual
     // ownership is still checked against live ranges, so recycled addresses are never stale.
-    if !in_heaps(p) { return Owner::System; }
+    if !in_heaps(p) && !(LOADER && may_be_program_memory(p)) { return Owner::System; }
+    owner_in_bounds::<LOADER>(p)
+}
+
+#[cold]
+unsafe fn owner_in_bounds<const LOADER: bool>(p: *mut u8) -> Owner {
     // (a fork child opened the bounds to every address, arena.rs `close_for_fork_child`: its own
     // system blocks are found here, past the bounds every free of a parent stops at, and the
     // rest outside the true bounds are the system's without the registry: it may be held)
     let _registry = if super::arenas_closed() {
         if child_system::find(p, false) { return Owner::Child; }
-        if !compiler::in_parent_heaps(p) { return Owner::System; }
+        if !compiler::in_parent_heaps(p) && !(LOADER && may_be_program_memory(p)) { return Owner::System; }
         let Some(g) = Registry::try_lock() else { return Owner::Unknown };
         g
     } else {
@@ -246,7 +316,12 @@ unsafe fn owner(p: *mut u8) -> Owner {
     };
     let mut h = HEAD.load(Ordering::Relaxed);
     while let Some(heap) = h.as_ref() {
-        if let Some(r) = heap.arena.region_of(p) {
+        // The loader owns Rust blocks by range. Program mappings join the static block here.
+        let region = heap.arena.region_of(p).or_else(|| {
+            (LOADER && heap.program.is_some() && (p as usize).wrapping_sub(heap.statics.0) < heap.statics.1)
+                .then_some(&*heap.arena)
+        });
+        if let Some(r) = region {
             Arc::increment_strong_count(h);
             return Owner::Domain(Arc::from_raw(h), r);
         }
@@ -384,7 +459,7 @@ pub unsafe fn dealloc(p: *mut u8) -> bool {
         release(r, p);
         return true;
     }
-    match owner(p) {
+    match owner::<false>(p) {
         Owner::Domain(_heap, r) => { release(&*r, p); true }
         Owner::Unknown => true,
         Owner::Child => { child_system::find(p, true); false }
@@ -395,7 +470,7 @@ pub unsafe fn realloc_owned(p: *mut u8, size: usize) -> Option<*mut u8> {
     if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
         return Some(reallocate(r, p, size));
     }
-    match owner(p) {
+    match owner::<false>(p) {
         Owner::Domain(_heap, r) => Some(reallocate(&*r, p, size)),
         // The bounds include system blocks. Only a proven domain C block has a Header.
         Owner::Unknown => Some(std::ptr::null_mut()),
@@ -447,40 +522,61 @@ pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut
         None => System.alloc_zeroed(l),
     }
 }
-/// A block of the calling thread's domain heap for a provided crate's op (the run phase), or
-/// null when the thread is in no domain or the heap refused. The heap accounting's allocator
-/// takes these without its header: a domain block is freed by address, by JIT code and native
-/// code alike.
+/// The loader consults these entries only for run allocations and Rust blocks owned by this
+/// heap. The JIT's System and C allocation ABIs use the underlying regions directly.
 #[inline]
-pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
-    if !relax_session::phase::in_run() {
-        return std::ptr::null_mut();
-    }
-    match compiler::domain_here() {
-        Some(a) if zeroed => a.alloc_zeroed(l),
-        Some(a) => a.alloc(l),
-        None => std::ptr::null_mut(),
-    }
+fn program_allocator(arena: &Arena) -> Option<&ProgramAllocator> {
+    unsafe { arena.program.load(Ordering::Relaxed).as_ref() }
 }
+
+#[inline]
+unsafe fn arena_alloc(arena: &Arena, l: Layout, zeroed: bool) -> *mut u8 {
+    if zeroed { arena.alloc_zeroed(l) } else { arena.alloc(l) }
+}
+
+/// A run op's headerless allocation. None lets the loader use its usual fallback. In a PA
+/// domain even a null result is final, including a failed allocation after the code ended.
+#[inline]
+pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> Option<*mut u8> {
+    if !relax_session::phase::in_run() { return None; }
+    let arena = compiler::domain_here()?;
+    if let Some(pa) = program_allocator(arena) {
+        if super::arenas_closed() { return Some(child_alloc(l, zeroed)); }
+        let mut out = std::ptr::null_mut();
+        if (pa.alloc)(pa.ctx, l.size(), l.align(), zeroed, &mut out) { return Some(out); }
+        return Some(arena_alloc(arena, l, zeroed));
+    }
+    let p = arena_alloc(arena, l, zeroed);
+    (!p.is_null()).then_some(p)
+}
+
+#[inline]
+unsafe fn program_free_layout(arena: &Arena, p: *mut u8, l: Layout) -> bool {
+    let Some(pa) = program_allocator(arena) else { return false };
+    if !super::arenas_closed() {
+        // After code end the block stays live until whole-heap release.
+        (pa.dealloc)(pa.ctx, p, l.size(), l.align());
+    }
+    true
+}
+
 /// Also the native global allocator's free (every free of a provided crate passes here).
 #[inline]
 pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
-    if compiler::domain_dealloc(p, l) {
-        return true;
-    }
-    // a block outside every domain heap's range (an ordinary native one, or the web target's
-    // linear memory): no call into the owner lookup
-    if !in_heaps(p) {
-        return false;
-    }
-    dealloc_other(p, l)
+    if compiler::domain_dealloc(p, l, |r| program_free_layout(r, p, l)) { return true; }
+    if !in_heaps(p) && !may_be_program_memory(p) { return false; }
+    dealloc_other::<true>(p, l)
 }
+
 /// A block of another domain's heap (freed by native code, another thread or after an enter).
 #[cold]
 #[inline(never)]
-unsafe fn dealloc_other(p: *mut u8, l: Layout) -> bool {
-    match owner(p) {
-        Owner::Domain(_heap, r) => { (*r).dealloc(p, l); true }
+unsafe fn dealloc_other<const LOADER: bool>(p: *mut u8, l: Layout) -> bool {
+    match owner_in_bounds::<LOADER>(p) {
+        Owner::Domain(_heap, r) => {
+            if !(LOADER && program_free_layout(&*r, p, l)) { (*r).dealloc(p, l); }
+            true
+        }
         Owner::Unknown => true,
         Owner::Child => {
             child_system::find(p, true);
@@ -510,12 +606,29 @@ unsafe extern "C" fn dealloc_shared(p: *mut u8, size: usize, align: usize) {
 #[inline(never)]
 unsafe extern "C" fn dealloc_owned(p: *mut u8, size: usize, align: usize) {
     let l = Layout::from_size_align_unchecked(size, align);
-    let handled = if super::arenas_closed() { dealloc_layout(p, l) } else { dealloc_other(p, l) };
-    if !handled {
+    if super::arenas_closed() && compiler::domain_dealloc(p, l, |_| false) { return; }
+    if !dealloc_other::<false>(p, l) {
         System.dealloc(p, l);
     }
 }
-unsafe fn resize_layout(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+unsafe fn resize_layout<const LOADER: bool>(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+    if LOADER {
+        if let Some(pa) = program_allocator(a) {
+            let new = Layout::from_size_align_unchecked(size, l.align());
+            let mut q = std::ptr::null_mut();
+            // GlobalAlloc permits the loader to resize by alloc, copy, free. It never calls the
+            // program's realloc, so a run ending inside the allocator leaves nothing half moved.
+            let called = !super::arenas_closed() && (pa.alloc)(pa.ctx, size, l.align(), false, &mut q);
+            if !called {
+                q = if super::arenas_closed() { child_alloc(new, false) } else { a.alloc(new) };
+            }
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
+                if called { (pa.dealloc)(pa.ctx, p, l.size(), l.align()); }
+            }
+            return q;
+        }
+    }
     if a.resize_in_place(p, l, size) { return p; }
     let q = a.alloc(Layout::from_size_align_unchecked(size, l.align()));
     if !q.is_null() {
@@ -524,14 +637,19 @@ unsafe fn resize_layout(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u
     }
     q
 }
+#[inline]
 pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
+    realloc_owned_layout::<true>(p, l, size)
+}
+
+unsafe fn realloc_owned_layout<const LOADER: bool>(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
     // a fork child's domain block moves to the system heap here too: its arena's in-place
     // resize refuses and its allocation is the system heap's (arena.rs `alloc_slow`)
     if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
-        return Some(resize_layout(r, p, l, size));
+        return Some(resize_layout::<LOADER>(r, p, l, size));
     }
-    match owner(p) {
-        Owner::Domain(_heap, r) => Some(resize_layout(&*r, p, l, size)),
+    match owner::<LOADER>(p) {
+        Owner::Domain(_heap, r) => Some(resize_layout::<LOADER>(&*r, p, l, size)),
         Owner::System => None,
         // only in a fork child: its own system block, or one the address alone cannot place (the
         // registry was held at the fork). A Layout also describes an unconfirmed block: it is
@@ -552,7 +670,7 @@ pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut 
 
 pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, size: usize) -> *mut u8 {
     let l = Layout::from_size_align_unchecked(old, align);
-    realloc_layout(p, l, size).unwrap_or_else(|| System.realloc(p, l, size))
+    realloc_owned_layout::<false>(p, l, size).unwrap_or_else(|| System.realloc(p, l, size))
 }
 
 extern "C" {
@@ -697,8 +815,8 @@ mod tests {
     #[test]
     fn layout_entries_fast_and_slow_paths() {
         symbol(b"relax_alloc");
-        let first = DomainHeap::new().unwrap();
-        let second = DomainHeap::new().unwrap();
+        let first = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
+        let second = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*first);
             // small (fast path), large, over-aligned, zero-sized-ish: allocate, fill, free
@@ -741,7 +859,7 @@ mod tests {
             enter(std::ptr::null());
             // no domain: the system heap
             let p = program_alloc(32, 8);
-            assert!(owner(p).is_none());
+            assert!(owner::<false>(p).is_none());
             program_dealloc(p, 32, 8);
         }
     }
@@ -751,7 +869,7 @@ mod tests {
     #[test]
     fn a_sparse_detached_chunk_gives_its_free_pages_back_on_free() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         // (a failed assert: this thread leaves the heap before the heap goes, a failure and no crash)
         struct Leave;
         impl Drop for Leave {
@@ -794,7 +912,7 @@ mod tests {
     #[test]
     fn large_runs_stay_warm_and_zeroed_allocs_stay_zero() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*heap);
             // a per-frame large Vec: the freed run is parked committed and the next block of
@@ -836,7 +954,7 @@ mod tests {
     #[test]
     fn a_full_region_reserves_another() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         let (base, size) = heap.range();
         let block = size / 64;
         unsafe {
@@ -892,7 +1010,7 @@ mod tests {
     #[test]
     fn program_malloc_trim_trims_the_domain_heap() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         let addr = &*heap as *const DomainHeap as usize;
         // half of a class's blocks freed, the low half: the current chunk is half live (not
         // sparse) and its low pages are whole free pages
@@ -954,7 +1072,7 @@ mod tests {
     #[test]
     fn densify_marks_dense_chunks_only() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*heap);
             // a sparse class: one block of 48 bytes; a dense one: 1.5 MB of 1000-byte blocks
@@ -992,7 +1110,7 @@ mod tests {
     #[test]
     fn sparse_current_chunk_gives_free_pages_back() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*heap);
             // a burst: 1.2 MB of 64-byte blocks in this thread's current chunk of the class
@@ -1051,7 +1169,7 @@ mod tests {
     #[test]
     fn a_waiting_owner_takes_the_remote_frees() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         let addr = &*heap as *const DomainHeap as usize;
         unsafe {
             enter(&*heap);
@@ -1098,7 +1216,7 @@ mod tests {
     #[test]
     fn the_monitor_settles_a_waiting_owners_chunk() {
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         let addr = &*heap as *const DomainHeap as usize;
         let (to_owner, owner_rx) = std::sync::mpsc::channel::<()>();
         let (blocks_tx, blocks_rx) = std::sync::mpsc::channel::<Vec<usize>>();
@@ -1149,7 +1267,7 @@ mod tests {
         // one 2 MB chunk per size class it had used: a large app's thread churn used up the heap's
         // reservation (exit -6 in a thread start on macOS).
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         let addr = &*heap as *const DomainHeap as usize;
         let sizes = [16usize, 48, 100, 300, 1000, 4000, 20_000, 100_000];
         for _ in 0..64 {
@@ -1176,8 +1294,8 @@ mod tests {
     #[test]
     fn cross_thread_free_realloc_and_native_state() {
         symbol(b"relax_alloc");
-        let first = DomainHeap::new().unwrap();
-        let second = DomainHeap::new().unwrap();
+        let first = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
+        let second = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*first);
             let mut p = std::ptr::null_mut();
@@ -1186,7 +1304,7 @@ mod tests {
             std::ptr::write_bytes(p, 71, 8192);
             // A native helper called on this thread must still allocate shared state.
             let native = Box::new([23u8; 2048]);
-            assert!(owner(native.as_ptr() as *mut u8).is_none());
+            assert!(owner::<false>(native.as_ptr() as *mut u8).is_none());
             enter(&*second);
             let q = program_realloc(p, 32768);
             assert!(!q.is_null());
@@ -1218,7 +1336,7 @@ mod tests {
         let Ok(mode) = std::env::var("RELAX_HEAP_CHECK_CHILD") else { return };
         assert!(compiler::heap_check_on());
         symbol(b"relax_alloc");
-        let heap = DomainHeap::new().unwrap();
+        let heap = unsafe { DomainHeap::new(None, (0, 0)) }.unwrap();
         unsafe {
             enter(&*heap);
             match mode.as_str() {

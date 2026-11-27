@@ -86,6 +86,14 @@ pub struct ProvidedCrate {
     pub table: Vec<&'static relax_api::Entry>,
 }
 
+impl ProvidedCrate {
+    /// Whether one of the crate's ops is marked `run`: what it allocates is the program's, so a
+    /// program with a `#[global_allocator]` has its allocator probed and routed to (domain.rs).
+    pub fn runs_in_program(&self) -> bool {
+        self.table.iter().any(|e| e.kind == relax_api::OP && e.run)
+    }
+}
+
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
         ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), shared: self.shared.clone(), loader: self.loader.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest, table: self.table.clone() }
