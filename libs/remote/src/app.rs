@@ -143,6 +143,50 @@ fn get<'a>(kv: &'a [(String, String)], keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| kv.iter().find(|x| x.0 == *k).map(|x| x.1.as_str()))
 }
 
+/// `makepad-remote app <pid|app|socket> <command> [k=v ...]`: prints the answer's lines; exit
+/// status 1 when the answer had an error, 2 when the app cannot be reached.
+pub fn run_command_line(spec: &str, argv: &[String]) -> i32 {
+    if let Some(("--reconnect", call)) = argv.split_first().map(|(flag, rest)| (flag.as_str(), rest)) {
+        return match reconnect_call(spec, call, &mut |line| println!("{line}")) {
+            Ok(false) => 0,
+            Ok(true) => 1,
+            Err(e) => { eprintln!("makepad-remote app: {e}"); 1 }
+        }
+    }
+    // `<host>:<app|pid>` goes through the hub to an app on another machine (a phone that dials in)
+    #[cfg(unix)]
+    let routed = (spec.contains(':') && !spec.contains('/')).then(|| {
+        let bin = std::env::var_os("RELAX_BIN").map(PathBuf::from);
+        crate::hub::connect(bin.as_deref()).map(|hub| crate::Client::routed(&hub, spec))
+    });
+    #[cfg(not(unix))]
+    let routed: Option<Result<crate::Client, String>> = None;
+    let connected = match routed {
+        Some(Ok(c)) => Ok(c),
+        Some(Err(e)) => { eprintln!("makepad-remote app: {e}"); return 2; }
+        None => crate::Client::connect_as(spec, &crate::discovery::Caller::command_line()),
+    };
+    let client = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            return 2;
+        }
+    };
+    let argv = if argv.is_empty() { vec!["help".to_string()] } else { argv.to_vec() };
+    match run_printed(&client, &argv, &mut |l| {
+        println!("{l}");
+        true
+    }) {
+        Ok(false) => 0,
+        Ok(true) => 1,
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            2
+        }
+    }
+}
+
 /// [`run`] as a command line prints it: a tool result's inline pictures are written to files in
 /// the app's grab folder and the line names them instead (`image_files`, [`call_image_line`]), so
 /// a shell or a coding agent reads paths, not megabytes of base64. A library caller of [`run`]
