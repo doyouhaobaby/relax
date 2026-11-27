@@ -11119,6 +11119,21 @@ fn removed_module_line(path: &str, declares: &str) -> String {
     format!("error[E0583]: file not found for module `{name}`: {path} was removed and {declares} still declares it")
 }
 
+/// Whether the live watcher watches one of these absolute paths or its parent folder.
+/// Returns `None` when there is no watcher.
+pub fn watches(paths: &[String]) -> Option<bool> {
+    let inputs = {
+        let view = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        if WATCH_GONE.load(Ordering::Acquire) { return None; }
+        view.as_ref()?.inputs.clone()
+    };
+    Some(paths.iter().any(|path| {
+        let path = crate::vfs::normalize_path(path);
+        inputs.paths.contains_key(&path) || std::path::Path::new(&path).parent()
+            .and_then(|p| p.to_str()).is_some_and(|p| inputs.paths.contains_key(p))
+    }))
+}
+
 /// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
 /// waits for their verdict. No inputs lock survives that request or the path formatting.
 /// The run's inputs `keep` takes (an absolute path; `inspect inputs` answers relative ones).
