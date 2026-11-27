@@ -650,7 +650,7 @@ static WAIT_HOOK: OnceLock<extern "C" fn(u8)> = OnceLock::new();
 fn global() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let cores = granted_cores(thread::available_parallelism().map_or(1, usize::from), std::env::var("MAKEPAD_CPU_CORES").ok().as_deref());
+        let cores = granted_cores(machine_cores(), std::env::var("MAKEPAD_CPU_CORES").ok().as_deref());
         // (a machine whose topology is not known: every CPU a core)
         Budget::new(cores, match physical_cores() { 0 => cores, n => n.min(cores) }).with_fast(fast_cores())
     })
@@ -668,9 +668,27 @@ fn global() -> &'static Budget {
 ///   `MAKEPAD_POOL_CORES` is set.
 /// - `MAKEPAD_POOL_CORES`: the long-lived pools alone ([`pool_cores`]): the platform's app pool,
 ///   the CSG pool and the script compute pool. Nothing else reads it.
+/// - `MAKEPAD_MACHINE_CORES`: the machine itself ([`machine_cores`]), which the two above are at
+///   most.
 /// - `RELAX_JOBS`: the JIT's parse jobs (relax/session options), not this budget.
 fn granted_cores(machine: usize, jobs: Option<&str>) -> usize {
     jobs.and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).map_or(machine, |n| n.min(machine))
+}
+
+/// The machine's cores as the process counts them: `MAKEPAD_MACHINE_CORES` where its run was told
+/// them, else what the OS shows it (`available_parallelism`, which on Linux is also its cgroup's
+/// CPU quota). A process sizes from this once, at its start: one started under a quota that lifts
+/// later is told its machine's cores, or it keeps its quota's size for its whole life. A live
+/// session launched under a 10-core quota beside a tests shard would have kept a 10-core JIT on a
+/// 16-core box after its launch ended (11-26). Read once.
+pub fn machine_cores() -> usize {
+    static MACHINE: OnceLock<usize> = OnceLock::new();
+    *MACHINE.get_or_init(|| machine_from(std::env::var("MAKEPAD_MACHINE_CORES").ok().as_deref(), || thread::available_parallelism().map_or(1, usize::from)))
+}
+
+/// `given` when it is a count above zero, else what `seen` counts.
+fn machine_from(given: Option<&str>, seen: impl FnOnce() -> usize) -> usize {
+    given.and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or_else(seen)
 }
 
 /// The machine's cores, an SMT core's hardware threads counted once (Linux: one per distinct

@@ -504,4 +504,9 @@ fn a_granted_run_sizes_the_budget_from_its_grant() {
     assert_eq!(granted_cores(16, None), 16);
     assert_eq!(granted_cores(16, Some("0")), 16);
     assert_eq!(granted_cores(16, Some("four")), 16);
+    // the machine a run was told (`MAKEPAD_MACHINE_CORES`) stands for the one it sees, which a CPU
+    // quota at its start narrows; an unset or unreadable count is the one it sees
+    assert_eq!(machine_from(Some("16"), || 10), 16, "a run under a 10-core quota sizes from its 16-core machine");
+    assert_eq!(machine_from(None, || 10), 10, "unset: the cores it sees");
+    assert_eq!((machine_from(Some("0"), || 10), machine_from(Some("all"), || 10)), (10, 10), "unreadable: the cores it sees");
 }
