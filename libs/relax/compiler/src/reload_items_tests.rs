@@ -413,9 +413,49 @@ pub fn holds(out: &mut u64) {
 }
 "#;
 
+/// A body whose nested fn returns `impl Trait` (its opaque type, which captures the elided
+/// lifetime), after an item before it in the body, and an inner block with an item of its own
+/// that calls the nested fn: platform remote.rs `publish_windows`, whose edit removing such a
+/// `static` stopped with an internal compiler error (rpitit.rs "collected opaque captures",
+/// 11-27). The edit gives the body's block a new module and the nested fn a new def; the inner
+/// block's module, carried over by its unchanged items, still looked names up in the old one.
+const NESTED_OPAQUE: &str = r#"pub mod imp {
+    use std::sync::OnceLock;
+    pub struct Info { pub id: usize, pub title: String, pub visible: bool }
+    pub fn publish(out: &mut u64) {
+        static HIDDEN: OnceLock<bool> = OnceLock::new();
+        let hidden = *HIDDEN.get_or_init(|| false);
+        let windows: Vec<Info> = vec![Info { id: 1, title: "a".into(), visible: !hidden }];
+        fn advertised(windows: &[Info]) -> impl Iterator<Item = (usize, &str)> {
+            windows.iter().filter(|w| w.visible).map(|w| (w.id, w.title.as_str()))
+        }
+        *out = advertised(&windows).count() as u64 + 10;
+        if *out > 0 {
+            // an item in an inner block: the block keeps its module through the edit
+            const ONE: u64 = 1;
+            *out += advertised(&windows).count() as u64 * ONE;
+        }
+    }
+}
+pub fn evens(out: &mut u64) { imp::publish(out) }
+"#;
+
 #[test]
 fn removed_inner_items_are_not_checked_against_the_next_edit() {
-    in_child("reload_items_tests::removed_inner_items_are_not_checked_against_the_next_edit", &["two_saves", "one_save"], |case| {
+    in_child("reload_items_tests::removed_inner_items_are_not_checked_against_the_next_edit", &["two_saves", "one_save", "nested_opaque"], |case| {
+        if case == "nested_opaque" {
+            live_app("inner-opaque", &[("lib.rs", NESTED_OPAQUE)], &["evens"], |call, edit| {
+                assert_eq!(call("evens"), 12);
+                let outcome = edit("lib.rs", &[
+                    ("        static HIDDEN: OnceLock<bool> = OnceLock::new();\n        let hidden = *HIDDEN.get_or_init(|| false);\n", ""),
+                    ("visible: !hidden", "visible: true"),
+                    ("+ 10;", "+ 20;"),
+                ]);
+                assert_eq!(outcome.rung, Rung::Patch, "an item removed before a nested fn returning impl Trait: {:?}", outcome.lines);
+                assert_eq!(call("evens"), 22, "the inner block calls the edited body's nested fn");
+            });
+            return;
+        }
         live_app("inner-items", &[("lib.rs", INNER)], &["holds"], |call, edit| {
             assert_eq!(call("holds"), 1);
             let inner = "    struct Guard(u64);\n    impl Drop for Guard {\n        fn drop(&mut self) { let _ = Duration::from_millis(self.0); }\n    }\n    let _g = Guard(1);\n    *out = 1;";

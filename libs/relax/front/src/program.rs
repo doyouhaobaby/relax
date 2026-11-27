@@ -3621,7 +3621,13 @@ impl Program {
 
     fn collect_new_block_items(&mut self, file: u32, b: BlockId, module: u32, owner: Option<DefId>) -> Result<(), String> {
         let Some((items, subs)) = self.file_blocks[file as usize].get(&b.0).cloned() else { return Ok(()) };
-        let inner = match self.block_mods.get(&(file, b.0)).copied() {
+        // A block module the commit carried over (its items paired) keeps its names only under
+        // the module it was in. When the enclosing block's module is new (an item there was added
+        // or removed), that block's names are new defs, and a lookup from this block falls through
+        // to its old parent's: the old defs. Then this block gets a new module too (11-27: an
+        // `if` block calling a nested fn returning `impl Trait` reached its old opaque).
+        let carried = self.block_mods.get(&(file, b.0)).copied().filter(|&m| self.mods[m as usize].lexical_parent == Some(module));
+        let inner = match carried {
             Some(m) => m,
             None if !items.is_empty() => {
                 let krate = self.mods[module as usize].krate;
