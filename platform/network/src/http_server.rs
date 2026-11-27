@@ -982,6 +982,35 @@ mod tests {
     }
 
     #[test]
+    fn expired_get_returns_gateway_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listen_address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listen_address).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let (headers, _) = HttpServerHeaders::from_tcp_stream(&mut stream).unwrap();
+        let (request, _unanswered_requests) = mpsc::channel();
+        let server = HttpServer {
+            listen_address,
+            request,
+            post_max_size: 0,
+            post_max_size_overrides: Vec::new(),
+            pre_admit_posts: false,
+            client_ip_resolver: None,
+            trusted_proxy: None,
+            allowed_methods: None,
+        };
+
+        handle_get(server, stream, headers, Instant::now());
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+            "an expired GET must deliver its 504 before closing the connection, received {response:?}"
+        );
+    }
+
+    #[test]
     fn range_write_deadline_has_slack_and_stalled_peers_remain_capped() {
         let now = Instant::now();
         let api_deadline = now + API_CONNECTION_TIMEOUT;
