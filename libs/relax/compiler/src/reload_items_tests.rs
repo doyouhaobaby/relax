@@ -315,6 +315,20 @@ fn edits_of_items_apply_live() {
             // items a macro makes in a fn body
             patch(&mut *edit, "lib.rs", &[("pub fn tls(out: &mut u64) {\n    *out = 1;\n}", "pub fn tls(out: &mut u64) {\n    thread_local! { static T: std::cell::Cell<u64> = std::cell::Cell::new(5); }\n    *out = T.with(|t| t.get());\n}")]);
             assert_eq!(call("tls"), 5);
+            // two items of one name in one body, or in one module, are E0428, as a fresh build
+            // refuses them (such an edit applied, a lookup taking one for both): the edit is
+            // refused beside the running item, the running code goes on, and the edit that names
+            // the second ones apart applies
+            patch(&mut *edit, "lib.rs", &[("    *out = T.with(|t| t.get());", "    static ONE: u64 = 1;\n    *out = T.with(|t| t.get()) + ONE;")]);
+            assert_eq!(call("tls"), 6);
+            let outcome = edit("lib.rs", &[("    static ONE: u64 = 1;\n", "    static ONE: u64 = 1;\n    static ONE: u64 = 2;\n"), ("pub fn tls(", "pub static TWICE: u64 = 1;\npub static TWICE: u64 = 2;\n\npub fn tls(")]);
+            assert_eq!(outcome.rung, Rung::Refuse, "{:?}", outcome.lines);
+            for name in ["ONE", "TWICE"] {
+                assert!(outcome.lines.iter().any(|l| l.contains(&format!("E0428: the name `{name}` is defined multiple times"))), "{name}: {:?}", outcome.lines);
+            }
+            assert_eq!(call("tls"), 6, "the running code goes on");
+            patch(&mut *edit, "lib.rs", &[("    static ONE: u64 = 2;\n", "    static TWO: u64 = 2;\n"), ("pub static TWICE: u64 = 2;\n", "pub static TWO: u64 = 2;\n"), ("t.get()) + ONE;", "t.get()) + ONE + TWO + TWICE;")]);
+            assert_eq!(call("tls"), 9, "the block's TWO shadows the module's");
             // Qualifying the type keeps the stored value. A different element type needs a restart.
             assert_eq!(call("level"), 1);
             assert_eq!(call("level"), 2);

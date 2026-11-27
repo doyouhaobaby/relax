@@ -3,7 +3,7 @@
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
 use crate::ast;
-use crate::program::{DefId, DefKind, Program, NO_DEF};
+use crate::program::{DefId, DefKind, Judged, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
 
@@ -35,13 +35,13 @@ fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
 /// are collected into (their `scope`; their parent is the body's owner, a fn, a constant or a
 /// closure), so sibling blocks, a block and the module around it, and an inner block and the outer
 /// one never collide. (Two of one block were let through, and a lookup took one for both.)
-pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn duplicate_items(prog: &Program, j: Judged) -> Vec<String> {
     // (the scope: a module's or a trait's def, or a block's module index, with whether it is a block)
     let mut seen: crate::fxhash::HashMap<(u32, bool, bool, u32), DefId> = Default::default();
     let mut errors = Vec::new();
     let mut top_foreign: crate::fxhash::HashSet<(u32, u32)> = Default::default();
     for (m, md) in prog.mods.iter().enumerate() {
-        if !own.get(md.krate as usize).copied().unwrap_or(false) || md.lexical_parent.is_some() { continue; }
+        if !j.has_file(prog, md.file) || md.lexical_parent.is_some() { continue; }
         let (file, items) = crate::lint_dead::module_items(prog, m as u32);
         let ast = &prog.files[file as usize].ast;
         for it in items {
@@ -50,10 +50,9 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
             }
         }
     }
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for d in j.defs(prog) {
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || def.parent == NO_DEF { continue; }
+        if !j.has_crate(def.krate) || def.parent == NO_DEF { continue; }
         let parent_kind = prog.def(def.parent).kind;
         let (scope, block) = match parent_kind {
             DefKind::Mod | DefKind::Trait => (def.parent.0, false),
@@ -152,7 +151,7 @@ pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
 /// E0446 (rustc_privacy `check_assoc_item` with `hard_error` for associated types): the type of an
 /// associated type of a trait impl is no less visible than the impl itself (the least visible of
 /// the trait and the types of its trait reference).
-pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<String> {
+pub fn private_assoc_types(prog: &Program, tcx: &Tcx, judged: Judged) -> Vec<String> {
     fn adts(prog: &Program, tcx: &Tcx, t: TyId, out: &mut Vec<DefId>, depth: u32) {
         if depth > 24 { return; }
         match tcx.tys.kind(t).clone() {
@@ -179,27 +178,27 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
     let written = |d: DefId| { let def = prog.def(d); def.item.0 != u32::MAX && prog.files.get(def.file as usize).is_some_and(|f| f.ast.items.get(def.item.0 as usize).is_some_and(|it| it.lo < f.src_len)) };
     // the associated types of each impl, in definition order
     let mut assoc_tys: std::collections::HashMap<DefId, Vec<DefId>> = std::collections::HashMap::new();
-    for j in 0..prog.defs.len() {
-        let adef = prog.def(DefId(j as u32));
-        if adef.kind == DefKind::AssocTy && adef.parent != NO_DEF { assoc_tys.entry(adef.parent).or_default().push(DefId(j as u32)); }
+    // (an impl's associated types are in its file)
+    for a in judged.defs(prog) {
+        let adef = prog.def(a);
+        if adef.kind == DefKind::AssocTy && adef.parent != NO_DEF { assoc_tys.entry(adef.parent).or_default().push(a); }
     }
-    for i in 0..prog.defs.len() {
-        let imp = DefId(i as u32);
+    for imp in judged.defs(prog) {
         let idef = prog.def(imp);
-        if idef.kind != DefKind::Impl || !own.get(idef.krate as usize).copied().unwrap_or(false) || !written(imp) { continue; }
+        if idef.kind != DefKind::Impl || !judged.has_crate(idef.krate) || !written(imp) { continue; }
         let Some(&tr) = tcx.impl_trait.get(&imp) else { continue };
-        if !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false) && prog.def(tr).krate != idef.krate { /* foreign trait: its vis is public */ }
+        if !judged.has_crate(prog.def(tr).krate) && prog.def(tr).krate != idef.krate { /* foreign trait: its vis is public */ }
         // the impl's visibility
         let mut vis = prog.def_item_vis(tr);
-        if !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false) { vis = None; }
+        if !judged.has_crate(prog.def(tr).krate) { vis = None; }
         let mut tys: Vec<DefId> = Vec::new();
         let args = tcx.generic_indices_of(prog, imp).identity_args(&tcx.tys);
         for a in tcx.impl_trait_ref(prog, imp, &args).args.iter() {
             if let crate::consts::GenericArg::Type(t) = a { adts(prog, tcx, *t, &mut tys, 0); }
         }
-        let mut known = written(tr) || !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false);
+        let mut known = written(tr) || !judged.has_crate(prog.def(tr).krate);
         for d in tys {
-            if own.get(prog.def(d).krate as usize).copied().unwrap_or(false) {
+            if judged.has_crate(prog.def(d).krate) {
                 known &= written(d);
                 vis = prog.vis_min(vis, prog.def_item_vis(d));
             }
@@ -211,7 +210,7 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
             let mut used = Vec::new();
             adts(prog, tcx, t, &mut used, 0);
             for u in used {
-                if !own.get(prog.def(u).krate as usize).copied().unwrap_or(false) || !written(u) { continue; }
+                if !judged.has_crate(prog.def(u).krate) || !written(u) { continue; }
                 // (a trait's associated item has the trait's visibility: rustc resolve_visibility
                 // of an inherited visibility directly inside a trait)
                 let owner = if prog.def(u).kind == DefKind::AssocTy && prog.def(prog.def(u).parent).kind == DefKind::Trait { prog.def(u).parent } else { u };
@@ -233,12 +232,11 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
 
 /// The path of an impl's trait is privacy-checked like any path (rustc_resolve: E0603 for a
 /// private module or trait on the way).
-pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<String> {
+pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, j: Judged) -> Vec<String> {
     let mut errors = Vec::new();
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for d in j.defs(prog) {
         let def = prog.def(d);
-        if def.kind != DefKind::Impl || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        if def.kind != DefKind::Impl || !j.has_crate(def.krate) { continue; }
         let ast = &prog.files[def.file as usize].ast;
         let Some(imp) = ast.as_impl(&ast.item(def.item).kind) else { continue };
         let Some(p) = imp.trait_.get() else { continue };
@@ -281,13 +279,12 @@ fn vis_path_segments(prog: &Program, file: u32, scope: u32, p: crate::ast::Row<c
 /// E0433 `too many leading `super` keywords`: a `pub(super)` / `pub(in super::super)` visibility
 /// (also one a macro expansion wrote) with fewer enclosing modules than `super`s; and a global
 /// `::super::x` path in a `use` (rustc_resolve: global paths cannot start with `super`).
-pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn super_paths(prog: &Program, j: Judged) -> Vec<String> {
     use crate::ast::{SegKind, Vis};
     let mut errors = Vec::new();
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
+    for d in j.defs(prog) {
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || def.item.0 == u32::MAX { continue; }
+        if !j.has_crate(def.krate) || def.item.0 == u32::MAX { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let ast = &prog.files[def.file as usize].ast;
         let item = ast.item(def.item);
@@ -311,7 +308,7 @@ pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
     let mut seen_items = crate::fxhash::HashSet::default();
     for im in prog.imports_iter() {
         let krate = prog.mods[im.module as usize].krate;
-        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if !j.has_crate(krate) || j.files.is_some_and(|fs| !fs.contains(&im.file)) { continue; }
         // the visibility path of the `use` / `extern crate` item this import came from
         if im.pos < prog.files[im.file as usize].src_len && seen_items.insert((im.file, im.pos)) {
             let ast = &prog.files[im.file as usize].ast;
@@ -870,12 +867,12 @@ pub fn entry_symbol_conflict(prog: &Program, own: &[bool], root: u32) -> Vec<Str
 /// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
 /// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
 /// 2024), and a safety qualifier on an item of a plain block.
-pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn foreign_blocks(prog: &Program, j: Judged) -> Vec<String> {
     use crate::ast::ItemKind;
     let mut errors = Vec::new();
     let mut scope: crate::fxhash::HashMap<u32, DefId> = Default::default();
-    for (i, d) in prog.defs.iter().enumerate() {
-        if own.get(d.krate as usize).copied().unwrap_or(false) { scope.entry(d.file).or_insert(DefId(i as u32)); }
+    for i in j.defs(prog) {
+        if j.has_crate(prog.def(i).krate) { scope.entry(prog.def(i).file).or_insert(i); }
     }
     for (&file, &def) in &scope {
         let pf = &prog.files[file as usize];
@@ -1976,15 +1973,16 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool], binaries: 
 /// and the body of a `macro_rules!` defined in it (reported at the token in the definition, as
 /// rustc does); what a built-in macro or another crate's macro produced is not (it may carry
 /// `allow_internal_unstable`). A body parsed after the load (a run's) is judged once it is parsed.
-pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn gated_syntax(prog: &Program, j: Judged) -> Vec<String> {
     use crate::parser::ExpnKind;
     let mut errors = Vec::new();
-    for (f, pf) in prog.files.iter().enumerate() {
+    for f in j.file_ids(prog).map(|f| f as usize) {
+        let pf = &prog.files[f];
         // the file's text, then its bodies a run parsed on their first need (ParsedFile::part)
         let asts = || std::iter::successors(Some(&pf.ast), |a| a.part.get().map(|p| &**p));
         if asts().all(|a| a.gated_syntax.is_empty()) { continue; }
         let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
-        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if !j.has_crate(krate) { continue; }
         let features = prog.crates[krate as usize].features(prog);
         for &(feature, pos) in asts().flat_map(|a| &a.gated_syntax) {
             if features.has(feature) || !matches!(pf.expansion_kind(pos), ExpnKind::Root | ExpnKind::LocalRules) { continue; }
@@ -2005,13 +2003,14 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
 /// rustc_attr_parsing `AllowedTargets` for the attributes of nodes that have no definition of
 /// their own: the targets of `#[inline]`, `#[track_caller]`, `#[target_feature]`, `#[used]`,
 /// `#[export_name]` and `#[link_ordinal]` never include enum variants or the crate.
-pub fn node_attribute_targets(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn node_attribute_targets(prog: &Program, j: Judged) -> Vec<String> {
     use crate::ast::ItemKind;
     const NAMES: &[&[u8]] = &[b"inline", b"track_caller", b"target_feature", b"used", b"export_name", b"link_ordinal"];
     let mut errors = Vec::new();
-    for (f, pf) in prog.files.iter().enumerate() {
+    for f in j.file_ids(prog).map(|f| f as usize) {
+        let pf = &prog.files[f];
         let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
-        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if !j.has_crate(krate) { continue; }
         let ast = &pf.ast;
         let p = prog.src(f as u32);
         let mut check = |attrs: &[crate::ast::Attr], what: &str| {
@@ -2042,11 +2041,12 @@ pub fn node_attribute_targets(prog: &Program, own: &[bool]) -> Vec<String> {
 /// rustc_ast_passes `check_decl_attrs` (+ rustc_resolve): the attributes of a function parameter
 /// are `cfg`, `cfg_attr` and the lint attributes, or non-builtin ones; a built-in attribute macro
 /// (`#[test]`) is not a non-macro attribute.
-pub fn param_attributes(prog: &Program, own: &[bool]) -> Vec<String> {
+pub fn param_attributes(prog: &Program, j: Judged) -> Vec<String> {
     let mut errors = Vec::new();
-    for (f, pf) in prog.files.iter().enumerate() {
+    for f in j.file_ids(prog).map(|f| f as usize) {
+        let pf = &prog.files[f];
         let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
-        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if !j.has_crate(krate) { continue; }
         let ast = &pf.ast;
         let p = prog.src(f as u32);
         // rustc_resolve: enum variants and struct fields take only non-macro attributes (struct-pattern

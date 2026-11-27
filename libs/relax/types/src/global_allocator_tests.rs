@@ -115,9 +115,14 @@ fn two_items_of_one_name_in_one_module_or_block_are_refused_and_no_others() {
     own[k as usize] = true;
     // (each as "line:col: message", the file's path cut off; by position, the order check_order
     // gives them)
-    let mut errors: Vec<String> = crate::item_checks::duplicate_items(&prog, &own).iter().map(|e| e.split_once(".rs:").map_or(e.clone(), |(_, at)| at.to_string())).collect();
+    let judged = |files: Option<&[u32]>| {
+        let j = files.map_or(crate::program::Judged::crates(&own), |fs| crate::program::Judged::files(&own, fs));
+        let mut errors: Vec<String> = crate::item_checks::duplicate_items(&prog, j).iter().map(|e| e.split_once(".rs:").map_or(e.clone(), |(_, at)| at.to_string())).collect();
+        errors.sort();
+        errors
+    };
+    let errors = judged(None);
     let e0428 = |at: &str, name: &str, ns: &str, scope: &str| format!("{at}: E0428: the name `{name}` is defined multiple times -- note: `{name}` must be defined only once in the {ns} namespace of {scope}");
-    errors.sort();
     let mut want = [
         e0428("3:1", "MET", "value", "this module"),
         e0428("7:5", "MET", "value", "this block"),
@@ -128,4 +133,9 @@ fn two_items_of_one_name_in_one_module_or_block_are_refused_and_no_others() {
     ];
     want.sort();
     assert_eq!(errors, want);
+    // a live edit's check judges its files alone (reload.rs): the crate's one file finds them all,
+    // no file none
+    let root = prog.mods[prog.crates[k as usize].root_mod as usize].file;
+    assert_eq!(judged(Some(&[root])), want, "the edited file's items");
+    assert_eq!(judged(Some(&[])), Vec::<String>::new(), "no file judged");
 }

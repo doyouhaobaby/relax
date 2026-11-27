@@ -6693,6 +6693,50 @@ impl ParseSnapshot {
     }
 }
 
+/// What a crate-level check judges (relax_types item_checks, check.rs crate_level_errors): every
+/// item of the own crates (`makepad check`, a run's app check), or only those of some files of
+/// them (a live edit's new texts: reload.rs). A module's, a block's and a trait's items are in
+/// one file, so an edit's files hold every scope its items can collide or go wrong in (but for
+/// the items an `include!` brings into a module from another file).
+#[derive(Clone, Copy)]
+pub struct Judged<'a> {
+    pub own: &'a [bool],
+    /// None: every file of the own crates
+    pub files: Option<&'a [u32]>,
+}
+
+impl<'a> Judged<'a> {
+    pub fn crates(own: &'a [bool]) -> Self {
+        Judged { own, files: None }
+    }
+    pub fn files(own: &'a [bool], files: &'a [u32]) -> Self {
+        Judged { own, files: Some(files) }
+    }
+    pub fn has_crate(&self, k: u32) -> bool {
+        self.own.get(k as usize).copied().unwrap_or(false)
+    }
+    /// Whether file `f` is judged: its crate is an own one and, for an edit, it is one of its files.
+    pub fn has_file(&self, prog: &Program, f: u32) -> bool {
+        self.has_crate(prog.file_crate.get(f as usize).copied().unwrap_or(u32::MAX)) && self.files.map_or(true, |fs| fs.contains(&f))
+    }
+    /// The files judged, by index.
+    pub fn file_ids(self, prog: &'a Program) -> impl Iterator<Item = u32> + 'a {
+        let all = self.files.is_none().then(|| 0..prog.files.len() as u32);
+        all.into_iter().flatten().chain(self.files.into_iter().flatten().copied()).filter(move |&f| self.has_file(prog, f))
+    }
+    /// The defs to look at, in definition order: every def (a check skips other crates' by
+    /// `has_crate`), or those of the files judged (from the per-file index).
+    pub fn defs(self, prog: &'a Program) -> impl Iterator<Item = DefId> + 'a {
+        let all = self.files.is_none().then(|| 0..prog.defs.len() as u32);
+        let some = self.files.map(|fs| {
+            let mut v: Vec<u32> = fs.iter().flat_map(|&f| prog.defs_in_file(f).iter().copied()).collect();
+            v.sort_unstable();
+            v
+        });
+        all.into_iter().flatten().chain(some.into_iter().flatten()).map(DefId)
+    }
+}
+
 /// A parsed next version of a loaded file (hot reload: Program::parse_version / commit_version).
 pub struct FileVersion {
     pub old: u32,

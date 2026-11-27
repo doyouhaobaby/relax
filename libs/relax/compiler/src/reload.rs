@@ -7518,6 +7518,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         .map(|f| u.prog.file_paths[f as usize].clone()).chain(edit_paths).collect();
     let mut errs: Vec<String> = add_errs.into_iter().filter(|e| !(e.contains(".rs:")) || edited.iter().any(|p| e.starts_with(p.as_str()))).collect();
     errs.extend(removed_errs);
+    // what a fresh build's crate-level checks refuse in the edit's new texts (two items of one
+    // name in one module or block, E0428, and the rest of check.rs edit_crate_level_errors): a
+    // patch refuses what a fresh build refuses, the running code going on (such an edit used to
+    // apply, a lookup taking one of the two items for both)
+    let new_files: Vec<u32> = news.iter().map(|&(_, n)| n).collect();
+    errs.extend(crate::check::edit_crate_level_errors(&u.prog, &u.tcx, &new_files));
     // The edit's own errors, as a fresh build of its text reports them: they refuse it even
     // where a restart is also needed (a restart would only stop at them)
     let mut real: Vec<String> = errs.clone();
