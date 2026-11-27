@@ -10632,6 +10632,47 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A slot whose code reads a `#[thread_local]` static names its place (the thread-local's
+    /// offset). The startup image holds it, and the next run places the thread-local again from
+    /// the image's symbol, with the code's shape, as a cache link does.
+    #[test]
+    fn an_image_holds_a_slot_that_reads_a_thread_local() {
+        isolated_test!(an_image_holds_a_slot_that_reads_a_thread_local);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-image-thread-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "#![no_std]\n#![feature(thread_local)]\n#[thread_local] pub static T: u32 = 7;\npub fn reader() -> u32 { 1 }\npub fn plain() -> u32 { 2 }\n").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        let root = prog.load_crate("a", dir.join("a.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let def = |u: &Unit, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
+        let (reader, plain, t) = (u.fn_id(FnKey::Inst(def(&u, "reader"), vec![])), u.fn_id(FnKey::Inst(def(&u, "plain"), vec![])), def(&u, "T"));
+        let place = u.thread_local_place(t).expect("T is placed");
+        let cache_dir = dir.join("cache");
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.record(&u, reader, &[0, 0, 0, 0, 0, 0, 0, 0, 0xc3], &[RelocAt { at: 0, kind: RelocKind::Pool64, target: Reloc::Sym(place.sym) }], &[]);
+        cache.record(&u, plain, &[0xc3], &[], &[]);
+        assert!(cache.record_manifest(&u, root, &[reader, plain], 2, &|| false));
+        assert_eq!(cache.image_built.as_ref().map(|b| b.1), Some(2), "both slots are placed, the reader with them");
+        cache.flush().unwrap();
+        drop(cache);
+        // the next run loads the manifest as a start does and links the reader's symbols from the image
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.load_manifest(root);
+        assert!(cache.has_startup_image(), "the manifest wrote a startup image");
+        let syms = cache.image_slot_syms(&mut u, reader).expect("the image holds the reader's slot");
+        assert_eq!(syms.len(), 1, "the reader's code names one symbol: {syms:?}");
+        let linked = syms[0].expect("the thread-local's place links from the image");
+        assert!(matches!(u.syms.kind(linked.id), Some(SymKind::ThreadLocal(d)) if d == t), "it links to T's place: {:?}", u.syms.kind(linked.id));
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     impl Cache {
         fn pending_manifest_payload(&self, root: u32) -> Option<&[u8]> {
             let key = self.manifest_key(root)?;

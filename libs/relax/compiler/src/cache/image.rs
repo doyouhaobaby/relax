@@ -276,8 +276,10 @@ impl Cache {
                 // are built in checked steps below)
                 let mut crates: Vec<u32> = Vec::new();
                 for b in tab.syms.list.iter().skip(resume.at) {
-                    if b.first() != Some(&3) || b.len() < 17 { continue; }
-                    let ci = u128::from_le_bytes(b[1..17].try_into().unwrap());
+                    // (the definition's crate: after the tag, and a thread-local's shape byte)
+                    let at = match b.first() { Some(&3) => 1, Some(&11) => 2, _ => continue };
+                    if b.len() < at + 16 { continue; }
+                    let ci = u128::from_le_bytes(b[at..at + 16].try_into().unwrap());
                     if let Some(&c) = self.crate_by_ident.get(&ci) {
                         if !self.def_maps.contains_key(&c) && !crates.contains(&c) { crates.push(c); }
                     }
@@ -308,8 +310,9 @@ impl Cache {
                     let k = u128::from_le_bytes(b[1..17].try_into().unwrap());
                     let o = data.index(k);
                     data.sym.push((i as u32, o));
-                } else if b.first() == Some(&3) {
-                    // a static: its cached initial value (const_value's object) goes with the data
+                } else if is_static_sym(b) {
+                    // a static or a thread-local's: its cached initial value (const_value's
+                    // object) goes with the data
                     let b = b.clone();
                     if let Some(o) = self.static_value_obj(u, &b, data, pend_const) {
                         data.statics.push((i as u32, o));
@@ -493,9 +496,9 @@ impl Cache {
     }
 
     /// The data object of the cached initial value of the static image symbol `b` names (tag 3:
-    /// its definition), if the cache has one.
+    /// its definition; tag 11: the shape byte, then its definition), if the cache has one.
     fn static_value_obj(&mut self, u: &Unit, b: &[u8], data: &mut ImageData, pend: &HashMap<u128, usize>) -> Option<u32> {
-        let def = self.dec_def(u, &mut D { b, p: 1 })?;
+        let def = self.dec_def(u, &mut D { b, p: if b.first() == Some(&11) { 2 } else { 1 } })?;
         let (key, _, _) = self.const_key(u, def, &[])?;
         // (only a value this run certified: a stored one that no longer holds stays out)
         if !self.const_live.contains(&key) { return None; }
@@ -813,6 +816,13 @@ fn skip_sym(d: &mut D, inner: bool) -> Option<()> {
             d.u64()?;
             d.u64()?;
             d.u32()?;
+        }
+        // a `#[thread_local]` static's offset: the code's shape and the static. The load places it
+        // again (link_symbol) and refuses another shape, as a link from the cache does; it links
+        // the symbol with the statics (is_static_sym): the place needs the static's initial value
+        11 => {
+            d.u8()?;
+            skip_def(d, &mut no_atoms)?;
         }
         // a vtable's made cell, by the vtable's own symbol: the load links the vtable and takes
         // its cell (link_symbol), as a link from the cache does. Code that makes a trait object
@@ -1772,7 +1782,8 @@ enum Resolved { Ready(u32), NeedsStatics(u32), Lazy }
 
 /// Static symbols (`enc_sym` tag 3): initializing one may run code.
 fn is_static_sym(b: &[u8]) -> bool {
-    b.first() == Some(&3)
+    // a static (3) or a thread-local's place (11), made from its static's initial value
+    matches!(b.first(), Some(&3) | Some(&11))
 }
 
 impl Linker {
