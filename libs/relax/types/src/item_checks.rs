@@ -1287,7 +1287,7 @@ fn transparent_fields(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
     let fields = &adt.variants[0].fields;
     if fields.len() <= 1 { return None; }
     let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, d), param_env: tcx.param_env_id(prog, d), mode: crate::tcx::TypingMode::non_body_analysis() };
-    let (lay, lcx) = (crate::layout::Layouts::new(), crate::layout::LayoutCx::new(prog));
+    let (lay, lcx) = (crate::layout::Layouts::for_typing_env(env), crate::layout::LayoutCx::new(prog));
     let krate = prog.def(d).krate;
     let count = fields.iter().filter(|f| {
         // layout_of fails for a type that does not normalize, references an error or depends on
@@ -1736,7 +1736,18 @@ pub fn attribute_shapes(prog: &Program, d: DefId) -> Vec<String> {
             }
             b"must_use" => {
                 if list { bad("E0539"); }
-                else if let Some(v) = eq_value { if !is_str(v) { bad("E0539"); } }
+                else if let Some(v) = eq_value {
+                    use crate::lexer::T;
+                    // The parser validates the expanded value of a macro call.
+                    let mut path_end = v;
+                    while path_end < end && matches!(p.tok(path_end).kind, T::Ident | T::RawIdent | T::PathSep | T::KwCrate | T::KwSelfValue | T::KwSuper) {
+                        path_end += 1;
+                    }
+                    let macro_call = path_end > v && path_end + 1 < end
+                        && p.tok(path_end).kind == T::Not
+                        && matches!(p.tok(path_end + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace);
+                    if !is_str(v) && !macro_call { bad("E0539"); }
+                }
             }
             b"link_name" => {
                 if eq_value.map_or(true, |v| !is_str(v)) { bad("E0539"); }

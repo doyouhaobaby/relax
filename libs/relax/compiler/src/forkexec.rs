@@ -120,6 +120,8 @@ pub(crate) extern "C" fn relax_fork_exec() -> i32 {
 pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) -> u32 {
     let _kept = crate::zone_alloc::kept();
     let _keep = crate::os::proc::KeepLastError::new();
+    // SIGCHLD can arrive while the retry queues a compile on the owner.
+    let _signals = crate::os::progsig::compiling(u32::MAX);
     let Some(t) = table() else { return 0 };
     let mut unbuilt = None;
     for e in t.iter().filter(|e| pid > 0 && e[0].load(Ordering::Acquire) == pid as u64) {

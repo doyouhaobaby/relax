@@ -1087,7 +1087,11 @@ impl<'a> Parser<'a> {
             return Err(PErr { pos: err_pos, msg: format!("cannot find macro `{name}` in this scope") });
         }
         let value = self.eager_macro_arg(TokRange { lo: (i + 1) as u32, hi: hi as u32 })?;
-        crate::builtins::eval_lit_range(self, value.lo as usize, value.hi as usize).map_err(|msg| PErr { pos: err_pos, msg })?;
+        let (_, string) = crate::builtins::eval_lit_range(self, value.lo as usize, value.hi as usize)
+            .map_err(|msg| PErr { pos: err_pos, msg })?;
+        if i == lo + 1 && self.tok_text(self.toks.at(lo)) == b"must_use" && !string {
+            return Err(PErr { pos: err_pos, msg: "E0539: malformed `must_use` attribute input".into() });
+        }
         Ok(())
     }
 

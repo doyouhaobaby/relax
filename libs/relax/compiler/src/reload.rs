@@ -8,8 +8,8 @@
 //!    apply, as do supported layout, macro and visibility edits. Types are laid out as rustc lays
 //!    them: a field renamed applies, a type no running value of is left takes its new layout,
 //!    and an enum's added variant takes a free tag where one passes the check. Unsupported edits
-//!    offer a restart with a reason. With `RELAX_AUTO_RESTART=1`, the watcher requests the
-//!    restart itself. The landing check also detects old code remaining on a thread's stack.
+//!    offer a restart with a reason. With `RELAX_AUTO_RESTART=1`, the watcher checks the
+//!    new sources before requesting a restart. The landing check also detects old code remaining on a thread's stack.
 //! 3. Freeze: closures of the functions about to be rebuilt that were never compiled are
 //!    compiled now, from the version their stored values were made by.
 //! 4. Commit the versions (each a new file index: old code, closure and coroutine types and
@@ -9837,7 +9837,7 @@ fn reverted_waits(what: &str, paths: &[String], kept: &[String]) {
     let mut gone = Vec::new();
     {
         let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        p.retain_mut(|(why, _, files)| {
+        p.retain_mut(|(why, _, files, _)| {
             if files.is_empty() {
                 return true;
             }
@@ -10299,27 +10299,71 @@ pub(crate) fn offer_restart(why: &str) {
     offer_restart_in(why, Vec::new());
 }
 
-/// A source restart uses the same safe-point and state handover as a manual relaunch.
+/// Record the source edits that can restart automatically after checking the new tree.
 fn offer_source_restart(why: &str, files: Vec<String>) {
     if std::env::var_os("RELAX_AUTO_RESTART").is_some_and(|value| value == "1")
         && !crate::harness::live::enabled()
-        && !pinned()
     {
-        note_restart_pending_in(why, files.clone());
-        if crate::run_end::restarting() || host::restart_asked() {
-            return;
-        }
-        match relaunch_pending("RELAX_AUTO_RESTART", false) {
-            Ok(_) => return,
-            Err(error) => eprintln!("relax live: automatic restart failed: {error}"),
+        note_restart_pending_in(why, files, true);
+    } else {
+        offer_restart_in(why, files);
+    }
+}
+
+fn auto_restart_pending() -> bool {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.3)
+}
+
+/// Check in a fresh loader: the live unit may still have old layouts and cannot check the
+/// exact tree a relaunch loads. Keep the old run if the check fails or a save arrives during it.
+fn try_auto_restart(files: &[WatchFile]) {
+    if !auto_restart_pending() || pinned() || crate::run_end::restarting() || host::restart_asked() {
+        return;
+    }
+    let Some(exe) = host::loader() else { return };
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("run")) {
+        return;
+    }
+    let mut check = std::process::Command::new(exe);
+    check.args(["run", "--check", "--no-live"]).args(args);
+    let (before, dir) = crate::crates::program_process_before();
+    for (name, value) in before {
+        match value {
+            Some(value) => { check.env(name, value); }
+            None => { check.env_remove(name); }
         }
     }
-    offer_restart_in(why, files);
+    if let Some(dir) = dir { check.current_dir(dir); }
+    for name in NATIVE_RECEIPTS.into_iter().chain(["RELAX_RESTORE", "RELAX_JIT_RECOVERY", "RELAX_REPORT_TO"]) {
+        check.env_remove(name);
+    }
+
+    let before: Vec<_> = files.iter().map(|file| stamp(&file.0)).collect();
+    match check.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("relax live: automatic restart check failed ({status}); keeping the running code");
+            return;
+        }
+        Err(error) => {
+            eprintln!("relax live: could not check sources for automatic restart: {error}");
+            return;
+        }
+    }
+    if pinned() || crate::run_end::restarting() || crate::run_threads::run_ending()
+        || host::restart_asked() || !files.iter().map(|file| stamp(&file.0)).eq(before)
+    {
+        return;
+    }
+    if let Err(error) = relaunch_pending("RELAX_AUTO_RESTART", false) {
+        eprintln!("relax live: automatic restart failed: {error}");
+    }
 }
 
 /// offer_restart for an edit of `files`: their revert ends the wait.
 fn offer_restart_in(why: &str, files: Vec<String>) {
-    note_restart_pending_in(why, files);
+    note_restart_pending_in(why, files, false);
     eprintln!("relax live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `{tool} inspect <app> session relaunch`); the app keeps running meanwhile", tool = crate::tool_name());
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
@@ -10345,8 +10389,8 @@ pub(crate) static RESTART_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::
 
 /// Edits waiting for a relaunch (`session` in inspect lists them), each with when it began to
 /// wait (unix ms) and the edited files whose text it waits on (restart_for_edit; none: no revert
-/// ends it).
-static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+/// ends it), and whether the watcher can apply them after a successful check.
+static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64, Vec<String>, bool)>> = std::sync::Mutex::new(Vec::new());
 
 /// A run that failed its app check ended in place (run_end::check_failed): the sources wait for a
 /// run that passes it, as an edit waits for a restart (`session` lists it), until a run loads them.
@@ -10357,22 +10401,23 @@ pub(crate) fn check_failed_pending(why: &str) {
 }
 
 fn note_restart_pending(why: &str) {
-    note_restart_pending_in(why, Vec::new());
+    note_restart_pending_in(why, Vec::new(), false);
 }
 
-fn note_restart_pending_in(why: &str, files: Vec<String>) {
+fn note_restart_pending_in(why: &str, files: Vec<String>, automatic: bool) {
     let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
     match p.iter_mut().find(|x| x.0 == why) {
         // (a wait no file's revert ends stays so)
-        Some(x) if x.2.is_empty() => {}
         Some(x) => {
+            x.3 |= automatic;
+            if x.2.is_empty() { return; }
             for f in files {
                 if !x.2.contains(&f) {
                     x.2.push(f);
                 }
             }
         }
-        None => p.push((why.to_string(), unix_ms(std::time::SystemTime::now()) as u64, files)),
+        None => p.push((why.to_string(), unix_ms(std::time::SystemTime::now()) as u64, files, automatic)),
     }
 }
 
@@ -12039,12 +12084,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let woke = Instant::now();
         // a kept closure's first trait object, made after its patch (by an old frame, or kept
         // code): held for a restart from now
-        for (path, l) in unsafe { late_held(up) } {
+        let late_restarts = unsafe { late_held(up) };
+        let has_late_restarts = !late_restarts.is_empty();
+        for (path, l) in late_restarts {
             let what = short(&path).to_string();
             eprintln!("relax live: {what}: {l}");
             let held: Vec<String> = l.strip_prefix(HELD).map(str::to_string).into_iter().collect();
             restart_for_edit(&what, &held, &[path]);
         }
+        if has_late_restarts { try_auto_restart(&files); }
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
@@ -12196,6 +12244,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     for l in &lines { eprintln!("relax live:   {}", l); }
                     patch_refused_event(&what, false, &lines);
                     landing.clear();
+                    try_auto_restart(&files);
                     break;
                 }
             }
@@ -12402,6 +12451,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     }, &why);
                 } else { offer_source_restart(&why, Vec::new()); }
                 for &k in &changed { files[k].2 = settled_stamps[k]; stalled.remove(&k); }
+                try_auto_restart(&files);
                 continue;
             }
             // a change the running process cannot take: offered, and the person's restart builds
@@ -12593,6 +12643,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             eprintln!("relax live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
             patch_verified_event(&what.join(", "), 0, &[], &[]);
+            reverted_waits(&what.join(", "), &paths, &[]);
+            drop(_reloading);
+            try_auto_restart(&files);
             continue;
         }
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
@@ -12655,6 +12708,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                             }, &o.lines.join("; "));
                         }
                     } else { recover_hot_failure(failure, &o.lines, None); }
+                } else if !quiet_retry {
+                    drop(_reloading);
+                    try_auto_restart(&files);
                 }
             }
             continue;
@@ -12767,6 +12823,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // a round that installed nothing and left no refused text: what it found the program read
         // goes alone (a restart re-reads everything)
         if !patched && stalled.is_empty() && !restart_required { resources_alone(); }
+        drop(_reloading);
+        if !quiet_retry { try_auto_restart(&files); }
     }
 }
 
@@ -13114,8 +13172,6 @@ mod watch_wait_tests {
     #[test]
     fn a_source_edit_restarts_only_when_opted_in() {
         isolated_test!(a_source_edit_restarts_only_when_opted_in);
-        // The app can hand over its state. Observe its request without ending the test process.
-        RESTART_SUPPORTED.store(true, Ordering::SeqCst);
         let lines = ["the running layout changed".to_string()];
         let paths = ["src/lib.rs".to_string()];
 
@@ -13126,8 +13182,8 @@ mod watch_wait_tests {
             }
             restart_for_edit("lib.rs", &lines, &paths);
             assert_eq!(restart_pending(), ["lib.rs: the running layout changed"]);
-            assert_eq!(RESTART_REQUESTED.load(Ordering::SeqCst), value == Some("1"));
-            assert!(!RESTART_ANYWAY.load(Ordering::SeqCst), "the app can postpone the restart");
+            assert_eq!(auto_restart_pending(), value == Some("1"));
+            assert!(!RESTART_REQUESTED.load(Ordering::SeqCst), "a pending edit still needs a check");
         }
     }
 

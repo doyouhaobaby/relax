@@ -247,6 +247,8 @@ pub struct Layouts {
     /// provided crates' opaque types (provided.rs): rustc's size and align, no fields Relax
     /// may read; set once when the unit is made
     pub opaque: std::collections::HashMap<crate::program::DefId, (u32, u32)>,
+    /// Diagnostic layouts can depend on an item's predicates. Keep their cache separate.
+    typing_env: Option<crate::tcx::TypingEnv>,
     /// a field type that does not normalize stays as written (transmute's size skeletons erase
     /// parameters to `()`, so `PhantomData<<() as Tr>::Assoc>` need not project)
     lenient_fields: bool,
@@ -406,7 +408,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false, probe: false }
+        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), typing_env: None, lenient_fields: false, probe: false }
     }
 
     /// Layouts of types whose parameters were erased (see `lenient_fields`).
@@ -416,8 +418,14 @@ impl Layouts {
         l
     }
 
+    pub(crate) fn for_typing_env(env: crate::tcx::TypingEnv) -> Layouts {
+        let mut layouts = Layouts::new();
+        layouts.typing_env = Some(env);
+        layouts
+    }
+
     fn field_ty(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, variant: u32, field: u32, args: &[TyId]) -> TyId {
-        let env = crate::tcx::TypingEnv::fully_monomorphized(lcx.prog);
+        let env = self.typing_env.unwrap_or_else(|| crate::tcx::TypingEnv::fully_monomorphized(lcx.prog));
         if !self.lenient_fields { return tcx.field_ty(lcx.prog, env, d, variant, field, args); }
         let decl = tcx.adts[&d].variants[variant as usize].fields[field as usize].ty;
         let ty = tcx.tys.subst(decl, args);
@@ -583,6 +591,7 @@ impl Layouts {
     pub fn probe(&self) -> Layouts {
         let mut p = Layouts::new();
         p.opaque = self.opaque.clone();
+        p.typing_env = self.typing_env;
         p.lenient_fields = self.lenient_fields;
         p.probe = true;
         for (t, s) in self.closure_storage.snapshot() { p.closure_storage.insert(t, s); }

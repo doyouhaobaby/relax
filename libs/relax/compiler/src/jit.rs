@@ -2921,6 +2921,8 @@ pub(crate) unsafe extern "C" fn relax_precompile(roots: *const usize, len: usize
     let at = roots as usize;
     crate::jit::host_boundary("relax_precompile", move || {
         let _keep = os::proc::KeepLastError::new();
+        // The fork preparation queues owner work before compiling any individual slot.
+        let _signals = compiling(u32::MAX);
         let up = cur_unit();
         if up.is_null() || at == 0 || len == 0 {
             return 0;

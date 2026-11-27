@@ -1207,38 +1207,12 @@ pub mod obligations {
         if def.kind != DefKind::AssocTy || prog.def(parent).kind != DefKind::Impl || !tcx.impl_trait.contains_key(&parent) { return; }
         let mut need = Vec::new();
         if wf_region_pairs(tcx, ty, &mut need, 0).is_none() || need.is_empty() { return; }
-        let indices = tcx.generic_indices_of(prog, parent);
-        let args = indices.identity_args(&tcx.tys);
-        let tr = tcx.impl_trait_ref(prog, parent, &args);
-        let mut known: Vec<(crate::types::RegionId, crate::types::RegionId)> = Vec::new();
-        for a in tr.args.iter() {
-            if let GenericArg::Type(t) = a { let t = w.normalize(*t); if wf_region_pairs(tcx, t, &mut known, 0).is_none() { return; } }
-        }
-        for q in tcx.clauses_of(prog, w.def) {
-            if let PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) = &q.kind { known.push((*a, *b)); }
-            if matches!(&q.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(..))) { return; }
-        }
         let kind = |r: crate::types::RegionId| tcx.tys.region_kind(r);
         let simple = |r: crate::types::RegionId| matches!(kind(r), crate::types::RegionKind::ReEarlyParam(_) | crate::types::RegionKind::ReStatic);
-        if need.iter().any(|&(a, b)| !simple(a) || !simple(b)) || known.iter().any(|&(a, b)| !simple(a) || !simple(b)) { return; }
-        let holds = |from: crate::types::RegionId, to: crate::types::RegionId| -> bool {
-            if from == to || kind(from) == crate::types::RegionKind::ReStatic { return true; }
-            let mut seen = vec![from];
-            let mut i = 0;
-            while i < seen.len() {
-                let cur = seen[i];
-                i += 1;
-                for &(a, b) in &known {
-                    if a == cur && !seen.contains(&b) {
-                        if b == to || false { return true; }
-                        seen.push(b);
-                    }
-                }
-            }
-            false
-        };
+        if need.iter().any(|&(a, b)| !simple(a) || !simple(b)) { return; }
+        let outlives = w.outlives_environment();
         for &(from, to) in &need {
-            if !holds(from, to) {
+            if !outlives.free_region_map.sub_free_regions(&tcx.tys, to, from) {
                 let shown = crate::typeck::ty_to_string(false, prog, tcx, w.infcx.deeply_resolve_ignoring_regions(ty));
                 w.extra.push(prog.record_error(def.file, pos, "typeck", format!("E0491: in type `{}`, reference has a longer lifetime than the data it references", shown)));
                 return;
@@ -1323,7 +1297,6 @@ pub mod obligations {
     /// impl's self type are the impl's own distinct parameters (E0366), and every predicate of the impl
     /// holds in the environment of the type's definition (E0367).
     fn always_applicable(prog: &Program, tcx: &Tcx, imp: DefId, item: &ast::Item, file: u32, adt: DefId, args: crate::types::TyList, regions: crate::types::RegionArgsId) -> Vec<String> {
-        use crate::tcx::outlives::OutlivesPredicate;
         use crate::types::RegionKind;
         let tys = &tcx.tys;
         // uses_unique_generic_params(adt_to_impl_args, CheckRegions::OnlyParam)
@@ -1354,11 +1327,7 @@ pub mod obligations {
         let mut clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
         // rustc's `predicates_of` of an ADT includes its `inferred_outlives_of` (RFC 2093).
         for p in crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, prog, adt) {
-            let kind = match p {
-                OutlivesPredicate::Region(a, b) => ClauseKind::RegionOutlives(a, b),
-                OutlivesPredicate::Type(t, r) => ClauseKind::TypeOutlives(t, r),
-            };
-            let clause = tcx.instantiate_predicate(prog, adt, &adt_args, &Predicate::dummy(PredicateKind::Clause(kind)));
+            let clause = tcx.instantiate_predicate(prog, adt, &adt_args, &p.as_clause());
             if !clauses.contains(&clause) { clauses.push(clause); }
         }
         let env = tcx.intern_param_env(crate::next_solver::ParamEnv { clauses: clauses.into() });

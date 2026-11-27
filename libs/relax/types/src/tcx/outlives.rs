@@ -8,6 +8,17 @@ pub enum OutlivesPredicate {
     Type(TyId, RegionId),
 }
 
+impl OutlivesPredicate {
+    pub(crate) fn as_clause(self) -> crate::next_solver::Predicate {
+        use crate::next_solver::{ClauseKind, Predicate, PredicateKind};
+        let kind = match self {
+            Self::Region(a, b) => ClauseKind::RegionOutlives(a, b),
+            Self::Type(t, r) => ClauseKind::TypeOutlives(t, r),
+        };
+        Predicate::dummy(PredicateKind::Clause(kind))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RegionContract {
     /// Bound callable I/O retained before selection erases regions. Closure
