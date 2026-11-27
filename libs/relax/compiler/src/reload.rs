@@ -1994,9 +1994,11 @@ impl ExpIncludes {
         Self { hot: Vec::new(), sites: Vec::new() }
     }
 
-    /// Read the includer's resolved sites once, even when no expansion text names an include.
+    /// Read the includer's resolved sites once, even when no expansion text names an include:
+    /// those of this version's text (`include_call_at`).
     pub(crate) fn of(pf: &crate::parser::ParsedFile, path: &str) -> Self {
-        let sites = crate::builtins::include_sites(path);
+        let src = &pf.src[..pf.src_len as usize];
+        let sites: Vec<(u32, String)> = crate::builtins::include_sites(path).into_iter().filter(|&(at, _)| at == u32::MAX || include_call_at(src, at)).collect();
         if !expansions_include(pf) { return Self { hot: Vec::new(), sites }; }
         let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
         for part in pf.parts() { regions.extend(part.exp_map.iter()); }
@@ -2027,6 +2029,36 @@ impl ExpIncludes {
     fn any(&self) -> bool {
         !self.hot.is_empty() || !self.sites.is_empty()
     }
+}
+
+/// Whether an include macro's call (include!/include_str!/include_bytes!, by any path) starts at
+/// byte `at` of text `src`. A recorded include site is its includer's path's, not one version's:
+/// each version of the file the session parsed recorded its own offset of the call, and an offset
+/// of an earlier version lies anywhere in a later one. Taken there for the call, an item it fell in
+/// included the file: a save of an included file, after edits of its includer had moved the call,
+/// marked unchanged items as changed (a static's initializer: the restart rung). At an offset of
+/// this version's text a site holds the call whose tokens the file has there (the macro's own, an
+/// include a `macro_rules!` body makes); one under another name (`use .. as`) is not taken, and
+/// a save of the file it reads is then nobody's (`include_unmatched`: a restart is offered).
+fn include_call_at(src: &[u8], at: u32) -> bool {
+    let ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    let at = at as usize;
+    if at >= src.len() || (at > 0 && (ident(src[at - 1]) || src[at - 1] == b'$')) { return false; }
+    let space = |mut i: usize| { while i < src.len() && src[i].is_ascii_whitespace() { i += 1; } i };
+    let mut i = at;
+    if src[i..].starts_with(b"::") { i = space(i + 2); }
+    let mut last: (usize, usize);
+    loop {
+        if src.get(i) == Some(&b'$') { i += 1; }
+        let s = i;
+        while i < src.len() && ident(src[i]) { i += 1; }
+        if i == s { return false; }
+        last = (s, i);
+        i = space(i);
+        if !src[i..].starts_with(b"::") { break; }
+        i = space(i + 2);
+    }
+    src.get(i) == Some(&b'!') && matches!(&src[last.0..last.1], b"include" | b"include_str" | b"include_bytes")
 }
 
 /// The content hashes each included file was read with by the running code (one per crate that

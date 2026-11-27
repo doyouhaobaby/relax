@@ -6717,8 +6717,9 @@ impl ParseSnapshot {
 /// What a crate-level check judges (relax_types item_checks, check.rs crate_level_errors): every
 /// item of the own crates (`makepad check`, a run's app check), or only those of some files of
 /// them (a live edit's new texts: reload.rs). A module's, a block's and a trait's items are in
-/// one file, so an edit's files hold every scope its items can collide or go wrong in (but for
-/// the items an `include!` brings into a module from another file).
+/// one file, so an edit's files hold every scope its items can collide or go wrong in. The items
+/// an `include!` brings into a module are its includer's (its parse holds them), and a save of
+/// the included file is an edit of the includer (reload.rs include_edits).
 #[derive(Clone, Copy)]
 pub struct Judged<'a> {
     pub own: &'a [bool],

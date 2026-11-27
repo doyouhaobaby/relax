@@ -6,6 +6,19 @@
 use crate::reload::Rung;
 use crate::reload_async_tests::{in_child, live_app, LIVE_UNIT};
 
+/// A module whose items are in part an included file's (`include!` at item position: PARTS).
+const INCLUDER: &str = r#"
+pub mod parts {
+    include!("parts.rs");
+    pub fn base() -> u64 { 1 }
+}
+
+pub fn part(out: &mut u64) {
+    *out = parts::base() + parts::add();
+}
+"#;
+const PARTS: &str = "pub fn add() -> u64 { 2 }\n";
+
 const LIB: &str = r#"mod other;
 pub use other::*;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -262,8 +275,9 @@ fn edits_of_items_apply_live() {
             });
             return;
         }
-        let names = ["sig", "uses_gone", "same", "same_gen", "drops", "cfg_let", "tls", "level"];
-        live_app("items-patch", &[("lib.rs", LIB), ("other.rs", OTHER)], &names, |call, edit| {
+        let names = ["sig", "uses_gone", "same", "same_gen", "drops", "cfg_let", "tls", "level", "part"];
+        let lib = format!("{LIB}{INCLUDER}");
+        live_app("items-patch", &[("lib.rs", &lib), ("other.rs", OTHER), ("parts.rs", PARTS)], &names, |call, edit| {
             let patch = |edit: &mut dyn FnMut(&str, &[(&str, &str)]) -> crate::reload::Outcome, file: &str, subs: &[(&str, &str)]| {
                 let outcome = edit(file, subs);
                 assert_eq!(outcome.rung, Rung::Patch, "{subs:?}: {:?}", outcome.lines);
@@ -334,6 +348,42 @@ fn edits_of_items_apply_live() {
             assert_eq!(call("sig"), 36);
             patch(&mut *edit, "lib.rs", &[("    x + 30\n}", "    x + 50\n}")]);
             assert_eq!(call("sig"), 56, "the running `helper`'s patch reaches its caller after the refusal");
+            // an included file's items are its includer's module's: its save is an edit of the
+            // includer (reload.rs include_edits), judged with the includer's items. The edits above
+            // moved the include's call, and the offsets of the includer's earlier versions lie in
+            // other items now: a plain save patches (those items' code "included" the file, and
+            // unchanged statics' initializers took the restart rung). A name the included file
+            // gives twice, or one the includer's module has already, is refused. (The includer's
+            // second `base` is at its line, as rustc says; an error in the included text is at the
+            // include's call, where rustc says the included file's line, a fresh build alike.)
+            let save_parts = |text: &str| {
+                let up = LIVE_UNIT.load(std::sync::atomic::Ordering::Relaxed) as *mut crate::jit::Unit;
+                let edits = crate::owner::call(crate::owner::Class::Program, || {
+                    let prog = unsafe { &(*up).prog };
+                    let (lib, _) = prog.current_source_files(|p| std::path::Path::new(p).ends_with("app/src/lib.rs")).into_iter().next().unwrap();
+                    let parts = std::path::Path::new(&lib).with_file_name("parts.rs").to_string_lossy().into_owned();
+                    std::fs::write(&parts, text).unwrap();
+                    let mut edits = crate::reload::include_edits(prog, &[parts.clone()], &[]);
+                    assert_eq!(edits.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), [lib.as_str()], "the includer is the edit");
+                    // the saved text goes with the batch, as the watcher sends it
+                    edits.push(crate::reload::Edit { file: u32::MAX, path: parts, src: text.as_bytes().to_vec() });
+                    edits
+                });
+                unsafe { crate::reload::apply_update(up, edits) }
+            };
+            assert_eq!(call("part"), 3);
+            let outcome = save_parts("pub fn add() -> u64 { 3 }\n");
+            assert_eq!(outcome.rung, Rung::Patch, "{}: {:?}", "a plain save of the included file", outcome.lines);
+            assert_eq!(call("part"), 4);
+            let outcome = save_parts("pub fn add() -> u64 { 3 }\npub fn add() -> u64 { 4 }\npub fn base() -> u64 { 5 }\n");
+            assert_eq!(outcome.rung, Rung::Refuse, "{:?}", outcome.lines);
+            for (name, at) in [("add", ""), ("base", "lib.rs:")] {
+                assert!(outcome.lines.iter().any(|l| l.contains(&format!("E0428: the name `{name}` is defined multiple times")) && l.contains(at)), "{name} at {at}: {:?}", outcome.lines);
+            }
+            assert_eq!(call("part"), 4, "the running code goes on");
+            let outcome = save_parts("pub fn add() -> u64 { 5 }\n");
+            assert_eq!(outcome.rung, Rung::Patch, "{}: {:?}", "the fixed save", outcome.lines);
+            assert_eq!(call("part"), 6, "the fixed save applies");
             // Qualifying the type keeps the stored value. A different element type needs a restart.
             assert_eq!(call("level"), 1);
             assert_eq!(call("level"), 2);
