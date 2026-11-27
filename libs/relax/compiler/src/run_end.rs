@@ -140,19 +140,19 @@ pub unsafe fn end(up: *mut Unit, grace: Duration) -> Ended {
     Ended { program, stayed, ms }
 }
 
-static NATIVE_END: std::sync::OnceLock<(fn(), fn(std::ops::Range<usize>))> = std::sync::OnceLock::new();
+static NATIVE_END: std::sync::OnceLock<(fn(), fn(usize, usize))> = std::sync::OnceLock::new();
 
 /// What the crates linked into this binary hold of a run goes in `native`, called when a run's
 /// threads have ended (`hal::end_run`, `script::end_run`). What they hold of one domain's heap goes
 /// in `domain`, called before that heap goes, also while other programs go on.
-pub fn set_native_end(native: fn(), domain: fn(std::ops::Range<usize>)) {
+pub fn set_native_end(native: fn(), domain: fn(usize, usize)) {
     let _ = NATIVE_END.set((native, domain));
 }
 
 /// A domain's heap is about to go.
 pub(crate) fn heap_goes(heap: std::ops::Range<usize>) {
     if let Some((_, domain)) = NATIVE_END.get() {
-        domain(heap);
+        domain(heap.start, heap.end);
     }
 }
 
