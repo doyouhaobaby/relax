@@ -818,13 +818,28 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
     }
     let id = fnv(&format!("static {name}"));
     let none = "{ fn s() -> &'static str { \"\" } s }";
+    // The static's def path, as Relax keys it: the scope of a marker fn declared beside it. A
+    // static inside a fn body is in that fn's scope, which module_path!() leaves out.
+    let marker = format!("{CFG} #[doc(hidden)] #[allow(non_snake_case)] fn __relax_api_m{id:016x}() {{}}");
+    let key = format!(
+        "{{ fn k() -> &'static str {{
+    static K: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();
+    K.get_or_init(|| {{
+        let marker = ::core::any::type_name_of_val(&__relax_api_m{id:016x});
+        let scope = marker.rsplit_once(\"::\").expect(\"a static marker's def path\").0;
+        let mut key = ::std::string::String::from(scope);
+        key.push_str(\"::{name}\");
+        key
+    }}).as_str()
+}} k }}"
+    );
     if per_side {
         if mutable {
             return Err("a `static mut` is not marked: use a static with interior mutability".to_string());
         }
-        let key = format!("{{ fn k() -> &'static str {{ concat!(module_path!(), \"::{name}\") }} k }}");
         let extra = format!(
-            "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+            "{marker}
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
         );
@@ -851,20 +866,8 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
         return Err(format!("`{name}`: cannot read the static's type and initializer"));
     }
     let ty = toks[start..end].iter().cloned().collect::<TokenStream>().to_string();
-    let key = format!(
-        "{{ fn k() -> &'static str {{
-    static K: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();
-    K.get_or_init(|| {{
-        let marker = ::core::any::type_name_of_val(&__relax_api_m{id:016x});
-        let scope = marker.rsplit_once(\"::\").expect(\"a static marker's def path\").0;
-        let mut key = ::std::string::String::from(scope);
-        key.push_str(\"::{name}\");
-        key
-    }}).as_str()
-}} k }}"
-    );
     let extra = format!(
-        "{CFG} #[doc(hidden)] #[allow(non_snake_case)] fn __relax_api_m{id:016x}() {{}}
+        "{marker}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::SHARED, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
