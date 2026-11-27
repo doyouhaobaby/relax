@@ -11,8 +11,8 @@ pub fn relax_api_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = idents(&attr);
     let toks: Vec<TokenTree> = item.into_iter().collect();
     let res = match item_kind(&toks) {
-        Some("impl") => expand_impl(&toks, &args),
-        Some("fn") => expand_fn(&toks, &args),
+        Some("impl") => loader_arg(&attr.clone().into_iter().collect::<Vec<_>>()).and_then(|loader| expand_impl(&toks, &args, loader)),
+        Some("fn") => loader_arg(&attr.clone().into_iter().collect::<Vec<_>>()).and_then(|loader| expand_fn(&toks, &args, loader)),
         Some("struct") | Some("enum") => expand_type(&toks, &args),
         Some("static") => expand_static(&toks, &attr),
         _ => Err("#[relax_api] goes on a fn, an impl block, a struct, an enum or a static".to_string()),
@@ -34,6 +34,26 @@ pub fn relax_api_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             tb.end()
         }
     }
+}
+
+/// The `loader = "text"` argument of a mark (the literal as written): None without one.
+fn loader_arg(ts: &[TokenTree]) -> Result<Option<String>, String> {
+    let Some(i) = ts.iter().position(|t| is_ident(Some(t), "loader")) else { return Ok(None) };
+    match ts.get(i + 2) {
+        Some(TokenTree::Literal(l)) if is_punct(ts.get(i + 1), '=') && l.to_string().starts_with('"') => Ok(Some(l.to_string())),
+        _ => Err("`loader = \"..\"`: the text of JIT code's error, which names the op to call instead or says the item is the loader's alone".to_string()),
+    }
+}
+
+/// The entry of an item the loader keeps to itself (`#[relax_api(loader = "..")]`): its key and
+/// the text JIT code's error at a call, fn pointer or read of it gives. `cfg`: the item's own.
+fn loader_code(id: u64, key: &str, text: &str, cfg: &[String]) -> String {
+    let own = if cfg.is_empty() { String::new() } else { format!("#[cfg(all({}))]", cfg.join(", ")) };
+    format!(
+        "{CFG} {own} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_l{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::LOADER, module: module_path!(), key: {key}, sig: {{ fn s() -> &'static str {{ {text} }} s }},
+  shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
+    )
 }
 
 fn idents(ts: &TokenStream) -> Vec<String> {
@@ -216,6 +236,10 @@ struct Sig {
     generic: bool,
     /// the fn's own `#[relax_api]` mark (inside an impl)
     marked: bool,
+    /// the tokens inside that mark's parentheses (`loader = ".."`)
+    mark_args: Vec<TokenTree>,
+    /// `pub` (not `pub(crate)` or the like): code outside the crate can name it
+    public: bool,
     cfg: Vec<String>,
 }
 
@@ -224,24 +248,32 @@ struct Sig {
 fn parse_fn(toks: &[TokenTree], start: usize) -> Option<(Sig, usize, Vec<(usize, usize)>)> {
     let mut strip = Vec::new();
     let mut marked = false;
+    let mut mark_args = Vec::new();
     let mut i = start;
     while is_punct(toks.get(i), '#') {
         if let Some(TokenTree::Group(g)) = toks.get(i + 1) {
             let inner: Vec<TokenTree> = g.stream().into_iter().collect();
             if is_ident(inner.first(), "relax_api") {
                 marked = true;
+                if let Some(TokenTree::Group(a)) = inner.last().filter(|t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis)) {
+                    mark_args = a.stream().into_iter().collect();
+                }
                 strip.push((i, i + 2));
             }
         }
         i += 2;
     }
     let mut is_unsafe = false;
+    let mut public = false;
     loop {
         match toks.get(i) {
             Some(TokenTree::Ident(id)) if id.to_string() == "fn" => break,
             Some(TokenTree::Ident(id)) => {
                 if id.to_string() == "unsafe" {
                     is_unsafe = true;
+                }
+                if id.to_string() == "pub" {
+                    public = !matches!(toks.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis);
                 }
                 i += 1;
             }
@@ -250,6 +282,9 @@ fn parse_fn(toks: &[TokenTree], start: usize) -> Option<(Sig, usize, Vec<(usize,
                     let inner: Vec<TokenTree> = g.stream().into_iter().collect();
                     if is_ident(inner.first(), "relax_api") {
                         marked = true;
+                        if let Some(TokenTree::Group(a)) = inner.last().filter(|t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis)) {
+                            mark_args = a.stream().into_iter().collect();
+                        }
                         strip.push((i, i + 2));
                     }
                 }
@@ -353,7 +388,7 @@ fn parse_fn(toks: &[TokenTree], start: usize) -> Option<(Sig, usize, Vec<(usize,
         let Some(c) = first_colon(&p) else { return None };
         params.push(p[c + 1..].to_vec());
     }
-    let sig = Sig { name, is_unsafe, params, ret, never, generic, marked, cfg: layout_conditions(&toks[start..]) };
+    let sig = Sig { name, is_unsafe, params, ret, never, generic, marked, mark_args, public, cfg: layout_conditions(&toks[start..]) };
     Some((sig, i, strip))
 }
 
@@ -640,7 +675,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
     extra
 }
 
-fn expand_fn(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
+fn expand_fn(toks: &[TokenTree], args: &[String], loader: Option<String>) -> Result<(TokenStream, String), String> {
     let (s, _, _) = parse_fn(toks, 0).ok_or("cannot read the fn")?;
     if s.generic {
         return Err(format!("`{}` is generic: an op has one compiled body", s.name));
@@ -649,11 +684,15 @@ fn expand_fn(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String
         return Err(format!("`{}` is a method: put #[relax_api] on its impl block (and on the method inside it)", s.name));
     }
     let o = Owner { self_ty: Vec::new(), trait_: None };
+    if let Some(text) = loader {
+        let id = fnv(&format!("loader fn {}", s.name));
+        return Ok((toks.iter().cloned().collect(), loader_code(id, &key_code(&o, &s.name), &text, &s.cfg)));
+    }
     let extra = op_code(&o, &s, op_phase(args));
     Ok((toks.iter().cloned().collect(), extra))
 }
 
-fn expand_impl(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
+fn expand_impl(toks: &[TokenTree], args: &[String], impl_loader: Option<String>) -> Result<(TokenStream, String), String> {
     // impl [<generics>] [!]Trait for SelfTy [where ..] { body }
     let mut i = skip_attrs(toks, 0);
     while !is_ident(toks.get(i), "impl") {
@@ -765,9 +804,26 @@ fn expand_impl(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     }
     // `#[relax_api(marked)]`: only the fns marked inside, none when none is (a macro's impl,
     // whose fns are marked per invocation)
-    let any_marked = args.iter().any(|a| a == "marked") || fns.iter().any(|f| f.marked);
-    let mut extra = String::new();
+    // A method's `#[relax_api(loader = "..")]` makes no op and leaves the impl's other fns as
+    // they are: it is no op mark. The impl's own `#[relax_api(loader = "..")]` keeps each of its
+    // unmarked non-generic `pub` fns for the loader with that text (a type only the loader holds),
+    // and makes ops of the fns marked `#[relax_api]` alone.
+    let mut loaders = Vec::new();
     for s in &fns {
+        loaders.push(if s.marked { loader_arg(&s.mark_args)? } else if s.public && !s.generic { impl_loader.clone() } else { None });
+    }
+    let any_marked = args.iter().any(|a| a == "marked") || impl_loader.is_some() || fns.iter().zip(&loaders).any(|(f, l)| f.marked && l.is_none());
+    let mut extra = String::new();
+    for (s, loader) in fns.iter().zip(&loaders) {
+        if let Some(words) = loader {
+            if s.generic {
+                return Err(format!("`{}` is generic: a loader mark names one fn", s.name));
+            }
+            let id = fnv(&format!("loader {} {} {}", text(&owner.self_ty, None), owner.trait_.as_ref().map_or(String::new(), |t| text(t, None)), s.name));
+            extra.push_str(&loader_code(id, &key_code(&owner, &s.name), words, &s.cfg));
+            extra.push('\n');
+            continue;
+        }
         if any_marked && !s.marked {
             continue;
         }
@@ -793,6 +849,8 @@ fn expand_impl(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
 /// `#[relax_api] static [mut] NAME: T = ..;`: the loader's one instance, with its def path,
 /// address and rustc layout. `#[relax_api(per_side)] static NAME: T = ..;`: an entry naming
 /// the static so Relax gives JIT code its own instance instead of refusing the read.
+/// `#[relax_api(loader = "..")]`: an entry naming a static only the loader's code uses, so JIT
+/// code that names it is refused with that text.
 fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream, String), String> {
     let mut args: Vec<TokenTree> = attr.clone().into_iter().collect();
     let shared = args.is_empty();
@@ -800,6 +858,7 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
         args.pop();
     }
     let per_side = args.len() == 1 && is_ident(args.first(), "per_side");
+    let loader = if args.len() == 3 { loader_arg(&args)? } else { None };
     let mut i = skip_attrs(toks, 0);
     while !is_ident(toks.get(i), "static") {
         i += 1;
@@ -813,8 +872,8 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
         Some(TokenTree::Ident(id)) => id.to_string(),
         _ => return Err("a static without a name".to_string()),
     };
-    if !shared && !per_side {
-        return Err(format!("`{name}`: a static is marked #[relax_api] (one instance, the loader's) or #[relax_api(per_side)] (each side its own)"));
+    if !shared && !per_side && loader.is_none() {
+        return Err(format!("`{name}`: a static is marked #[relax_api] (one instance, the loader's), #[relax_api(per_side)] (each side its own) or #[relax_api(loader = \"..\")] (the loader's code alone uses it)"));
     }
     let id = fnv(&format!("static {name}"));
     let none = "{ fn s() -> &'static str { \"\" } s }";
@@ -833,6 +892,9 @@ fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream,
     }}).as_str()
 }} k }}"
     );
+    if let Some(words) = loader {
+        return Ok((toks.iter().cloned().collect(), format!("{marker}\n{}", loader_code(id, &key, &words, &[]))));
+    }
     if per_side {
         if mutable {
             return Err("a `static mut` is not marked: use a static with interior mutability".to_string());

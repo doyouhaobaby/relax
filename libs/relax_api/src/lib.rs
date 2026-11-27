@@ -21,6 +21,14 @@
 //!   only that side's code makes and reads, laid out by that side's std). JIT code reaching an
 //!   unmarked provided static is refused; a type not the same bytes on both sides needs an op
 //!   or its own per-side instance.
+//! - `#[relax_api(loader = "..")]` on a fn, a method (inside a marked impl, whose other fns it
+//!   leaves as they are: it is no op mark) or a static: the loader's code alone uses the item (it
+//!   sets the crate up, or native code fills it). JIT code that calls the fn, takes it as a fn
+//!   pointer or names the static gets an error at that site with the text, which names the op to
+//!   call instead or says the item is the loader's alone. Without the mark Relax compiles the fn
+//!   from source and the error comes later, at whatever static its body reaches. On an impl
+//!   (a type only the loader holds), the mark keeps each of the impl's unmarked non-generic `pub`
+//!   fns for the loader with that text; a fn marked `#[relax_api]` in it is an op.
 //! - `run`, beside a fn, impl or type mark: the ops allocate in the program's heap ([`run_op`]), so the
 //!   program's end takes what they made. A crate whose objects are the program's (a script VM)
 //!   says it on every attribute. Without it an op allocates in the host's heap ([`host_op`]).
@@ -177,6 +185,9 @@ pub const PER_SIDE: u32 = 4;
 pub const SHARED: u32 = 5;
 /// A const-verified `Option<X>` layout; `Entry::enum_layout` holds [`option_layout`]'s six words.
 pub const OPTION: u32 = 6;
+/// A fn or static only the loader's code uses (`#[relax_api(loader = "..")]`): `Entry::sig` gives
+/// the text of JIT code's error at a use of it.
+pub const LOADER: u32 = 7;
 
 /// `[size, align, payload_off, tag_bytes, none_tag, some_tag]` for `Option<X>`.
 /// When rustc niche-encodes it (`size_of::<Option<X>>() == size_of::<X>()`),
@@ -259,6 +270,7 @@ pub struct Entry {
     /// OP: `core::any::type_name` of the op's fn pointer type (`fn(&krate::heap::ScriptHeap) -> u32`):
     /// Relax compares it with its own reading of the same source; "" for a handle's trait ops
     /// OPTION: "option_layouts" for an explicit list, "" for a marked item's inferred entry.
+    /// LOADER: the text of JIT code's error at a use of the item.
     pub sig: fn() -> &'static str,
     pub shim: Option<ShimFn>,
     /// OP: per parameter, then the result: [size, align, pointee size, pointee align] as rustc

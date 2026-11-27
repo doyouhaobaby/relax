@@ -495,7 +495,7 @@ mod tests {
         let mut u = crate::jit::Unit::new(prog, tcx, core);
         // the crate provided as the loader provides the CPU budget (no op listed)
         unsafe extern "C" fn no_panic_text(_: *mut *const u8, _: *mut usize) {}
-        let fixture = crate::provided::ProvidedCrate { name: "provided_section".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), shared: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[], table: Vec::new() };
+        let fixture = crate::provided::ProvidedCrate { name: "provided_section".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), shared: Default::default(), loader: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[], table: Vec::new() };
         u.provided.push((krate, fixture));
         let (group, bound) = u.section_place(entry).expect("ENTRY is in a link section");
         assert_eq!(bound, None);

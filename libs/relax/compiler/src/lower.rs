@@ -810,6 +810,28 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// A call or fn pointer of JIT-compiled code naming a fn its provided crate keeps for the
+    /// loader's code (`#[relax_api(loader = "..")]`): refused here, at the use, with the crate's
+    /// text (the op to call instead, or that the fn is the loader's alone). Compiled from source,
+    /// the fn would fail later and further in, at a static its body reaches.
+    fn check_loader_only(&mut self, callee: u32) {
+        let FnKey::Inst(d, args) = &self.u.fns[callee as usize].key else { return };
+        if !args.is_empty() {
+            return;
+        }
+        let d = *d;
+        let krate = self.u.prog.def(d).krate;
+        let Some((_, pc)) = self.u.provided.iter().find(|(k, _)| *k == krate) else { return };
+        if pc.loader.is_empty() {
+            return;
+        }
+        let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
+        if let Some(text) = pc.loader.get(key.as_str()) {
+            let msg = format!("`{key}` of provided crate `{}` is the loader's alone (#[relax_api(loader)]): {text}", pc.name);
+            self.provided_err(krate, msg);
+        }
+    }
+
     /// An error of JIT-compiled code reaching into provided crate `krate` the way it cannot
     /// (check_provided_*): also a violation row of the boundary audit when one runs.
     fn provided_err(&mut self, krate: u32, msg: String) {
@@ -9493,6 +9515,7 @@ impl<'a> Lcx<'a> {
         }
         let instance = Instance::resolve_for_fn_ptr(&self.u.tcx, &self.u.prog, d, &args).expect("fn pointer instance");
         let id = self.u.instance_fn_id(instance);
+        self.check_loader_only(id);
         self.emit(Inst::FnAddr(r, id));
         r
     }
@@ -11596,6 +11619,7 @@ impl<'a> Lcx<'a> {
         if let Callee::Fn(id) = &callee {
             crate::boundary::note_call(self.u, self.b.def, &self.b.args, *id);
             self.check_provided_ownership(*id);
+            self.check_loader_only(*id);
         }
         // a #[track_caller] callee gets the caller location (this fn's own when it tracks too)
         if let Callee::Fn(id) = &callee {

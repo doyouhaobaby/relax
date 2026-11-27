@@ -1302,6 +1302,7 @@ fn count_refusal(class: u8) {
     }
 }
 /// This run's threads that met a refused OS class change, each once.
+#[relax_api::relax_api(loader = "the loader reports the refused class changes (the JIT's queue): JIT code has no use for it")]
 pub fn refused_threads() -> Vec<RefusedThread> { REFUSED_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
 
 fn apply_thread_class(class: u8) -> bool {
