@@ -815,11 +815,12 @@ impl<'a> Lcx<'a> {
     /// text (the op to call instead, or that the fn is the loader's alone). Compiled from source,
     /// the fn would fail later and further in, at a static its body reaches.
     fn check_loader_only(&mut self, callee: u32) {
-        let FnKey::Inst(d, args) = &self.u.fns[callee as usize].key else { return };
+        // (a lowering ahead's temporary callee identity names its key there: it has no slot yet)
+        let key = crate::jit::lower_ahead_fn_key(callee).unwrap_or_else(|| self.u.fns[callee as usize].key.clone());
+        let FnKey::Inst(d, args) = key else { return };
         if !args.is_empty() {
             return;
         }
-        let d = *d;
         let krate = self.u.prog.def(d).krate;
         let Some((_, pc)) = self.u.provided.iter().find(|(k, _)| *k == krate) else { return };
         if pc.loader.is_empty() {

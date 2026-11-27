@@ -158,7 +158,8 @@ pub fn note_call(u: &Unit, def: DefId, args: &[TyId], callee: u32) {
     if !on() {
         return;
     }
-    let key = u.fns[callee as usize].key.clone();
+    // (a lowering ahead's temporary callee identity names its key there: it has no slot yet)
+    let key = crate::jit::lower_ahead_fn_key(callee).unwrap_or_else(|| u.fns[callee as usize].key.clone());
     let FnKey::Inst(cd, cargs) = key else { return };
     let mut g = AUDIT.lock().unwrap();
     let Some(a) = g.as_mut() else { return };
