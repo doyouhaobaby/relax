@@ -713,8 +713,10 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
 
 /// The `--known-refused` list: `path<TAB>why` rows, `#` comments and blank lines skipped.
 pub fn read_allowed(path: &str) -> Result<Vec<(String, String)>, String> {
-    // through the vfs, as the program's sources are read: a lane's overlay holds its edit of the list
-    let text = crate::vfs::read_to_string(path).map_err(|e| format!("--known-refused {path}: {e}"))?;
+    // through the vfs, as the program's sources are read (by absolute path): a lane's overlay holds
+    // its edit of the list
+    let at = std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.into());
+    let text = crate::vfs::read_to_string(&at).map_err(|e| format!("--known-refused {}: {e}", at.display()))?;
     let mut rows = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() || line.starts_with('#') {
