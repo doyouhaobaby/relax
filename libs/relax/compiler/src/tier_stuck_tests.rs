@@ -223,6 +223,21 @@ pub fn native_cores() -> usize { *NATIVE.get_or_init(native_only) }
 static UNUSED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 fn native_only() -> usize { *UNUSED.get_or_init(|| 2) }
 pub static LIMIT: usize = 8;
+// a pub fn of a private module is no way in; a `pub use` of one is, and so is the drop of a type
+// a pub fn gives out (unnameable, in that module)
+mod inner {
+    pub fn hidden() -> usize { *super::HIDDEN.get_or_init(|| 3) }
+    pub fn shown() -> usize { *super::SHOWN.get_or_init(|| 5) }
+    pub struct Lease;
+    impl Drop for Lease {
+        fn drop(&mut self) { super::RETURNED.get_or_init(|| 1); }
+    }
+}
+pub use inner::shown;
+pub fn lease() -> inner::Lease { inner::Lease }
+static HIDDEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SHOWN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static RETURNED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 "#;
 
 /// A provided crate's opaque type (as the loader binds makepad-script's ScriptHeap) keeps the
@@ -233,7 +248,8 @@ pub static LIMIT: usize = 8;
 /// The same crate holds the loader build's provided-statics cases (boundary::statics): an unmarked
 /// static a plain fn reaches fails with the runtime's refusal and the way in, marked `per_side` it
 /// passes, an op's statics are the loader's, and the allow list passes a refusal but not a row that
-/// names none.
+/// names none. Ways in are what another crate can reach: a pub fn of a private module is none, a
+/// `pub use` of it is one, and so is the drop of an unnameable type a pub fn gives out.
 #[test]
 fn an_opaque_types_own_methods_are_made_off_the_owner() {
     isolated_test!(an_opaque_types_own_methods_are_made_off_the_owner);
@@ -281,15 +297,19 @@ fn an_opaque_types_own_methods_are_made_off_the_owner() {
     u.provided[0].1.shims.insert(key, crate::provided::Shim { sig: "", slots: &[], f: no_op });
     let statics = |u: &Unit, allowed: &[(String, String)]| crate::owner::call(crate::owner::Class::Program, || crate::boundary::statics(u, &["opaque_front".to_string()], allowed, "allow.tsv"));
     let (report, failed) = statics(&*u, &[]);
-    assert_eq!(failed, 1, "the unmarked MACHINE is the one failure:\n{report}");
+    assert_eq!(failed, 3, "the unmarked MACHINE, SHOWN and RETURNED are the failures:\n{report}");
     let refusal = "static `opaque_front::MACHINE` (`OnceLock<usize>`) is laid out and run by rustc's std on the loader's side and by Relax's on this side (a lock, a lazy cell, a collection, a box or an Rc/Arc): reach it through an op of the crate (#[relax_api] fn), or mark it `#[relax_api(per_side)]`";
     assert!(report.contains(&format!("static\tFAIL\topaque_front::MACHINE\t{refusal}\n  reached\topaque_front::machine_cores\n")), "the runtime's refusal, and the plain fn it is reached through:\n{report}");
     assert!(!report.contains("NATIVE") && !report.contains("UNUSED"), "an op's body, and the fn only it calls, are rustc's:\n{report}");
-    let allowed = [("opaque_front::MACHINE".to_string(), "a refusal case".to_string())];
+    assert!(!report.contains("HIDDEN"), "a pub fn of a private module is no way in:\n{report}");
+    assert!(report.contains("static\tFAIL\topaque_front::SHOWN\t") && report.contains("  reached\topaque_front::inner::shown\n"), "a `pub use` of a private module's fn is a way in:\n{report}");
+    assert!(report.contains("static\tFAIL\topaque_front::RETURNED\t") && report.contains("  reached\topaque_front::inner::::drop\n"), "the drop of a type a pub fn gives out is a way in:\n{report}");
+    let rest = ["SHOWN", "RETURNED"].map(|s| (format!("opaque_front::{s}"), "a way in".to_string()));
+    let allowed: Vec<_> = rest.iter().cloned().chain([("opaque_front::MACHINE".to_string(), "a refusal case".to_string())]).collect();
     let (report, failed) = statics(&*u, &allowed);
     assert!(failed == 0 && report.contains("static\tallowed\topaque_front::MACHINE\ta refusal case\n"), "a listed refusal passes:\n{report}");
     u.provided[0].1.per_side.insert(crate::provided::norm("opaque_front::MACHINE"));
-    let (report, failed) = statics(&*u, &[]);
+    let (report, failed) = statics(&*u, &rest);
     assert_eq!(failed, 0, "marked per_side, JIT code keeps its own instance:\n{report}");
     let (report, failed) = statics(&*u, &allowed);
     assert!(failed == 1 && report.contains("allow\tFAIL\topaque_front::MACHINE\tlisted in allow.tsv"), "a listed static that is no refusal fails, so the list keeps to what is true:\n{report}");

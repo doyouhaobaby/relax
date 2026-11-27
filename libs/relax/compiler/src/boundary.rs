@@ -567,12 +567,17 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
 ///
 /// What JIT code reaches is taken from the crates' source, not from any one app: the bodies
 /// Relax compiles from a provided crate's source are its fns that are not bound ops (generic
-/// fns, fns without an op mark or that refuse binding: `binding`), and JIT code can enter them
-/// through any `pub` fn, any trait impl's method (Drop's too) and any trait's default body. Each
-/// such body is read as typeck left it (closures with it), and every fn, const and static it
-/// names is followed: a provided crate's non-op fn or free const is read in turn, a static is
-/// judged.
-/// A `pub` static is reached as it is (JIT code names it). An op's body is rustc's: what it
+/// fns, fns without an op mark or that refuse binding: `binding`). JIT code enters them where
+/// rustc's effective visibility lets another crate: the fns it can name (`pub` through every
+/// module from the crate's root, or a `pub use`), the pub methods and trait impls of the types it
+/// can hold (named, or taken or given by a fn it can call, ops' included, or in a pub field of
+/// one), and the impls and default bodies of the traits it can name. A `pub` item of a private
+/// module is no way in. Each body is read as typeck left it (closures with it), and every fn,
+/// const and static it names is followed: a provided crate's non-op fn or free const is read in
+/// turn, a static is judged; the trait impls of the types it uses (a drop, a generic call) and of
+/// the traits it calls through are entered from it. A handle's drop is the loader's (rustc's
+/// drop fn).
+/// A `pub` static JIT code can name is reached as it is. An op's body is rustc's: what it
 /// reaches is the loader's.
 ///
 /// `registered`: the crates the loader provides (provided::registered_names), each of which the
@@ -582,6 +587,7 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
 /// (Tested with the opaque-front fixture crate: tier_stuck_tests.rs.)
 pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], allow_file: &str) -> (String, usize) {
     use crate::ast::{ItemKind, Vis};
+    use std::collections::HashSet;
     let prog = &u.prog;
     let provided: Vec<u32> = u.provided.iter().map(|(k, _)| *k).collect();
     use std::fmt::Write;
@@ -603,40 +609,211 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
             _ => false,
         }
     };
-    // the body (or `pub`) each def was first reached from: the way in, for a failure's row
+    let in_provided = |d: DefId| (d.0 as usize) < prog.defs.len() && provided.contains(&prog.def(d).krate);
+    // an item's own `pub` (a module's from its `mod` item; `pub(crate)` and narrower are not
+    // another crate's)
+    let item_pub = |d: DefId| {
+        let def = prog.def(d);
+        let it = prog.files[def.file as usize].ast.item(def.item);
+        if def.kind == DefKind::Mod && !matches!(it.kind, ItemKind::Mod(_)) {
+            return def.is_pub;
+        }
+        matches!(it.vis, Vis::Pub)
+    };
+    // What JIT code can name, as rustc's effective visibility has it: from each provided crate's
+    // root module through its `pub` items, its `pub use` re-exports and `pub use ..::*` globs. A
+    // `pub` item of a private module is not reached that way.
+    let pub_imports: HashSet<(u32, u32)> = prog.imports_iter()
+        .filter(|im| !im.glob && prog.import_vis(im).is_none())
+        .filter_map(|im| Some((im.module, im.bind?)))
+        .collect();
+    let mut nameable: Vec<DefId> = Vec::new();
+    let mut mods_seen: HashSet<u32> = HashSet::new();
+    let mut mq: Vec<u32> = provided.iter().map(|&k| prog.crates[k as usize].root_mod).collect();
+    while let Some(m) = mq.pop() {
+        if !mods_seen.insert(m) {
+            continue;
+        }
+        let md = &prog.mods[m as usize];
+        for (ns_type, map) in [(true, &md.types), (false, &md.values)] {
+            for (&name, &d) in map {
+                let public = if md.import_pub.contains_key(&(name, ns_type)) { pub_imports.contains(&(m, name)) } else { item_pub(d) };
+                if !public || !in_provided(d) {
+                    continue;
+                }
+                nameable.push(d);
+                if prog.def(d).kind == DefKind::Mod {
+                    mq.push(prog.def(d).sub);
+                }
+            }
+        }
+        for &(t, vis) in &md.globs {
+            if vis.is_none() && in_provided(t) && prog.def(t).kind == DefKind::Mod {
+                mq.push(prog.def(t).sub);
+            }
+        }
+    }
+    // the provided ADTs (and traits, of a `dyn`) a type holds
+    fn adts_in(u: &Unit, t: TyId, out: &mut Vec<DefId>) {
+        match u.tcx.tys.kind(t).clone() {
+            TyKind::Adt(d, args, _) => {
+                out.push(d);
+                for &a in u.tcx.tys.list(args).iter() { adts_in(u, a, out); }
+            }
+            TyKind::Tuple(v) | TyKind::Alias(_, AliasTy { args: v, .. }) => {
+                for &a in u.tcx.tys.list(v).iter() { adts_in(u, a, out); }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => adts_in(u, e, out),
+            TyKind::FnPtr(ps, r, _, _) => {
+                for &a in u.tcx.tys.list(ps).iter() { adts_in(u, a, out); }
+                adts_in(u, r, out);
+            }
+            TyKind::Dyn(tr, args, ..) => {
+                out.push(tr);
+                for &a in u.tcx.tys.list(args).iter() { adts_in(u, a, out); }
+            }
+            _ => {}
+        }
+    }
+    // the impls of the provided crates, by their self type's ADT (None: it holds none of theirs,
+    // `impl Trait for u32`); a handle's Drop is the loader's (its rustc drop fn: provided types)
+    let drop_trait = u.tcx.lang_items.get(LangItem::Drop);
+    let handle = |d: DefId| u.provided.iter().any(|(k, p)| *k == prog.def(d).krate && p.types.contains_key(crate::provided::norm(&prog.def_path(d)).as_str()));
+    let mut impls: Vec<(Option<DefId>, Option<DefId>, &[DefId])> = Vec::new();
+    for im in prog.impls.iter() {
+        if !in_provided(im.def) {
+            continue;
+        }
+        let Some(&st) = u.tcx.impl_self.get(&im.def) else { continue };
+        let mut st = st;
+        while let TyKind::Ref(_, x, _) = u.tcx.tys.kind(st).clone() { st = x; }
+        let adt = match u.tcx.tys.kind(st).clone() { TyKind::Adt(d, ..) if in_provided(d) => Some(d), _ => None };
+        let tr = u.tcx.impl_trait.get(&im.def).copied();
+        if tr.is_some() && tr == drop_trait && adt.is_some_and(handle) {
+            continue;
+        }
+        impls.push((adt, tr, &im.items));
+    }
+    // impls by what enters them: their self type's ADT, their trait; a trait's own fns (the
+    // default bodies)
+    let mut by_adt: std::collections::HashMap<DefId, Vec<usize>> = std::collections::HashMap::new();
+    let mut by_trait: std::collections::HashMap<DefId, Vec<usize>> = std::collections::HashMap::new();
+    let mut recheck: Vec<usize> = Vec::new();
+    for (i, &(adt, tr, _)) in impls.iter().enumerate() {
+        match adt { Some(a) => by_adt.entry(a).or_default().push(i), None => recheck.push(i) }
+        if let Some(t) = tr.filter(|&t| in_provided(t)) { by_trait.entry(t).or_default().push(i); }
+    }
+    let mut trait_fns: std::collections::HashMap<DefId, Vec<DefId>> = std::collections::HashMap::new();
+    for (di, def) in prog.defs.iter().enumerate() {
+        if def.kind == DefKind::AssocFn && provided.contains(&def.krate) && prog.def(def.parent).kind == DefKind::Trait {
+            trait_fns.entry(def.parent).or_default().push(DefId(di as u32));
+        }
+    }
+    let mut taken = vec![false; impls.len()];
+    // the body (or the name) each def was first reached from: the way in, for a failure's row
     let mut from: std::collections::HashMap<DefId, Option<DefId>> = std::collections::HashMap::new();
     let mut queue: Vec<DefId> = Vec::new();
     let mut reached_statics: BTreeMap<String, DefId> = BTreeMap::new();
-    for (di, def) in prog.defs.iter().enumerate() {
-        if !provided.contains(&def.krate) {
-            continue;
-        }
-        let d = DefId(di as u32);
-        let public = || matches!(prog.files[def.file as usize].ast.item(def.item).vis, Vis::Pub);
-        let root = match def.kind {
-            DefKind::Fn | DefKind::AssocFn => {
-                let parent = prog.def(def.parent);
-                (public() || (parent.kind == DefKind::Impl && u.tcx.impl_trait.contains_key(&def.parent)) || parent.kind == DefKind::Trait)
-                    && has_body(d) && jit_side(d)
+    // Types JIT code can hold (it names them, a fn it can call takes or gives them, or a pub field
+    // of one holds them): their pub methods and their trait impls are entered. Types only the
+    // JIT-compiled bodies use: their trait impls are (a drop, a generic call), from that body.
+    // Traits JIT code can name, hold as `dyn` or the bodies call through: their impls' methods
+    // and their default bodies are.
+    let mut live: HashSet<DefId> = HashSet::new();
+    let mut used: std::collections::HashMap<DefId, Option<DefId>> = std::collections::HashMap::new();
+    let mut live_traits: HashSet<DefId> = HashSet::new();
+    let mut callable: Vec<(DefId, Option<DefId>)> = Vec::new();
+    let mut sigs_read: HashSet<DefId> = HashSet::new();
+    let mut new_live: Vec<DefId> = Vec::new();
+    let mut new_used: Vec<(DefId, Option<DefId>)> = Vec::new();
+    let mut new_traits: Vec<DefId> = Vec::new();
+    for &d in &nameable {
+        match prog.def(d).kind {
+            DefKind::Struct | DefKind::Enum | DefKind::Union => new_live.push(d),
+            DefKind::Trait => new_traits.push(d),
+            DefKind::Fn => callable.push((d, None)),
+            DefKind::Const if !from.contains_key(&d) => {
+                from.insert(d, None);
+                queue.push(d);
             }
-            DefKind::Const => public(),
             DefKind::Static => {
-                if public() {
-                    from.insert(d, None);
-                    reached_statics.insert(prog.def_path(d), d);
-                }
-                false
+                from.insert(d, None);
+                reached_statics.insert(prog.def_path(d), d);
             }
-            _ => false,
-        };
-        if root {
-            from.insert(d, None);
-            queue.push(d);
+            _ => {}
         }
     }
     let mut read = 0usize;
     let mut unread: Vec<String> = Vec::new();
-    while let Some(d) = queue.pop() {
+    loop {
+        while !(callable.is_empty() && new_live.is_empty() && new_used.is_empty() && new_traits.is_empty() && recheck.is_empty()) {
+            // a fn JIT code can call: the types it takes or gives are JIT code's; its body is read
+            while let Some((f, why)) = callable.pop() {
+                if sigs_read.insert(f) {
+                    if let Some(sig) = u.tcx.fn_sig(prog, f) {
+                        let mut out = Vec::new();
+                        for &t in sig.params.iter().chain(std::iter::once(&sig.ret)) { adts_in(u, t, &mut out); }
+                        new_live.extend(out.into_iter().filter(|&d| in_provided(d)));
+                    }
+                }
+                if !from.contains_key(&f) && has_body(f) && jit_side(f) {
+                    from.insert(f, why);
+                    queue.push(f);
+                }
+            }
+            while let Some(t) = new_live.pop() {
+                if prog.def(t).kind == DefKind::Trait {
+                    new_traits.push(t);
+                } else if live.insert(t) {
+                    if let Some(a) = u.tcx.adts.get(&t) {
+                        let mut out = Vec::new();
+                        for v in &a.variants {
+                            for fl in &v.fields {
+                                if a.is_enum || fl.vis_mod == u32::MAX { adts_in(u, fl.ty, &mut out); }
+                            }
+                        }
+                        new_live.extend(out.into_iter().filter(|&d| in_provided(d)));
+                    }
+                    recheck.extend(by_adt.get(&t).into_iter().flatten().copied());
+                }
+            }
+            while let Some((t, why)) = new_used.pop() {
+                if prog.def(t).kind == DefKind::Trait {
+                    new_traits.push(t);
+                } else if !used.contains_key(&t) {
+                    used.insert(t, why);
+                    recheck.extend(by_adt.get(&t).into_iter().flatten().copied());
+                }
+            }
+            while let Some(t) = new_traits.pop() {
+                if live_traits.insert(t) {
+                    callable.extend(trait_fns.get(&t).into_iter().flatten().map(|&f| (f, None)));
+                    recheck.extend(by_trait.get(&t).into_iter().flatten().copied());
+                }
+            }
+            // an impl is entered: an inherent one's pub methods for a type JIT code holds; a trait
+            // impl's methods for a type it holds or a body uses (or none of the crates'), of a
+            // trait not the crates' or one JIT code reaches
+            while let Some(i) = recheck.pop() {
+                let (adt, tr, items) = impls[i];
+                if taken[i] || tr.is_some_and(|t| in_provided(t) && !live_traits.contains(&t)) {
+                    continue;
+                }
+                let why = match (adt, tr) {
+                    (Some(a), _) if live.contains(&a) => None,
+                    (Some(a), Some(_)) => match used.get(&a) { Some(&w) => w, None => continue },
+                    (None, Some(_)) => None,
+                    _ => continue,
+                };
+                taken[i] = true;
+                for &f in items {
+                    if prog.def(f).kind == DefKind::AssocFn && (tr.is_some() || item_pub(f)) {
+                        callable.push((f, why));
+                    }
+                }
+            }
+        }
+        let Some(d) = queue.pop() else { break };
         read += 1;
         let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.typeck(prog, d))) {
             Ok(b) => b,
@@ -645,11 +822,15 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
                 continue;
             }
         };
+        // the types the body uses
+        let mut out = Vec::new();
+        for &t in body.expr_ty.iter().chain(body.pat_ty.iter()) { adts_in(u, t, &mut out); }
+        new_used.extend(out.into_iter().filter(|&t| in_provided(t) && !used.contains_key(&t)).map(|t| (t, Some(d))));
         let named = body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values())
             .filter_map(|r| if let crate::typeck::Res::Def(x) = r { Some(*x) } else { None })
             .chain(body.methods.values().chain(body.binops.values()).map(|m| m.def));
         for x in named {
-            if (x.0 as usize) >= prog.defs.len() || !provided.contains(&prog.def(x).krate) || from.contains_key(&x) {
+            if !in_provided(x) || from.contains_key(&x) {
                 continue;
             }
             match prog.def(x).kind {
@@ -657,9 +838,16 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
                     from.insert(x, Some(d));
                     reached_statics.insert(prog.def_path(x), x);
                 }
-                DefKind::Fn | DefKind::AssocFn if has_body(x) && jit_side(x) => {
-                    from.insert(x, Some(d));
-                    queue.push(x);
+                DefKind::Fn | DefKind::AssocFn => {
+                    // a call through a trait's fn: the trait's impls are entered
+                    let parent = prog.def(x).parent;
+                    if prog.def(x).kind == DefKind::AssocFn && prog.def(parent).kind == DefKind::Trait && !live_traits.contains(&parent) {
+                        new_traits.push(parent);
+                    }
+                    if has_body(x) && jit_side(x) {
+                        from.insert(x, Some(d));
+                        queue.push(x);
+                    }
                 }
                 DefKind::Const => {
                     from.insert(x, Some(d));
