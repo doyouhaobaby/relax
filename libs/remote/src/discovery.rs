@@ -89,8 +89,6 @@ pub(crate) fn lease_field() -> String {
 pub struct App {
     pub pid: u32,
     pub app: String,
-    /// Main window title as supplied by the application, without the remote marker.
-    pub title: Option<String>,
     pub socket: String,
     pub started_ms: u64,
     pub caps: Vec<String>,
@@ -113,6 +111,9 @@ impl App {
         let mut i = 0;
         string(raw.as_bytes(), &mut i)
     }
+
+    /// Main window title as supplied by the application, without the remote marker.
+    pub fn title(&self) -> Option<String> { self.text("title") }
 
     /// Visible window IDs and their titles, in window order. Older endpoints advertise none.
     pub fn visible_windows(&self) -> Vec<(usize, String)> {
@@ -273,7 +274,6 @@ pub fn parse(text: &str) -> Option<App> {
     Some(App {
         pid: get("pid")?.parse().ok()?,
         app: text_of("app"),
-        title: get("title").and_then(|r| string(r.as_bytes(), &mut 0)),
         socket: text_of("socket"),
         started_ms: get("started_ms").and_then(|v| v.parse().ok()).unwrap_or(0),
         caps: get("caps").map(|r| list_of_strings(&r)).unwrap_or_default(),
@@ -510,7 +510,7 @@ pub fn publish(path: &std::path::Path) -> std::io::Result<()> {
 
 /// The line [`publish`] writes for `app`.
 fn published_line(app: &App) -> String {
-    let [(_, title), (_, windows)] = window_fields(app.title.as_deref(), &app.visible_windows());
+    let [(_, title), (_, windows)] = window_fields(app.title().as_deref(), &app.visible_windows());
     format!("{{\"pid\":{},\"app\":{},\"started_ms\":{},\"title\":{title},\"windows\":{windows}}}\n", app.pid, crate::cmd::json_str(&app.app), app.started_ms)
 }
 
@@ -632,14 +632,14 @@ mod rewrite_tests {
         let file = std::env::temp_dir().join(format!("makepad-remote-caps-test-{}.json", std::process::id()));
         std::fs::write(&file, "{\"pid\":1,\"app\":\"x\",\"socket\":\"/s\",\"started_ms\":2,\"caps\":[\"cmd/1\"],\"extra\":3}\n").unwrap();
         let read = || super::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert!(read().title.is_none() && read().visible_windows().is_empty(), "an older entry has no advertised windows");
+        assert!(read().title().is_none() && read().visible_windows().is_empty(), "an older entry has no advertised windows");
         let windows = vec![(2, "Board ]".into()), (7, "Editor · \"notes\"".into())];
         super::rewrite_fields(&file, &super::window_fields(Some("Board ]"), &windows)).unwrap();
         super::rewrite_caps(&file, &["cmd/1".into(), "app/1".into()]);
         let app = super::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert!(app.serves("app") && app.serves("cmd"));
         for app in [read(), super::parse(&super::published_line(&app)).unwrap()] {
-            assert_eq!(app.title.as_deref(), Some("Board ]"));
+            assert_eq!(app.title().as_deref(), Some("Board ]"));
             assert_eq!(app.visible_windows(), windows);
         }
         super::rewrite_fields(&file, &super::window_fields(None, &[])).unwrap();
