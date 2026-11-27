@@ -265,6 +265,9 @@ fn shape(u: &mut Unit, a: &Audit, t: TyId) -> String {
         TyKind::Array(..) => "array".into(),
         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => match u.tcx.tys.kind(x).clone() {
             TyKind::Str => "&str".into(),
+            // a pointer to a scalar (`*const usize`): an address, bound as provided.rs's
+            // `pointee` binds it
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) => "&scalar".into(),
             TyKind::Slice(el) => format!("&[{}]", shape(u, a, el)),
             TyKind::Dyn(..) => "&dyn".into(),
             TyKind::Adt(d, _, _) if provided(a, u, d) => "&vm".into(),
@@ -600,7 +603,17 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
             let _ = writeln!(rows, "crate\tFAIL\t{name}\tregistered by the loader but not bound in this program: its statics go unchecked (the program depends on every provided crate)");
         }
     }
-    let jit_side = |d: DefId| provided.contains(&prog.def(d).krate) && !binding(u, d, &[]).0;
+    // a fn or static its crate keeps for the loader (`#[relax_api(loader = "..")]`): JIT code's use
+    // of one is refused where it is made (lower.rs check_loader_only, provided::static_use), so its
+    // body is none JIT code compiles; a use from a body JIT code does compile is a failure
+    let loader_text = |d: DefId| -> Option<&'static str> {
+        let pc = &u.provided.iter().find(|(k, _)| *k == prog.def(d).krate)?.1;
+        let key = if prog.def(d).kind == DefKind::Static { crate::provided::norm(&prog.def_path(d)) } else { crate::provided::key(prog, &u.tcx, d) };
+        pc.loader.get(key.as_str()).copied()
+    };
+    let jit_side = |d: DefId| provided.contains(&prog.def(d).krate) && !binding(u, d, &[]).0 && loader_text(d).is_none();
+    // the loader's fns a body JIT code compiles calls or names: (fn, that body)
+    let mut loader_used: BTreeMap<String, (DefId, DefId)> = BTreeMap::new();
     let has_body = |d: DefId| {
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
@@ -727,10 +740,18 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
     let mut new_live: Vec<DefId> = Vec::new();
     let mut new_used: Vec<(DefId, Option<DefId>)> = Vec::new();
     let mut new_traits: Vec<DefId> = Vec::new();
+    // why JIT code holds a type or trait (the first way found), and why it can call a method of
+    // an impl entered from one: a row whose way in starts at such a method names it
+    let mut hold_why: std::collections::HashMap<DefId, String> = std::collections::HashMap::new();
+    let mut method_why: std::collections::HashMap<DefId, String> = std::collections::HashMap::new();
+    // a trait a JIT-compiled body calls through: that body, the way in to the trait's fns
+    let mut trait_from: std::collections::HashMap<DefId, DefId> = std::collections::HashMap::new();
     for &d in &nameable {
         match prog.def(d).kind {
-            DefKind::Struct | DefKind::Enum | DefKind::Union => new_live.push(d),
-            DefKind::Trait => new_traits.push(d),
+            DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait => {
+                hold_why.entry(d).or_insert_with(|| "it is named".to_string());
+                if prog.def(d).kind == DefKind::Trait { new_traits.push(d) } else { new_live.push(d) }
+            }
             DefKind::Fn => callable.push((d, None)),
             DefKind::Const if !from.contains_key(&d) => {
                 from.insert(d, None);
@@ -747,12 +768,16 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
     let mut unread: Vec<String> = Vec::new();
     loop {
         while !(callable.is_empty() && new_live.is_empty() && new_used.is_empty() && new_traits.is_empty() && recheck.is_empty()) {
-            // a fn JIT code can call: the types it takes or gives are JIT code's; its body is read
+            // a fn JIT code can call: the types it takes or gives are JIT code's; its body is read.
+            // One kept for the loader gives JIT code nothing: its call is refused where it is made.
             while let Some((f, why)) = callable.pop() {
-                if sigs_read.insert(f) {
+                if sigs_read.insert(f) && loader_text(f).is_none() {
                     if let Some(sig) = u.tcx.fn_sig(prog, f) {
                         let mut out = Vec::new();
                         for &t in sig.params.iter().chain(std::iter::once(&sig.ret)) { adts_in(u, t, &mut out); }
+                        for &d in out.iter().filter(|&&d| in_provided(d)) {
+                            hold_why.entry(d).or_insert_with(|| format!("the signature of `{}`", prog.def_path(f)));
+                        }
                         new_live.extend(out.into_iter().filter(|&d| in_provided(d)));
                     }
                 }
@@ -772,6 +797,9 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
                                 if a.is_enum || fl.vis_mod == u32::MAX { adts_in(u, fl.ty, &mut out); }
                             }
                         }
+                        for &d in out.iter().filter(|&&d| in_provided(d)) {
+                            hold_why.entry(d).or_insert_with(|| format!("a pub field of `{}`", prog.def_path(t)));
+                        }
                         new_live.extend(out.into_iter().filter(|&d| in_provided(d)));
                     }
                     recheck.extend(by_adt.get(&t).into_iter().flatten().copied());
@@ -787,7 +815,8 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
             }
             while let Some(t) = new_traits.pop() {
                 if live_traits.insert(t) {
-                    callable.extend(trait_fns.get(&t).into_iter().flatten().map(|&f| (f, None)));
+                    let via = trait_from.get(&t).copied();
+                    callable.extend(trait_fns.get(&t).into_iter().flatten().map(|&f| (f, via)));
                     recheck.extend(by_trait.get(&t).into_iter().flatten().copied());
                 }
             }
@@ -806,8 +835,16 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
                     _ => continue,
                 };
                 taken[i] = true;
+                let held = match (adt, tr) {
+                    (Some(a), _) if live.contains(&a) => Some(a),
+                    (_, Some(t)) if live_traits.contains(&t) => Some(t),
+                    _ => None,
+                };
                 for &f in items {
                     if prog.def(f).kind == DefKind::AssocFn && (tr.is_some() || item_pub(f)) {
+                        if let Some(h) = held {
+                            method_why.entry(f).or_insert_with(|| format!("JIT code holds `{}`: {}", prog.def_path(h), hold_why.get(&h).map_or("?", |s| s.as_str())));
+                        }
                         callable.push((f, why));
                     }
                 }
@@ -842,7 +879,11 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
                     // a call through a trait's fn: the trait's impls are entered
                     let parent = prog.def(x).parent;
                     if prog.def(x).kind == DefKind::AssocFn && prog.def(parent).kind == DefKind::Trait && !live_traits.contains(&parent) {
+                        trait_from.entry(parent).or_insert(d);
                         new_traits.push(parent);
+                    }
+                    if loader_text(x).is_some() {
+                        loader_used.entry(prog.def_path(x)).or_insert((x, d));
                     }
                     if has_body(x) && jit_side(x) {
                         from.insert(x, Some(d));
@@ -859,20 +900,35 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
     }
     let way_in = |s: DefId| {
         let mut path = Vec::new();
+        let mut root = None;
         let mut at = from.get(&s).copied().flatten();
         while let Some(d) = at.filter(|_| path.len() < 24) {
             path.push(prog.def_path(d));
+            root = Some(d);
             at = from.get(&d).copied().flatten();
         }
         path.reverse();
-        if path.is_empty() { "pub: JIT code names it".to_string() } else { path.join(" -> ") }
+        let why = root.and_then(|r| method_why.get(&r)).map_or(String::new(), |w| format!(" [{w}]"));
+        if path.is_empty() { "pub: JIT code names it".to_string() } else { format!("{}{why}", path.join(" -> ")) }
     };
     let mut refused = 0usize;
+    let mut kept = 0usize;
     let mut listed_seen: Vec<&str> = Vec::new();
+    for (path, &(x, body)) in &loader_used {
+        failed += 1;
+        let _ = writeln!(rows, "loader\tFAIL\t{path}\tkept for the loader ({}), but a body JIT code compiles uses it: make that body an op or keep it for the loader too", loader_text(x).unwrap_or(""));
+        let _ = writeln!(rows, "  reached\t{}", if from.contains_key(&body) { format!("{} -> {}", way_in(body), prog.def_path(body)) } else { prog.def_path(body) });
+    }
     for (path, &s) in &reached_statics {
         let Some(t) = u.tcx.const_ty(prog, s) else { continue };
         let crate::provided::StaticUse::Refused(msg) = crate::provided::static_use(u, s, t) else { continue };
         refused += 1;
+        // a static kept for the loader that JIT code can name: its use is refused with its text
+        if loader_text(s).is_some() && from.get(&s).copied().flatten().is_none() {
+            kept += 1;
+            let _ = writeln!(rows, "static\tloader\t{path}");
+            continue;
+        }
         if let Some((p, why)) = allowed.iter().find(|(p, _)| p == path) {
             listed_seen.push(p);
             let _ = writeln!(rows, "static\tallowed\t{path}\t{why}");
@@ -892,9 +948,30 @@ pub fn statics(u: &Unit, registered: &[String], allowed: &[(String, String)], al
         failed += 1;
         let _ = writeln!(rows, "body\tFAIL\t{e}\t(its statics go unchecked)");
     }
+    // every loader mark names a fn or static of the crate's source: a stale one keeps nothing back
+    for (k, pc) in u.provided.iter() {
+        let mut named: HashSet<String> = HashSet::new();
+        for (di, d) in prog.defs.iter().enumerate() {
+            if d.krate != *k {
+                continue;
+            }
+            match d.kind {
+                DefKind::Fn | DefKind::AssocFn => { named.insert(crate::provided::key(prog, &u.tcx, DefId(di as u32))); }
+                DefKind::Static => { named.insert(crate::provided::norm(&prog.def_path(DefId(di as u32)))); }
+                _ => {}
+            }
+        }
+        let mut stale: Vec<&String> = pc.loader.keys().filter(|key| !named.contains(key.as_str())).collect();
+        stale.sort();
+        for key in stale {
+            failed += 1;
+            let _ = writeln!(rows, "loader\tFAIL\t{key}\tmarked #[relax_api(loader)] in {}, but no fn or static of this source has that path: the mark keeps nothing back", pc.name);
+        }
+    }
     let names: Vec<&str> = u.provided.iter().map(|(_, p)| p.name.as_str()).collect();
     let mut out = String::new();
-    let _ = writeln!(out, "# provided statics: {} provided crates ({}), {} bodies JIT code can compile read, {} statics reached, {} refused ({} allowed): {} failures", names.len(), names.join(", "), read, reached_statics.len(), refused, listed_seen.len(), failed);
+    let loader_items: usize = u.provided.iter().map(|(_, p)| p.loader.len()).sum();
+    let _ = writeln!(out, "# provided statics: {} provided crates ({}), {} bodies JIT code can compile read, {} statics reached, {} refused ({} allowed, {} kept for the loader; {} items kept for the loader): {} failures", names.len(), names.join(", "), read, reached_statics.len(), refused, listed_seen.len(), kept, loader_items, failed);
     out.push_str(&rows);
     (out, failed)
 }
