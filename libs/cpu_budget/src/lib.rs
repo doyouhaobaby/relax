@@ -958,6 +958,7 @@ pub fn checkpoint(permit: u32, held_locks: u32, lock_site: &str) -> u32 { global
 #[relax_api]
 pub fn release(permit: u32) { global().release(permit); }
 /// `Budget::end_run`
+#[relax_api]
 pub fn end_run() { global().end_run(); }
 #[relax_api]
 pub fn reclass(permit: u32, class: u8) { global().reclass(permit, class); }
@@ -1175,12 +1176,14 @@ pub fn set_thread_floor(on: bool) { THREAD_FLOOR.with(|floor| floor.set(on)); }
 /// The calling thread goes below every other thread: Linux SCHED_IDLE (a core runs it only when no
 /// other thread wants that core), elsewhere the Background class's priority. A thread without
 /// CAP_SYS_NICE (RLIMIT_NICE 0) cannot leave SCHED_IDLE again; Background work keeps it there.
+#[relax_api]
 pub fn set_thread_idle() -> bool {
     if UI_THREAD.with(Cell::get) || THREAD_FLOOR.with(Cell::get) || KEEPS_PRIORITY.with(Cell::get) { return false; }
     apply_thread_class(IDLE)
 }
 /// The calling thread runs at the OS's idle policy (`set_thread_idle` took effect, and nothing
 /// raised it since).
+#[relax_api]
 pub fn thread_idle() -> bool { IDLE_NOW.with(Cell::get) }
 /// The OS class code of `set_thread_idle` (below Background; 3 is the UI's).
 const IDLE: u8 = 4;
@@ -1248,6 +1251,7 @@ pub fn set_thread_deadline(on: bool) {
 /// The performance cores the person's work leaves now (the cores of the faster kind less the
 /// Interactive and Visible jobs that run, averaged over a span, and the deadline threads); 0 on a
 /// machine with one kind of core. For the budget's report, the JIT's hold ledger and tests.
+#[relax_api]
 pub fn fast_room() -> u32 { global().fast_room() as u32 }
 
 /// The OS class code of Background work of the calling thread's kind (`set_thread_work`), now.
@@ -1272,8 +1276,10 @@ fn background_class() -> u8 { BACKGROUND }
 static CLASS_REFUSALS: [[AtomicU64; 7]; 2] = [const { [const { AtomicU64::new(0) }; 7] }; 2];
 static REFUSALS_MARKED: AtomicBool = AtomicBool::new(false);
 /// Split this run's refused OS class changes at the calling event.
+#[relax_api]
 pub fn mark_class_refusals() { REFUSALS_MARKED.store(true, Relaxed); }
 /// Counts by requested OS class, before and after the mark. Without a mark all are before.
+#[relax_api]
 pub fn class_refusals() -> [[u64; 7]; 2] { CLASS_REFUSALS.each_ref().map(|row| row.each_ref().map(|n| n.load(Relaxed))) }
 /// The threads a refused change was counted on in this run, each once (at its first): the class
 /// asked, whether it came after the mark, the thread's id and name. A refused raise is not tried
