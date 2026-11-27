@@ -74,7 +74,7 @@ impl Drop for FreeReplies {
 /// `bytes` become this thread's reply `slot` (valid until its next reply): (start, length). The
 /// reply is freed at the thread's end; one made after that (by a destructor that runs later) is
 /// left to the process.
-fn reply(slot: &'static std::thread::LocalKey<Reply>, bytes: Vec<u8>) -> (*const u8, usize) {
+fn reply(slot: &'static makepad_thread_local::LocalKey<Reply>, bytes: Vec<u8>) -> (*const u8, usize) {
     let _ = FREE_REPLIES.try_with(|_| ());
     slot.with(|r| {
         drop(r.take());
