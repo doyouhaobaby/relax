@@ -32,6 +32,11 @@ pub struct Iter<'a, T: 'a> {
     marker: PhantomData<&'a Node<T>>,
 }
 
+// SAFETY: the list is shared-borrowed for 'a. The pointers only read its nodes
+// and yield shared references to T; iterator state changes require &mut self.
+unsafe impl<'a, T: Sync> Send for Iter<'a, T> {}
+unsafe impl<'a, T: Sync> Sync for Iter<'a, T> {}
+
 pub struct IterMut<'a, T: 'a> {
     head: *mut Node<T>,
     tail: *mut Node<T>,

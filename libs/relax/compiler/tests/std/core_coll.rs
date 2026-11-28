@@ -112,3 +112,17 @@ fn a05_linked_list() {
     }).next();
     println!("| owned {:?} {:?}", removed, words);
 }
+
+#[test]
+fn linked_list_shared_iterator_can_be_boxed_as_send_sync() {
+    use std::collections::LinkedList;
+
+    fn boxed<T: Sync>(list: &LinkedList<T>) -> Box<dyn DoubleEndedIterator<Item = &T> + Send + Sync + '_> {
+        Box::new(list.iter())
+    }
+
+    let list = LinkedList::from([1, 2, 3]);
+    let mut iter = boxed(&list);
+    assert_eq!(iter.next(), Some(&1));
+    assert_eq!(iter.next_back(), Some(&3));
+}
